@@ -168,7 +168,7 @@ class TestTheApplierIsShippable:
 class TestTheGhLogin:
     def test_the_token_reaches_gh_on_stdin_only(self, box, tmp_path, capsys):
         gh = box.add("gh")
-        assert box.apply(_work(tmp_path, login="amin"), token=TOKEN) == 0
+        assert box.apply(_work(tmp_path, login="demo"), token=TOKEN) == 0
         (login,) = [c for c in gh.calls() if c.argv[:2] == ["auth", "login"]]
         assert login.stdin == (TOKEN + "\n").encode()
         assert all(TOKEN not in " ".join(c.argv) for c in gh.calls())
@@ -179,8 +179,8 @@ class TestTheGhLogin:
         self, box, tmp_path, capsys
     ):
         gh = box.add("gh")
-        gh.set_reply("api user", stdout="amin\n")
-        work = _work(tmp_path, login="amin")
+        gh.set_reply("api user", stdout="demo\n")
+        work = _work(tmp_path, login="demo")
         box.apply(work, token=TOKEN)
         capsys.readouterr()
         box.apply(work, token=TOKEN)
@@ -190,7 +190,7 @@ class TestTheGhLogin:
     def test_a_login_gh_no_longer_holds_is_redone(self, box, tmp_path):
         gh = box.add("gh")
         gh.set_reply("api user", stdout="someone-else\n")
-        work = _work(tmp_path, login="amin")
+        work = _work(tmp_path, login="demo")
         box.apply(work, token=TOKEN)
         box.apply(work, token=TOKEN)
         assert [c.argv[:2] for c in gh.calls()].count(["auth", "login"]) == 2
@@ -207,7 +207,7 @@ class TestTheGhLogin:
     def test_no_gh_on_the_node_fails_the_step_and_names_the_repair(
         self, box, tmp_path, capsys
     ):
-        assert box.apply(_work(tmp_path, login="amin"), token=TOKEN) == 1
+        assert box.apply(_work(tmp_path, login="demo"), token=TOKEN) == 1
         (line,) = [line for line in _lines(capsys) if line.item == "gh"]
         assert line.status == "fail"
         assert "magent node setup" in line.detail
@@ -217,7 +217,7 @@ class TestTheGhLogin:
     ):
         gh = box.add("gh")
         gh.set_reply("auth login", stderr="HTTP 401: Bad credentials\n", rc=1)
-        work = _work(tmp_path, login="amin")
+        work = _work(tmp_path, login="demo")
         assert box.apply(work, token=TOKEN) == 1
         assert box.apply(work, token=TOKEN) == 1
         assert "Bad credentials" in capsys.readouterr().out
@@ -238,14 +238,14 @@ class TestAGhDigestIsKeptOnlyWhileTheLoginHolds:
 
     def _clean_login(self, box: Box, tmp_path: Path) -> FakeSsh:
         gh = box.add("gh")
-        assert box.apply(_work(tmp_path, login="amin"), token=TOKEN) == 0
+        assert box.apply(_work(tmp_path, login="demo"), token=TOKEN) == 0
         assert "gh" in self._digests(box)
         return gh
 
     def test_a_refused_token_drops_it(self, box, tmp_path):
         gh = self._clean_login(box, tmp_path)
         gh.set_reply("auth login", stderr="HTTP 401: Bad credentials\n", rc=1)
-        box.apply(_work(tmp_path, login="amin", name="again"), token=TOKEN)
+        box.apply(_work(tmp_path, login="demo", name="again"), token=TOKEN)
         assert "gh" not in self._digests(box)
 
     def test_a_pc_that_no_longer_shares_a_login_drops_it(self, box, tmp_path):
@@ -256,7 +256,7 @@ class TestAGhDigestIsKeptOnlyWhileTheLoginHolds:
     def test_a_node_that_lost_gh_drops_it(self, box, tmp_path):
         self._clean_login(box, tmp_path)
         del box.fakes["gh"]
-        assert box.apply(_work(tmp_path, login="amin", name="no-gh"), token=TOKEN) == 1
+        assert box.apply(_work(tmp_path, login="demo", name="no-gh"), token=TOKEN) == 1
         assert "gh" not in self._digests(box)
 
 
@@ -281,7 +281,7 @@ class TestGhRunsWithoutATokenFromTheEnvironment:
 
         monkeypatch.setattr(node_apply.subprocess, "run", spy)
         box.add("gh")
-        assert box.apply(_work(tmp_path, login="amin"), token=TOKEN) == 0
+        assert box.apply(_work(tmp_path, login="demo"), token=TOKEN) == 0
         assert len(seen) == 2  # auth login, auth setup-git
         for env in seen:
             assert env is not None
@@ -324,14 +324,14 @@ class TestNothingLeaksAndEveryModeIsExplicit:
     def test_a_tool_that_echoes_the_token_prints_a_mask(self, box, tmp_path, capsys):
         gh = box.add("gh")
         gh.set_reply("auth login", stderr=f"bad credentials {TOKEN}\n", rc=1)
-        box.apply(_work(tmp_path, login="amin"), token=TOKEN)
+        box.apply(_work(tmp_path, login="demo"), token=TOKEN)
         out = capsys.readouterr().out
         assert TOKEN not in out
         assert "[gh-token]" in out
 
     def test_the_token_lands_in_no_file_under_home(self, box, tmp_path):
         box.add("gh")
-        box.apply(_work(tmp_path, login="amin"), token=TOKEN)
+        box.apply(_work(tmp_path, login="demo"), token=TOKEN)
         written = [p for p in box.home.rglob("*") if p.is_file()]
         assert written  # the store and the hook, at least
         assert all(TOKEN.encode() not in p.read_bytes() for p in written)
@@ -365,7 +365,7 @@ class TestNothingLeaksAndEveryModeIsExplicit:
         gh = box.add("gh")
         prefix = "x" * (200 - len(TOKEN) // 2)
         gh.set_reply("auth login", stderr=f"{prefix}{TOKEN}\n", rc=1)
-        box.apply(_work(tmp_path, login="amin"), token=TOKEN)
+        box.apply(_work(tmp_path, login="demo"), token=TOKEN)
         out = capsys.readouterr().out
         assert TOKEN[:12] not in out
         (line,) = [
@@ -381,7 +381,7 @@ class TestNothingLeaksAndEveryModeIsExplicit:
         gh = box.add("gh")
         prefix = "x" * (200 - len(TOKEN) // 2)
         gh.set_reply("auth setup-git", stderr=f"{prefix}{TOKEN}\n", rc=1)
-        assert box.apply(_work(tmp_path, login="amin"), token=TOKEN) == 0
+        assert box.apply(_work(tmp_path, login="demo"), token=TOKEN) == 0
         out = capsys.readouterr().out
         assert TOKEN[:12] not in out
         (line,) = [
@@ -611,7 +611,7 @@ class TestTheRun:
         # at a tmp dir.
         gh = box.add("gh")
         monkeypatch.setattr(sys, "stdin", io.StringIO(TOKEN + "\n"))
-        work = _work(tmp_path, login="amin")
+        work = _work(tmp_path, login="demo")
         assert node_apply.main(["--work", str(work), "--path", box.path]) == 0
         (login,) = [c for c in gh.calls() if c.argv[:2] == ["auth", "login"]]
         assert login.stdin == (TOKEN + "\n").encode()
@@ -708,7 +708,7 @@ class TestAnOffContractPayloadIsRefusedWhole:
         assert "a link or a special file" in _nothing_applied(box, capsys)
 
     @pytest.mark.parametrize(
-        "stray", ["notes.txt", "home/amin/.bashrc", "tmp/abs/escape.md"]
+        "stray", ["notes.txt", "home/demo/.bashrc", "tmp/abs/escape.md"]
     )
     def test_anything_outside_skills_is_refused(self, box, tmp_path, capsys, stray):
         # An absolute member name lands here, under the work dir, tar-stripped.
@@ -1343,7 +1343,7 @@ RUNNER = SkillFile(
 )
 PLUGGED = replace(EMPTY, plugins=("p@mkt",), marketplaces={"mkt": "owner/mkt"})
 # A git marketplace source can carry a credential in its userinfo.
-SECRET_URL = "https://amin:ghp_DECOY0123@git.example.com/mkt.git"
+SECRET_URL = "https://demo:ghp_DECOY0123@git.example.com/mkt.git"
 
 
 def _skills(box: Box) -> Path:
@@ -1625,7 +1625,7 @@ def _edit_manifest(work: Path, **changes: object) -> None:
 SECRET_SOURCES = [
     (SECRET_URL, "https://***@git.example.com/mkt.git"),
     (
-        "https://amin:ghp_DECOY0123@x@git.example.com/mkt.git",
+        "https://demo:ghp_DECOY0123@x@git.example.com/mkt.git",
         "https://***@git.example.com/mkt.git",
     ),
     (
@@ -1633,7 +1633,7 @@ SECRET_SOURCES = [
         "https://git.example.com/mkt.git?***",
     ),
     (
-        "https://amin:ghp_DECOY0123@git.example.com/mkt.git?token=ghp_DECOY0123",
+        "https://demo:ghp_DECOY0123@git.example.com/mkt.git?token=ghp_DECOY0123",
         "https://***@git.example.com/mkt.git?***",
     ),
     ("https://git.example.com?token=ghp_DECOY0123@x", "https://git.example.com?***"),
@@ -1648,9 +1648,9 @@ class TestTheUrlSecretMask:
         "text",
         [
             # git's own wording for a scheme-less (scp-style) remote.
-            "fatal: could not read from amin:ghp_DECOY0123@git.example.com:o/m.git",
-            "remote: amin:ghp_DECOY0123@git.example.com/o/m.git not found",
-            "cloning amin:ghp_DECOY0123@git.example.com",
+            "fatal: could not read from demo:ghp_DECOY0123@git.example.com:o/m.git",
+            "remote: demo:ghp_DECOY0123@git.example.com/o/m.git not found",
+            "cloning demo:ghp_DECOY0123@git.example.com",
         ],
     )
     def test_a_schemeless_userinfo_is_masked(self, text):
@@ -1664,19 +1664,19 @@ class TestTheUrlSecretMask:
             # What follows the host is not part of the test: a quote, a
             # bracket, a comma or a ";" after it still masks the password.
             (
-                f"fatal: repository 'amin:{PASSWORD}@git.example.com' not found",
+                f"fatal: repository 'demo:{PASSWORD}@git.example.com' not found",
                 "fatal: repository '***@git.example.com' not found",
             ),
-            (f'remote "amin:{PASSWORD}@h.com"', 'remote "***@h.com"'),
-            (f"(amin:{PASSWORD}@h.com)", "(***@h.com)"),
+            (f'remote "demo:{PASSWORD}@h.com"', 'remote "***@h.com"'),
+            (f"(demo:{PASSWORD}@h.com)", "(***@h.com)"),
             (
-                f"hosts amin:{PASSWORD}@a.example.com, b",
+                f"hosts demo:{PASSWORD}@a.example.com, b",
                 "hosts ***@a.example.com, b",
             ),
-            (f"url=amin:{PASSWORD}@h.com;", "url=***@h.com;"),
+            (f"url=demo:{PASSWORD}@h.com;", "url=***@h.com;"),
             # ... nor does a ":" before the user: a path's own colon.
             (
-                f"clone of /srv/x:amin:{PASSWORD}@host/r failed",
+                f"clone of /srv/x:demo:{PASSWORD}@host/r failed",
                 "clone of /srv/x:***@host/r failed",
             ),
         ],
@@ -1812,7 +1812,7 @@ class TestThePlugins:
         claude = _claude(box, markets=())
         claude.set_reply(
             "marketplace add",
-            stderr=f"fatal: repository 'amin:{PASSWORD}@git.example.com' not found\n",
+            stderr=f"fatal: repository 'demo:{PASSWORD}@git.example.com' not found\n",
             rc=1,
         )
         box.apply(_work(tmp_path, replace(PLUGGED, marketplaces={"mkt": SECRET_URL})))
@@ -1996,7 +1996,7 @@ class TestThePlugins:
     ):
         # _last cuts a tool's line at 200 chars. Cut first and the "@" is
         # gone, so no userinfo pattern matches what is left of the secret.
-        pad = "x" * (200 - len(" https://amin:ghp_DE"))
+        pad = "x" * (200 - len(" https://demo:ghp_DE"))
         claude = _claude(box, markets=())
         claude.set_reply("marketplace add", stderr=f"{pad} {SECRET_URL}\n", rc=1)
         box.apply(_work(tmp_path, replace(PLUGGED, marketplaces={"mkt": SECRET_URL})))
@@ -2113,8 +2113,8 @@ def _everything() -> UserScope:
 
 
 def _stocked(box: Box) -> None:
-    """A node with gh (logged in as amin once asked) and claude on its PATH."""
-    box.add("gh").set_reply("api user", stdout="amin\n")
+    """A node with gh (logged in as demo once asked) and claude on its PATH."""
+    box.add("gh").set_reply("api user", stdout="demo\n")
     _claude(box)
 
 
@@ -2124,7 +2124,7 @@ STEP_ITEMS = {"gh", "state_hook", "settings", "mcp", "mcp_oauth", "plugins", "sk
 class TestAppliedTwice:
     def test_a_second_run_prints_only_skip_rows(self, box, tmp_path, capsys):
         _stocked(box)
-        work = _work(tmp_path, _everything(), login="amin")
+        work = _work(tmp_path, _everything(), login="demo")
         assert box.apply(work, token=TOKEN) == 0
         capsys.readouterr()
         assert box.apply(work, token=TOKEN) == 0
@@ -2135,7 +2135,7 @@ class TestAppliedTwice:
     def test_force_redoes_every_step_but_mcp_oauth(self, box, tmp_path, capsys):
         # F10 decision 2: a node-refreshed token is never overwritten by force.
         _stocked(box)
-        work = _work(tmp_path, _everything(), login="amin")
+        work = _work(tmp_path, _everything(), login="demo")
         box.apply(work, token=TOKEN)
         capsys.readouterr()
         assert box.apply(work, token=TOKEN, force=True) == 0
@@ -3052,7 +3052,7 @@ class TestAPcThatHangsUpDoesNotStopTheApply:
         def leak(name: str) -> tuple[str, object]:
             def step(ctx: node_apply.Ctx) -> None:
                 node_apply._row(
-                    ctx, "warn", name, f"{TOKEN} https://amin:{PASSWORD}@h/x?t=q"
+                    ctx, "warn", name, f"{TOKEN} https://demo:{PASSWORD}@h/x?t=q"
                 )
 
             return (name, step)

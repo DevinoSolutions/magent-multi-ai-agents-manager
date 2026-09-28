@@ -216,7 +216,7 @@ def gh_auth_status(
     ``accounts`` are ``(login, active, state[, error])`` entries, listed
     FIRST and in order; ``login``, when not None, is then appended as the
     active, verified (``state: success``) account -- so the common case stays
-    ``gh_auth_status("amin", "repo")`` and a test can still put the active
+    ``gh_auth_status("demo", "repo")`` and a test can still put the active
     one anywhere but first. ``state`` is gh's own vocabulary: ``success``,
     ``error``, ``timeout``; ``error`` is gh's own words for a failed check
     (``HTTP 401: Bad credentials ...``, a DNS failure), empty by default. No

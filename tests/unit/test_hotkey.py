@@ -580,7 +580,7 @@ class TestDoOpenCode(_OpenCodeHarness):
                 ],
             },
         )
-        hotkey._do_open_code("http://x:8034", "caly", "amin@deck")
+        hotkey._do_open_code("http://x:8034", "caly", "demo@deck")
         assert spawned == [["code", "--remote", "ssh-remote+deck", "/base/caly"]]
 
     def test_the_editor_gets_a_scrubbed_environment(self, monkeypatch):
@@ -802,12 +802,12 @@ class TestF2HookDecision:
             HC_ACTION,
             WM_KEYDOWN,
             self._lparam(VK_F2),
-            "amin@deck",
+            "demo@deck",
         )
         # 1 == swallow: the agent pane must never also receive the F2.
         assert result == 1
         assert started[0][0] is hotkey._do_open_code
-        assert started[0][1] == ("http://x:8034", "caly", "amin@deck")
+        assert started[0][1] == ("http://x:8034", "caly", "demo@deck")
 
     def test_f2_outside_a_magent_window_passes_through(self, monkeypatch):
         from magent import hotkey
@@ -1599,7 +1599,7 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
     authority (C3)."""
 
     def _map(
-        self, monkeypatch, tmp_path, *, nick="second", cwd="/home/amin/magent/api"
+        self, monkeypatch, tmp_path, *, nick="second", cwd="/home/demo/magent/api"
     ):
         from magent import nodes
         from magent.nodes import NodeMapEntry
@@ -1613,7 +1613,7 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
                     placed_ts=1.0,
                     attached_existing=False,
                     remote_root="~/magent/api",
-                    target="amin@devino-second",
+                    target="demo@devino-second",
                     cwd=cwd,
                 )
             }
@@ -1639,11 +1639,11 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
             [
                 "code",
                 "--remote",
-                "ssh-remote+amin@devino-second",
-                "/home/amin/magent/api",
+                "ssh-remote+demo@devino-second",
+                "/home/demo/magent/api",
             ]
         ]
-        assert self.flashed[-1] == "F2: VS Code -> /home/amin/magent/api"
+        assert self.flashed[-1] == "F2: VS Code -> /home/demo/magent/api"
         assert round_trips == []
 
     def test_a_cloud_placement_falls_through_to_the_server(self, monkeypatch, tmp_path):
@@ -1720,7 +1720,7 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
     ):
         from magent import hotkey
 
-        self._map(monkeypatch, tmp_path, cwd="/home/amin/magent/R&D")
+        self._map(monkeypatch, tmp_path, cwd="/home/demo/magent/R&D")
         spawned = self._patch(monkeypatch, code_bin=self._SHIM)
         hotkey._do_open_code("http://x:8034", "api", None)
         self._assert_refused(spawned)
@@ -1730,7 +1730,7 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
     ):
         from magent import hotkey
 
-        self._map(monkeypatch, tmp_path, cwd="/home/amin/magent/%USERNAME%")
+        self._map(monkeypatch, tmp_path, cwd="/home/demo/magent/%USERNAME%")
         spawned = self._patch(monkeypatch, code_bin=self._SHIM)
         hotkey._do_open_code("http://x:8034", "api", None)
         self._assert_refused(spawned)
@@ -1761,7 +1761,7 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
     ):
         from magent import hotkey
 
-        self._map(monkeypatch, tmp_path, cwd=f"/home/amin/magent/a{char}b")
+        self._map(monkeypatch, tmp_path, cwd=f"/home/demo/magent/a{char}b")
         spawned = self._patch(monkeypatch, code_bin=rf"C:\VS Code\bin\{shim}")
         hotkey._do_open_code("http://x:8034", "api", None)
         self._assert_refused(spawned)
@@ -1771,18 +1771,18 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
     ):
         from magent import hotkey
 
-        self._map(monkeypatch, tmp_path, cwd="/home/amin/magent/my api")
+        self._map(monkeypatch, tmp_path, cwd="/home/demo/magent/my api")
         spawned = self._patch(monkeypatch, code_bin=self._SHIM)
         hotkey._do_open_code("http://x:8034", "api", None)
         assert spawned == [
             [
                 self._SHIM,
                 "--remote",
-                "ssh-remote+amin@devino-second",
-                "/home/amin/magent/my api",
+                "ssh-remote+demo@devino-second",
+                "/home/demo/magent/my api",
             ]
         ]
-        assert self.flashed[-1] == "F2: VS Code -> /home/amin/magent/my api"
+        assert self.flashed[-1] == "F2: VS Code -> /home/demo/magent/my api"
 
     @pytest.mark.parametrize(
         "code_bin", [r"C:\VS Code\Code.exe", "/usr/bin/code", "code"]
@@ -1792,15 +1792,15 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
     ):
         from magent import hotkey
 
-        self._map(monkeypatch, tmp_path, cwd="/home/amin/magent/R&D")
+        self._map(monkeypatch, tmp_path, cwd="/home/demo/magent/R&D")
         spawned = self._patch(monkeypatch, code_bin=code_bin)
         hotkey._do_open_code("http://x:8034", "api", None)
         assert spawned == [
             [
                 code_bin,
                 "--remote",
-                "ssh-remote+amin@devino-second",
-                "/home/amin/magent/R&D",
+                "ssh-remote+demo@devino-second",
+                "/home/demo/magent/R&D",
             ]
         ]
 
@@ -1856,8 +1856,8 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
             [
                 "code",
                 "--remote",
-                "ssh-remote+amin@devino-second",
-                "/home/amin/magent/api",
+                "ssh-remote+demo@devino-second",
+                "/home/demo/magent/api",
             ]
         ]
 

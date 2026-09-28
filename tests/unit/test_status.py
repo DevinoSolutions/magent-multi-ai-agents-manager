@@ -1674,7 +1674,7 @@ class TestStatusShowsNodeSessions:
             {
                 "projects": [{"path": str(tmp_path), "title": "api", "node": "second"}],
                 "settings": {
-                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
                 },
             }
         )
@@ -1767,7 +1767,7 @@ class TestStatusShowsNodeSessions:
             {
                 "projects": [{"path": str(tmp_path), "title": "new", "node": "auto"}],
                 "settings": {
-                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
                 },
             }
         )
@@ -1796,7 +1796,7 @@ class TestStatusShowsNodeSessions:
                 sid="api-old",
                 placed_ts=1.0,
                 attached_existing=False,
-                remote_root="/home/amin/magent/api",
+                remote_root="/home/demo/magent/api",
             ),
         )
         result = runner.invoke(
@@ -1832,7 +1832,7 @@ class TestStatusShowsNodeSessions:
                     sid=sid,
                     placed_ts=1.0,
                     attached_existing=False,
-                    remote_root=f"/home/amin/magent/{name}",
+                    remote_root=f"/home/demo/magent/{name}",
                 ),
             )
         for sub in ("api", "web"):
@@ -1844,7 +1844,7 @@ class TestStatusShowsNodeSessions:
                     {"path": str(tmp_path / "web"), "title": "web", "node": "second"},
                 ],
                 "settings": {
-                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
                 },
             }
         )
@@ -1895,7 +1895,7 @@ class TestAStaleNodeSyncDaemonDegradesStatus:
             {
                 "projects": [project],
                 "settings": {
-                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
                 },
             }
         )
@@ -2358,8 +2358,8 @@ class TestDownStopsNodeSessionsWhereTheyRun:
                 "version": SCHEMA_VERSION,
                 "settings": {
                     "nodes": {
-                        "second": {"host": "devino-second", "user": "amin"},
-                        "third": {"host": "devino-third", "user": "amin"},
+                        "second": {"host": "devino-second", "user": "demo"},
+                        "third": {"host": "devino-third", "user": "demo"},
                     }
                 },
                 "projects": projects,
@@ -3479,7 +3479,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         cfgpath = tmp_config(
             {
                 "version": SCHEMA_VERSION,
-                "settings": {"nodes": {"second": {"host": "h", "user": "amin"}}},
+                "settings": {"nodes": {"second": {"host": "h", "user": "demo"}}},
                 "projects": [{"path": str(tmp_path / "api"), "node": "second"}],
             }
         )

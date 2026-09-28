@@ -39,7 +39,7 @@ from tests.unit._pull_reply import (
     pull_reply,
 )
 
-NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
+NODE = Node(nick="second", host="devino-second", user="demo", root="~/magent")
 
 
 def _parse(reply: str, dest, sids=("api",)):
@@ -204,14 +204,14 @@ class TestParsePull:
         self, tmp_path
     ):
         meta = pull_meta(
-            realpaths={"api": "/home/amin/magent/api", "web": "/etc", "x": 3},
+            realpaths={"api": "/home/demo/magent/api", "web": "/etc", "x": 3},
             state_files={
                 "api": ["k1.json", "../k2.json", "k3.txt", 4],
                 "web": ["k9.json"],
             },
         )
         snap = _parse(pull_reply(meta), tmp_path / "second")
-        assert snap.realpaths == {"api": "/home/amin/magent/api"}
+        assert snap.realpaths == {"api": "/home/demo/magent/api"}
         assert snap.state_files == {"api": ("k1.json",)}
 
     @pytest.mark.parametrize(
@@ -899,7 +899,7 @@ class TestPullNode:
         )
         (call,) = fake_ssh.calls()
         assert call.argv[-2:] == [
-            "amin@devino-second",
+            "demo@devino-second",
             "bash -c " + shlex.quote(f"bash -s -- {remote_mux.SOCKET}"),
         ]
         script, _ = call.stdin.rsplit(b"\n__MAGENT_PAYLOAD__\n", 1)
@@ -954,7 +954,7 @@ class TestPull:
         self, fake_ssh, tmp_path, monkeypatch
     ):
         monkeypatch.setattr(nodes, "NODES_DIR", tmp_path)
-        meta = pull_meta(realpaths={"api": "/home/amin/magent/api"})
+        meta = pull_meta(realpaths={"api": "/home/demo/magent/api"})
         fake_ssh.set_reply(
             "devino-second",
             stdout=pull_reply(meta, {"api/transcripts/abc.jsonl": "x\n"}),
@@ -964,7 +964,7 @@ class TestPull:
         assert _sid_payload(first, "api")["project_dir"] is None
         assert _sid_payload(second, "api") == {
             "roots": ["~/magent/api"],
-            "project_dir": encoded_project_dir("/home/amin/magent/api"),
+            "project_dir": encoded_project_dir("/home/demo/magent/api"),
             "since": 0.0,
         }
         assert result.since == 5000.0 - remote_mux.WATERMARK_OVERLAP_S
@@ -1000,7 +1000,7 @@ class TestPull:
         monkeypatch.setattr(nodes, "NODES_DIR", tmp_path)
         (tmp_path / "second").mkdir()
         (tmp_path / "second" / "api").write_text("not a directory", encoding="utf-8")
-        meta = pull_meta(realpaths={"api": "/home/amin/magent/api"})
+        meta = pull_meta(realpaths={"api": "/home/demo/magent/api"})
         fake_ssh.set_reply(
             "devino-second",
             stdout=pull_reply(meta, {"api/transcripts/abc.jsonl": "x\n"}),
@@ -1013,7 +1013,7 @@ class TestPull:
     ):
         monkeypatch.setattr(nodes, "NODES_DIR", tmp_path)
         meta = pull_meta(
-            realpaths={"api": "/home/amin/magent/api"},
+            realpaths={"api": "/home/demo/magent/api"},
             skipped={"api": ["api/transcripts/huge.jsonl"]},
         )
         fake_ssh.set_reply("devino-second", stdout=pull_reply(meta))
@@ -1021,7 +1021,7 @@ class TestPull:
         assert result.since == 5000.0 - remote_mux.WATERMARK_OVERLAP_S
 
 
-REAL = "/home/amin/magent/api"
+REAL = "/home/demo/magent/api"
 
 
 def _snap(

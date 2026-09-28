@@ -206,7 +206,7 @@ class TestReadStore:
         rec = {
             "state": "done",
             "ts": 1.0,
-            "cwd": "/home/amin/magent/api",
+            "cwd": "/home/demo/magent/api",
             "session_id": "s",
         }
         _put(mirror, "a.json", rec)
@@ -215,11 +215,11 @@ class TestReadStore:
     def test_a_mirror_and_the_local_store_never_mix(self, tmp_path):
         """The cross-check: each store answers with its own records only."""
         mirror = _mirror(tmp_path)
-        agent_state.write_state("/home/amin/local", "working", "local-sid")
+        agent_state.write_state("/home/demo/local", "working", "local-sid")
         remote = {
             "state": "needs-input",
             "ts": time.time(),
-            "cwd": "/home/amin/remote",
+            "cwd": "/home/demo/remote",
             "session_id": "node-sid",
         }
         _put(mirror, "r.json", remote)
@@ -229,7 +229,7 @@ class TestReadStore:
     def test_a_missing_directory_is_an_empty_store(self, tmp_path):
         # The local store beside it is NOT empty, so reading the wrong
         # directory cannot pass as "empty".
-        agent_state.write_state("/home/amin/local", "working", "local-sid")
+        agent_state.write_state("/home/demo/local", "working", "local-sid")
         assert agent_state.read_store(tmp_path / "nodes" / "gone" / "state") == []
 
     def test_an_unreadable_directory_is_an_empty_store_logged_once(

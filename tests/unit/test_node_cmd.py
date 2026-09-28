@@ -29,7 +29,7 @@ def _pool_file(tmp_config, nicks=("second",), projects=()) -> str:
         {
             "version": SCHEMA_VERSION,
             "settings": {
-                "nodes": {n: {"host": f"devino-{n}", "user": "amin"} for n in nicks}
+                "nodes": {n: {"host": f"devino-{n}", "user": "demo"} for n in nicks}
             },
             "projects": list(projects),
         }
@@ -131,12 +131,12 @@ class TestNodeDoctor:
             "bash -s",
             stdout=(
                 "fail\tclaude-login\tClaude Code is not logged in here -- "
-                "run once: ssh amin@devino-second claude\n"
+                "run once: ssh demo@devino-second claude\n"
             ),
         )
         result = _doctor(runner, _pool_file(tmp_config))
         assert result.exit_code == 1
-        assert "run once: ssh amin@devino-second claude" in result.stdout
+        assert "run once: ssh demo@devino-second claude" in result.stdout
 
     def test_warnings_alone_exit_zero(self, runner, tmp_config, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="warn\tlocale\tcharmap is POSIX\n")
@@ -153,14 +153,14 @@ class TestNodeDoctor:
         result = _doctor(runner, _pool_file(tmp_config))
         assert result.exit_code == 1
         assert (
-            "cannot reach amin@devino-second: ssh: connect to host devino-second "
+            "cannot reach demo@devino-second: ssh: connect to host devino-second "
             "port 22: Connection refused"
         ) in result.stdout
 
     def test_a_nick_checks_only_that_node(self, runner, tmp_config, fake_ssh):
         _doctor(runner, _pool_file(tmp_config, ("second", "fifth")), "fifth")
         (call,) = fake_ssh.calls()
-        assert "amin@devino-fifth" in call.argv
+        assert "demo@devino-fifth" in call.argv
 
     def test_no_nick_checks_every_node_in_config_order(
         self, runner, tmp_config, fake_ssh
@@ -306,7 +306,7 @@ class TestThisPcsRowsAreReadBeforeTheSsh:
             {
                 "version": SCHEMA_VERSION,
                 "settings": {
-                    "nodes": {"second": {"host": "devino-second", "user": "amin"}},
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}},
                     "nodeSync": {"pullIntervalS": 5},
                 },
                 "projects": [],
@@ -365,7 +365,7 @@ class TestTheDoctorNeverReadsSilenceOrACrashAsHealth:
         result = _doctor(runner, _pool_file(tmp_config))
         assert result.exit_code == 1
         assert (
-            "no answer from amin@devino-second: timed out after "
+            "no answer from demo@devino-second: timed out after "
             f"{remote_mux.DOCTOR_TIMEOUT_S:g}s"
         ) in result.stdout
         assert "cannot reach" not in result.stdout
@@ -380,7 +380,7 @@ class TestTheDoctorNeverReadsSilenceOrACrashAsHealth:
         monkeypatch.setattr(remote_mux, "doctor", doctor)
         result = _doctor(runner, _pool_file(tmp_config))
         assert result.exit_code == 1
-        assert "cannot reach amin@devino-second: rc=None" in result.stdout
+        assert "cannot reach demo@devino-second: rc=None" in result.stdout
 
     @pytest.mark.parametrize(
         ("raised", "named"),
@@ -576,7 +576,7 @@ class TestTheUnreachableRow:
             rc=255,
         )
         result = _doctor(runner, _pool_file(tmp_config))
-        assert "cannot reach amin@devino-second: ssh: connect to host" in (
+        assert "cannot reach demo@devino-second: ssh: connect to host" in (
             result.stdout
         )
         assert "Warning: banner" not in result.stdout
@@ -584,7 +584,7 @@ class TestTheUnreachableRow:
     def test_a_blank_stderr_falls_back_to_the_rc(self, runner, tmp_config, fake_ssh):
         fake_ssh.set_reply("bash -s", stderr="\n\n", rc=255)
         result = _doctor(runner, _pool_file(tmp_config))
-        assert "cannot reach amin@devino-second: rc=255" in result.stdout
+        assert "cannot reach demo@devino-second: rc=255" in result.stdout
 
 
 def _over_cap(said: str) -> remote_mux.RemoteError:
@@ -606,7 +606,7 @@ class TestAnOverCapReplyIsNotUnreachable:
     ROW = ScriptLine(
         "fail",
         "reach",
-        "amin@devino-second answered, but its reply ran past the size cap",
+        "demo@devino-second answered, but its reply ran past the size cap",
     )
 
     @pytest.fixture
@@ -685,7 +685,7 @@ class TestTheSnapshotRow:
 PC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEPCKEY me@pc"
 NOT_LOGGED_IN = (
     "fail\tclaude-login\tClaude Code is not logged in here -- "
-    "run once: ssh amin@devino-second claude\n"
+    "run once: ssh demo@devino-second claude\n"
 )
 
 
@@ -697,7 +697,7 @@ def _pc_key(name: str = "id_ed25519.pub", text: str = PC_KEY + "\n") -> Path:
 
 
 def _node_answers(
-    fake_ssh, *, users=("amin",), setup_extra="", doctor=NOT_LOGGED_IN
+    fake_ssh, *, users=("demo",), setup_extra="", doctor=NOT_LOGGED_IN
 ) -> None:
     """The fake node: root's setup call reports a key per user; provision
     (`--force`) installs the hook; doctor (`--target`) answers ``doctor``."""
@@ -715,7 +715,7 @@ def _node_answers(
 
 def _gh_can_add_keys(fake_gh) -> None:
     fake_gh.set_reply(
-        "auth status", stdout=gh_auth_status("amin", "admin:public_key, repo")
+        "auth status", stdout=gh_auth_status("demo", "admin:public_key, repo")
     )
 
 
@@ -745,8 +745,8 @@ class TestNodeSetup:
         calls = fake_ssh.calls()
         assert _targets(fake_ssh) == [
             "root@devino-second",
-            "amin@devino-second",
-            "amin@devino-second",
+            "demo@devino-second",
+            "demo@devino-second",
         ]
         assert "--force" in calls[1].argv[-1]
         assert "--target" in calls[2].argv[-1]
@@ -767,8 +767,8 @@ class TestNodeSetup:
         _gh_can_add_keys(fake_gh)
         _setup(runner, _pool_file(tmp_config), "second")
         (add,) = [c for c in fake_gh.calls() if c.argv[:2] == ["ssh-key", "add"]]
-        assert add.argv[add.argv.index("--title") + 1] == "magent amin@devino-second"
-        assert add.stdin == b"ssh-ed25519 AAAAAMIN magent@devino-second\n"
+        assert add.argv[add.argv.index("--title") + 1] == "magent demo@devino-second"
+        assert add.stdin == b"ssh-ed25519 AAAADEMO magent@devino-second\n"
 
     def test_the_nodes_key_row_is_not_printed(
         self, runner, tmp_config, fake_ssh, fake_gh
@@ -777,7 +777,7 @@ class TestNodeSetup:
         _node_answers(fake_ssh)
         _gh_can_add_keys(fake_gh)
         result = _setup(runner, _pool_file(tmp_config), "second")
-        assert "AAAAAMIN" not in result.output
+        assert "AAAADEMO" not in result.output
 
     def test_a_missing_claude_login_is_the_one_fail_that_does_not_fail_setup(
         self, runner, tmp_config, fake_ssh, fake_gh
@@ -788,7 +788,7 @@ class TestNodeSetup:
         result = _setup(runner, _pool_file(tmp_config), "second")
         assert result.exit_code == 0, result.output
         assert (
-            "last step, by hand, once: ssh amin@devino-second claude" in result.stdout
+            "last step, by hand, once: ssh demo@devino-second claude" in result.stdout
         )
 
     def test_a_logged_in_node_gets_no_reminder(
@@ -807,7 +807,7 @@ class TestNodeSetup:
     ):
         _pc_key()
         _node_answers(
-            fake_ssh, setup_extra="fail\tdocker:amin\tusermod -aG docker amin failed\n"
+            fake_ssh, setup_extra="fail\tdocker:demo\tusermod -aG docker demo failed\n"
         )
         _gh_can_add_keys(fake_gh)
         result = _setup(runner, _pool_file(tmp_config), "second")
@@ -828,17 +828,17 @@ class TestNodeSetup:
         self, runner, tmp_config, fake_ssh, fake_gh
     ):
         _pc_key()
-        _node_answers(fake_ssh, users=("amin", "bob"))
+        _node_answers(fake_ssh, users=("demo", "bob"))
         _gh_can_add_keys(fake_gh)
         _setup(
-            runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
+            runner, _pool_file(tmp_config), "second", "--user", "demo", "--user", "bob"
         )
         assert fake_ssh.calls()[0].argv[-1] == (
-            f"bash -c 'bash -s -- {remote_mux.SOCKET} amin bob'"
+            f"bash -c 'bash -s -- {remote_mux.SOCKET} demo bob'"
         )
         assert _targets(fake_ssh)[1:] == [
-            "amin@devino-second",
-            "amin@devino-second",
+            "demo@devino-second",
+            "demo@devino-second",
             "bob@devino-second",
             "bob@devino-second",
         ]
@@ -848,11 +848,11 @@ class TestNodeSetup:
     ):
         _pc_key()
         _node_answers(
-            fake_ssh, users=("amin",), setup_extra="fail\tuser:bob\tuseradd: nope\n"
+            fake_ssh, users=("demo",), setup_extra="fail\tuser:bob\tuseradd: nope\n"
         )
         _gh_can_add_keys(fake_gh)
         _setup(
-            runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
+            runner, _pool_file(tmp_config), "second", "--user", "demo", "--user", "bob"
         )
         assert "bob@devino-second" not in _targets(fake_ssh)
 
@@ -860,7 +860,7 @@ class TestNodeSetup:
         _pc_key()
         _setup(runner, _pool_file(tmp_config), "second")
         assert fake_ssh.calls()[0].argv[-1] == (
-            f"bash -c 'bash -s -- {remote_mux.SOCKET} amin'"
+            f"bash -c 'bash -s -- {remote_mux.SOCKET} demo'"
         )
 
     def test_key_names_the_public_key_to_authorize(self, runner, tmp_config, fake_ssh):
@@ -893,22 +893,22 @@ class TestNodeSetup:
         self, runner, tmp_config, fake_ssh, fake_gh
     ):
         _pc_key()
-        _node_answers(fake_ssh, users=("bob", "amin"))
+        _node_answers(fake_ssh, users=("bob", "demo"))
         _gh_can_add_keys(fake_gh)
         _setup(
             runner,
             _pool_file(tmp_config),
             "second",
-            *("--user", "bob", "--user", "amin", "--user", "bob"),
+            *("--user", "bob", "--user", "demo", "--user", "bob"),
         )
         assert fake_ssh.calls()[0].argv[-1] == (
-            f"bash -c 'bash -s -- {remote_mux.SOCKET} bob amin'"
+            f"bash -c 'bash -s -- {remote_mux.SOCKET} bob demo'"
         )
         assert _targets(fake_ssh)[1:] == [
             "bob@devino-second",
             "bob@devino-second",
-            "amin@devino-second",
-            "amin@devino-second",
+            "demo@devino-second",
+            "demo@devino-second",
         ]
         adds = [c for c in fake_gh.calls() if c.argv[:2] == ["ssh-key", "add"]]
         assert len(adds) == 2
@@ -929,7 +929,7 @@ class TestNodeSetup:
         monkeypatch.setattr(remote_mux, "run_script", spy)
         _pc_key()
         _setup(
-            runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
+            runner, _pool_file(tmp_config), "second", "--user", "demo", "--user", "bob"
         )
         assert budgets == [remote_mux.SETUP_TIMEOUT_S + 2 * remote_mux.SETUP_PER_USER_S]
 
@@ -1092,7 +1092,7 @@ class TestNodeSetupUnreachable:
         _pc_key()
         result = _setup(runner, _pool_file(tmp_config), "second")
         assert result.exit_code == 1
-        assert calls == ["amin@devino-second"]
+        assert calls == ["demo@devino-second"]
         assert "may still be running" in result.stdout
         assert "ssh root@devino-second true" not in result.stdout
         assert "cannot reach" not in result.stdout
@@ -1114,7 +1114,7 @@ class TestNodeSetupUnreachable:
         _gh_can_add_keys(fake_gh)
         result = _setup(runner, _pool_file(tmp_config), "second")
         assert result.exit_code == 1
-        assert seen == ["amin@devino-second"]
+        assert seen == ["demo@devino-second"]
         assert "may still be running" in result.stdout
         assert "--target" not in " ".join(c.argv[-1] for c in fake_ssh.calls())
 
@@ -1130,7 +1130,7 @@ class TestNodeSetupUnreachable:
         _gh_can_add_keys(fake_gh)
         result = _setup(runner, _pool_file(tmp_config), "second")
         assert result.exit_code == 1
-        assert "cannot reach amin@devino-second" in result.stdout
+        assert "cannot reach demo@devino-second" in result.stdout
         assert "last step" not in result.stdout
 
     def test_a_timed_out_root_hop_names_root_the_bound_and_the_step(
@@ -1159,7 +1159,7 @@ class TestNodeSetupUnreachable:
         _gh_can_add_keys(fake_gh)
         result = _setup(runner, _pool_file(tmp_config), "second")
         assert (
-            "no answer from amin@devino-second (timed out after 300s) -- the "
+            "no answer from demo@devino-second (timed out after 300s) -- the "
             "provision may still be running there"
         ) in result.stdout
 
@@ -1256,10 +1256,10 @@ class TestNodeSetupNeverReadsSilenceAsSuccess:
         _pc_key()
         _gh_can_add_keys(fake_gh)
         result = _setup(
-            runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
+            runner, _pool_file(tmp_config), "second", "--user", "demo", "--user", "bob"
         )
         assert result.exit_code == 1
-        assert "no node key came back for amin" in result.stdout
+        assert "no node key came back for demo" in result.stdout
         assert "no node key came back for bob" in result.stdout
         assert "Ready." not in result.stdout
         assert len(fake_ssh.calls()) == 1
@@ -1269,11 +1269,11 @@ class TestNodeSetupNeverReadsSilenceAsSuccess:
     ):
         _pc_key()
         _node_answers(
-            fake_ssh, users=("amin",), setup_extra="fail\tuser:bob\tuseradd: nope\n"
+            fake_ssh, users=("demo",), setup_extra="fail\tuser:bob\tuseradd: nope\n"
         )
         _gh_can_add_keys(fake_gh)
         result = _setup(
-            runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
+            runner, _pool_file(tmp_config), "second", "--user", "demo", "--user", "bob"
         )
         assert "no node key came back" not in result.stdout
         assert "1 step(s) failed." in result.stdout
@@ -1284,7 +1284,7 @@ class TestNodeSetupNeverReadsSilenceAsSuccess:
         _pc_key()
         fake_ssh.set_reply(
             "root@devino-second",
-            stdout="key\tamin\tssh-ed25519 AAAAAMIN magent@devino-second\n",
+            stdout="key\tdemo\tssh-ed25519 AAAADEMO magent@devino-second\n",
         )
         fake_ssh.set_reply("--target", stdout="")
         _gh_can_add_keys(fake_gh)
@@ -1307,12 +1307,12 @@ class TestNodeSetupProvisionsThroughTheOneBody:
 
         monkeypatch.setattr(remote_mux, "provision_node", fake)
         _pc_key()
-        _node_answers(fake_ssh, users=("amin", "bob"))
+        _node_answers(fake_ssh, users=("demo", "bob"))
         _gh_can_add_keys(fake_gh)
         _setup(
-            runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
+            runner, _pool_file(tmp_config), "second", "--user", "demo", "--user", "bob"
         )
-        assert seen == [("amin@devino-second", True), ("bob@devino-second", True)]
+        assert seen == [("demo@devino-second", True), ("bob@devino-second", True)]
 
     def test_provision_gets_its_own_budget_and_this_pcs_home(
         self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch

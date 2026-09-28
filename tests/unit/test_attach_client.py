@@ -418,14 +418,14 @@ class TestStatusText:
 
     def test_it_says_everything_that_changes_in_one_line(self):
         line = attach_client.status_text(
-            target="amind@amin-desktop",
+            target="amind@demo-desktop",
             attempt=3,
             remaining=8.0,
-            last_error="ssh: connect to host amin-desktop port 22: Connection timed out",
+            last_error="ssh: connect to host demo-desktop port 22: Connection timed out",
             width=120,
         )
         assert "\n" not in line
-        assert "reconnecting to amind@amin-desktop" in line
+        assert "reconnecting to amind@demo-desktop" in line
         assert "attempt 3" in line
         assert "retry in 8s" in line
         assert "last: Connection timed out" in line
@@ -460,11 +460,11 @@ class TestStatusText:
             "last_error": "Connection timed out",
         }
         line = attach_client.status_text(
-            target="amind@amin-desktop", width=72, **kwargs
+            target="amind@demo-desktop", width=72, **kwargs
         )
         assert "last: Connection timed out" in line
         assert "Ctrl+C" not in line
-        assert "amind@amin-desktop" not in line
+        assert "amind@demo-desktop" not in line
         assert "attempt 4" in line
         assert "retry in 16s" in line
 
@@ -472,7 +472,7 @@ class TestStatusText:
         # Below every other sacrifice, "this pane is alive and will try again"
         # is the whole message.
         line = attach_client.status_text(
-            target="amind@amin-desktop",
+            target="amind@demo-desktop",
             attempt=4,
             remaining=16.0,
             last_error="Connection timed out",
@@ -504,7 +504,7 @@ class TestCondenseError:
     def test_it_keeps_only_the_part_of_an_ssh_error_that_varies(self):
         assert (
             attach_client.condense_error(
-                "ssh: connect to host amin-desktop port 22: Connection timed out"
+                "ssh: connect to host demo-desktop port 22: Connection timed out"
             )
             == "Connection timed out"
         )
@@ -1291,10 +1291,10 @@ class TestOneSshClientForTheProbeAndThePane:
     def test_the_pane_and_the_probe_dial_the_resolved_client(self, monkeypatch):
         client = r"C:\Windows\System32\OpenSSH\ssh.exe"
         monkeypatch.setattr(attach_client, "find_ssh", lambda: client)
-        assert attach_client.ssh_argv("amin@h", "tmux attach")[0] == client
-        assert attach_client.session_probe_argv("amin@h", "api", "tmux")[0] == client
+        assert attach_client.ssh_argv("demo@h", "tmux attach")[0] == client
+        assert attach_client.session_probe_argv("demo@h", "api", "tmux")[0] == client
         assert (
-            attach_client.pane_command("amin@h", "api", None, mux="tmux")[0] == client
+            attach_client.pane_command("demo@h", "api", None, mux="tmux")[0] == client
         )
 
     def test_no_client_found_leaves_the_bare_name_for_the_spawn_to_report(
@@ -1303,8 +1303,8 @@ class TestOneSshClientForTheProbeAndThePane:
         # Resolved nowhere: the spawn's own "not found" (SSH_MISSING_RC in
         # _run_ssh, PROBE_FAILED in the probe) stays the one missing-client path.
         monkeypatch.setattr(attach_client, "find_ssh", lambda: None)
-        assert attach_client.ssh_argv("amin@h", "tmux attach")[0] == "ssh"
-        assert attach_client.session_probe_argv("amin@h", "api", "tmux")[0] == "ssh"
+        assert attach_client.ssh_argv("demo@h", "tmux attach")[0] == "ssh"
+        assert attach_client.session_probe_argv("demo@h", "api", "tmux")[0] == "ssh"
 
     def test_supervise_dials_the_system_client_with_none_on_path(self, monkeypatch):
         client = r"C:\Windows\System32\OpenSSH\ssh.exe"
@@ -1320,7 +1320,7 @@ class TestOneSshClientForTheProbeAndThePane:
 
         monkeypatch.setattr(attach_client, "_run_ssh", fake_run)
         rc = attach_client.supervise(
-            "amin@h", "tmux attach", "api", mux="tmux", reconnect=False
+            "demo@h", "tmux attach", "api", mux="tmux", reconnect=False
         )
         assert rc == 0
         assert [argv[0] for argv in dialled] == [client]

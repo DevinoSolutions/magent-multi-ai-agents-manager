@@ -214,7 +214,7 @@ class TestNoTestResolvesTheRealSsh:
         # keeps the bare name, and Windows' own OpenSSH is never looked up.
         assert attach_client.find_ssh() is None
         assert attach_client._system_directory() is None
-        assert attach_client.ssh_argv("amin@h", "true")[0] == "ssh"
+        assert attach_client.ssh_argv("demo@h", "true")[0] == "ssh"
 
 
 @pytest.fixture(scope="class")

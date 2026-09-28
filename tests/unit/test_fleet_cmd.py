@@ -421,12 +421,12 @@ class TestSessionsJson:
                     *extra,
                 ],
                 "settings": {
-                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
                 },
             }
         )
 
-    def _node_state(self, monkeypatch, tmp_path, *, ts, cwd="/home/amin/magent/api"):
+    def _node_state(self, monkeypatch, tmp_path, *, ts, cwd="/home/demo/magent/api"):
         from magent import nodes
         from magent.nodes import NodeMapEntry
 
@@ -443,7 +443,7 @@ class TestSessionsJson:
                 placed_ts=1.0,
                 attached_existing=False,
                 remote_root="~/magent/api",
-                target="amin@devino-second",
+                target="demo@devino-second",
                 cwd=cwd,
             ),
         )
@@ -464,7 +464,7 @@ class TestSessionsJson:
         assert [r["name"] for r in rows] == ["caramel", "api"]
         assert rows[1] == {
             "name": "api",
-            "cwd": "/home/amin/magent/api",
+            "cwd": "/home/demo/magent/api",
             "live": True,
             "state": "live",
             "model": None,
@@ -496,7 +496,7 @@ class TestSessionsJson:
         row = json.loads(result.stdout)[1]
         assert (row["name"], row["state"]) == ("api-old", "live")
         # The map is keyed by PROJECT, so the folder survives the sid drift.
-        assert row["cwd"] == "/home/amin/magent/api"
+        assert row["cwd"] == "/home/demo/magent/api"
 
     def test_a_node_config_that_fails_validation_answers_the_json_envelope(
         self, runner, tmp_config, tmp_path, monkeypatch
@@ -511,7 +511,7 @@ class TestSessionsJson:
                     {"path": str(tmp_path / "api"), "title": "api", "node": "nope"}
                 ],
                 "settings": {
-                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
                 },
             }
         )

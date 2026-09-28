@@ -1151,8 +1151,8 @@ def _node_map(projects: int) -> str:
                 placed_ts=1727200000.0,
                 attached_existing=False,
                 remote_root=f"~/magent/proj{i}",
-                target="amin@devino-second",
-                cwd=f"/home/amin/magent/proj{i}",
+                target="demo@devino-second",
+                cwd=f"/home/demo/magent/proj{i}",
             )
         )
         for i in range(projects)
@@ -1757,12 +1757,12 @@ class TestUserScopePluginsAndSkills:
 
     @pytest.mark.skipif(sys.platform != "win32", reason="drive letters are Windows'")
     def test_drive_letter_case_is_ignored_and_another_drive_shares_nothing(self):
-        assert nodes._above("c:\\Users\\Amin", "C:\\users\\amin\\.claude\\skills")
-        assert nodes._within("C:\\Users\\amin\\.SSH", "c:\\users\\AMIN\\.ssh\\id")
-        assert not nodes._above("c:\\users\\amin", "C:\\Users\\Amin")  # the same
+        assert nodes._above("c:\\Users\\Demo", "C:\\users\\demo\\.claude\\skills")
+        assert nodes._within("C:\\Users\\demo\\.SSH", "c:\\users\\DEMO\\.ssh\\id")
+        assert not nodes._above("c:\\users\\demo", "C:\\Users\\Demo")  # the same
         # commonpath raises ValueError across drives: that is "no ancestor".
-        assert not nodes._above("D:\\", "C:\\Users\\amin\\.claude\\skills")
-        assert not nodes._within("D:\\Users\\amin", "C:\\Users\\amin")
+        assert not nodes._above("D:\\", "C:\\Users\\demo\\.claude\\skills")
+        assert not nodes._within("D:\\Users\\demo", "C:\\Users\\demo")
 
     def test_a_skills_folder_that_is_itself_a_link_above_ships_nothing(
         self, tmp_path, caplog
@@ -1792,11 +1792,11 @@ class TestUserScopePluginsAndSkills:
         _skill(claude, "history.jsonl", b"HISTORY-DECOY")
 
     def test_a_home_reached_through_a_link_is_above_its_skills_folder(self, tmp_path):
-        real_home = tmp_path / "var" / "home" / "amin"
+        real_home = tmp_path / "var" / "home" / "demo"
         self._transcripts(real_home / ".claude")
         _skill(real_home, "notes/private.md", b"PRIVATE-DECOY")
         (tmp_path / "home").mkdir()
-        home = tmp_path / "home" / "amin"
+        home = tmp_path / "home" / "demo"
         _link_dir(home, real_home)
         _link_dir(home / ".claude" / "skills", home)
         scope = _walked(home)
@@ -3265,7 +3265,7 @@ class TestUserScopeDigests:
         assert digest(True) != digest(False)
 
 
-NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
+NODE = Node(nick="second", host="devino-second", user="demo", root="~/magent")
 
 
 class TestAScriptAnswersInRows:
@@ -3297,9 +3297,9 @@ class TestAScriptAnswersInRows:
 
     def test_key_rows_are_data(self):
         report = remote_mux.parse_report(
-            "did\tnode-key:amin\t\nkey\tamin\tssh-ed25519 AAAA magent@devino-second\n"
+            "did\tnode-key:demo\t\nkey\tdemo\tssh-ed25519 AAAA magent@devino-second\n"
         )
-        assert report.keys() == {"amin": "ssh-ed25519 AAAA magent@devino-second"}
+        assert report.keys() == {"demo": "ssh-ed25519 AAAA magent@devino-second"}
         assert not report.failed
 
 
@@ -3386,10 +3386,10 @@ class TestThisPcsGh:
 
     def test_the_active_logged_in_account_is_read(self, fake_gh):
         fake_gh.set_reply(
-            "auth status", stdout=gh_auth_status("amin", "repo, admin:public_key")
+            "auth status", stdout=gh_auth_status("demo", "repo, admin:public_key")
         )
         assert remote_mux.local_gh_account() == remote_mux.GhAccount(
-            login="amin",
+            login="demo",
             scopes=frozenset({"repo", "admin:public_key"}),
             token_source="keyring",
         )
@@ -3403,19 +3403,19 @@ class TestThisPcsGh:
         fake_gh.set_reply(
             "auth status",
             stdout=gh_auth_status(
-                "amin", "repo", accounts=[("other", False, "success")]
+                "demo", "repo", accounts=[("other", False, "success")]
             ),
         )
         account = remote_mux.local_gh_account()
         assert isinstance(account, remote_mux.GhAccount)
-        assert account.login == "amin"
+        assert account.login == "demo"
 
     def test_where_the_token_came_from_is_carried(self, fake_gh):
         # A caller can say "GH_TOKEN from the environment" instead of
         # advising a gh auth refresh that would not change it.
         fake_gh.set_reply(
             "auth status",
-            stdout=gh_auth_status("amin", "repo", token_source="GH_TOKEN"),
+            stdout=gh_auth_status("demo", "repo", token_source="GH_TOKEN"),
         )
         account = remote_mux.local_gh_account()
         assert isinstance(account, remote_mux.GhAccount)
@@ -3605,7 +3605,7 @@ class TestThisPcsGh:
                 'Get "https://<redacted>@github.com/o/r": EOF',
             ),
             (
-                "proxyconnect tcp: http://amin:FAKE-PASSWORD@10.1.2.3:3128: refused",
+                "proxyconnect tcp: http://demo:FAKE-PASSWORD@10.1.2.3:3128: refused",
                 "proxyconnect tcp: http://<redacted>@10.1.2.3:3128: refused",
             ),
         ],
@@ -3635,10 +3635,10 @@ class TestThisPcsGh:
         assert remote_mux.local_gh_token() == GhUnavailable("failed", detail=said)
 
     def test_the_did_gh_run_wrapper_hands_back_the_result_or_none(self, fake_gh):
-        fake_gh.set_reply("api user", stdout="amin\n", rc=3)
+        fake_gh.set_reply("api user", stdout="demo\n", rc=3)
         result = remote_mux._gh(["api", "user"])
         assert result is not None
-        assert (result.returncode, result.stdout) == (3, b"amin\n")
+        assert (result.returncode, result.stdout) == (3, b"demo\n")
         (call,) = fake_gh.calls()
         assert call.argv == ["api", "user"]
 
@@ -3687,7 +3687,7 @@ class TestThisPcsGh:
         # With --json gh always exits 0, so a non-zero exit is gh failing --
         # whatever it printed.
         fake_gh.set_reply(
-            "auth status", stdout=gh_auth_status("amin", "repo"), stderr="boom", rc=1
+            "auth status", stdout=gh_auth_status("demo", "repo"), stderr="boom", rc=1
         )
         assert remote_mux.local_gh_account() == GhUnavailable("failed", detail="boom")
 
@@ -3819,7 +3819,7 @@ def _unpack(payload: bytes) -> tuple[str, dict[str, tarfile.TarInfo], dict[str, 
     return head.decode("utf-8"), infos, data
 
 
-def _payload(scope=None, *, token=TOKEN, login="amin") -> bytes:
+def _payload(scope=None, *, token=TOKEN, login="demo") -> bytes:
     return remote_mux.build_payload(
         scope if scope is not None else _scope(),
         gh_token=token,
@@ -3879,7 +3879,7 @@ class TestThePayload:
         assert set(manifest["digests"]) == {*scope.digests(), "gh", "state_hook"}
         assert manifest["plugins"] == ["p@mkt"]
         assert manifest["marketplaces"] == {"mkt": "owner/mkt"}
-        assert manifest["gh_login"] == "amin"
+        assert manifest["gh_login"] == "demo"
         assert manifest["hook_entries"] == remote_mux.state_hook_entries()
 
     def test_the_same_scope_packs_to_the_same_bytes(self):
@@ -4052,7 +4052,7 @@ class TestProvision:
     def test_the_token_rides_stdin_after_the_sentinel_and_never_argv(
         self, fake_ssh, fake_gh
     ):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", "repo"))
         fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
         remote_mux.provision(NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S)
         (call,) = fake_ssh.calls()
@@ -4082,7 +4082,7 @@ class TestProvision:
     def test_an_unverified_login_still_shares_its_token(self, fake_ssh, fake_gh):
         fake_gh.set_reply(
             "auth status",
-            stdout=gh_auth_status(None, accounts=[("amin", True, "timeout")]),
+            stdout=gh_auth_status(None, accounts=[("demo", True, "timeout")]),
         )
         fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
         report = remote_mux.provision(
@@ -4091,7 +4091,7 @@ class TestProvision:
         (call,) = fake_ssh.calls()
         assert _sent(call).split(b"\n", 1)[0] == TOKEN.encode("ascii")
         _, _, data = _unpack(_sent(call))
-        assert json.loads(data["manifest.json"])["gh_login"] == "amin"
+        assert json.loads(data["manifest.json"])["gh_login"] == "demo"
         # Shared, but never silently: the user sees it was not checked.
         assert [line for line in report.lines if line.item == "gh"] == [
             ScriptLine(
@@ -4111,7 +4111,7 @@ class TestProvision:
         said = "dial tcp: lookup api.github.com: no such host"
         fake_gh.set_reply(
             "auth status",
-            stdout=gh_auth_status(None, accounts=[("amin", True, "error", said)]),
+            stdout=gh_auth_status(None, accounts=[("demo", True, "error", said)]),
         )
         fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
         caplog.set_level("WARNING", logger="magent.nodes")
@@ -4134,7 +4134,7 @@ class TestProvision:
         said = f"dial tcp: token {PLAIN_TOKEN}: i/o timeout"
         fake_gh.set_reply(
             "auth status",
-            stdout=gh_auth_status(None, accounts=[("amin", True, "error", said)]),
+            stdout=gh_auth_status(None, accounts=[("demo", True, "error", said)]),
         )
         fake_gh.set_reply("auth token", stdout=PLAIN_TOKEN + "\n")
         caplog.set_level("WARNING", logger="magent.nodes")
@@ -4149,7 +4149,7 @@ class TestProvision:
             "auth status",
             stdout=gh_auth_status(
                 None,
-                accounts=[("amin", True, "error", "HTTP 401: Bad credentials")],
+                accounts=[("demo", True, "error", "HTTP 401: Bad credentials")],
             ),
         )
         fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
@@ -4177,7 +4177,7 @@ class TestProvision:
             "auth status",
             stdout=gh_auth_status(
                 None,
-                accounts=[("amin", True, "error", "HTTP 401: Requires authentication")],
+                accounts=[("demo", True, "error", "HTTP 401: Requires authentication")],
             ),
         )
         fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
@@ -4201,7 +4201,7 @@ class TestProvision:
     def test_a_token_read_that_fails_shares_nothing_and_says_why(
         self, fake_ssh, fake_gh
     ):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", "repo"))
         fake_gh.set_reply("auth token", stdout="warning\n")
         report = remote_mux.provision(
             NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
@@ -4223,7 +4223,7 @@ class TestProvision:
     def test_a_named_login_whose_token_gh_cannot_find_is_never_silent(
         self, fake_ssh, fake_gh, caplog
     ):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", "repo"))
         fake_gh.set_reply(
             "auth token", stderr="no oauth token found for github.com\n", rc=1
         )
@@ -4253,7 +4253,7 @@ class TestProvision:
         monkeypatch.setattr(
             remote_mux, "find_gh", lambda: found.pop(0) if found else None
         )
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", "repo"))
         caplog.set_level("WARNING", logger="magent.nodes")
         report = remote_mux.provision(
             NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
@@ -4274,7 +4274,7 @@ class TestProvision:
         said = "dial tcp: lookup api.github.com: no such host"
         fake_gh.set_reply(
             "auth status",
-            stdout=gh_auth_status(None, accounts=[("amin", True, "error", said)]),
+            stdout=gh_auth_status(None, accounts=[("demo", True, "error", said)]),
         )
         fake_gh.set_reply(
             "auth token", stderr="no oauth token found for github.com\n", rc=1
@@ -4479,7 +4479,7 @@ class TestProvision:
         # The row is our words and the class; the refusal's own is logged.
         caplog.set_level("WARNING", logger="magent.nodes")
         monkeypatch.setattr(
-            remote_mux, "_gh_to_share", lambda: ("amin", TOKEN + " x", ())
+            remote_mux, "_gh_to_share", lambda: ("demo", TOKEN + " x", ())
         )
         report = remote_mux.provision(
             NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
@@ -4621,7 +4621,7 @@ class TestProvision:
     def test_a_transport_failure_names_the_call_that_ran_force_and_all(
         self, fake_ssh, fake_gh
     ):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", "repo"))
         fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
         fake_ssh.set_reply("bash -s", stderr="ssh: connect to host: No route\n", rc=255)
         with pytest.raises(RemoteError) as info:
@@ -4674,7 +4674,7 @@ class TestProvision:
     def test_a_failed_call_names_stdin_by_its_length_never_the_token(
         self, fake_ssh, fake_gh, caplog
     ):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", "repo"))
         fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
         fake_ssh.set_mode("timeout")
         with pytest.raises(RemoteError) as info:
@@ -5110,7 +5110,7 @@ def _node_payload(scope: UserScope | None = None, *, token: str | None = None) -
     return remote_mux.build_payload(
         scope if scope is not None else _scope(),
         gh_token=token,
-        gh_login="amin" if token else None,
+        gh_login="demo" if token else None,
         state_hook=HOOK_TEXT,
     )
 
@@ -5322,7 +5322,7 @@ class TestProvisionShUnderRealBash:
 
     def test_a_second_run_only_skips(self, tmp_path):
         gh = make_fake_ssh(tmp_path, name="gh")
-        gh.set_reply("api user", stdout="amin\n")
+        gh.set_reply("api user", stdout="demo\n")
         payload = _node_payload(_scope(settings={"model": "opus"}), token=TOKEN)
         _run_provision(tmp_path, payload, fakes=(gh,))
         r = _run_provision(tmp_path, payload, fakes=(gh,))
@@ -5918,7 +5918,7 @@ LOGIN_DEFS = "UID_MIN 1000\nUID_MAX 60000\n"
 
 def _run_setup(
     env: dict[str, str],
-    users: tuple[str, ...] = ("amin",),
+    users: tuple[str, ...] = ("demo",),
     payload: str = PC_KEY + "\n",
     *,
     login_defs: str | None = LOGIN_DEFS,
@@ -5982,9 +5982,9 @@ def _keygen_calls(state: Path) -> list[str]:
 
 
 def _authorized_ssh_dir(state: Path, mode: int) -> Path:
-    """amin's ~/.ssh at ``mode``, already authorizing this PC's key: setup's
+    """demo's ~/.ssh at ``mode``, already authorizing this PC's key: setup's
     authorized_keys step skips it, so leaves the mode as it found it."""
-    ssh_dir = _existing_user(state, "amin") / ".ssh"
+    ssh_dir = _existing_user(state, "demo") / ".ssh"
     ssh_dir.mkdir()
     (ssh_dir / "authorized_keys").write_text(PC_KEY + "\n", encoding="utf-8")
     ssh_dir.chmod(mode)
@@ -5995,11 +5995,11 @@ def _authorized_ssh_dir(state: Path, mode: int) -> Path:
 class TestSetupShUnderRealBash:
     def test_a_fresh_node_gets_everything_and_reports_each_users_key(self, tmp_path):
         state, env = _setup_box(tmp_path)
-        r = _run_setup(env, ("amin", "bob"))
+        r = _run_setup(env, ("demo", "bob"))
         assert r.returncode == 0, r.stderr
         per_user = {
             f"{step}:{u}": "did"
-            for u in ("amin", "bob")
+            for u in ("demo", "bob")
             for step in ("user", "authorized_keys", "docker", "claude", "node-key")
         }
         assert _rows(r) == {
@@ -6007,25 +6007,25 @@ class TestSetupShUnderRealBash:
             "tmux": "ok",
             "gh": "skip",
             **per_user,
-            "amin": "key",
+            "demo": "key",
             "bob": "key",
         }
         assert _report(r).keys() == dict.fromkeys(
-            ("amin", "bob"), "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+            ("demo", "bob"), "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
         )
         assert (state / "home" / "bob" / ".local" / "bin" / "claude").is_file()
         assert "https://claude.ai/install.sh" in (state / "curl.log").read_text("utf-8")
 
     def test_a_second_run_only_skips_and_still_reports_the_keys(self, tmp_path):
         _, env = _setup_box(tmp_path)
-        _run_setup(env, ("amin", "bob"))
-        r = _run_setup(env, ("amin", "bob"))
+        _run_setup(env, ("demo", "bob"))
+        r = _run_setup(env, ("demo", "bob"))
         assert r.returncode == 0, r.stderr
         rows = _rows(r)
         # The tmux floor is a check, not a change: it answers ok every run.
         assert rows.pop("tmux") == "ok"
         assert set(rows.values()) == {"skip", "key"}
-        assert set(_report(r).keys()) == {"amin", "bob"}
+        assert set(_report(r).keys()) == {"demo", "bob"}
 
     @pytest.mark.parametrize(
         ("version", "status"),
@@ -6059,7 +6059,7 @@ class TestSetupShUnderRealBash:
         state, env = _setup_box(tmp_path)
         _run_setup(env)
         _run_setup(env)
-        ssh_dir = state / "home" / "amin" / ".ssh"
+        ssh_dir = state / "home" / "demo" / ".ssh"
         authorized = ssh_dir / "authorized_keys"
         assert authorized.read_text("utf-8").splitlines().count(PC_KEY) == 1
         assert ssh_dir.stat().st_mode & 0o777 == 0o700
@@ -6068,7 +6068,7 @@ class TestSetupShUnderRealBash:
     def test_an_existing_key_file_without_a_final_newline_is_not_glued(self, tmp_path):
         state, env = _setup_box(tmp_path)
         _run_setup(env)
-        authorized = state / "home" / "amin" / ".ssh" / "authorized_keys"
+        authorized = state / "home" / "demo" / ".ssh" / "authorized_keys"
         authorized.write_text("ssh-ed25519 AAAAOTHER other@box", encoding="utf-8")
         _run_setup(env)
         assert authorized.read_text("utf-8").splitlines() == [
@@ -6078,11 +6078,11 @@ class TestSetupShUnderRealBash:
 
     def test_no_docker_group_is_a_skip(self, tmp_path):
         _, env = _setup_box(tmp_path, docker=False)
-        assert _rows(_run_setup(env))["docker:amin"] == "skip"
+        assert _rows(_run_setup(env))["docker:demo"] == "skip"
 
     def test_a_bad_user_name_is_refused_before_anything_changes(self, tmp_path):
         state, env = _setup_box(tmp_path)
-        r = _run_setup(env, ("amin", "Bob;rm"))
+        r = _run_setup(env, ("demo", "Bob;rm"))
         assert r.returncode == 2
         assert _rows(r) == {"setup": "fail"}
         assert list((state / "users").iterdir()) == []
@@ -6119,8 +6119,8 @@ class TestSetupShUnderRealBash:
         assert r.returncode == 1
         rows = _rows(r)
         assert rows["packages"] == "fail"
-        assert rows["user:amin"] == "did"
-        assert set(_report(r).keys()) == {"amin"}
+        assert rows["user:demo"] == "did"
+        assert set(_report(r).keys()) == {"demo"}
 
     # -- review pins (cq-F13) ------------------------------------------------
 
@@ -6131,7 +6131,7 @@ class TestSetupShUnderRealBash:
         r = _run_setup(env)
         assert r.returncode == 0, r.stderr
         assert not (state / "chown.log").exists()
-        authorized = state / "home" / "amin" / ".ssh" / "authorized_keys"
+        authorized = state / "home" / "demo" / ".ssh" / "authorized_keys"
         assert authorized.read_text("utf-8").splitlines() == [PC_KEY]
 
     def test_a_symlinked_authorized_keys_never_reaches_its_target(self, tmp_path):
@@ -6139,13 +6139,13 @@ class TestSetupShUnderRealBash:
         victim = tmp_path / "victim"
         victim.write_bytes(b"root:x:0:0:root:/root:/bin/bash\n")
         victim.chmod(0o644)
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         ssh_dir.mkdir(mode=0o700)
         (ssh_dir / "authorized_keys").symlink_to(victim)
         r = _run_setup(env)
         assert victim.read_bytes() == b"root:x:0:0:root:/root:/bin/bash\n"
         assert victim.stat().st_mode & 0o777 == 0o644
-        assert _rows(r)["authorized_keys:amin"] == "fail"
+        assert _rows(r)["authorized_keys:demo"] == "fail"
         assert r.returncode == 1
 
     def test_a_symlinked_ssh_dir_never_reaches_its_target(self, tmp_path):
@@ -6154,14 +6154,14 @@ class TestSetupShUnderRealBash:
         victim.mkdir()
         (victim / "keep").write_bytes(b"x\n")
         victim.chmod(0o755)
-        (_existing_user(state, "amin") / ".ssh").symlink_to(victim)
+        (_existing_user(state, "demo") / ".ssh").symlink_to(victim)
         r = _run_setup(env)
         assert [p.name for p in victim.iterdir()] == ["keep"]
         assert (victim / "keep").read_bytes() == b"x\n"
         assert victim.stat().st_mode & 0o777 == 0o755
         rows = _rows(r)
-        assert rows["authorized_keys:amin"] == "fail"
-        assert rows["node-key:amin"] == "fail"
+        assert rows["authorized_keys:demo"] == "fail"
+        assert rows["node-key:demo"] == "fail"
         assert set(_report(r).keys()) == set()
         assert r.returncode == 1
 
@@ -6169,10 +6169,10 @@ class TestSetupShUnderRealBash:
         # I1: a failed write is `fail`, never `did` -- main's `step || rc=1`
         # switches set -e off inside every step.
         state, env = _setup_box(tmp_path)
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         (ssh_dir / "authorized_keys").mkdir(parents=True)
         r = _run_setup(env)
-        assert _rows(r)["authorized_keys:amin"] == "fail"
+        assert _rows(r)["authorized_keys:demo"] == "fail"
         assert r.returncode != 0
 
     def test_a_key_comment_is_data_not_code(self, tmp_path):
@@ -6181,7 +6181,7 @@ class TestSetupShUnderRealBash:
         key = PC_KEY + " it's $(touch pwned) `touch pwned2`"
         r = _run_setup(env, payload=key + "\n")
         assert r.returncode == 0, r.stderr
-        authorized = state / "home" / "amin" / ".ssh" / "authorized_keys"
+        authorized = state / "home" / "demo" / ".ssh" / "authorized_keys"
         assert authorized.read_text("utf-8").splitlines() == [key]
         assert not list(tmp_path.rglob("pwned*"))
 
@@ -6195,7 +6195,7 @@ class TestSetupShUnderRealBash:
         if user != "root":
             _existing_user(state, user, uid=1)
         users_before = sorted(p.name for p in (state / "users").iterdir())
-        r = _run_setup(env, ("amin", user))
+        r = _run_setup(env, ("demo", user))
         assert r.returncode == 2
         assert _rows(r) == {"setup": "fail"}
         assert sorted(p.name for p in (state / "users").iterdir()) == users_before
@@ -6223,7 +6223,7 @@ class TestSetupShUnderRealBash:
         _, env = _setup_box(tmp_path, without=("ssh-keygen",))
         r = _run_setup(env)
         assert r.returncode == 1
-        (row,) = [line for line in _report(r).lines if line.item == "node-key:amin"]
+        (row,) = [line for line in _report(r).lines if line.item == "node-key:demo"]
         assert row.status == "fail"
         assert "ssh-keygen" in row.detail
         assert "openssh-client" in row.detail
@@ -6235,7 +6235,7 @@ class TestSetupShUnderRealBash:
         # says about the accounts above it.
         state, env = _setup_box(tmp_path)
         _existing_user(state, user, uid=65534)
-        r = _run_setup(env, ("amin", user))
+        r = _run_setup(env, ("demo", user))
         assert r.returncode == 2
         assert _rows(r) == {"setup": "fail"}
         assert b"65534" in r.stdout
@@ -6256,7 +6256,7 @@ class TestSetupShUnderRealBash:
         # outside it was not made for a person.
         state, env = _setup_box(tmp_path)
         _existing_user(state, "svc", uid=uid)
-        r = _run_setup(env, ("amin", "svc"), login_defs=login_defs)
+        r = _run_setup(env, ("demo", "svc"), login_defs=login_defs)
         assert r.returncode == 2
         assert _rows(r) == {"setup": "fail"}
         assert f"uid {uid}".encode("ascii") in r.stdout
@@ -6273,16 +6273,16 @@ class TestSetupShUnderRealBash:
     @pytest.mark.parametrize("uid", [1000, 5000])
     def test_both_uid_bounds_are_a_persons_account(self, tmp_path, uid):
         state, env = _setup_box(tmp_path)
-        _existing_user(state, "amin", uid=uid)
+        _existing_user(state, "demo", uid=uid)
         r = _run_setup(env, login_defs="UID_MIN 1000\nUID_MAX 5000\n")
         assert r.returncode == 0, r.stderr
-        assert _rows(r)["user:amin"] == "skip"
+        assert _rows(r)["user:demo"] == "skip"
 
     def test_the_user_phase_runs_in_bash_whatever_the_login_shell(self, tmp_path):
         state, env = _setup_box(tmp_path)
         _run_setup(env)
         (line,) = (state / "runuser.log").read_text("utf-8").splitlines()
-        assert line.split() == ["--login", "--shell=/bin/bash", "amin"]
+        assert line.split() == ["--login", "--shell=/bin/bash", "demo"]
 
     def test_a_users_profile_cannot_forge_another_users_rows(self, tmp_path):
         # runuser --login sources the user's profile, and whatever it prints
@@ -6291,15 +6291,15 @@ class TestSetupShUnderRealBash:
         state, env = _setup_box(tmp_path)
         home = _existing_user(state, "mallory")
         (home / ".profile").write_text(
-            "printf 'key\\tamin\\tssh-ed25519 AAAAFORGED mallory@box\\n'\n"
-            "printf 'did\\tdocker:amin\\tFORGED\\n'\n",
+            "printf 'key\\tdemo\\tssh-ed25519 AAAAFORGED mallory@box\\n'\n"
+            "printf 'did\\tdocker:demo\\tFORGED\\n'\n",
             encoding="utf-8",
         )
-        r = _run_setup(env, ("amin", "mallory"))
+        r = _run_setup(env, ("demo", "mallory"))
         assert r.returncode == 0, r.stderr
         assert b"FORGED" not in r.stdout
         assert _report(r).keys() == dict.fromkeys(
-            ("amin", "mallory"), "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+            ("demo", "mallory"), "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
         )
         rows = _rows(r)
         for step in ("authorized_keys", "claude", "node-key"):
@@ -6307,11 +6307,11 @@ class TestSetupShUnderRealBash:
 
     def test_the_user_phase_keeps_its_exit_status_through_the_filter(self, tmp_path):
         state, env = _setup_box(tmp_path)
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         (ssh_dir / "authorized_keys").mkdir(parents=True)
         r = _run_setup(env)
         assert r.returncode == 1
-        assert _rows(r)["authorized_keys:amin"] == "fail"
+        assert _rows(r)["authorized_keys:demo"] == "fail"
 
     def test_a_package_left_in_state_rc_is_installed_again(self, tmp_path):
         # I3: `dpkg -s` succeeds for a removed package whose config files
@@ -6328,11 +6328,11 @@ class TestSetupShUnderRealBash:
 
     @pytest.mark.parametrize(
         "bad",
-        ["amin;rm", "Bob", "a" * 33, "-rf", "amin\nroot", "", "amin rm", "amin$(id)"],
+        ["demo;rm", "Bob", "a" * 33, "-rf", "demo\nroot", "", "demo rm", "demo$(id)"],
     )
     def test_a_bad_user_name_is_one_row_and_nothing_changes(self, tmp_path, bad):
         state, env = _setup_box(tmp_path)
-        r = _run_setup(env, ("amin", bad))
+        r = _run_setup(env, ("demo", bad))
         assert r.returncode == 2
         assert _rows(r) == {"setup": "fail"}
         # The name is %q-quoted: a newline in it cannot forge a second row.
@@ -6352,31 +6352,31 @@ class TestSetupShUnderRealBash:
         r = _run_setup(env)
         assert r.returncode == 1
         rows = _rows(r)
-        assert rows["user:amin"] == "fail"
-        assert not {k for k in rows if k.endswith(":amin") and k != "user:amin"}
-        assert "amin" not in rows
+        assert rows["user:demo"] == "fail"
+        assert not {k for k in rows if k.endswith(":demo") and k != "user:demo"}
+        assert "demo" not in rows
 
     def test_a_commented_or_longer_key_is_not_this_pcs_key(self, tmp_path):
         # M1: whole fields, on a line that is not a comment.
         state, env = _setup_box(tmp_path)
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         ssh_dir.mkdir(mode=0o700)
         authorized = ssh_dir / "authorized_keys"
         blob = PC_KEY.split()[1]
         others = ["# " + PC_KEY, f"ssh-ed25519 {blob}X longer@box"]
         authorized.write_text("\n".join(others) + "\n", encoding="utf-8")
         r = _run_setup(env)
-        assert _rows(r)["authorized_keys:amin"] == "did"
+        assert _rows(r)["authorized_keys:demo"] == "did"
         assert authorized.read_text("utf-8").splitlines() == [*others, PC_KEY]
 
     def test_a_key_behind_options_is_already_authorized(self, tmp_path):
         state, env = _setup_box(tmp_path)
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         ssh_dir.mkdir(mode=0o700)
         (ssh_dir / "authorized_keys").write_text(
             f'no-pty,from="10.0.0.1" {PC_KEY}\n', encoding="utf-8"
         )
-        assert _rows(_run_setup(env))["authorized_keys:amin"] == "skip"
+        assert _rows(_run_setup(env))["authorized_keys:demo"] == "skip"
 
     def test_the_installer_is_downloaded_whole_then_run(self, tmp_path):
         # M2: never `curl | bash` (a cut connection hands bash half a
@@ -6393,15 +6393,15 @@ class TestSetupShUnderRealBash:
         # a lost .pub is derived again from the private key.
         state, env = _setup_box(tmp_path)
         _run_setup(env)
-        ssh_dir = state / "home" / "amin" / ".ssh"
+        ssh_dir = state / "home" / "demo" / ".ssh"
         private = (ssh_dir / "id_ed25519").read_bytes()
         (ssh_dir / "id_ed25519.pub").unlink()
         r = _run_setup(env)
         assert r.returncode == 0, r.stderr
-        assert _rows(r)["node-key:amin"] == "did"
+        assert _rows(r)["node-key:demo"] == "did"
         assert (ssh_dir / "id_ed25519").read_bytes() == private
         assert _report(r).keys() == {
-            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+            "demo": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
         }
 
     def test_a_pub_without_its_private_key_is_a_fail_row_not_a_key(self, tmp_path):
@@ -6409,12 +6409,12 @@ class TestSetupShUnderRealBash:
         # not on the node: setup would say ok on a node that cannot clone. The
         # user's .pub is left as it was, and no key is generated beside it.
         state, env = _setup_box(tmp_path)
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         ssh_dir.mkdir(mode=0o700)
         pub = ssh_dir / "id_ed25519.pub"
         pub.write_bytes(b"ssh-ed25519 AAAAOLDKEY old@box\n")
         r = _run_setup(env)
-        assert self._row(r, "node-key:amin") == (
+        assert self._row(r, "node-key:demo") == (
             "fail",
             (
                 "id_ed25519.pub in ~/.ssh has no private key beside it;"
@@ -6431,7 +6431,7 @@ class TestSetupShUnderRealBash:
         # `-f`, not `-e`: a directory is no private key either, so its .pub
         # would reach GitHub the same way.
         state, env = _setup_box(tmp_path)
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         ssh_dir.mkdir(mode=0o700)
         blocker = ssh_dir / "id_ed25519"
         blocker.mkdir()
@@ -6439,7 +6439,7 @@ class TestSetupShUnderRealBash:
         pub = ssh_dir / "id_ed25519.pub"
         pub.write_bytes(b"ssh-ed25519 AAAAOLDKEY old@box\n")
         r = _run_setup(env)
-        assert self._row(r, "node-key:amin") == (
+        assert self._row(r, "node-key:demo") == (
             "fail",
             (
                 "id_ed25519.pub in ~/.ssh has no private key beside it;"
@@ -6460,9 +6460,9 @@ class TestSetupShUnderRealBash:
         (state / "curl-fail").touch()
         r = _run_setup(env)
         assert r.returncode == 1
-        assert _rows(r)["claude:amin"] == "fail"
+        assert _rows(r)["claude:demo"] == "fail"
         assert _report(r).keys() == {
-            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+            "demo": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
         }
         assert list((state / "tmp").iterdir()) == []
 
@@ -6470,27 +6470,27 @@ class TestSetupShUnderRealBash:
         # T14/T15: the umask alone makes a NEW dir and file private; these
         # already exist with open modes.
         state, env = _setup_box(tmp_path)
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         ssh_dir.mkdir()
         ssh_dir.chmod(0o755)
         authorized = ssh_dir / "authorized_keys"
         authorized.write_text("ssh-ed25519 AAAAOTHER other@box\n", encoding="utf-8")
         authorized.chmod(0o644)
         r = _run_setup(env)
-        assert _rows(r)["authorized_keys:amin"] == "did"
+        assert _rows(r)["authorized_keys:demo"] == "did"
         assert ssh_dir.stat().st_mode & 0o777 == 0o700
         assert authorized.stat().st_mode & 0o777 == 0o600
 
     def test_a_bare_key_line_without_a_comment_is_already_authorized(self, tmp_path):
         # T12
         state, env = _setup_box(tmp_path)
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         ssh_dir.mkdir(mode=0o700)
         authorized = ssh_dir / "authorized_keys"
         bare = " ".join(PC_KEY.split()[:2]) + "\n"
         authorized.write_text(bare, encoding="utf-8")
         r = _run_setup(env)
-        assert _rows(r)["authorized_keys:amin"] == "skip"
+        assert _rows(r)["authorized_keys:demo"] == "skip"
         assert authorized.read_text("utf-8") == bare
 
     def test_an_unreadable_private_key_leaves_no_pub(self, tmp_path):
@@ -6498,12 +6498,12 @@ class TestSetupShUnderRealBash:
         # failed derivation must not leave it behind, empty.
         state, env = _setup_box(tmp_path)
         _run_setup(env)
-        ssh_dir = state / "home" / "amin" / ".ssh"
+        ssh_dir = state / "home" / "demo" / ".ssh"
         (ssh_dir / "id_ed25519.pub").unlink()
         (state / "keygen-y-fail").touch()
         r = _run_setup(env)
         assert r.returncode == 1
-        assert _rows(r)["node-key:amin"] == "fail"
+        assert _rows(r)["node-key:demo"] == "fail"
         assert not (ssh_dir / "id_ed25519.pub").exists()
         assert set(_report(r).keys()) == set()
 
@@ -6515,12 +6515,12 @@ class TestSetupShUnderRealBash:
         state, env = _setup_box(tmp_path)
         (state / "keygen-acl").touch()
         r = _run_setup(env)
-        ssh_dir = state / "home" / "amin" / ".ssh"
+        ssh_dir = state / "home" / "demo" / ".ssh"
         assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
         assert ssh_dir.stat().st_mode & 0o777 == 0o700
-        assert _rows(r)["node-key:amin"] == "did"
+        assert _rows(r)["node-key:demo"] == "did"
         assert _report(r).keys() == {
-            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+            "demo": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
         }
         assert r.returncode == 0, r.stderr
 
@@ -6529,12 +6529,12 @@ class TestSetupShUnderRealBash:
         # is derived from it: `ssh-keygen -y` refuses an open key, as ssh does.
         state, env = _setup_box(tmp_path)
         _run_setup(env)
-        ssh_dir = state / "home" / "amin" / ".ssh"
+        ssh_dir = state / "home" / "demo" / ".ssh"
         (ssh_dir / "id_ed25519").chmod(0o644)
         (ssh_dir / "id_ed25519.pub").unlink()
         r = _run_setup(env)
         assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
-        assert self._row(r, "node-key:amin") == (
+        assert self._row(r, "node-key:demo") == (
             "did",
             (
                 "id_ed25519.pub derived again from the private key in ~/.ssh;"
@@ -6542,7 +6542,7 @@ class TestSetupShUnderRealBash:
             ),
         )
         assert _report(r).keys() == {
-            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+            "demo": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
         }
         assert r.returncode == 0, r.stderr
 
@@ -6551,16 +6551,16 @@ class TestSetupShUnderRealBash:
         # key, and would leave it open for good. The row says it was repaired.
         state, env = _setup_box(tmp_path)
         _run_setup(env)
-        ssh_dir = state / "home" / "amin" / ".ssh"
+        ssh_dir = state / "home" / "demo" / ".ssh"
         (ssh_dir / "id_ed25519").chmod(0o644)
         r = _run_setup(env)
         assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
-        assert self._row(r, "node-key:amin") == (
+        assert self._row(r, "node-key:demo") == (
             "did",
             "id_ed25519 made owner-only: it was 0644, now 0600",
         )
         assert _report(r).keys() == {
-            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+            "demo": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
         }
         assert r.returncode == 0, r.stderr
 
@@ -6584,12 +6584,12 @@ class TestSetupShUnderRealBash:
         # Rows say what happened: a key already at 0600 needed no repair.
         state, env = _setup_box(tmp_path)
         _run_setup(env)
-        ssh_dir = state / "home" / "amin" / ".ssh"
+        ssh_dir = state / "home" / "demo" / ".ssh"
         if lose_pub:
             (ssh_dir / "id_ed25519.pub").unlink()
         r = _run_setup(env)
         assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
-        assert self._row(r, "node-key:amin") == row
+        assert self._row(r, "node-key:demo") == row
         assert r.returncode == 0, r.stderr
 
     @pytest.mark.parametrize(
@@ -6609,11 +6609,11 @@ class TestSetupShUnderRealBash:
         # digits wide: stat's %a drops leading zeros.
         state, env = _setup_box(tmp_path)
         _run_setup(env)
-        key = state / "home" / "amin" / ".ssh" / "id_ed25519"
+        key = state / "home" / "demo" / ".ssh" / "id_ed25519"
         key.chmod(mode)
         r = _run_setup(env)
         assert key.stat().st_mode & 0o777 == 0o600
-        assert self._row(r, "node-key:amin") == ("did", detail)
+        assert self._row(r, "node-key:demo") == ("did", detail)
         assert r.returncode == 0, r.stderr
 
     def test_a_node_key_whose_mode_cannot_be_read_is_never_reported_clean(
@@ -6627,9 +6627,9 @@ class TestSetupShUnderRealBash:
         _run_setup(env)
         _fails_on_the_node_key(tmp_path, "stat")
         r = _run_setup(env)
-        key = state / "home" / "amin" / ".ssh" / "id_ed25519"
+        key = state / "home" / "demo" / ".ssh" / "id_ed25519"
         assert key.stat().st_mode & 0o777 == 0o600
-        assert self._row(r, "node-key:amin") == (
+        assert self._row(r, "node-key:demo") == (
             "did",
             "id_ed25519 made owner-only (0600): its earlier mode could not be read",
         )
@@ -6641,12 +6641,12 @@ class TestSetupShUnderRealBash:
         # the only one that can say the key was open.
         state, env = _setup_box(tmp_path)
         _run_setup(env)
-        key = state / "home" / "amin" / ".ssh" / "id_ed25519"
+        key = state / "home" / "demo" / ".ssh" / "id_ed25519"
         key.chmod(0o644)
         (key.parent / "id_ed25519.pub").unlink()
         (state / "keygen-y-fail").touch()
         r = _run_setup(env)
-        assert self._row(r, "node-key:amin") == (
+        assert self._row(r, "node-key:demo") == (
             "fail",
             (
                 f'ssh-keygen -y: Load key "{key}": invalid format;'
@@ -6659,13 +6659,13 @@ class TestSetupShUnderRealBash:
 
     def test_a_repair_is_reported_even_when_ssh_keygen_is_missing(self, tmp_path):
         state, env = _setup_box(tmp_path, without=("ssh-keygen",))
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         ssh_dir.mkdir(mode=0o700)
         key = ssh_dir / "id_ed25519"
         key.write_bytes(b"FAKE PRIVATE KEY x\n")
         key.chmod(0o644)
         r = _run_setup(env)
-        assert self._row(r, "node-key:amin") == (
+        assert self._row(r, "node-key:demo") == (
             "fail",
             (
                 "ssh-keygen is not installed (Debian/Ubuntu package openssh-client);"
@@ -6700,7 +6700,7 @@ class TestSetupShUnderRealBash:
         self, tmp_path, existing, detail
     ):
         state, env = _setup_box(tmp_path)
-        ssh_dir = state / "home" / "amin" / ".ssh"
+        ssh_dir = state / "home" / "demo" / ".ssh"
         if existing:
             _run_setup(env)
             (ssh_dir / "id_ed25519").chmod(0o644)
@@ -6708,7 +6708,7 @@ class TestSetupShUnderRealBash:
         before = _keygen_calls(state)
         _fails_on_the_node_key(tmp_path, "chmod")
         r = _run_setup(env)
-        assert self._row(r, "node-key:amin") == ("fail", detail)
+        assert self._row(r, "node-key:demo") == ("fail", detail)
         assert set(_report(r).keys()) == set()
         # magent's words, never chmod's.
         assert b"Operation not permitted" not in r.stdout + r.stderr
@@ -6729,7 +6729,7 @@ class TestSetupShUnderRealBash:
         victim = tmp_path / "victim-key"
         victim.write_bytes(b"x\n")
         victim.chmod(0o644)
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         ssh_dir.mkdir(mode=0o700)
         (ssh_dir / "id_ed25519").symlink_to(victim)
         (ssh_dir / "id_ed25519.pub").write_text(
@@ -6738,7 +6738,7 @@ class TestSetupShUnderRealBash:
         r = _run_setup(env)
         assert victim.stat().st_mode & 0o777 == 0o644
         assert victim.read_bytes() == b"x\n"
-        assert _rows(r)["node-key:amin"] == "fail"
+        assert _rows(r)["node-key:demo"] == "fail"
         assert set(_report(r).keys()) == set()
         assert r.returncode == 1
 
@@ -6748,15 +6748,15 @@ class TestSetupShUnderRealBash:
         state, env = _setup_box(tmp_path)
         target = tmp_path / "elsewhere" / "planted"
         target.parent.mkdir()
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         ssh_dir.mkdir(mode=0o700)
         (ssh_dir / "id_ed25519").symlink_to(target)
         r = _run_setup(env)
         assert not target.exists()
         assert _keygen_calls(state) == []
-        assert self._row(r, "node-key:amin") == (
+        assert self._row(r, "node-key:demo") == (
             "fail",
-            "amin's .ssh or its id_ed25519 is a symlink; magent does not write through it",
+            "demo's .ssh or its id_ed25519 is a symlink; magent does not write through it",
         )
         assert set(_report(r).keys()) == set()
         assert r.returncode == 1
@@ -6764,14 +6764,14 @@ class TestSetupShUnderRealBash:
     def test_a_directory_named_like_the_node_key_keeps_its_mode(self, tmp_path):
         # `-f`, not `-e`: chmod 600 would take a directory's x bit.
         state, env = _setup_box(tmp_path)
-        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
         ssh_dir.mkdir(mode=0o700)
         blocker = ssh_dir / "id_ed25519"
         blocker.mkdir()
         blocker.chmod(0o755)
         r = _run_setup(env)
         assert blocker.stat().st_mode & 0o777 == 0o755
-        assert _rows(r)["node-key:amin"] == "fail"
+        assert _rows(r)["node-key:demo"] == "fail"
         assert set(_report(r).keys()) == set()
         assert r.returncode == 1
 
@@ -6786,13 +6786,13 @@ class TestSetupShUnderRealBash:
         (state / "keygen-acl").touch()
         ssh_dir = _authorized_ssh_dir(state, mode)
         r = _run_setup(env)
-        assert _rows(r)["authorized_keys:amin"] == "skip"
+        assert _rows(r)["authorized_keys:demo"] == "skip"
         assert (state / "keygen-dir-mode").read_text("utf-8") == "700\n"
         assert ssh_dir.stat().st_mode & 0o777 == 0o700
         assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
-        assert _rows(r)["node-key:amin"] == "did"
+        assert _rows(r)["node-key:demo"] == "did"
         assert _report(r).keys() == {
-            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+            "demo": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
         }
         assert r.returncode == 0, r.stderr
 
@@ -6801,7 +6801,7 @@ class TestSetupShUnderRealBash:
         ssh_dir = _authorized_ssh_dir(state, 0o755)
         _fails_on_the_node_key(tmp_path, "chmod", "*/.ssh")
         r = _run_setup(env)
-        assert self._row(r, "node-key:amin") == (
+        assert self._row(r, "node-key:demo") == (
             "fail",
             "could not make ~/.ssh owner-only (0700) for the new key",
         )
@@ -6813,9 +6813,9 @@ class TestSetupShUnderRealBash:
 
     def test_an_ssh_path_that_is_a_file_gets_magents_own_fail_row(self, tmp_path):
         state, env = _setup_box(tmp_path)
-        (_existing_user(state, "amin") / ".ssh").write_bytes(b"x\n")
+        (_existing_user(state, "demo") / ".ssh").write_bytes(b"x\n")
         r = _run_setup(env)
-        assert self._row(r, "node-key:amin") == (
+        assert self._row(r, "node-key:demo") == (
             "fail",
             "could not make ~/.ssh owner-only (0700) for the new key",
         )
@@ -6840,30 +6840,30 @@ class TestSetupShUnderRealBash:
         assert time.monotonic() - started < 25
         assert r.returncode == 1
         assert self._row(r, "gh") == ("fail", "gh --version timed out after 4s")
-        assert set(_report(r).keys()) == {"amin"}
+        assert set(_report(r).keys()) == {"demo"}
 
     def test_a_hung_claude_is_its_own_fail_row_and_the_key_still_comes(self, tmp_path):
         state, env = _setup_box(tmp_path)
         _run_setup(env)
-        (state / "home" / "amin" / "claude-hangs").touch()
+        (state / "home" / "demo" / "claude-hangs").touch()
         started = time.monotonic()
         r = _run_setup(env)
         assert time.monotonic() - started < 25
         assert r.returncode == 1
-        assert self._row(r, "claude:amin") == (
+        assert self._row(r, "claude:demo") == (
             "fail",
             "claude --version timed out after 4s",
         )
-        assert set(_report(r).keys()) == {"amin"}
+        assert set(_report(r).keys()) == {"demo"}
 
     def test_a_claude_that_hangs_right_after_its_install_is_a_fail_row(self, tmp_path):
         state, env = _setup_box(tmp_path)
-        (_existing_user(state, "amin") / "claude-hangs").touch()
+        (_existing_user(state, "demo") / "claude-hangs").touch()
         started = time.monotonic()
         r = _run_setup(env)
         assert time.monotonic() - started < 25
         assert r.returncode == 1
-        assert self._row(r, "claude:amin") == (
+        assert self._row(r, "claude:demo") == (
             "fail",
             "claude --version timed out after 4s",
         )
@@ -6888,9 +6888,9 @@ class TestSetupShUnderRealBash:
         state, env = _setup_box(tmp_path)
         home = _existing_user(state, "min")
         (home / ".profile").write_text(
-            "printf 'did\\tdocker:amin\\tFORGED\\n'\n", encoding="utf-8"
+            "printf 'did\\tdocker:demo\\tFORGED\\n'\n", encoding="utf-8"
         )
-        r = _run_setup(env, ("amin", "min"))
+        r = _run_setup(env, ("demo", "min"))
         assert r.returncode == 0, r.stderr
         assert b"FORGED" not in r.stdout
 
@@ -6901,13 +6901,13 @@ class TestSetupShUnderRealBash:
         with open(awk, "w", encoding="utf-8", newline="\n") as f:
             f.write(
                 f"#!{BASH}\n"
-                'for a; do [ "$a" != u=amin ] || { cat >/dev/null; exit 2; }; done\n'
+                'for a; do [ "$a" != u=demo ] || { cat >/dev/null; exit 2; }; done\n'
                 f'exec {shlex.quote(os.path.join(sysbin, "awk"))} "$@"\n'
             )
         os.chmod(awk, 0o755)
         r = _run_setup(env)
         assert r.returncode == 1
-        assert _rows(r)["docker:amin"] == "did"
+        assert _rows(r)["docker:demo"] == "did"
 
     def test_a_two_line_version_is_its_first_line_only(self, tmp_path):
         # The real `gh --version` prints two lines (version, then release URL).
@@ -6955,31 +6955,31 @@ class TestTheTmuxFloor:
 class TestSetupNode:
     def test_it_connects_as_root_for_this_one_hop(self, fake_ssh):
         remote_mux.setup_node(
-            NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+            NODE, ["demo"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
         )
         (call,) = fake_ssh.calls()
         assert "root@devino-second" in call.argv
-        assert "amin@devino-second" not in call.argv
+        assert "demo@devino-second" not in call.argv
 
     def test_the_users_are_argv_and_the_key_is_the_payload(self, fake_ssh):
         remote_mux.setup_node(
-            NODE, ["amin", "bob"], PC_KEY + "\n\n", timeout_s=remote_mux.SETUP_TIMEOUT_S
+            NODE, ["demo", "bob"], PC_KEY + "\n\n", timeout_s=remote_mux.SETUP_TIMEOUT_S
         )
         (call,) = fake_ssh.calls()
         assert call.argv[-1] == _remote(
-            "bash", "-s", "--", remote_mux.SOCKET, "amin", "bob"
+            "bash", "-s", "--", remote_mux.SOCKET, "demo", "bob"
         )
         assert _sent(call) == (PC_KEY + "\n").encode("ascii")
 
     def test_the_node_keys_come_back_in_the_report(self, fake_ssh):
         fake_ssh.set_reply(
             "bash -s",
-            stdout="did\tuser:amin\tcreated\nkey\tamin\tssh-ed25519 AAAAN magent@devino-second\n",
+            stdout="did\tuser:demo\tcreated\nkey\tdemo\tssh-ed25519 AAAAN magent@devino-second\n",
         )
         report = remote_mux.setup_node(
-            NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+            NODE, ["demo"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
         )
-        assert report.keys() == {"amin": "ssh-ed25519 AAAAN magent@devino-second"}
+        assert report.keys() == {"demo": "ssh-ed25519 AAAAN magent@devino-second"}
 
     def test_an_unreachable_root_login_raises(self, fake_ssh):
         fake_ssh.set_reply(
@@ -6987,7 +6987,7 @@ class TestSetupNode:
         )
         with pytest.raises(RemoteError):
             remote_mux.setup_node(
-                NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+                NODE, ["demo"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
             )
 
     def test_a_transport_failure_names_the_users_and_never_the_key(self, fake_ssh):
@@ -6996,13 +6996,13 @@ class TestSetupNode:
         )
         with pytest.raises(RemoteError) as info:
             remote_mux.setup_node(
-                NODE, ["amin", "bob"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+                NODE, ["demo", "bob"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
             )
         (call,) = fake_ssh.calls()
         shown = info.value.command_redacted
         assert shown[:-1] == ("ssh", *call.argv)
         assert shown[-2] == _remote(
-            "bash", "-s", "--", remote_mux.SOCKET, "amin", "bob"
+            "bash", "-s", "--", remote_mux.SOCKET, "demo", "bob"
         )
         assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
         assert PC_KEY.split()[1] not in str(info.value)
@@ -7012,18 +7012,18 @@ class TestSetupNode:
         fake_ssh.set_reply(
             "bash -s",
             stdout=(
-                "did\tuser:amin\tcreated\n"
-                "fail\tclaude:amin\tthe Claude installer did not put claude on PATH\n"
-                "key\tamin\tssh-ed25519 AAAAN magent@devino-second\n"
+                "did\tuser:demo\tcreated\n"
+                "fail\tclaude:demo\tthe Claude installer did not put claude on PATH\n"
+                "key\tdemo\tssh-ed25519 AAAAN magent@devino-second\n"
             ),
             rc=1,
         )
         report = remote_mux.setup_node(
-            NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+            NODE, ["demo"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
         )
         assert report.failed
-        assert report.keys() == {"amin": "ssh-ed25519 AAAAN magent@devino-second"}
-        assert ScriptLine("did", "user:amin", "created") in report.lines
+        assert report.keys() == {"demo": "ssh-ed25519 AAAAN magent@devino-second"}
+        assert ScriptLine("did", "user:demo", "created") in report.lines
 
     def test_an_unreachable_root_login_names_root(self, fake_ssh):
         # P2: the error says who magent tried to be.
@@ -7032,7 +7032,7 @@ class TestSetupNode:
         )
         with pytest.raises(RemoteError) as info:
             remote_mux.setup_node(
-                NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+                NODE, ["demo"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
             )
         assert "root@devino-second" in info.value.command_redacted
 
@@ -7042,13 +7042,13 @@ class TestSetupNode:
         fake_ssh.set_reply("bash -s", stderr="ssh: connect to host: No route\n", rc=255)
         with pytest.raises(RemoteError) as info:
             remote_mux.setup_node(
-                NODE, ["amin", "bob"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+                NODE, ["demo", "bob"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
             )
         (call,) = fake_ssh.calls()
         shown = info.value.command_redacted
         assert shown[:-1] == ("ssh", *call.argv)
         assert shown[-2] == _remote(
-            "bash", "-s", "--", remote_mux.SOCKET, "amin", "bob"
+            "bash", "-s", "--", remote_mux.SOCKET, "demo", "bob"
         )
         assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
         assert PC_KEY not in str(info.value)
@@ -7064,8 +7064,8 @@ class TestSetupNode:
             return subprocess.CompletedProcess(["ssh"], 0, b"", b"")
 
         monkeypatch.setattr(remote_mux, "run_script", spy)
-        remote_mux.setup_node(NODE, ["amin", "bob"], PC_KEY)
-        remote_mux.setup_node(NODE, ["amin"], PC_KEY, timeout_s=5.0)
+        remote_mux.setup_node(NODE, ["demo", "bob"], PC_KEY)
+        remote_mux.setup_node(NODE, ["demo"], PC_KEY, timeout_s=5.0)
         assert seen == [
             remote_mux.SETUP_TIMEOUT_S + 2 * remote_mux.SETUP_PER_USER_S,
             5.0,
@@ -7073,7 +7073,7 @@ class TestSetupNode:
 
 
 NODE_KEY = "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
-TITLE = "magent amin@devino-second"
+TITLE = "magent demo@devino-second"
 KEY_SCOPES = "admin:public_key, repo"
 # What gh prints for a key GitHub refuses (here: on another account): two lines.
 REFUSED_ADD_STDERR = (
@@ -7131,7 +7131,7 @@ class TestGhsOwnWordsStayOffTheScreen:
 
     def test_a_keyring_failure_is_a_class_only_row(self, fake_ssh, fake_gh, caplog):
         caplog.set_level("WARNING", logger="magent.nodes")
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", "repo"))
         fake_gh.set_reply("auth token", stderr=KEYRING_FAILED + "\n", rc=1)
         report = remote_mux.provision(
             NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
@@ -7148,7 +7148,7 @@ class TestGhsOwnWordsStayOffTheScreen:
         fake_gh.set_reply(
             "auth status",
             stdout=gh_auth_status(
-                None, accounts=[("amin", True, "error", NO_SUCH_HOST)]
+                None, accounts=[("demo", True, "error", NO_SUCH_HOST)]
             ),
         )
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
@@ -7156,7 +7156,7 @@ class TestGhsOwnWordsStayOffTheScreen:
             "fail",
             "github-key",
             (
-                "this PC's gh could not verify its github.com login (amin): "
+                "this PC's gh could not verify its github.com login (demo): "
                 "check this PC's network, then retry"
             ),
         )
@@ -7177,7 +7177,7 @@ class TestGhsOwnWordsStayOffTheScreen:
 
     def test_a_failed_add_is_a_class_only_github_key_row(self, fake_gh, caplog):
         caplog.set_level("WARNING", logger="magent.nodes")
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         fake_gh.set_reply("ssh-key add", stderr=ADD_REFUSED, rc=1)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
@@ -7187,7 +7187,7 @@ class TestGhsOwnWordsStayOffTheScreen:
 
     def test_a_failed_add_logs_gh_s_words_scrubbed(self, fake_gh, caplog):
         caplog.set_level("WARNING", logger="magent.nodes")
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         fake_gh.set_reply("ssh-key add", stderr=f"HTTP 401: bad token {TOKEN}\n", rc=1)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
@@ -7198,7 +7198,7 @@ class TestGhsOwnWordsStayOffTheScreen:
     def test_a_failed_add_of_a_named_class_prints_its_repair(self, fake_gh, caplog):
         # gh's words name the class; the row carries the class's repair.
         caplog.set_level("WARNING", logger="magent.nodes")
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         fake_gh.set_reply("ssh-key add", stderr="unknown flag: --type\n", rc=1)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row == ScriptLine(
@@ -7211,7 +7211,7 @@ class TestGhsOwnWordsStayOffTheScreen:
 
     def test_a_failed_add_that_said_nothing_logs_its_exit(self, fake_gh, caplog):
         caplog.set_level("WARNING", logger="magent.nodes")
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         fake_gh.set_reply("ssh-key add", rc=3)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
@@ -7229,10 +7229,10 @@ class TestGhsOwnWordsStayOffTheScreen:
         "refusal",
         [
             GhUnavailable("failed", detail=PROXY_REFUSED),
-            GhUnavailable("unverified", login="amin", detail=NO_SUCH_HOST),
+            GhUnavailable("unverified", login="demo", detail=NO_SUCH_HOST),
             GhUnavailable("too-old", detail="unknown flag: --json"),
             GhUnavailable("not-logged-in", detail="not logged into any GitHub hosts"),
-            GhUnavailable("rejected", login="amin", detail="HTTP 401: Bad credentials"),
+            GhUnavailable("rejected", login="demo", detail="HTTP 401: Bad credentials"),
         ],
     )
     def test_no_hint_carries_gh_s_words(self, refusal):
@@ -7253,13 +7253,13 @@ class TestRegisterSshKey:
         ("accounts", "hint"),
         [
             (
-                [("amin", True, "error", "HTTP 401: Bad credentials")],
+                [("demo", True, "error", "HTTP 401: Bad credentials")],
                 "github.com rejected this PC's gh login: gh auth login -h github.com",
             ),
             (
-                [("amin", True, "timeout")],
+                [("demo", True, "timeout")],
                 (
-                    "this PC's gh could not verify its github.com login (amin): "
+                    "this PC's gh could not verify its github.com login (demo): "
                     "check this PC's network, then retry"
                 ),
             ),
@@ -7277,7 +7277,7 @@ class TestRegisterSshKey:
 
     def test_a_login_without_the_key_scope_names_the_refresh(self, fake_gh):
         fake_gh.set_reply(
-            "auth status", stdout=gh_auth_status("amin", "repo, workflow")
+            "auth status", stdout=gh_auth_status("demo", "repo, workflow")
         )
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row.status == "fail"
@@ -7285,7 +7285,7 @@ class TestRegisterSshKey:
         assert _adds(fake_gh) == []
 
     def test_a_login_with_no_reported_scopes_names_a_classic_token(self, fake_gh):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", ""))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", ""))
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row == ScriptLine(
             "fail",
@@ -7298,16 +7298,16 @@ class TestRegisterSshKey:
         assert _adds(fake_gh) == []
 
     def test_a_key_already_on_the_account_is_a_skip(self, fake_gh):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         fake_gh.set_reply(
             "user/keys", stdout="ssh-ed25519 AAAAOTHER\nssh-ed25519 AAAAFAKENODEKEY\n"
         )
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
-        assert row == ScriptLine("skip", "github-key", "already registered to amin")
+        assert row == ScriptLine("skip", "github-key", "already registered to demo")
         assert _adds(fake_gh) == []
 
     def test_a_new_key_is_added_on_stdin_as_an_authentication_key(self, fake_gh):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         (add,) = _adds(fake_gh)
         assert add.argv == [
@@ -7321,7 +7321,7 @@ class TestRegisterSshKey:
         ]
         assert add.stdin == (NODE_KEY + "\n").encode("ascii")
         assert row == ScriptLine(
-            "did", "github-key", f"registered to amin as '{TITLE}'"
+            "did", "github-key", f"registered to demo as '{TITLE}'"
         )
 
     @pytest.mark.parametrize(
@@ -7332,7 +7332,7 @@ class TestRegisterSshKey:
         ],
     )
     def test_every_openssh_key_family_is_added(self, fake_gh, key):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         row = remote_mux.register_ssh_key(key, title=TITLE)
         assert row.status == "did"
         (add,) = _adds(fake_gh)
@@ -7340,21 +7340,21 @@ class TestRegisterSshKey:
 
     def test_write_public_key_is_scope_enough(self, fake_gh):
         fake_gh.set_reply(
-            "auth status", stdout=gh_auth_status("amin", "write:public_key")
+            "auth status", stdout=gh_auth_status("demo", "write:public_key")
         )
         remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert len(_adds(fake_gh)) == 1
 
     def test_a_refused_add_fails_and_logs_ghs_own_words(self, fake_gh, caplog):
         caplog.set_level("WARNING", logger="magent.nodes")
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         fake_gh.set_reply("ssh-key add", stderr=REFUSED_ADD_STDERR, rc=1)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
         assert "key is already in use" in _nodes_log(caplog)
 
     def test_another_key_of_the_same_type_is_not_a_match(self, fake_gh):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         fake_gh.set_reply(
             "user/keys",
             stdout="ssh-ed25519 AAAAOTHER\nssh-ed25519 AAAAFAKENODEKEYLONGER\n",
@@ -7364,26 +7364,26 @@ class TestRegisterSshKey:
         assert len(_adds(fake_gh)) == 1
 
     def test_the_listing_asks_for_every_page(self, fake_gh):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         (listing,) = [c for c in fake_gh.calls() if "user/keys" in c.argv]
         assert listing.argv == ["api", "--paginate", "user/keys", "--jq", ".[].key"]
 
     def test_a_failed_listing_is_not_evidence_and_the_add_is_still_tried(self, fake_gh):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         fake_gh.set_reply("user/keys", stdout="ssh-ed25519 AAAAFAKENODEKEY\n", rc=1)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert len(_adds(fake_gh)) == 1
         assert row.status == "did"
 
     def test_a_malformed_key_is_refused_before_gh_is_asked_for_keys(self, fake_gh):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         row = remote_mux.register_ssh_key("ssh-ed25519", title=TITLE)
         assert row == ScriptLine("fail", "github-key", "not an ssh public key line")
         assert [c.argv[:2] for c in fake_gh.calls()] == [["auth", "status"]]
 
     def test_a_private_key_never_leaves_this_pc(self, fake_gh):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         row = remote_mux.register_ssh_key(
             "-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEAAAAA", title=TITLE
         )
@@ -7392,7 +7392,7 @@ class TestRegisterSshKey:
         assert all(c.stdin == b"" for c in fake_gh.calls())
 
     def test_an_add_that_cannot_run_fails(self, fake_gh, monkeypatch):
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         real_gh = remote_mux._gh
 
         def gh_without_add(
@@ -7422,7 +7422,7 @@ class TestRegisterSshKey:
 
     def test_a_multi_line_refusal_logs_the_last_line(self, fake_gh, caplog):
         caplog.set_level("WARNING", logger="magent.nodes")
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         fake_gh.set_reply("ssh-key add", stderr=REFUSED_ADD_STDERR, rc=1)
         remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert f"{ADD_LOGGED} failed: key is already in use" in _nodes_log(caplog)
@@ -7432,20 +7432,20 @@ class TestRegisterSshKey:
         # gh ssh-key add de-duplicates on its own (one unpaginated user/keys
         # page) and exits 0; when magent's own listing failed, that exit 0 is
         # the only word that the key was already there.
-        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("demo", KEY_SCOPES))
         fake_gh.set_reply("user/keys", stderr="HTTP 502\n", rc=1)
         fake_gh.set_reply(
             "ssh-key add",
             stderr="✓ Public key already exists on your account\n",
         )
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
-        assert row == ScriptLine("skip", "github-key", "already registered to amin")
+        assert row == ScriptLine("skip", "github-key", "already registered to demo")
 
 
 DOCTOR_TOOLS = ("bash", "awk", "dirname", "head", "wc", "timeout")
 NODE_TOOLS = ("tmux", "git", "claude", "python3", "gh", "ssh", "locale", "df")
 GIB_KB = 1024 * 1024
-HI = "Hi amin! You've successfully authenticated, but GitHub does not provide shell access."
+HI = "Hi demo! You've successfully authenticated, but GitHub does not provide shell access."
 DOCTOR_ITEMS = (
     "tmux",
     "git",
@@ -7538,7 +7538,7 @@ def _run_doctor(
     *,
     socket: str | None = remote_mux.SOCKET,
 ) -> subprocess.CompletedProcess[bytes]:
-    args = ["--root", root, "--target", "amin@devino-second"]
+    args = ["--root", root, "--target", "demo@devino-second"]
     return subprocess.run(
         _bash_argv(*args, socket=socket),
         input=remote_mux._frame_script(node_scripts.script("doctor"), None),
@@ -7572,7 +7572,7 @@ class TestDoctorShUnderRealBash:
         assert r.returncode == 0, r.stderr
         assert _rows(r) == dict.fromkeys(DOCTOR_ITEMS, "ok")
         details = {line.item: line.detail for line in _report(r).lines}
-        assert details["github-key"] == "authenticates as amin"
+        assert details["github-key"] == "authenticates as demo"
         assert details["sessions"] == f"2 on tmux socket {remote_mux.SOCKET}"
         assert details["tmux"] == "tmux 3.4"
 
@@ -7704,7 +7704,7 @@ class TestDoctorShUnderRealBash:
         report = _report(_run_doctor(env))
         (row,) = [line for line in report.lines if line.item == "claude-login"]
         assert row.status == "fail"
-        assert row.detail.endswith("run once: ssh amin@devino-second claude")
+        assert row.detail.endswith("run once: ssh demo@devino-second claude")
 
     def test_a_refused_github_key_fails(self, tmp_path):
         _, env = _doctor_box(
@@ -8147,7 +8147,7 @@ class TestDoctorCall:
             "--root",
             "~/magent",
             "--target",
-            "amin@devino-second",
+            "demo@devino-second",
         )
         assert SENTINEL_LINE not in call.stdin
 

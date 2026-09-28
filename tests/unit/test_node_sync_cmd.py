@@ -44,8 +44,8 @@ def pool_config(tmp_path, tmp_config, monkeypatch):
             "version": SCHEMA_VERSION,
             "settings": {
                 "nodes": {
-                    "second": {"host": "devino-second", "user": "amin"},
-                    "third": {"host": "devino-third", "user": "amin"},
+                    "second": {"host": "devino-second", "user": "demo"},
+                    "third": {"host": "devino-third", "user": "demo"},
                 }
             },
             "projects": [
@@ -558,7 +558,7 @@ class TestTheEnvGatesOnlyTheSupervisor:
             cli.main, ["--config", pool_config, "node", "sync", "--once"]
         )
         assert result.exit_code == 0, result.output
-        assert _hosts_dialled(fake_ssh) == ["amin@devino-second", "amin@devino-third"]
+        assert _hosts_dialled(fake_ssh) == ["demo@devino-second", "demo@devino-third"]
 
     def test_an_explicit_daemon_flag_still_spawns(
         self, runner, pool_config, monkeypatch
@@ -583,7 +583,7 @@ class TestTheEnvGatesOnlyTheSupervisor:
             cli.main, ["--config", pool_config, "node", "sync", "--ticks", "1"]
         )
         assert result.exit_code == 0, result.output
-        assert _hosts_dialled(fake_ssh) == ["amin@devino-second", "amin@devino-third"]
+        assert _hosts_dialled(fake_ssh) == ["demo@devino-second", "demo@devino-third"]
 
 
 def _both_answer(fake_ssh) -> None:

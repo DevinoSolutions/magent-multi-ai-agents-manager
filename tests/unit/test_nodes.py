@@ -41,12 +41,12 @@ from magent.sessions import IDE_TOOLS, is_ide_tool
 from tests.conftest import REAL_MAGENT_DIR
 from tests.unit._deny_stat import deny_open, deny_scandir, deny_stat
 
-NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
+NODE = Node(nick="second", host="devino-second", user="demo", root="~/magent")
 
 
 class TestTheDataShapes:
     def test_a_node_targets_user_at_host(self):
-        assert NODE.target == "amin@devino-second"
+        assert NODE.target == "demo@devino-second"
 
     @pytest.mark.parametrize(
         "shape",
@@ -139,8 +139,8 @@ class TestEncodedProjectDir:
 
     def test_a_node_side_path_encodes_by_the_same_rule(self):
         assert (
-            nodes.encoded_project_dir("/home/amin/magent/sendly")
-            == "-home-amin-magent-sendly"
+            nodes.encoded_project_dir("/home/demo/magent/sendly")
+            == "-home-demo-magent-sendly"
         )
 
 
@@ -149,7 +149,7 @@ ENTRY = NodeMapEntry(
     sid="api",
     placed_ts=1727200000.0,
     attached_existing=False,
-    remote_root="/home/amin/magent/api",
+    remote_root="/home/demo/magent/api",
 )
 
 
@@ -204,7 +204,7 @@ class TestTheNodeMap:
                 "sid": "api",
                 "placed_ts": 1727200000.0,
                 "attached_existing": False,
-                "remote_root": "/home/amin/magent/api",
+                "remote_root": "/home/demo/magent/api",
                 "target": "",
                 "cwd": "",
             }
@@ -261,7 +261,7 @@ class TestTheNodeMap:
         node_map.parent.mkdir(parents=True)
         node_map.write_text(
             '{"api": {"nick": "second", "sid": "api", "placed_ts": 1727200000.0,'
-            ' "attached_existing": false, "remote_root": "/home/amin/magent/api"}}',
+            ' "attached_existing": false, "remote_root": "/home/demo/magent/api"}}',
             encoding="utf-8",
         )
         assert nodes.read_node_map() == {"api": ENTRY}
@@ -406,7 +406,7 @@ class TestTheStrictRead:
 class TestTheMapRecordsHowToReachASession:
     def test_target_and_cwd_round_trip(self, node_map):
         entry = dataclasses.replace(
-            ENTRY, target="amin@devino-second", cwd="/home/amin/magent/api"
+            ENTRY, target="demo@devino-second", cwd="/home/demo/magent/api"
         )
         nodes.write_node_map({"api": entry})
         assert nodes.read_node_map() == {"api": entry}
@@ -698,15 +698,15 @@ class TestF2FindsANodeFolder:
             "API": dataclasses.replace(
                 ENTRY,
                 sid="API",
-                target="amin@devino-second",
-                cwd="/home/amin/magent/api",
+                target="demo@devino-second",
+                cwd="/home/demo/magent/api",
             )
         }
 
     def test_a_project_name_finds_its_target_and_folder(self):
         assert nodes.open_target("API", self._entries()) == (
-            "amin@devino-second",
-            "/home/amin/magent/api",
+            "demo@devino-second",
+            "/home/demo/magent/api",
         )
 
     def test_a_session_id_finds_it_too(self):
@@ -747,10 +747,10 @@ class TestF2FindsANodeFolder:
             "~/magent/api",  # the ~ a folder URI never expands
             r"C:\dev\api",  # a Windows path is not the node's
             "--install-extension=evil.vsix",  # would be a VS Code flag
-            "/home/amin/magent/a\nb",
-            "/home/amin/magent/a\x00b",
-            "/home/amin/magent/a\x7fb",
-            "/home/amin/magent/a\x85b",  # C1 control
+            "/home/demo/magent/a\nb",
+            "/home/demo/magent/a\x00b",
+            "/home/demo/magent/a\x7fb",
+            "/home/demo/magent/a\x85b",  # C1 control
         ],
     )
     def test_a_folder_that_is_not_a_clean_absolute_path_is_none(self, cwd):
@@ -762,7 +762,7 @@ class TestF2FindsANodeFolder:
         [
             "-oProxyCommand=calc@h",  # ssh would read an option
             "-h",
-            "amin@",  # no host: would build a LOCAL open of a node path
+            "demo@",  # no host: would build a LOCAL open of a node path
             "@",
         ],
     )
@@ -773,7 +773,7 @@ class TestF2FindsANodeFolder:
     @pytest.mark.parametrize("target", ["devino-second", "@devino-second"])
     def test_a_target_with_a_host_and_no_user_still_opens(self, target):
         entries = {"API": dataclasses.replace(self._entries()["API"], target=target)}
-        assert nodes.open_target("API", entries) == (target, "/home/amin/magent/api")
+        assert nodes.open_target("API", entries) == (target, "/home/demo/magent/api")
 
 
 def _pool(entries: dict[str, NodeConfig] | None = None) -> MagentConfig:
@@ -782,7 +782,7 @@ def _pool(entries: dict[str, NodeConfig] | None = None) -> MagentConfig:
     into the next. Default: ``second`` (explicit user) and ``third`` (none)."""
     if entries is None:
         entries = {
-            "second": NodeConfig(nick="second", host="devino-second", user="amin"),
+            "second": NodeConfig(nick="second", host="devino-second", user="demo"),
             "third": NodeConfig(nick="third", host="devino-third"),
         }
     return MagentConfig(projects=[], settings=Settings(nodes=entries))
@@ -794,20 +794,20 @@ class TestResolve:
             _pool(), ProjectConfig(path="api", node="second"), local_user="whoever"
         )
         assert node == Node(
-            nick="second", host="devino-second", user="amin", root="~/magent"
+            nick="second", host="devino-second", user="demo", root="~/magent"
         )
 
     def test_no_configured_user_means_the_local_one_lowercased(self):
         node = nodes.resolve(
-            _pool(), ProjectConfig(path="api", node="third"), local_user="Amin"
+            _pool(), ProjectConfig(path="api", node="third"), local_user="Demo"
         )
-        assert node.user == "amin"
+        assert node.user == "demo"
 
     def test_auto_resolves_to_the_placed_node(self):
         node = nodes.resolve(
             _pool(),
             ProjectConfig(path="api", node="auto"),
-            local_user="amin",
+            local_user="demo",
             placed="third",
         )
         assert node.nick == "third"
@@ -816,7 +816,7 @@ class TestResolve:
         node = nodes.resolve(
             _pool(),
             ProjectConfig(path="api", node="second"),
-            local_user="amin",
+            local_user="demo",
             placed="third",
         )
         assert node.nick == "second"
@@ -824,7 +824,7 @@ class TestResolve:
     def test_auto_without_a_placement_is_refused(self):
         with pytest.raises(NodeConfigError, match="placement"):
             nodes.resolve(
-                _pool(), ProjectConfig(path="api", node="auto"), local_user="amin"
+                _pool(), ProjectConfig(path="api", node="auto"), local_user="demo"
             )
 
     def test_a_cloud_project_is_refused_clearly_not_a_key_error(self):
@@ -832,12 +832,12 @@ class TestResolve:
         # caller that hands one to the node resolver gets a named refusal.
         with pytest.raises(NodeConfigError, match="cloud backend"):
             nodes.resolve(
-                _pool(), ProjectConfig(path="api", node="cloud"), local_user="amin"
+                _pool(), ProjectConfig(path="api", node="cloud"), local_user="demo"
             )
 
     def test_a_project_without_a_node_is_refused(self):
         with pytest.raises(NodeConfigError, match="not a node project"):
-            nodes.resolve(_pool(), ProjectConfig(path="api"), local_user="amin")
+            nodes.resolve(_pool(), ProjectConfig(path="api"), local_user="demo")
 
     def test_a_nick_missing_from_the_pool_is_refused_naming_it(self):
         # A PINNED nick falls through to node_for_nick's unknown-nick error,
@@ -848,7 +848,7 @@ class TestResolve:
             r"known nodes: second, third$",
         ):
             nodes.resolve(
-                _pool(), ProjectConfig(path="api", node="fourth"), local_user="amin"
+                _pool(), ProjectConfig(path="api", node="fourth"), local_user="demo"
             )
 
     def test_a_stale_placement_is_refused_saying_it_was_a_placement(self):
@@ -862,14 +862,14 @@ class TestResolve:
             nodes.resolve(
                 _pool(),
                 ProjectConfig(path="api", node="auto"),
-                local_user="amin",
+                local_user="demo",
                 placed="fourth",
             )
 
     def test_an_empty_pool_says_there_are_no_known_nodes(self):
         with pytest.raises(NodeConfigError, match="known nodes: none"):
             nodes.resolve(
-                _pool({}), ProjectConfig(path="api", node="second"), local_user="amin"
+                _pool({}), ProjectConfig(path="api", node="second"), local_user="demo"
             )
 
     @pytest.mark.parametrize("local_user", ["root", "ROOT"])
@@ -882,7 +882,7 @@ class TestResolve:
 
     @pytest.mark.parametrize(
         ("local_user", "derived"),
-        [("Alice Example", "alice example"), (" ", " "), ("1amin", "1amin")],
+        [("Alice Example", "alice example"), (" ", " "), ("1demo", "1demo")],
     )
     def test_a_derived_user_ssh_cannot_log_in_as_is_refused(self, local_user, derived):
         # A Windows USERNAME may hold a space; whitespace passes `if not user`.
@@ -906,7 +906,7 @@ class TestResolve:
             {"fifth": NodeConfig(nick="fifth", host="devino-fifth", user="root")}
         )
         node = nodes.resolve(
-            pool, ProjectConfig(path="api", node="fifth"), local_user="amin"
+            pool, ProjectConfig(path="api", node="fifth"), local_user="demo"
         )
         assert node.user == "root"
 
@@ -926,7 +926,7 @@ class TestANickResolvesLikeAProject:
             NodeConfigError,
             match=r"^node 'fifth' is not in settings\.nodes; known nodes: second, third$",
         ):
-            node_for_nick(_pool(), "fifth", local_user="amin")
+            node_for_nick(_pool(), "fifth", local_user="demo")
 
     @pytest.mark.parametrize("nick", ["auto", "cloud"])
     def test_a_placement_word_as_a_nick_is_just_an_unknown_nick(self, nick):
@@ -936,25 +936,25 @@ class TestANickResolvesLikeAProject:
             NodeConfigError,
             match=rf"^node '{nick}' is not in settings\.nodes; known nodes: second, third$",
         ):
-            node_for_nick(_pool(), nick, local_user="amin")
+            node_for_nick(_pool(), nick, local_user="demo")
 
     def test_the_label_prefixes_the_unknown_nick_error(self):
         with pytest.raises(
             NodeConfigError,
             match=r"^api: node 'fifth' is not in settings\.nodes; known nodes: second, third$",
         ):
-            node_for_nick(_pool(), "fifth", local_user="amin", label="api")
+            node_for_nick(_pool(), "fifth", local_user="demo", label="api")
 
     def test_an_empty_pool_says_there_are_no_known_nodes(self):
         with pytest.raises(
             NodeConfigError,
             match=r"^node 'fifth' is not in settings\.nodes; known nodes: none$",
         ):
-            node_for_nick(_pool({}), "fifth", local_user="amin")
+            node_for_nick(_pool({}), "fifth", local_user="demo")
 
     @pytest.mark.parametrize(
         ("local_user", "derived"),
-        [("Alice Example", "alice example"), (" ", " "), ("1amin", "1amin")],
+        [("Alice Example", "alice example"), (" ", " "), ("1demo", "1demo")],
     )
     def test_a_derived_user_ssh_cannot_log_in_as_is_refused_by_nick(
         self, local_user, derived
@@ -969,7 +969,7 @@ class TestANickResolvesLikeAProject:
 
     def test_an_empty_label_is_no_label(self):
         with pytest.raises(NodeConfigError, match=r"^node 'fifth' "):
-            node_for_nick(_pool(), "fifth", local_user="amin", label="")
+            node_for_nick(_pool(), "fifth", local_user="demo", label="")
 
     @pytest.mark.parametrize(
         ("local_user", "expected"),
@@ -1198,7 +1198,7 @@ def repo(tmp_path, monkeypatch):
 def _state(path: Path, ignored: tuple[str, ...]) -> LocalGitState:
     return LocalGitState(
         path=path,
-        url="git@github.com:amin/sendly.git",
+        url="git@github.com:demo/sendly.git",
         branch="main",
         dirty=False,
         unpushed=False,
@@ -1775,7 +1775,7 @@ class TestRecipeFor:
         assert recipe.remote_root == "~/magent/sendly"
         assert recipe.repos == (
             RepoSpec(
-                url="git@github.com:amin/sendly.git",
+                url="git@github.com:demo/sendly.git",
                 branch="main",
                 remote_dir="~/magent/sendly",
             ),
@@ -2525,7 +2525,7 @@ class TestTheRecipeWalksMemoryAsThePayloadDoes:
         assert (recipe.warnings, shipped) == ((), ["memory/MEMORY.md"])
 
 
-D_NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
+D_NODE = Node(nick="second", host="devino-second", user="demo", root="~/magent")
 
 
 def _pool_config(*projects: ProjectConfig) -> MagentConfig:
@@ -2533,8 +2533,8 @@ def _pool_config(*projects: ProjectConfig) -> MagentConfig:
         projects=list(projects),
         settings=Settings(
             nodes={
-                "second": NodeConfig(nick="second", host="devino-second", user="amin"),
-                "third": NodeConfig(nick="third", host="devino-third", user="amin"),
+                "second": NodeConfig(nick="second", host="devino-second", user="demo"),
+                "third": NodeConfig(nick="third", host="devino-third", user="demo"),
             }
         ),
     )
@@ -2665,19 +2665,19 @@ class TestWhereTheProjectLandsOnTheNode:
     @pytest.mark.parametrize(
         ("path", "expected"),
         [
-            ("~", "/home/amin"),
-            ("~/magent/api", "/home/amin/magent/api"),
+            ("~", "/home/demo"),
+            ("~/magent/api", "/home/demo/magent/api"),
             ("/srv/work/api", "/srv/work/api"),
         ],
     )
     def test_a_tilde_expands_against_the_nodes_home(self, path, expected):
-        assert nodes.absolute_remote(path, "/home/amin") == expected
+        assert nodes.absolute_remote(path, "/home/demo") == expected
 
     @pytest.mark.parametrize(
         ("path", "home", "expected"),
         [
-            ("~", "/home/amin/", "/home/amin"),
-            ("~/x", "/home/amin/", "/home/amin/x"),
+            ("~", "/home/demo/", "/home/demo"),
+            ("~/x", "/home/demo/", "/home/demo/x"),
             ("~", "/", "/"),
             ("~/x", "/", "/x"),
         ],

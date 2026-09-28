@@ -191,7 +191,7 @@ class TestDefaultAttachHost:
 
 class TestSplitTarget:
     def test_with_user(self):
-        assert cli._split_target("amin@host.ts.net") == ("amin", "host.ts.net")
+        assert cli._split_target("demo@host.ts.net") == ("demo", "host.ts.net")
 
     def test_without_user(self):
         user, hostname = cli._split_target("host.ts.net")
@@ -229,8 +229,8 @@ class TestLastAttachHost:
     def test_roundtrip(self, monkeypatch, tmp_path):
         attach_mod = self._isolate(monkeypatch, tmp_path)
         assert attach_mod._read_last_host() is None
-        attach_mod._remember_last_host("amin@desktop.ts.net")
-        assert attach_mod._read_last_host() == "amin@desktop.ts.net"
+        attach_mod._remember_last_host("demo@desktop.ts.net")
+        assert attach_mod._read_last_host() == "demo@desktop.ts.net"
 
     def test_blank_file_reads_as_none(self, monkeypatch, tmp_path):
         attach_mod = self._isolate(monkeypatch, tmp_path)
@@ -249,8 +249,8 @@ class TestLastAttachHost:
         import click
 
         attach_mod = self._isolate(monkeypatch, tmp_path)
-        attach_mod._remember_last_host("amin@last-used")
-        monkeypatch.setattr(attach_mod, "_default_attach_host", lambda: "amin@config")
+        attach_mod._remember_last_host("demo@last-used")
+        monkeypatch.setattr(attach_mod, "_default_attach_host", lambda: "demo@config")
         seen: dict[str, object] = {}
 
         def fake_prompt(text, **kwargs):
@@ -262,7 +262,7 @@ class TestLastAttachHost:
 
         with pytest.raises(SystemExit):
             attach_mod._attach_flow(None, no_mux=False, group=None, yes=False)
-        assert seen["default"] == "amin@last-used"
+        assert seen["default"] == "demo@last-used"
 
     def test_successful_status_read_remembers_target(self, monkeypatch, tmp_path):
         import json as json_mod
@@ -1167,7 +1167,7 @@ class TestAttachVersionSkew:
     def _warn(self, capsys, status):
         from magent.cli import attach as attach_mod
 
-        attach_mod._warn_version_skew("amin@desktop", status)
+        attach_mod._warn_version_skew("demo@desktop", status)
         return capsys.readouterr()
 
     def test_silent_when_versions_match(self, capsys):
@@ -1179,7 +1179,7 @@ class TestAttachVersionSkew:
 
     def test_warns_when_the_host_reports_an_older_version(self, capsys):
         captured = self._warn(capsys, {"version": "3.1.4"})
-        assert "amin@desktop runs magent 3.1.4" in captured.err
+        assert "demo@desktop runs magent 3.1.4" in captured.err
         assert "pip install -U magent-multi-ai-agents-manager" in captured.err
         # The warning must never contaminate stdout.
         assert captured.out == ""
@@ -1242,10 +1242,10 @@ class TestHotkeyCmdSshHost:
     def test_ssh_host_is_forwarded_to_the_listener(self, runner, monkeypatch):
         seen = self._patch(monkeypatch)
         result = runner.invoke(
-            cli.main, ["hotkey", "-s", "http://h:8033", "--ssh-host", "amin@deck"]
+            cli.main, ["hotkey", "-s", "http://h:8033", "--ssh-host", "demo@deck"]
         )
         assert result.exit_code == 0
-        assert seen == [("http://h:8033", "amin@deck")]
+        assert seen == [("http://h:8033", "demo@deck")]
 
     def test_default_is_none_for_a_local_open(self, runner, monkeypatch):
         seen = self._patch(monkeypatch)
@@ -1333,8 +1333,8 @@ class TestMaybeStartHotkeySshHost:
         return spawned[0]
 
     def test_ssh_host_is_passed_through(self, monkeypatch):
-        args = self._args(monkeypatch, "amin@deck")
-        assert args[-4:] == ["-s", "http://h:8033", "--ssh-host", "amin@deck"]
+        args = self._args(monkeypatch, "demo@deck")
+        assert args[-4:] == ["-s", "http://h:8033", "--ssh-host", "demo@deck"]
 
     def test_absent_ssh_host_adds_no_flag(self, monkeypatch):
         assert "--ssh-host" not in self._args(monkeypatch, None)
@@ -1442,7 +1442,7 @@ class TestCorpseDecision:
             [
                 _FAKE_SUPERVISOR,
                 "--target",
-                "amin@devino-second",
+                "demo@devino-second",
                 "--session",
                 "api",
                 "--remote",
@@ -1454,13 +1454,13 @@ class TestCorpseDecision:
         assert self._corpses(["api"], [cmd]) == set()
 
     def test_another_sessions_node_pane_does_not_rescue_this_one(self):
-        cmd = "ssh -t amin@devino-second tmux -L magent attach -t '=web'"
+        cmd = "ssh -t demo@devino-second tmux -L magent attach -t '=web'"
         assert self._corpses(["api", "web"], [cmd]) == {"api"}
 
     def test_a_longer_node_session_name_does_not_rescue_a_shorter_one(self):
         # The spawned target is quoted, `-t '=api2'`, and the closing quote
         # ends the name: a live api2 pane says nothing about api.
-        cmd = "ssh -t amin@devino-second tmux -L magent attach -t '=api2'"
+        cmd = "ssh -t demo@devino-second tmux -L magent attach -t '=api2'"
         assert self._corpses(["api"], [cmd]) == {"api"}
 
     @pytest.mark.parametrize("sid", ["magent", "Magent"])
@@ -1471,7 +1471,7 @@ class TestCorpseDecision:
         # is live. That is the conservative direction (never a false close),
         # and `magent` is a realistic project name -- this repo is one.
         # Matching is case-insensitive, so `Magent` is rescued the same way.
-        cmd = "ssh -t amin@devino-second tmux -L magent attach -t '=api'"
+        cmd = "ssh -t demo@devino-second tmux -L magent attach -t '=api'"
         assert self._corpses([sid], [cmd]) == set()
 
 
@@ -2335,7 +2335,7 @@ _BARE_WT_ARGV = [
     "psmux -L api attach || magent sessions api",
 ]
 # The node analogue of _SUPERVISED_WT_ARGV: the whole wt line a tmux pane for
-# session "api" on "amin@devino-second" opens, hand-written byte for byte
+# session "api" on "demo@devino-second" opens, hand-written byte for byte
 # rather than derived, so a drift in the exact-target attach form, the `--mux`
 # position or the title lock is a diff against one literal.
 _SUPERVISED_TMUX_WT_ARGV = [
@@ -2348,7 +2348,7 @@ _SUPERVISED_TMUX_WT_ARGV = [
     "--",
     _FAKE_SUPERVISOR,
     "--target",
-    "amin@devino-second",
+    "demo@devino-second",
     "--session",
     "api",
     "--remote",
@@ -2460,7 +2460,7 @@ class TestTmuxPaneCommand:
 
         assert (
             attach_client.pane_command(
-                "amin@devino-second",
+                "demo@devino-second",
                 "api",
                 _FAKE_SUPERVISOR,
                 mux="tmux",
@@ -2476,8 +2476,8 @@ class TestTmuxPaneCommand:
         from magent import attach_client
 
         assert attach_client.pane_command(
-            "amin@devino-second", "api", None, mux="tmux", remote=_TMUX_REMOTE
-        ) == [*_BARE_WT_ARGV[_PANE:-2], "amin@devino-second", _TMUX_REMOTE]
+            "demo@devino-second", "api", None, mux="tmux", remote=_TMUX_REMOTE
+        ) == [*_BARE_WT_ARGV[_PANE:-2], "demo@devino-second", _TMUX_REMOTE]
 
     def test_the_remote_defaults_to_the_multiplexers_attach_command(self):
         from magent import attach_client
@@ -2563,7 +2563,7 @@ class TestSpawnAttachWindow:
     def test_a_node_window_is_a_supervised_tmux_pane_under_the_title_lock(
         self, monkeypatch
     ):
-        _title, argv = self._spawn(monkeypatch, "amin@devino-second", "api", mux="tmux")
+        _title, argv = self._spawn(monkeypatch, "demo@devino-second", "api", mux="tmux")
         assert argv == _SUPERVISED_TMUX_WT_ARGV
 
     def test_a_node_window_without_reconnect_is_the_bare_ssh_tmux_pane(
@@ -2574,11 +2574,11 @@ class TestSpawnAttachWindow:
         # only the target and the tmux attach are node-specific. No `--mux`:
         # there is no supervisor to tell.
         _title, argv = self._spawn(
-            monkeypatch, "amin@devino-second", "api", mux="tmux", reconnect=False
+            monkeypatch, "demo@devino-second", "api", mux="tmux", reconnect=False
         )
         assert argv == [
             *_BARE_WT_ARGV[:-2],
-            "amin@devino-second",
+            "demo@devino-second",
             _TMUX_REMOTE,
         ]
 
@@ -2601,7 +2601,7 @@ class TestSpawnAttachWindow:
         # backoff the supervisor is the only process left for this window.
         from magent.cli import attach as attach_mod
 
-        _title, argv = self._spawn(monkeypatch, "amin@devino-second", "api", mux="tmux")
+        _title, argv = self._spawn(monkeypatch, "demo@devino-second", "api", mux="tmux")
         assert attach_mod._corpses({"api"}, [subprocess.list2cmdline(argv)]) == set()
 
     def test_an_unknown_multiplexer_never_opens_a_window(self, monkeypatch):

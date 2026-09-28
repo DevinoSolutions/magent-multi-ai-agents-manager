@@ -42,7 +42,7 @@ from tests.unit._deny_stat import deny_scandir, deny_stat
 from tests.unit._fake_ssh import make_fake_ssh
 from tests.unit._git_repos import commit, git, make_origin_and_clone, needs_git
 
-NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
+NODE = Node(nick="second", host="devino-second", user="demo", root="~/magent")
 
 
 class TestTheSocketHasOneOwner:
@@ -111,11 +111,11 @@ class TestSshArgv:
 
 class TestRemoteError:
     def test_it_carries_the_rc_the_tail_and_the_redacted_command(self):
-        err = RemoteError(255, "Connection refused", ("ssh", "amin@h", "true"))
+        err = RemoteError(255, "Connection refused", ("ssh", "demo@h", "true"))
         assert (err.rc, err.stderr_tail, err.command_redacted) == (
             255,
             "Connection refused",
-            ("ssh", "amin@h", "true"),
+            ("ssh", "demo@h", "true"),
         )
         assert "rc=255" in str(err)
         assert "Connection refused" in str(err)
@@ -210,13 +210,13 @@ class TestTheSshResolver:
 class TestTheFakeIsARealBinary:
     def test_it_records_argv_and_the_exact_stdin_bytes(self, fake_ssh):
         subprocess.run(
-            [fake_ssh.path, "-o", "BatchMode=yes", "amin@h", "tmux ls"],
+            [fake_ssh.path, "-o", "BatchMode=yes", "demo@h", "tmux ls"],
             input=b"\x00secret\xff",
             check=True,
             timeout=30,
         )
         (call,) = fake_ssh.calls()
-        assert call.argv == ["-o", "BatchMode=yes", "amin@h", "tmux ls"]
+        assert call.argv == ["-o", "BatchMode=yes", "demo@h", "tmux ls"]
         assert call.stdin == b"\x00secret\xff"
 
     def test_the_first_matching_reply_answers(self, fake_ssh):
@@ -238,15 +238,15 @@ class TestRun:
         sock = remote_mux.SOCKET
         remote_mux.run(
             NODE,
-            ["tmux", "-L", sock, "new-session", "-c", "/home/amin/my repo"],
+            ["tmux", "-L", sock, "new-session", "-c", "/home/demo/my repo"],
             timeout_s=30,
         )
         (call,) = fake_ssh.calls()
         assert call.argv[-1].startswith("bash -c ")
         assert call.argv[-1] == "bash -c " + shlex.quote(
-            f"tmux -L {sock} new-session -c '/home/amin/my repo'"
+            f"tmux -L {sock} new-session -c '/home/demo/my repo'"
         )
-        assert call.argv[-2] == "amin@devino-second"
+        assert call.argv[-2] == "demo@devino-second"
         assert "BatchMode=yes" in call.argv
 
     def test_the_spawned_program_is_the_client_find_ssh_resolved(self, fake_ssh):
@@ -1049,7 +1049,7 @@ class TestRunScript:
             remote_mux.run_script(
                 NODE,
                 "sample",
-                ["--user", "amin"],
+                ["--user", "demo"],
                 timeout_s=30,
                 stdin=json.dumps({"gh": token}).encode("utf-8"),
             )
@@ -1498,7 +1498,7 @@ class TestWhichReposMakeTheProject:
         # An OSError with no strerror is named by its class too; its str()
         # (which can name another path) goes to the log.
         def broken(self):
-            raise OSError(r"C:\Users\amin\ws: gone")
+            raise OSError(r"C:\Users\demo\ws: gone")
 
         monkeypatch.setattr(Path, "iterdir", broken)
         with pytest.raises(RemoteError) as exc:
@@ -1506,7 +1506,7 @@ class TestWhichReposMakeTheProject:
         assert exc.value.stderr_tail == f"cannot read {tmp_path} (OSError)"
         assert "ws: gone" not in str(exc.value)
         logged = (log.LOG_DIR / "nodes.log").read_text(encoding="utf-8")
-        assert r"C:\Users\amin\ws: gone" in logged
+        assert r"C:\Users\demo\ws: gone" in logged
 
     def test_a_workspace_repo_that_cannot_be_read_fails_it_not_left_out(
         self, tmp_path, monkeypatch
@@ -1892,7 +1892,7 @@ class TestANodeSessionIsDecoratedLikeALocalOne:
 
 
 _SENTINEL = b"\n__MAGENT_PAYLOAD__\n"
-_ROOT = "/home/amin/magent/api"
+_ROOT = "/home/demo/magent/api"
 _RESULT = {
     "sid": "api",
     "attached_existing": False,
@@ -1977,7 +1977,7 @@ def patient_probe(monkeypatch):
 @pytest.fixture
 def node_home(fake_ssh, monkeypatch, patient_probe):
     monkeypatch.setattr(psmux, "code_on_path", lambda: False)
-    fake_ssh.set_reply("printenv HOME", stdout="/home/amin\n")
+    fake_ssh.set_reply("printenv HOME", stdout="/home/demo\n")
     return fake_ssh
 
 
@@ -2663,7 +2663,7 @@ class TestWhatTheNodeAnswersIsVetted:
     character or pose as an option."""
 
     @pytest.mark.parametrize(
-        "answer", ["/home/amin\nWelcome!\n", "/home/a\tmin\n", "/home/amin\r\n"]
+        "answer", ["/home/demo\nWelcome!\n", "/home/a\tmin\n", "/home/demo\r\n"]
     )
     def test_a_home_with_a_control_character_is_refused(
         self, fake_ssh, patient_probe, tmp_path, answer
@@ -2680,7 +2680,7 @@ class TestWhatTheNodeAnswersIsVetted:
         assert len(fake_ssh.calls()) == 1
 
     @pytest.mark.parametrize(
-        "cwd", ["magent/api", "-rf", "/home/amin/x\ny", "/home/amin/\x1b[2Jx", 7]
+        "cwd", ["magent/api", "-rf", "/home/demo/x\ny", "/home/demo/\x1b[2Jx", 7]
     )
     def test_a_result_cwd_that_is_not_a_clean_absolute_path_is_the_root(
         self, node_home, tmp_path, cwd

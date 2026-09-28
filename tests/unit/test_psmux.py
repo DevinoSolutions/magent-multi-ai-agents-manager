@@ -469,7 +469,7 @@ class TestPanePids:
         assert cmd[cmd.index("-t") + 1] == "a"
         assert cmd[-1] == "#{pane_pid}"
 
-    @pytest.mark.parametrize("raw", ["", "AMIN", "0", "-4", "12x"])
+    @pytest.mark.parametrize("raw", ["", "DEMO", "0", "-4", "12x"])
     def test_anything_but_a_positive_pid_is_unreadable(self, monkeypatch, raw):
         # An empty or garbled reading must never become a root to walk from:
         # unreadable is the one answer that keeps the pane out of revive.

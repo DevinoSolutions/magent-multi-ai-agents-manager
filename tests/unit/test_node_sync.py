@@ -118,8 +118,8 @@ class TestNoTestRunsTheRealDaemon:
 
 
 POOL = {
-    "second": NodeConfig(nick="second", host="devino-second", user="amin"),
-    "third": NodeConfig(nick="third", host="devino-third", user="amin"),
+    "second": NodeConfig(nick="second", host="devino-second", user="demo"),
+    "third": NodeConfig(nick="third", host="devino-third", user="demo"),
 }
 
 
@@ -1051,13 +1051,13 @@ class TestAttentionSeesNodeSessions:
         record = {
             "state": "needs-input",
             "ts": time.time(),
-            "cwd": "/home/amin/magent/api",
+            "cwd": "/home/demo/magent/api",
             "session_id": "s",
         }
         (store / "k.json").write_text(json.dumps(record), encoding="utf-8")
         views = engine_from_config(_config()).poll()
         assert [(v.name, v.cwd, v.state) for v in views] == [
-            ("api", "@second:/home/amin/magent/api", "needs-input")
+            ("api", "@second:/home/demo/magent/api", "needs-input")
         ]
 
     def test_without_a_node_project_the_engine_reads_only_this_pc(
@@ -1100,7 +1100,7 @@ def _payload(call) -> dict[str, object]:
 
 
 def _calls_to(fake, host: str) -> list:
-    return [c for c in fake.calls() if c.argv[-2] == f"amin@{host}"]
+    return [c for c in fake.calls() if c.argv[-2] == f"demo@{host}"]
 
 
 class TestOneTick:
@@ -1110,8 +1110,8 @@ class TestOneTick:
         results = node_sync.NodeSyncer(_config()).tick()
         assert results == {"second": (node_sync.OK, ""), "third": (node_sync.OK, "")}
         assert sorted(c.argv[-2] for c in fake_ssh.calls()) == [
-            "amin@devino-second",
-            "amin@devino-third",
+            "demo@devino-second",
+            "demo@devino-third",
         ]
 
     def test_a_node_with_nothing_placed_on_it_is_still_asked_for_its_load(
@@ -1376,19 +1376,19 @@ class TestTheWatermark:
         _answer(
             fake_ssh,
             "devino-second",
-            meta=pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+            meta=pull_meta(realpaths={"api": "/home/demo/magent/api"}),
         )
         syncer = node_sync.NodeSyncer(_second_only())
         syncer.tick()
-        assert _marks() == {"api": {"since": 0.0, "realpath": "/home/amin/magent/api"}}
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/home/demo/magent/api"}}
         syncer.tick()
         assert _payload(fake_ssh.calls()[-1])["sids"]["api"] == {
             "roots": ["~/magent/api"],
-            "project_dir": encoded_project_dir("/home/amin/magent/api"),
+            "project_dir": encoded_project_dir("/home/demo/magent/api"),
             "since": 0.0,
         }
         assert _marks() == {
-            "api": {"since": 4999.0, "realpath": "/home/amin/magent/api"}
+            "api": {"since": 4999.0, "realpath": "/home/demo/magent/api"}
         }
         syncer.tick()
         assert _payload(fake_ssh.calls()[-1])["sids"]["api"]["since"] == 4999.0
@@ -1401,10 +1401,10 @@ class TestTheWatermark:
         _answer(
             fake_ssh,
             "devino-second",
-            meta=pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+            meta=pull_meta(realpaths={"api": "/home/demo/magent/api"}),
         )
         node_sync.NodeSyncer(_second_only()).tick()
-        assert _marks() == {"api": {"since": 0.0, "realpath": "/home/amin/magent/api"}}
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/home/demo/magent/api"}}
 
     def test_a_session_whose_files_could_not_be_stored_keeps_its_watermark_and_its_state(
         self, placed
@@ -1527,7 +1527,7 @@ class TestMarksMoveOnlyAfterAPull:
     def test_an_unreachable_node_leaves_the_marks_byte_identical(
         self, placed, fake_ssh
     ):
-        before = _seed_marks(api=(10.0, "/home/amin/magent/api"))
+        before = _seed_marks(api=(10.0, "/home/demo/magent/api"))
         _answer(fake_ssh, "devino-second", rc=255, stderr=REFUSED)
         results = node_sync.NodeSyncer(_second_only()).tick()
         assert results["second"][0] == node_sync.UNREACHABLE
@@ -1536,9 +1536,9 @@ class TestMarksMoveOnlyAfterAPull:
     def test_a_reply_cut_off_before_its_trailer_leaves_the_marks_byte_identical(
         self, placed, fake_ssh
     ):
-        before = _seed_marks(api=(10.0, "/home/amin/magent/api"))
+        before = _seed_marks(api=(10.0, "/home/demo/magent/api"))
         reply = pull_reply(
-            pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+            pull_meta(realpaths={"api": "/home/demo/magent/api"}),
             {"api/transcripts/a.jsonl": "x\n"},
         )
         cut = reply[: reply.rindex(remote_mux.PULL_TRAILER.decode("ascii"))]
@@ -2715,7 +2715,7 @@ class TestAHungNodeDoesNotHoldTheTick:
 
         old_row = json.dumps({**SAMPLE, "ts": 1000.0 - 2 * 3600})
         nodes.write_text_atomic(nodes.load_path("second"), old_row + "\n")
-        moved = {"second": NodeConfig(nick="second", host="devino-moved", user="amin")}
+        moved = {"second": NodeConfig(nick="second", host="devino-moved", user="demo")}
         syncer = node_sync.NodeSyncer(
             _config(history_h=24), pull=pull, now=lambda: 1000.0
         )
@@ -2818,8 +2818,8 @@ class TestAHungNodeDoesNotHoldTheTick:
 
 def _pull_shown(sid: str, root: str) -> tuple[str, ...]:
     """The shown form of the first pull final_pull would send for ``sid``
-    on second (as local user amin) -- what a refusal must name exactly."""
-    node = nodes.node_for_nick(_config(), "second", local_user="amin")
+    on second (as local user demo) -- what a refusal must name exactly."""
+    node = nodes.node_for_nick(_config(), "second", local_user="demo")
     spec = remote_mux.SidPull(roots=(root,), project_dir=None, since=0.0)
     return remote_mux._run_shown(node, *remote_mux._pull_call({sid: spec}))
 
@@ -2831,7 +2831,7 @@ class TestTheFinalPull:
         _answer(
             fake_ssh,
             "devino-second",
-            meta=pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+            meta=pull_meta(realpaths={"api": "/home/demo/magent/api"}),
             files={"api/transcripts/abc.jsonl": "x\n"},
         )
         result = node_sync.final_pull(_config(), "api")
@@ -2840,18 +2840,18 @@ class TestTheFinalPull:
         assert nodes.transcripts_dir("second", "api") / "abc.jsonl" in result.files
         assert result.since == 4999.0
         assert _marks() == {
-            "api": {"since": 4999.0, "realpath": "/home/amin/magent/api"}
+            "api": {"since": 4999.0, "realpath": "/home/demo/magent/api"}
         }
 
     def test_a_final_pull_with_a_known_directory_is_one_call(self, placed, fake_ssh):
         nodes.write_json_atomic(
             nodes.pull_marks_path("second"),
-            {"api": {"since": 10.0, "realpath": "/home/amin/magent/api"}},
+            {"api": {"since": 10.0, "realpath": "/home/demo/magent/api"}},
         )
         _answer(
             fake_ssh,
             "devino-second",
-            meta=pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+            meta=pull_meta(realpaths={"api": "/home/demo/magent/api"}),
         )
         node_sync.final_pull(_config(), "api")
         (call,) = _calls_to(fake_ssh, "devino-second")
@@ -2872,7 +2872,7 @@ class TestTheFinalPull:
         # None is "never placed". A map that could not be read says nothing
         # about placement, so it is an error the caller must handle -- one
         # that names the map's failure by class alone, never its path.
-        before = _seed_marks(api=(10.0, "/home/amin/magent/api"))
+        before = _seed_marks(api=(10.0, "/home/demo/magent/api"))
         if state == "torn":
             nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
         else:
@@ -2912,12 +2912,12 @@ class TestTheFinalPull:
     ):
         nodes.write_node_map({"api": _entry("second", sid)})
         with pytest.raises(remote_mux.RemoteError) as info:
-            node_sync.final_pull(_config(), "api", local_user="amin")
+            node_sync.final_pull(_config(), "api", local_user="demo")
         assert info.value.rc == 0
         assert info.value.stderr_tail == f"not a pullable session name: {sid!r}"
         assert info.value.command_redacted == _pull_shown(sid, f"~/magent/{sid}")
         assert info.value.command_redacted[0] == "ssh"
-        assert "amin@devino-second" in info.value.command_redacted
+        assert "demo@devino-second" in info.value.command_redacted
         assert info.value.command_redacted[-1].startswith("<stdin: ")
         assert fake_ssh.calls() == []
 
@@ -2937,7 +2937,7 @@ class TestTheFinalPull:
             }
         )
         with pytest.raises(remote_mux.RemoteError) as info:
-            node_sync.final_pull(_config(), "api", local_user="amin")
+            node_sync.final_pull(_config(), "api", local_user="demo")
         assert info.value.rc == 0
         assert info.value.stderr_tail == (
             "session 'api' has an empty remote_root in the node map"
@@ -2983,7 +2983,7 @@ def _cut(resume: float, files: tuple[Path, ...] = ()) -> remote_mux.NodeSnapshot
     )
 
 
-_REAL = "/home/amin/magent/api"
+_REAL = "/home/demo/magent/api"
 
 
 class TestAFinalPullThatDidNotFinish:
@@ -3422,7 +3422,7 @@ class TestABugInOneNodeFailsItAlone:
         # words (a path on this PC) in nodes.log -- once per state change,
         # like every other failure, not once per tick.
         _capture_nodes_log(caplog)
-        denied = PermissionError(13, "Permission denied", r"C:\Users\amin\a.jsonl")
+        denied = PermissionError(13, "Permission denied", r"C:\Users\demo\a.jsonl")
         syncer = node_sync.NodeSyncer(_config(), pull=_pull_raising({"second": denied}))
         first = syncer.tick()
         syncer.tick()
@@ -3486,7 +3486,7 @@ class TestWhatCountsAsUnreachable:
         The cap is why the pull failed, so the log detail names it."""
         fake_ssh.set_reply("flood", stderr="boom: disk full\n")
         fake_ssh.set_mode("flood")
-        node = nodes.Node(nick="second", host="devino-second", user="amin", root="~")
+        node = nodes.Node(nick="second", host="devino-second", user="demo", root="~")
         with pytest.raises(remote_mux.RemoteError) as info:
             remote_mux.run(node, ["flood"], timeout_s=60, max_stdout_bytes=1024)
         assert "boom: disk full" in info.value.stderr_tail.splitlines()[1:]
@@ -3530,7 +3530,7 @@ class TestABadWatermarkIsNoWatermark:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Raw text: json.loads accepts each of these, and none is a time.
         # float() of the 309-digit int raises OverflowError, not ValueError.
-        bad = '{"since": ' + since + ', "realpath": "/home/amin/magent/api"}'
+        bad = '{"since": ' + since + ', "realpath": "/home/demo/magent/api"}'
         path.write_text(
             '{"api": ' + bad + ', "ok": {"since": 5, "realpath": null}}',
             encoding="utf-8",
@@ -3597,7 +3597,7 @@ class TestARemovedNodeIsForgotten:
 # Every node-JSON reader refuses both before json parses them.
 _TOO_DEEP = "[" * 200_000
 _DEEP = ["200k-open", "65-deep-beside"]
-_A_MARK = {"api": {"since": 100.0, "realpath": "/home/amin/magent/api"}}
+_A_MARK = {"api": {"since": 100.0, "realpath": "/home/demo/magent/api"}}
 
 
 def _past(deep: str, good: dict[str, object]) -> str:

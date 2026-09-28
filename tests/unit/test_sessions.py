@@ -532,7 +532,7 @@ class TestBuildCodeOpenCommand:
     def test_user_prefix_is_stripped_from_the_authority(self):
         # VS Code resolves the login user from the machine's ssh config; the
         # attach target is user@host, so only the hostname goes into the URI.
-        assert build_code_open_command("/a/api", "amin@deck", "code") == [
+        assert build_code_open_command("/a/api", "demo@deck", "code") == [
             "code",
             "--remote",
             "ssh-remote+deck",
@@ -541,7 +541,7 @@ class TestBuildCodeOpenCommand:
 
     def test_empty_ssh_host_degrades_to_a_local_open(self):
         assert build_code_open_command("/a/api", "", "code") == ["code", "/a/api"]
-        assert build_code_open_command("/a/api", "amin@", "code") == ["code", "/a/api"]
+        assert build_code_open_command("/a/api", "demo@", "code") == ["code", "/a/api"]
 
     def test_resolved_code_binary_is_used_verbatim(self):
         # shutil.which resolves code.cmd on Windows; Popen runs it directly.
@@ -752,7 +752,7 @@ class TestAFreshFormNeedsNoStore:
 
 class TestRemoteSshCanKeepTheUser:
     def test_by_default_the_user_is_stripped(self):
-        assert build_code_open_command("/f", "amin@devino-second", "code") == [
+        assert build_code_open_command("/f", "demo@devino-second", "code") == [
             "code",
             "--remote",
             "ssh-remote+devino-second",
@@ -763,17 +763,17 @@ class TestRemoteSshCanKeepTheUser:
         # D4: the node user may exist only in magent's config, never in
         # ~/.ssh/config, so the authority has to carry it.
         assert build_code_open_command(
-            "/home/amin/magent/api", "amin@devino-second", "code", keep_user=True
+            "/home/demo/magent/api", "demo@devino-second", "code", keep_user=True
         ) == [
             "code",
             "--remote",
-            "ssh-remote+amin@devino-second",
-            "/home/amin/magent/api",
+            "ssh-remote+demo@devino-second",
+            "/home/demo/magent/api",
         ]
 
     def test_a_user_only_target_still_opens_locally_when_keeping_the_user(self):
-        # `amin@` names no host; `ssh-remote+amin@` would be a broken URI.
-        assert build_code_open_command("/f", "amin@", "code", keep_user=True) == [
+        # `demo@` names no host; `ssh-remote+demo@` would be a broken URI.
+        assert build_code_open_command("/f", "demo@", "code", keep_user=True) == [
             "code",
             "/f",
         ]

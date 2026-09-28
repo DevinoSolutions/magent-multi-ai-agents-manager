@@ -632,11 +632,11 @@ class TestSupervisedHotkeyTarget:
         manifest = {
             "version": "9.9.9",
             "server_url": "http://deck:8034",
-            "ssh_host": "amin@deck",
+            "ssh_host": "demo@deck",
         }
         assert launch.supervised_hotkey_target(manifest, "http://127.0.0.1:8034") == (
             "http://deck:8034",
-            "amin@deck",
+            "demo@deck",
         )
 
     def test_a_local_listener_keeps_its_null_ssh_host(self):
@@ -659,10 +659,10 @@ class TestSupervisedHotkeyTarget:
         )
 
     def test_a_manifest_missing_its_url_falls_back_rather_than_aiming_at_none(self):
-        manifest = {"version": "9.9.9", "server_url": None, "ssh_host": "amin@deck"}
+        manifest = {"version": "9.9.9", "server_url": None, "ssh_host": "demo@deck"}
         url, ssh_host = launch.supervised_hotkey_target(manifest, "http://fallback:1")
         assert url == "http://fallback:1"
-        assert ssh_host == "amin@deck"
+        assert ssh_host == "demo@deck"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="hotkey is Windows-only")
@@ -694,7 +694,7 @@ class TestEnsureHotkeyListener:
             manifest={
                 "version": "9.9.9",
                 "server_url": "http://deck:8034",
-                "ssh_host": "amin@deck",
+                "ssh_host": "demo@deck",
             },
         )
 
@@ -702,7 +702,7 @@ class TestEnsureHotkeyListener:
 
         # NOT the supervisor's own loopback URL -- that would read as a target
         # change and kill the listener `magent attach` set up.
-        assert calls == [("http://deck:8034", "amin@deck")]
+        assert calls == [("http://deck:8034", "demo@deck")]
 
 
 class TestLocalHotkeyListener:

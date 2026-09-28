@@ -746,7 +746,7 @@ def _nodes_cfg(tmp_config, nicks=("second",)):
             {
                 "version": SCHEMA_VERSION,
                 "settings": {
-                    "nodes": {n: {"host": f"devino-{n}", "user": "amin"} for n in nicks}
+                    "nodes": {n: {"host": f"devino-{n}", "user": "demo"} for n in nicks}
                 },
                 "projects": [],
             }
@@ -814,7 +814,7 @@ class TestTheNodesRow:
                     ScriptLine("skip", "snapshot", ""),
                 ],
                 "fifth": [
-                    ScriptLine("fail", "reach", "cannot reach amin@devino-fifth")
+                    ScriptLine("fail", "reach", "cannot reach demo@devino-fifth")
                 ],
             },
         )
@@ -857,7 +857,7 @@ class TestTheNodesRow:
             {
                 "version": SCHEMA_VERSION,
                 "settings": {
-                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
                 },
                 "projects": [],
             }

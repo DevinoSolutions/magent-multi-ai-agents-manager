@@ -633,8 +633,8 @@ class TestLocalUsername:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("USERNAME", raising=False)
-        monkeypatch.setenv("USER", "amin")
-        assert env_module.local_username() == "amin"
+        monkeypatch.setenv("USER", "demo")
+        assert env_module.local_username() == "demo"
 
     def test_neither_set_is_an_empty_name_not_a_guess(
         self, monkeypatch: pytest.MonkeyPatch

@@ -37,13 +37,13 @@ class TestTheNodePoolParses:
             _cfg(
                 tmp_config,
                 nodes={
-                    "second": {"host": "devino-second", "user": "amin", "root": "~/w"}
+                    "second": {"host": "devino-second", "user": "demo", "root": "~/w"}
                 },
             )
         )
         assert cfg.settings.nodes == {
             "second": NodeConfig(
-                nick="second", host="devino-second", user="amin", root="~/w"
+                nick="second", host="devino-second", user="demo", root="~/w"
             )
         }
 
@@ -126,14 +126,14 @@ class TestTheNodePoolSerializes:
     def test_a_pool_round_trips(self):
         settings = Settings(
             nodes={
-                "second": NodeConfig(nick="second", host="devino-second", user="amin")
+                "second": NodeConfig(nick="second", host="devino-second", user="demo")
             },
             node_sync=NodeSyncConfig(pull_interval_s=15),
         )
         assert _parse_settings(settings_to_dict(settings)) == settings
 
 
-_POOL = {"second": {"host": "devino-second", "user": "amin"}}
+_POOL = {"second": {"host": "devino-second", "user": "demo"}}
 
 
 class TestNodeProjectsParse:
@@ -216,7 +216,7 @@ class TestThePoolIsValidated:
         with pytest.raises(
             ConfigError, match=r"settings\.nodes\.second must have a 'host' field"
         ):
-            load_config(_cfg(tmp_config, nodes={"second": {"user": "amin"}}))
+            load_config(_cfg(tmp_config, nodes={"second": {"user": "demo"}}))
 
     @pytest.mark.parametrize("key", ["host", "user", "root"])
     def test_a_non_string_field_is_refused(self, tmp_config, key):
@@ -253,7 +253,7 @@ class TestThePoolIsValidated:
         ):
             load_config(_cfg(tmp_config, nodes={"second": {"host": host}}))
 
-    @pytest.mark.parametrize("user", ["am in", "amin ", "a\tb", " root "])
+    @pytest.mark.parametrize("user", ["de mo", "demo ", "a\tb", " root "])
     def test_a_user_with_whitespace_is_refused(self, tmp_config, user):
         # The user lands in the same ssh argv as the host.
         with pytest.raises(
@@ -278,7 +278,7 @@ class TestThePoolIsValidated:
             ConfigError, match=r"settings\.nodes\.second\.user must not contain '@'"
         ):
             load_config(
-                _cfg(tmp_config, nodes={"second": {"host": "h", "user": "amin@evil"}})
+                _cfg(tmp_config, nodes={"second": {"host": "h", "user": "demo@evil"}})
             )
 
     def test_a_host_with_a_user_is_refused(self, tmp_config):

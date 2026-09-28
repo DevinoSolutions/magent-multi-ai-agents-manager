@@ -920,14 +920,14 @@ class TestNodeStores:
             "k.json",
             state="needs-input",
             ts=990.0,
-            cwd="/home/amin/magent/api",
+            cwd="/home/demo/magent/api",
             session_id="s",
         )
         engine = AttentionEngine(
             now=lambda: 1000.0, extra_stores=lambda: [("api", "@second", store)]
         )
         assert [(v.name, v.cwd, v.state) for v in engine.poll()] == [
-            ("api", "@second:/home/amin/magent/api", "needs-input")
+            ("api", "@second:/home/demo/magent/api", "needs-input")
         ]
 
     def test_one_directory_on_two_nodes_is_two_sessions(self, state_dir, tmp_path):
@@ -937,7 +937,7 @@ class TestNodeStores:
             "k.json",
             state="done",
             ts=990.0,
-            cwd="/home/amin/magent/api",
+            cwd="/home/demo/magent/api",
             session_id="s",
         )
         self._write(
@@ -945,7 +945,7 @@ class TestNodeStores:
             "k.json",
             state="done",
             ts=990.0,
-            cwd="/home/amin/magent/api",
+            cwd="/home/demo/magent/api",
             session_id="t",
         )
         engine = AttentionEngine(
@@ -954,8 +954,8 @@ class TestNodeStores:
         )
         views = engine.poll()
         assert sorted(v.cwd for v in views) == [
-            "@second:/home/amin/magent/api",
-            "@third:/home/amin/magent/api",
+            "@second:/home/demo/magent/api",
+            "@third:/home/demo/magent/api",
         ]
         assert len(engine.transitions(views)) == 2
 
@@ -1036,7 +1036,7 @@ class TestNodeStores:
             "k.json",
             state="needs-input",
             ts=990.0,
-            cwd="/home/amin/magent/api",
+            cwd="/home/demo/magent/api",
             session_id="s",
         )
         calls = {"n": 0}
@@ -1056,12 +1056,12 @@ class TestNodeStores:
 
         tick1 = engine.poll()
         assert [(v.name, v.cwd) for v in tick1] == [
-            ("api", "@second:/home/amin/magent/api")
+            ("api", "@second:/home/demo/magent/api")
         ]
 
         tick2 = engine.poll()
         assert [(v.name, v.cwd) for v in tick2] == [
-            ("api", "@second:/home/amin/magent/api")
+            ("api", "@second:/home/demo/magent/api")
         ]
 
         tick3 = engine.poll()
@@ -1133,7 +1133,7 @@ class TestNodeStores:
             "k.json",
             state="needs-input",
             ts=990.0,
-            cwd="/home/amin/magent/api",
+            cwd="/home/demo/magent/api",
             session_id="s",
         )
         calls = {"n": 0}
@@ -1152,7 +1152,7 @@ class TestNodeStores:
 
         clock.t = 990.0 + attention.STALENESS_S[agent_state.NEEDS_INPUT] + 50.0
         (held,) = engine.poll()
-        assert held.cwd == "@second:/home/amin/magent/api"
+        assert held.cwd == "@second:/home/demo/magent/api"
         assert held.state == agent_state.IDLE
         assert held.age_s == clock.t - 990.0
 
@@ -1233,7 +1233,7 @@ class TestNodeStores:
             "k.json",
             state="needs-input",
             ts=990.0,
-            cwd="/home/amin/magent/api",
+            cwd="/home/demo/magent/api",
             session_id="s",
         )
         engine = AttentionEngine(
@@ -1247,7 +1247,7 @@ class TestNodeStores:
             tick2 = engine.poll()
             tick3 = engine.poll()
 
-        held = [("api", "@second:/home/amin/magent/api", agent_state.NEEDS_INPUT)]
+        held = [("api", "@second:/home/demo/magent/api", agent_state.NEEDS_INPUT)]
         assert [(v.name, v.cwd, v.state) for v in tick2] == held
         assert [(v.name, v.cwd, v.state) for v in tick3] == held
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]

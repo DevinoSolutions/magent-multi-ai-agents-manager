@@ -65,8 +65,8 @@ def _config(*projects: ProjectConfig) -> MagentConfig:
             psmux=False,
             upload_server=False,
             nodes={
-                "second": NodeConfig(nick="second", host="devino-second", user="amin"),
-                "third": NodeConfig(nick="third", host="devino-third", user="amin"),
+                "second": NodeConfig(nick="second", host="devino-second", user="demo"),
+                "third": NodeConfig(nick="third", host="devino-third", user="demo"),
             },
         ),
     )
@@ -121,7 +121,7 @@ class NodeRig:
         return BringUpResult(
             sid=recipe.sid,
             attached_existing=False,
-            cwd=f"/home/amin/magent/{Path(recipe.remote_root).name}",
+            cwd=f"/home/demo/magent/{Path(recipe.remote_root).name}",
         )
 
     def _window(self, target, sid, *, mux, remote=None, reconnect=True):
@@ -159,8 +159,8 @@ class TestACleanProjectComesUpOnItsNode:
         assert (entry.nick, entry.sid, entry.target, entry.cwd, entry.remote_root) == (
             "second",
             "api",
-            "amin@devino-second",
-            "/home/amin/magent/api",
+            "demo@devino-second",
+            "/home/demo/magent/api",
             "~/magent/api",
         )
 
@@ -205,7 +205,7 @@ class TestACleanProjectComesUpOnItsNode:
         )
         launch.bring_up_node_project(_config(api), api, window=True)
         assert rig.windows == [
-            ("amin@devino-second", "api", "tmux", "tmux -L magent attach -t '=api'")
+            ("demo@devino-second", "api", "tmux", "tmux -L magent attach -t '=api'")
         ]
 
     def test_a_platform_without_attach_windows_opens_none(self, rig, api, monkeypatch):
@@ -235,7 +235,7 @@ class TestTheWindowTitleIsTheOneTheSpawnUsed:
     only its ``wt`` Popen and the supervisor lookup are faked."""
 
     _NODE = nodes.Node(
-        nick="second", host="devino-second", user="amin", root="~/magent"
+        nick="second", host="devino-second", user="demo", root="~/magent"
     )
 
     def _spawned(self, monkeypatch) -> list[list[str]]:
@@ -357,7 +357,7 @@ class TestD7RefusesWhatTheNodeCouldNotReproduce:
                 placed_ts=1.0,
                 attached_existing=False,
                 remote_root="~/magent/api",
-                target="amin@devino-second",
+                target="demo@devino-second",
             ),
         )
         rig.live = True
@@ -678,7 +678,7 @@ def _record(name: str, nick: str, remote_root: str) -> None:
             placed_ts=1.0,
             attached_existing=False,
             remote_root=remote_root,
-            target=f"amin@devino-{nick}",
+            target=f"demo@devino-{nick}",
         ),
     )
 
@@ -1377,7 +1377,7 @@ class TestUpBringsUpNodeProjectsToo:
                 placed_ts=1.0,
                 attached_existing=False,
                 remote_root="~/magent/api",
-                target="amin@devino-second",
+                target="demo@devino-second",
             ),
         )
         rig.live = True
@@ -1472,7 +1472,7 @@ def _hold(name: str, nick: str = "second", sid: str | None = None) -> None:
             placed_ts=1.0,
             attached_existing=False,
             remote_root=f"~/magent/{name}",
-            target=f"amin@devino-{nick}",
+            target=f"demo@devino-{nick}",
         ),
     )
 
@@ -1547,7 +1547,7 @@ class TestTheAttachInsteadPathIsNarrow:
         outcome = launch.bring_up_node_project(_config(api), api, window=True)
         assert outcome.attached_existing
         assert rig.windows == [
-            ("amin@devino-second", "api", "tmux", "tmux -L magent attach -t '=api'")
+            ("demo@devino-second", "api", "tmux", "tmux -L magent attach -t '=api'")
         ]
 
 
@@ -1573,7 +1573,7 @@ class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
 
         get_logger("nodes")  # sets the level; caplog must come after
         caplog.set_level("WARNING", logger="magent.nodes")
-        rig.error = PermissionError(13, "Permission denied", r"C:\Users\amin\sa.json")
+        rig.error = PermissionError(13, "Permission denied", r"C:\Users\demo\sa.json")
         outcome = launch.bring_up_node_project(_config(api), api)
         assert outcome.ok is False
         assert outcome.error == "local error: PermissionError; see nodes.log"
@@ -1684,7 +1684,7 @@ class TestGoBringsNodeProjectsUp:
         assert "[@second]" in out
         assert "api @second started" in out
         assert rig.windows == [
-            ("amin@devino-second", "api", "tmux", "tmux -L magent attach -t '=api'")
+            ("demo@devino-second", "api", "tmux", "tmux -L magent attach -t '=api'")
         ]
         assert "api" in nodes.read_node_map()
 
@@ -1719,7 +1719,7 @@ class TestGoBringsNodeProjectsUp:
         monkeypatch.setattr(launch, "_provision_once", forbidden)
         assert launch.run_magent(_config(api), launch.RunOpts(dry_run=True)) == 0
         out = capsys.readouterr().out
-        assert "-> amin@devino-second:~/magent/api" in out
+        assert "-> demo@devino-second:~/magent/api" in out
         # DECISION-24: what the real run would do first, said and not done.
         assert "would provision second" in out
         assert not (tmp_path / "node-map.json").exists()
@@ -1974,7 +1974,7 @@ class TestADryRunPreviewsOnlyWhatTheRunWillDo:
         launch.run_magent(_config(api), launch.RunOpts(dry_run=True, retile_all=True))
         out = capsys.readouterr().out
         assert "would provision" not in out
-        assert "-> amin@devino-second" not in out
+        assert "-> demo@devino-second" not in out
 
     def test_a_retile_is_not_previewed(self, rig, api, desk, no_sleep, capsys):
         launch.run_magent(
@@ -1996,15 +1996,15 @@ class TestADryRunPreviewsOnlyWhatTheRunWillDo:
                 placed_ts=0.0,
                 attached_existing=False,
                 remote_root="~/magent/web",
-                target="amin@devino-third",
-                cwd="/home/amin/magent/web",
+                target="demo@devino-third",
+                cwd="/home/demo/magent/web",
             ),
         )
         proj = ProjectConfig(path=str(folder), node="auto")
         launch.run_magent(_config(proj), launch.RunOpts(dry_run=True))
         out = capsys.readouterr().out
         assert "[@third]" in out
-        assert "-> amin@devino-third:~/magent/web" in out
+        assert "-> demo@devino-third:~/magent/web" in out
         assert "would provision third" in out
 
     def test_a_relative_path_under_base_dir_names_its_folder(
@@ -2016,7 +2016,7 @@ class TestADryRunPreviewsOnlyWhatTheRunWillDo:
         cfg = _config(proj)
         cfg.base_dir = str(base)
         launch.run_magent(cfg, launch.RunOpts(dry_run=True))
-        assert "-> amin@devino-second:~/magent/svc" in capsys.readouterr().out
+        assert "-> demo@devino-second:~/magent/svc" in capsys.readouterr().out
 
 
 class TestARetileOrAnOpenWindowDialsNoNode:
@@ -2218,7 +2218,7 @@ class TestUpCommandBringsNodeProjectsUp:
                         "psmux": False,
                         "uploadServer": False,
                         "tools": _TOOLS,
-                        "nodes": {"second": {"host": "devino-second", "user": "amin"}},
+                        "nodes": {"second": {"host": "devino-second", "user": "demo"}},
                     },
                 }
             ),
@@ -2751,13 +2751,13 @@ class TestDownPullsTheLastTurnHomeFirst:
         [
             (
                 PermissionError(
-                    13, "Access is denied", "C:\\Users\\amin\\.magent\\pull.json"
+                    13, "Access is denied", "C:\\Users\\demo\\.magent\\pull.json"
                 ),
                 "(PermissionError)",
                 "Access is denied",
             ),
             (
-                OSError("could not write C:\\Users\\amin\\x.part"),
+                OSError("could not write C:\\Users\\demo\\x.part"),
                 "(OSError)",
                 "could not write",
             ),
@@ -2780,14 +2780,14 @@ class TestDownPullsTheLastTurnHomeFirst:
         launch.stop_node_sessions(_config(api), ["api"])
         out = capsys.readouterr().out
         assert f"api: last turn not pulled {shown}" in out
-        assert "amin" not in out
+        assert "demo" not in out
         assert os_words not in out
         logged = [
             r.getMessage()
             for r in caplog.records
             if r.name == "magent.nodes" and r.levelno == logging.WARNING
         ]
-        assert any("amin" in m and os_words in m for m in logged)
+        assert any("demo" in m and os_words in m for m in logged)
 
     def test_the_pulls_announce_themselves_once(
         self, rig, tmp_path, monkeypatch, capsys, killed
@@ -3448,7 +3448,7 @@ class TestTheBringUpProvisionsFirst:
         monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
         fake_gh.set_reply(
             "auth status",
-            stdout=gh_auth_status(None, accounts=[("amin", True, "timeout")]),
+            stdout=gh_auth_status(None, accounts=[("demo", True, "timeout")]),
         )
         fake_gh.set_reply("auth token", stdout=token + "\n")
         with caplog.at_level(logging.WARNING, logger="magent.nodes"):
@@ -3489,7 +3489,7 @@ class TestTextWithNoUtf8FormReachesTheRowInOurWords:
         monkeypatch.setattr(remote_mux, "decorate", real_decorate)
         monkeypatch.setattr(remote_mux, "PROBE_TIMEOUT_S", 60.0)
         monkeypatch.setattr(psmux, "code_on_path", lambda: False)
-        fake_ssh.set_reply("printenv HOME", stdout="/home/amin\n")
+        fake_ssh.set_reply("printenv HOME", stdout="/home/demo\n")
         get_logger("nodes")  # sets the level; caplog must come after
         caplog.set_level("WARNING", logger="magent.nodes")
         return fake_ssh
