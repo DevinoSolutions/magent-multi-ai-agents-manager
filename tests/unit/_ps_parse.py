@@ -15,8 +15,9 @@ Windows PowerShell 5.1 and nothing else, because it is the production host
 (the launcher is ``powershell.exe``) and because the host decides the decoding:
 PowerShell 7 reads a file with no BOM as UTF-8, so under ``pwsh`` an encoding
 pin passes against the very writer it exists to catch. The executable comes
-from the system directory, never PATH, and the script refuses to parse on any
-other major version.
+from the system directory, never PATH, and ``parse_file`` refuses to parse on
+any other major version. ``parse`` needs no such check: .NET decodes its text
+as UTF-8 before the parser sees it, whatever the host.
 """
 
 from __future__ import annotations
@@ -29,19 +30,17 @@ from typing import NamedTuple
 
 # Only .NET calls and language keywords: no cmdlet, so nothing autoloads a
 # module (which is what writes a ModuleAnalysisCache under the redirected home).
-_GUARD = r"""
-if ($PSVersionTable.PSVersion.Major -ne 5) {
-  [Console]::Error.WriteLine("not Windows PowerShell 5.1: " + $PSVersionTable.PSVersion)
-  exit 3
-}
-"""
 # Each reader leaves $ast and $errors behind for _EMIT.
 _READ_TEXT = r"""
 $text = [IO.File]::ReadAllText($env:PS_PARSE_INPUT, [Text.Encoding]::UTF8)
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)
 """
+# ParseFile must decode like `powershell.exe -File` (Windows PowerShell 5.1);
+# pwsh 7 reads BOM-less files as UTF-8 and would hide the bug. So the version
+# check comes first, and a failure names the version it found.
 _READ_FILE = r"""
+if ($PSVersionTable.PSVersion.Major -ne 5) { [Console]::Error.WriteLine("parse_file needs Windows PowerShell 5.1; got " + $PSVersionTable.PSVersion); exit 3 }
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($env:PS_PARSE_INPUT, [ref]$tokens, [ref]$errors)
 """
@@ -103,7 +102,7 @@ def _windows_powershell() -> str:
 
 
 def _run(reader: str, src: Path, tmp_path: Path) -> Parsed:
-    program = _GUARD + reader + _EMIT
+    program = reader + _EMIT
     encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
     proc = subprocess.run(
         [

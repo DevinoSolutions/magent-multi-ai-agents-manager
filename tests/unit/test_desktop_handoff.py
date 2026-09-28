@@ -282,6 +282,11 @@ elif mode == "/run":
         # of our own, because a real task starts in system32, never in the
         # caller's directory: a launcher that dropped -WorkingDirectory must
         # not pass by inheriting the right one.
+        late = os.environ.get("MDTEST_HANDOFF_STARTS_LATE_S")
+        if late:
+            # Started, but slow to reach Start-Process (a loaded box): the
+            # launcher is alive, so /Query says Running, and no pid.txt yet.
+            spec = f'"{sys.executable}" -c "import time; time.sleep({late})" && {spec}'
         launcher = subprocess.Popen(
             spec,
             shell=True,
@@ -541,6 +546,25 @@ class TestRunOnDesktopOnWindows:
         assert result.timed_out is False
         assert "never started" in result.detail
         assert "logged on" in result.detail
+
+    def test_a_running_task_with_no_pid_yet_is_waited_for(
+        self, fake_schtasks, monkeypatch
+    ):
+        # The other half of the start check: past the grace with no pid.txt,
+        # but the scheduler says Running -- a slow launcher, not an empty
+        # desktop, and abandoning it throws away a hand-off about to work. A
+        # zero grace puts the /Query on the first polls, while the launcher is
+        # still held back, so it is this branch that runs, on every run.
+        monkeypatch.setenv("MDTEST_HANDOFF_STARTS_LATE_S", "2")
+        monkeypatch.setattr("magent.platform.windows._HANDOFF_START_GRACE_S", 0.0)
+
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-c", "pass"], timeout_s=60
+        )
+
+        assert result.rc == 0, result.detail
+        modes = [c[0] for c in _calls(fake_schtasks)]
+        assert modes == ["/Create", "/Run", "/Query", "/Delete"]
 
     def test_no_schtasks_is_a_named_failure_not_a_crash(self, monkeypatch):
         monkeypatch.setattr("magent.platform.windows._schtasks_exe", lambda: None)
@@ -814,6 +838,12 @@ class TestTheStagedScriptParsesBackToTheArgv:
     U+0442 each hold a typographic single quote -- and that parses with NO
     error and different values, which is why every literal is compared, not
     just the error count.
+
+    Blind spot: a machine whose ANSI code page is 65001 (UTF-8) reads a script
+    with no BOM as UTF-8 too, so there these pins pass against a BOM-less
+    writer as well. They discriminate wherever the ANSI code page is not
+    UTF-8 -- cp1252 on windows-latest -- and the decoding check below skips,
+    saying so, on a 65001 machine.
     """
 
     def test_its_parser_decodes_a_file_the_way_dash_file_does(self, tmp_path):
