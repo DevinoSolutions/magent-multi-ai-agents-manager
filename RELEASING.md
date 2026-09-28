@@ -83,6 +83,9 @@ From an up-to-date `main` (or a release branch that will be merged):
    ## [X.Y.Z] - YYYY-MM-DD
    ```
 
+   For an rc, the pending section becomes the rc's and a fresh pending one
+   opens above it; see **Pre-release changelog** below.
+
 3. **Refresh the lock** — `uv.lock` records the project's own version, so a
    version bump changes it and CI's `uv lock --check` will fail if it drifts:
 
@@ -134,10 +137,28 @@ finishes and paste in the matching `CHANGELOG.md` section.
 > as a pre-release that never becomes **Latest**. PyPI and `pip` treat the
 > version as a pre-release too: a plain `pip install` skips it, so testers need
 > `pip install --pre magent-multi-ai-agents-manager` or an exact `==X.Y.0rc1`.
-> In `CHANGELOG.md` an rc gets its own section, headed like a final one
-> (`## [X.Y.0rc1] - YYYY-MM-DD`, plus its link reference). The final `X.Y.0`
-> section summarizes everything since the last final release; the rc sections
-> stay as history.
+> magent cuts only `rcN` pre-releases; `a`/`b`/`.dev` versions are not used for
+> its releases. The workflow would still classify one as a pre-release, which is
+> the fail-safe direction.
+>
+> **Pre-release changelog.** Only an `rcN` gets a `CHANGELOG.md` section, headed
+> like a final one. When cutting `X.Y.0rc1`, rename step 2's pending
+> `## [X.Y.0] - UNRELEASED` heading to `## [X.Y.0rc1] - YYYY-MM-DD` and open a
+> fresh `## [X.Y.0] - UNRELEASED` above it for post-rc work; each later `rcN`
+> does the same. At the final, stamp that pending section and make it summarize
+> everything since the last final release, rc changes included; the rc sections
+> stay below it as history. Link references stay in heading order, newest
+> first, and the final's link starts at the last **final** tag, not at the rc
+> (`vLASTFINAL` is the previous final release's tag):
+>
+> ```text
+> [X.Y.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/vLASTFINAL...vX.Y.0
+> [X.Y.0rc2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/vX.Y.0rc1...vX.Y.0rc2
+> [X.Y.0rc1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/vLASTFINAL...vX.Y.0rc1
+> ```
+>
+> These links only resolve if the tags are spelled exactly `vX.Y.0rc1` (never
+> `vX.Y.0-rc1`), which the `build` job enforces.
 
 ---
 
