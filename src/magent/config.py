@@ -35,7 +35,8 @@ DEFAULT_TOOLS: dict[str, str] = {
 
 
 class ConfigError(ValueError):
-    """Structurally invalid magent config: bad JSON, wrong-typed field, or missing required key."""
+    """Structurally invalid magent config: bad JSON, wrong-typed field, missing
+    required key, or text with no UTF-8 form."""
 
 
 @dataclass
@@ -136,15 +137,53 @@ class MagentConfig:
 
 
 def _load_json_object(text: str) -> dict[str, object]:
-    """Parse ``text`` as a JSON object, or raise ConfigError. The single JSON
-    entry point shared by load_config and migrate_config_file."""
+    """Parse ``text`` as a JSON object whose every string has a UTF-8 form, or
+    raise ConfigError. The single JSON entry point shared by load_config and
+    migrate_config_file, so both refuse the same text in the same words."""
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
         raise ConfigError(f"Config is not valid JSON: {e}") from e
     if not isinstance(data, dict):
         raise ConfigError("Config must be a JSON object")
+    _refuse_text_with_no_utf8_form(data, "")
     return data
+
+
+def _escaped(text: str) -> str:
+    """``text`` as pure-ASCII escape text (a lone surrogate reads ``\\ud83d``),
+    so a message quoting it prints on any stream in any code page."""
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _refuse_text_with_no_utf8_form(node: object, where: str) -> None:
+    """Raise ConfigError at the first string in ``node`` -- a value or a key,
+    at any depth -- that has no UTF-8 form.
+
+    Only a lone UTF-16 surrogate qualifies, and JSON can spell one
+    (``"api\\ud83d"``) that json.loads hands back as-is. Loaded, it crashed
+    ``--go`` at its first listing row on every Windows stdout (a pipe in
+    either encoding, and a real console), and a colorless one crashed the
+    tab-color hash in the codec's own words; a session name, window title or
+    argv made from it fares no better. Refused here, once, the whole document
+    is covered -- fields added later and the unknown keys load only warns
+    about included. The refusal shows the value escaped and names the class,
+    never the codec's message, so it cannot crash on the text it reports."""
+    if isinstance(node, str):
+        try:
+            node.encode("utf-8")
+        except UnicodeEncodeError as e:
+            raise ConfigError(
+                f"{_escaped(where)} has text with no UTF-8 form"
+                f" ({type(e).__name__}): '{_escaped(node)}'"
+            ) from e
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            _refuse_text_with_no_utf8_form(key, f"a key in {where or 'the config'}")
+            _refuse_text_with_no_utf8_form(value, f"{where}.{key}" if where else key)
+    elif isinstance(node, list):
+        for i, item in enumerate(node):
+            _refuse_text_with_no_utf8_form(item, f"{where}[{i}]")
 
 
 def _obj(raw: dict[str, object], key: str) -> dict[str, object]:
