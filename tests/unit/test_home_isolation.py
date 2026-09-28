@@ -243,9 +243,12 @@ _POWERSHELL = shutil.which("powershell.exe") if sys.platform == "win32" else Non
 
 # The same lookup .NET's GetFolderPath makes, from a child that has no startup
 # side effects of its own. KF_FLAG_DEFAULT (0) verifies the folder exists, so a
-# missing one is an HRESULT rather than a path.
+# missing one is an HRESULT rather than a path. It prints UTF-8 and the pin
+# decodes UTF-8: a redirected stdout is cp1252, which cannot carry every
+# profile name.
 _KNOWN_FOLDER_CHILD = """
 import ctypes, sys, uuid
+sys.stdout.reconfigure(encoding="utf-8")
 guid = (ctypes.c_char * 16).from_buffer_copy(uuid.UUID(sys.argv[1]).bytes_le)
 path = ctypes.c_wchar_p()
 hr = ctypes.windll.shell32.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(path))
@@ -348,13 +351,19 @@ class TestTheTmpHomeResolvesItsKnownFolders:
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                f"[Environment]::GetFolderPath('{folder}')",
+                # UTF-8 on both sides. Left alone, a redirected powershell.exe
+                # writes the OEM code page and text=True decodes ANSI, so a
+                # non-ASCII profile path came back mangled or not at all.
+                (
+                    "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                    f"[Environment]::GetFolderPath('{folder}')"
+                ),
             ],
             # Not the checkout: at red, this child must not be the one that
             # drops a cache into it.
             cwd=tmp_path,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             timeout=60,
             check=False,
         )
@@ -384,7 +393,7 @@ class TestTheTmpHomeResolvesItsKnownFolders:
             [sys.executable, "-c", _KNOWN_FOLDER_CHILD, folder_id],
             cwd=tmp_path,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             timeout=60,
             check=False,
         )
