@@ -602,10 +602,8 @@ class TestTheReplyIsBoundedInMemory:
         assert lines[0] == f"reply exceeded {CAP} bytes"
         assert "boom: disk full" in lines[1:]
 
-    def test_the_stderr_wait_after_the_cap_is_bounded_by_the_reap(self, tmp_path):
-        # A grandchild still holds stderr, so it never ends: the over-cap path
-        # must give up after the reap bound and raise without the tail, not
-        # wait out the grandchild's 90s.
+    def _flood_past_a_held_stderr(self, tmp_path) -> tuple[RemoteError, float]:
+        """_HELD_STDERR_CHILD's over-cap error, and how long it took."""
         pidfile = tmp_path / "grandchild.pid"
         started = time.monotonic()
         try:
@@ -624,8 +622,44 @@ class TestTheReplyIsBoundedInMemory:
         finally:
             with contextlib.suppress(OSError, ValueError):
                 os.kill(int(pidfile.read_text(encoding="utf-8")), signal.SIGTERM)
-        assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
+        return exc.value, elapsed
+
+    def test_the_stderr_wait_after_the_cap_is_bounded_by_the_reap(self, tmp_path):
+        # A grandchild still holds stderr, so it never ends: the over-cap path
+        # must give up after the reap bound, not wait out the grandchild's 90s.
+        error, elapsed = self._flood_past_a_held_stderr(tmp_path)
+        assert error.stderr_tail.splitlines()[0] == f"reply exceeded {CAP} bytes"
         assert elapsed < 20
+
+    def test_a_stderr_held_open_still_hands_over_the_childs_words(self, tmp_path):
+        # The words were read before the cap; only the stream's END waits on
+        # the grandchild. Dropping them made the error depend on how fast some
+        # other process exits -- the fake ssh's flake on a loaded Windows box,
+        # where kill() takes cmd.exe and the interpreter behind it holds stderr.
+        error, _ = self._flood_past_a_held_stderr(tmp_path)
+        assert "boom: disk full" in error.stderr_tail.splitlines()[1:]
+
+    def test_the_drain_hands_over_what_arrived_before_the_stream_ends(self):
+        # A data() taken mid-read is what has arrived, and the read goes on
+        # from empty: exactly the cap (16 bytes) is held first, so a drain
+        # that kept counting the handed-over bytes would trim past its last
+        # chunk.
+        r, w = os.pipe()
+        drain = remote_mux._Drain(os.fdopen(r, "rb"), 16, tail=True)
+        drain.start()
+        try:
+            os.write(w, b"boom: disk full\n")
+            deadline = time.monotonic() + 5
+            while drain._held < 16 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert drain.is_alive()
+            assert drain.data() == b"boom: disk full\n"
+            os.write(w, b"more\n")
+        finally:
+            os.close(w)
+        drain.join(5)
+        assert not drain.is_alive()
+        assert drain.data() == b"more\n"
 
     def test_the_drain_drops_what_it_held_once_over_the_cap(self):
         # Two writes, so the first cap's worth is HELD before the byte that
