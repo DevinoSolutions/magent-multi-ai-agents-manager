@@ -62,10 +62,14 @@ STAGE_FLOOR_S = 5.0
 CLEANUP_TIMEOUT_S = 60.0
 # One diag() call: its reads share DIAG_S while the module budget lasts and
 # DIAG_FLOOR_S after it (a failure is usually read after the budget ran out),
-# each read at most DIAG_READ_S. A read with no time left is skipped, named.
+# each read at most DIAG_READ_S. A read with less than DIAG_MIN_READ_S left is
+# skipped, named: no ssh round trip fits in less, and on a coarse clock
+# (Windows' 15.6 ms monotonic tick before Python 3.13) the allowance's last
+# crumbs were each "tried" and timed out at once, seven reads for three.
 DIAG_S = 30.0
 DIAG_FLOOR_S = 10.0
 DIAG_READ_S = 10.0
+DIAG_MIN_READ_S = 1.0
 # Lines of each log and of the pane a diag() shows.
 DIAG_TAIL = 80
 GATE_VAR = "MDTEST_NODES_REAL"
@@ -1153,7 +1157,7 @@ class NodeRig:
 
         def node(title: str, argv: Sequence[str]) -> None:
             timeout = allowance.clamp(DIAG_READ_S)
-            if timeout <= 0:
+            if timeout < DIAG_MIN_READ_S:
                 parts.append(f"--- node: {title} ---\n(skipped: diag allowance spent)")
                 return
             try:

@@ -658,6 +658,7 @@ class TestDiagNamesEveryRead:
         monkeypatch.setattr(rig, "DIAG_S", 0.3)
         monkeypatch.setattr(rig, "DIAG_FLOOR_S", 0.3)
         monkeypatch.setattr(rig, "DIAG_READ_S", 0.1)
+        monkeypatch.setattr(rig, "DIAG_MIN_READ_S", 0.05)
 
         def wedged(argv: list[str], *, timeout: float, **_: object) -> None:
             time.sleep(timeout)
@@ -735,7 +736,7 @@ def _root_script(tmp_path: Path, text: str, *args: str, passwd: str = "") -> _Ra
     if bash is None:
         pytest.fail("no bash on a POSIX runner")
     fakes = tmp_path / "fakes"
-    fakes.mkdir()
+    fakes.mkdir(parents=True)
     for name in _FAKED:
         path = fakes / name
         path.write_text(_RECORDER, encoding="utf-8")
