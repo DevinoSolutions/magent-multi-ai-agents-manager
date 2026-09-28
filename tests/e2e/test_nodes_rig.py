@@ -584,7 +584,8 @@ def _offline_rig(tmp_path: Path) -> rig.NodeRig:
 
 class TestCloseKillsOnlyWhatItOwns:
     """``close`` against a recording root hop, with the pid file naming a
-    live pid and ``/proc`` answering ``cmdline`` for it."""
+    pid (live unless ``alive=False``) and ``/proc`` answering ``cmdline``
+    for it."""
 
     def _close(
         self,
@@ -592,6 +593,7 @@ class TestCloseKillsOnlyWhatItOwns:
         monkeypatch: pytest.MonkeyPatch,
         *,
         cmdline: Callable[[Path], bytes],
+        alive: bool = True,
         **answers: rig.Run | BaseException,
     ) -> tuple[list[str], list[int]]:
         built = _offline_rig(tmp_path)
@@ -608,7 +610,7 @@ class TestCloseKillsOnlyWhatItOwns:
                 lambda argv, **_: subprocess.CompletedProcess(argv, 0, b"", b"")
             ),
         )
-        monkeypatch.setattr(rig, "_alive", lambda pid: pid == _DAEMON_PID)
+        monkeypatch.setattr(rig, "_alive", lambda pid: alive and pid == _DAEMON_PID)
         monkeypatch.setattr(rig, "_cmdline", lambda pid: cmdline(pc.cfg))
         killed: list[int] = []
         monkeypatch.setattr(rig, "_kill", killed.append)
@@ -636,6 +638,16 @@ class TestCloseKillsOnlyWhatItOwns:
         assert killed == []
         (problem,) = problems
         assert f"live pid {_DAEMON_PID}" in problem and "left alone" in problem
+
+    def test_a_stale_pid_file_naming_a_dead_pid_is_no_problem(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A dead pid has no /proc entry, so its cmdline reads as b"".
+        problems, killed = self._close(
+            tmp_path, monkeypatch, cmdline=lambda cfg: b"", alive=False
+        )
+        assert killed == []
+        assert problems == []
 
     def test_a_live_daemon_is_only_ever_this_pcs_own(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
