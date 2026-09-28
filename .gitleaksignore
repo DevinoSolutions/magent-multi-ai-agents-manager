@@ -1,0 +1,32 @@
+# gitleaks fingerprints (commit:file:rule:line) of canaries committed BEFORE the
+# DECOY convention in .gitleaks.toml. Each was checked without printing its value;
+# none is real key or token material. Suppression is per exact fingerprint: the
+# rules still fire on any other commit or line. New canaries carry DECOY instead
+# of growing this list.
+
+# nodes-F plan: 42-char canary = base64 of the bare "openssh-key-v1...none" header, no key blobs
+62000b68a3e878b84e94e1c19d0675689d7e2200:docs/superpowers/plans/2026-09-24-nodes-F.md:generic-api-key:4689
+# nodes-F plan: OPENSSH armor around the {secret} canary above, no base64 body of its own
+62000b68a3e878b84e94e1c19d0675689d7e2200:docs/superpowers/plans/2026-09-24-nodes-F.md:private-key:4693
+# nodes-F plan: the same header-only canary, repeated in a later task
+62000b68a3e878b84e94e1c19d0675689d7e2200:docs/superpowers/plans/2026-09-24-nodes-F.md:generic-api-key:6285
+# sentry-scrub test: 13-char ghp_ fake token (a real classic PAT is 40 chars)
+d1dff34ce2127e1523e984ef9321a656a1b600e9:tests/unit/test_remote_mux.py:generic-api-key:641
+# node-cmd key-refusal test: 42-char base64 of the bare openssh header, no key blobs
+642569b112cb27e1f96a5372bfb75877ea434059:tests/unit/test_node_cmd.py:generic-api-key:813
+# node-cmd key-refusal test: OPENSSH armor around the {secret} canary above
+642569b112cb27e1f96a5372bfb75877ea434059:tests/unit/test_node_cmd.py:private-key:817
+# node-apply scrub test: example.com URL carrying a 13-char DECOY ghp_ fake
+1fdceb782eaa34a2f9b24deab48e46b76eac3ac6:tests/unit/test_node_apply.py:generic-api-key:1249
+# node-apply scrub test: second example.com URL with the same DECOY ghp_ fake
+1fdceb782eaa34a2f9b24deab48e46b76eac3ac6:tests/unit/test_node_apply.py:generic-api-key:1253
+# node-apply scrub test: PASSWORD constant holding the 13-char DECOY ghp_ fake
+1fdceb782eaa34a2f9b24deab48e46b76eac3ac6:tests/unit/test_node_apply.py:generic-api-key:1258
+# node-provision key-refusal test: 42-char base64 of the bare openssh header, no key blobs
+ac44a6ee6f7043602121bbb5765b53c6bb2f71b7:tests/unit/test_node_provision.py:generic-api-key:1620
+# node-provision key-refusal test: OPENSSH armor around the {secret} canary above
+ac44a6ee6f7043602121bbb5765b53c6bb2f71b7:tests/unit/test_node_provision.py:private-key:1624
+# node-provision digest pin: sha256 hex of test data in scope.digests(), not a credential
+a95a6c9b7e93a0703f1da20a56a894c39df3b588:tests/unit/test_node_provision.py:generic-api-key:1689
+# node-provision gh-token test: the match is the code text stdout=legacy (a 0-9a-f repeat fixture)
+33de526fd43ff64bd884872d4f4a031f4c8c43b7:tests/unit/test_node_provision.py:generic-api-key:1746

@@ -1,3 +1,10 @@
+# Canary convention: every fake secret a test or plan needs (token, key,
+# password) carries the literal marker DECOY in its value, e.g. ghp_DECOY....
+# The one allowlist below honours the marker only under tests/ and
+# docs/superpowers/, and only when the flagged secret itself carries it: both
+# must hold. A real-looking secret without DECOY is caught everywhere, and so is
+# a DECOY value anywhere else. Canaries committed before this convention are
+# pinned one by one, by fingerprint, in .gitleaksignore.
 title = "magent gitleaks config"
 
 [extend]
@@ -8,3 +15,15 @@ id = "tailscale-magdns-hostname"
 description = "Tailscale MagicDNS hostname (contains the tailnet name)"
 regex = '''[a-z0-9-]+\.tail[a-z0-9-]+\.ts\.net'''
 tags = ["tailscale", "infra"]
+
+[[allowlists]]
+description = "Test/plan canaries: the secret carries DECOY AND lives under tests/ or docs/superpowers/"
+condition = "AND"
+paths = [
+  '''^tests/''',
+  '''^docs/superpowers/''',
+]
+# "secret" = the captured value, not the whole match: a DECOY in a key NAME
+# next to a real value must not pass.
+regexTarget = "secret"
+regexes = ['''DECOY''']
