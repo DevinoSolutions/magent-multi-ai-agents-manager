@@ -2994,12 +2994,14 @@ class TestTheScriptLiterals:
 
     def test_a_folder_that_appears_meanwhile_is_already_there(self):
         # Another bring-up may make a folder between the walk and the mkdir:
-        # that is "already there", not a failure, and mkdir's words stay off
-        # the screen (the rig proves both on a real shell).
+        # that is "already there", not a failure, and its "File exists" is
+        # dropped. A real failure keeps mkdir's words, above the line its
+        # caller dies with (the rig proves all three on a real shell).
         helper = _shell_function(node_scripts._read("bring_up"), "mkdir_private")
-        assert 'mkdir -m 700 -- "$dir" 2>/dev/null || [ -d "$dir" ] || return 1' in (
-            helper
-        )
+        assert (
+            'why=$(mkdir -m 700 -- "$dir" 2>&1) || [ -d "$dir" ] ||'
+            " { printf '%s\\n' \"$why\" >&2; return 1; }"
+        ) in helper
 
     def test_the_archive_is_never_extracted_with_absolute_names(self):
         text = node_scripts._read("bring_up")
@@ -3900,17 +3902,21 @@ class TestBringUpShOnARealShell:
         self, rig, tmp_path, monkeypatch
     ):
         # A mkdir that really fails, and leaves nothing: the push dies with
-        # exit 5 and the script's own line, mkdir's words off the screen, and
-        # nothing written.
+        # exit 5 and the script's own line last, mkdir's reason above it --
+        # nodes.log's, never the row's -- and nothing written.
         root = rig["root"]
         root.mkdir(parents=True)
         _mkdir_shim(tmp_path, monkeypatch, _refuses(f"{root}/sub"))
         with pytest.raises(RemoteError) as info:
             self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
         assert info.value.rc == 5
-        assert (
-            info.value.stderr_tail
-            == "magent: cannot create a folder for sub/deeper/.env"
+        lines = info.value.stderr_tail.splitlines()
+        assert lines[-1] == "magent: cannot create a folder for sub/deeper/.env"
+        reason = f"mkdir: cannot create directory '{root}/sub': Permission denied"
+        assert reason in lines[:-1]
+        assert reason in str(info.value)  # what launch logs
+        assert launch._node_error_text(info.value) == (
+            "cannot create a folder for sub/deeper/.env"
         )
         assert _tree(root) == []
 
@@ -3918,13 +3924,18 @@ class TestBringUpShOnARealShell:
         self, rig, tmp_path, monkeypatch
     ):
         # The seed's own refusal: exit 5 before any session starts, the
-        # script's own line, and no memory written.
+        # script's own line last with mkdir's reason above it, and no memory
+        # written.
         dest = Path.home() / ".claude" / "projects" / rig["enc"] / "memory"
         _mkdir_shim(tmp_path, monkeypatch, _refuses(str(dest)))
         with pytest.raises(RemoteError) as info:
             remote_mux.bring_up(rig["node"], rig["recipe"])
         assert info.value.rc == 5
-        assert info.value.stderr_tail == f"magent: cannot create {dest}"
+        lines = info.value.stderr_tail.splitlines()
+        assert lines[-1] == f"magent: cannot create {dest}"
+        reason = f"mkdir: cannot create directory '{dest}': Permission denied"
+        assert reason in lines[:-1]
+        assert launch._node_error_text(info.value) == f"cannot create {dest}"
         assert not dest.exists()
         assert not (rig["state"] / "sessions" / "api").exists()
 

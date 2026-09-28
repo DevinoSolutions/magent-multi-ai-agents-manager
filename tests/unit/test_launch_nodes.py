@@ -388,6 +388,32 @@ class TestAFailureIsAnOutcomeNeverACrash:
         assert outcome.error.startswith("~/magent/api has uncommitted changes")
         assert nodes.read_node_map() == {}
 
+    def test_the_os_reason_above_a_refusal_is_logged_never_shown(
+        self, rig, api, caplog
+    ):
+        # bring_up.sh keeps a failed mkdir's words above the line it dies
+        # with: the row is the script's line alone, and nodes.log has both.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        reason = "mkdir: cannot create directory '/n/api/sub': Permission denied"
+        rig.error = RemoteError(
+            5,
+            f"{reason}\nmagent: cannot create a folder for sub/.env",
+            ("bring_up",),
+        )
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.error == "cannot create a folder for sub/.env"
+        logged = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes" and r.levelno == logging.WARNING
+        ]
+        assert any(
+            reason in m and "cannot create a folder for sub/.env" in m for m in logged
+        )
+
     def test_an_unreachable_node_is_an_outcome(self, rig, api):
         rig.error = RemoteError(
             None, "ssh: connect to host devino-second: timed out", ("ssh",)
