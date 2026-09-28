@@ -746,7 +746,8 @@ class TestThePowerShellQuoting:
 @pytestmark_win
 class TestTheLauncherReallyRuns:
     """The generated PowerShell, executed for real, from a directory whose name
-    has a space in it."""
+    has spaces and non-ASCII in it -- so a script staged in any encoding but
+    production's cannot pass."""
 
     def test_a_path_with_spaces_survives_both_layers(self, tmp_path):
         from magent.platform.windows import (
@@ -755,7 +756,7 @@ class TestTheLauncherReallyRuns:
             _handoff_script,
         )
 
-        work = tmp_path / "a b c"
+        work = tmp_path / "a b Ñ т"
         work.mkdir()
         script = work / "run.ps1"
         out, err = work / "out.txt", work / "err.txt"
@@ -814,6 +815,27 @@ class TestTheStagedScriptParsesBackToTheArgv:
     error and different values, which is why every literal is compared, not
     just the error count.
     """
+
+    def test_its_parser_decodes_a_file_the_way_dash_file_does(self, tmp_path):
+        # The pins below are only as good as this parser's DECODING. ParseInput
+        # over text we decoded ourselves, or a PowerShell 7 host (UTF-8 when
+        # there is no BOM), would read both of these files alike -- and pass
+        # the very writer the pins exist to catch.
+        import ctypes
+
+        value = "café"
+        ansi = value.encode("utf-8").decode(f"cp{ctypes.windll.kernel32.GetACP()}")
+        if ansi == value:
+            pytest.skip("the ANSI code page is UTF-8: a BOM changes nothing here")
+        seen = {}
+        for encoding in ("utf-8", "utf-8-sig"):
+            src = tmp_path / f"{encoding}.ps1"
+            src.write_text(f"Set-Content -LiteralPath '{value}'\n", encoding=encoding)
+            (command,) = parse_file(src, tmp_path).named("Set-Content")
+            seen[encoding] = argument_of(command, "LiteralPath")[-1]
+
+        # No BOM: the ANSI code page, as -File reads it. A BOM: honoured.
+        assert seen == {"utf-8": ansi, "utf-8-sig": value}
 
     @pytest.mark.parametrize(
         ("argv", "cwd_name"), list(_STAGED_CASES.values()), ids=list(_STAGED_CASES)

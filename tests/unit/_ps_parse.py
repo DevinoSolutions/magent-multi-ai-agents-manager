@@ -8,8 +8,15 @@ hands a FILE to ``::ParseFile``, which decodes it exactly as
 PowerShell 5.1 reads the ANSI code page). Either way the parser builds the
 syntax tree and executes nothing, and every command in the tree comes back
 with its elements: parameters by name, string constants with their parsed
-VALUE and quote kind. Windows only (``powershell.exe``); the output is ASCII
-(base64 for every value), so no console code page can bend it.
+VALUE and quote kind. Windows only; the output is ASCII (base64 for every
+value), so no console code page can bend it.
+
+Windows PowerShell 5.1 and nothing else, because it is the production host
+(the launcher is ``powershell.exe``) and because the host decides the decoding:
+PowerShell 7 reads a file with no BOM as UTF-8, so under ``pwsh`` an encoding
+pin passes against the very writer it exists to catch. The executable comes
+from the system directory, never PATH, and the script refuses to parse on any
+other major version.
 """
 
 from __future__ import annotations
@@ -17,13 +24,17 @@ from __future__ import annotations
 import base64
 import os
 import subprocess
-from typing import TYPE_CHECKING, NamedTuple
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from pathlib import Path
+from typing import NamedTuple
 
 # Only .NET calls and language keywords: no cmdlet, so nothing autoloads a
 # module (which is what writes a ModuleAnalysisCache under the redirected home).
+_GUARD = r"""
+if ($PSVersionTable.PSVersion.Major -ne 5) {
+  [Console]::Error.WriteLine("not Windows PowerShell 5.1: " + $PSVersionTable.PSVersion)
+  exit 3
+}
+"""
 # Each reader leaves $ast and $errors behind for _EMIT.
 _READ_TEXT = r"""
 $text = [IO.File]::ReadAllText($env:PS_PARSE_INPUT, [Text.Encoding]::UTF8)
@@ -79,10 +90,29 @@ def parse_file(path: Path, tmp_path: Path) -> Parsed:
     return _run(_READ_FILE, path, tmp_path)
 
 
+def _windows_powershell() -> str:
+    """Windows PowerShell's ``powershell.exe`` under the system directory --
+    the same place production takes schtasks from, and never a PATH lookup."""
+    import ctypes  # win-only: ctypes.windll doesn't exist off Windows
+
+    buffer = ctypes.create_unicode_buffer(260)
+    assert ctypes.windll.kernel32.GetSystemDirectoryW(buffer, 260), "no system dir"
+    exe = Path(buffer.value) / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    assert exe.is_file(), f"Windows PowerShell is not at {exe}"
+    return str(exe)
+
+
 def _run(reader: str, src: Path, tmp_path: Path) -> Parsed:
-    encoded = base64.b64encode((reader + _EMIT).encode("utf-16-le")).decode("ascii")
+    program = _GUARD + reader + _EMIT
+    encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
     proc = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        [
+            _windows_powershell(),
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            encoded,
+        ],
         capture_output=True,
         text=True,
         encoding="ascii",
