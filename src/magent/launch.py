@@ -2199,10 +2199,13 @@ def bring_up_node_project(
                     node, recipe, allow_dirty=allow_dirty, resume_id=resume_id
                 )
                 # What the node's repos were at this bring-up, for a later
-                # recall from a node that no longer answers. A fresh bring-up
-                # just checked the trees clean (bring_up.sh refuses a dirty
-                # one); an attach checked nothing. A record that cannot be
-                # written is logged and keeps the old one (write_repo_record).
+                # recall from a node that no longer answers. Clean or dirty
+                # only where bring_up.sh read the tree (repo_status.sh's rule,
+                # untracked files included); an attach and --allow-dirty read
+                # nothing, and a tree it could not read is missing from
+                # result.dirty -- all unknown, never clean. A record that
+                # cannot be written is logged and keeps the old one
+                # (write_repo_record).
                 nodes.write_repo_record(
                     nick,
                     result.sid,
@@ -2214,7 +2217,11 @@ def bring_up_node_project(
                                 remote_dir=repo,
                                 head=sha,
                                 branch="",
-                                dirty=None if result.attached_existing else False,
+                                dirty=(
+                                    None
+                                    if result.attached_existing or allow_dirty
+                                    else result.dirty.get(repo)
+                                ),
                                 unpushed=None,
                             )
                             for repo, sha in sorted(result.commits.items())

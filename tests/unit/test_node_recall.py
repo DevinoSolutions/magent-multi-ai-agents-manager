@@ -359,6 +359,7 @@ class TestTheRepoRecord:
         ]
 
     def test_the_bring_up_records_the_commits_it_found(self, pipeline, api_repo):
+        # ...and the tree clean: bring_up.sh read it and found nothing.
         config = pool("second", projects=[_api(api_repo, "second")])
 
         launch.bring_up_node_project(config, config.projects[0])
@@ -388,6 +389,53 @@ class TestTheRepoRecord:
         record = nodes.read_repo_record("second", "api")
         assert record is not None
         assert record.repos == (nodes.RepoStatus("api", "a" * 40, "", None, None),)
+
+    def _recorded_dirty(self, monkeypatch, api_repo, reported, *, allow_dirty=False):
+        """The record's dirty flag after a fresh bring-up whose script
+        reported ``reported`` (BringUpResult.dirty) for the tree."""
+
+        def _bring_up(node, recipe, **_k):
+            return remote_mux.BringUpResult(
+                sid=recipe.sid,
+                attached_existing=False,
+                commits={"api": "a" * 40},
+                cwd="/home/amin/magent/api",
+                dirty=reported,
+            )
+
+        monkeypatch.setattr(remote_mux, "bring_up", _bring_up)
+        config = pool("second", projects=[_api(api_repo, "second")])
+        launch.bring_up_node_project(
+            config, config.projects[0], allow_dirty=allow_dirty
+        )
+        record = nodes.read_repo_record("second", "api")
+        assert record is not None
+        assert [(r.remote_dir, r.head) for r in record.repos] == [("api", "a" * 40)]
+        return record.repos[0].dirty
+
+    def test_an_untracked_only_tree_is_not_recorded_clean(
+        self, pipeline, api_repo, monkeypatch
+    ):
+        # Only tracked changes refuse a bring-up, so it went ahead; the
+        # script read the untracked file as repo_status.sh does: dirty.
+        assert self._recorded_dirty(monkeypatch, api_repo, {"api": True}) is True
+
+    def test_allow_dirty_records_the_tree_as_unknown(
+        self, pipeline, api_repo, monkeypatch
+    ):
+        # --allow-dirty looked at nothing: even a clean report is not a
+        # claim this bring-up made.
+        dirty = self._recorded_dirty(
+            monkeypatch, api_repo, {"api": False}, allow_dirty=True
+        )
+        assert dirty is None
+
+    def test_a_tree_the_script_did_not_read_is_recorded_unknown(
+        self, pipeline, api_repo, monkeypatch
+    ):
+        # A status that failed on the node leaves the tree out of the
+        # report: unknown, never clean.
+        assert self._recorded_dirty(monkeypatch, api_repo, {}) is None
 
     def test_a_record_that_cannot_be_written_is_not_a_failed_bring_up(
         self, pipeline, api_repo, caplog
@@ -4363,6 +4411,7 @@ def pipeline(monkeypatch, api_repo):
             attached_existing=False,
             commits={recipe.sid: "a" * 40},
             cwd=f"/home/amin/magent/{recipe.sid}",
+            dirty={recipe.sid: False},
         )
 
     monkeypatch.setattr(remote_mux, "bring_up", _bring_up)
