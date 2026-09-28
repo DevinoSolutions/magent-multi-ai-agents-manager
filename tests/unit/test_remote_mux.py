@@ -24,6 +24,7 @@ import tarfile
 import time
 from importlib import resources
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -2848,8 +2849,8 @@ def _shell_function(text: str, name: str) -> str:
 def _grant_by_default_acl(path: Path) -> None:
     """Give ``path`` a default ACL of u::rwx g::r-x o::r-x -- the shape a
     GitHub runner home carries -- written as the kernel's own xattr, so no
-    setfacl is needed. Skips where the filesystem keeps no POSIX ACLs, or
-    keeps one that does not override the umask: nothing to prove there."""
+    setfacl is needed. Where the filesystem keeps no POSIX ACLs, or keeps one
+    that does not override the umask, there is nothing to prove."""
     user_obj, group_obj, other, no_id = 0x01, 0x04, 0x20, 0xFFFFFFFF
     blob = struct.pack("<I", 2) + b"".join(
         struct.pack("<HHI", tag, perm, no_id)
@@ -2858,7 +2859,7 @@ def _grant_by_default_acl(path: Path) -> None:
     try:
         os.setxattr(path, "system.posix_acl_default", blob)
     except OSError as exc:
-        pytest.skip(f"no POSIX default ACL on this filesystem: {exc}")
+        _no_real_acl(f"no POSIX default ACL on this filesystem: {exc}")
     probe = path / ".acl-probe"
     mask = os.umask(0o077)
     try:
@@ -2868,7 +2869,22 @@ def _grant_by_default_acl(path: Path) -> None:
     mode = stat.S_IMODE(probe.stat().st_mode)
     probe.rmdir()
     if mode == 0o700:
-        pytest.skip("a default ACL here does not override the umask")
+        _no_real_acl("a default ACL here does not override the umask")
+
+
+def _no_real_acl(reason: str) -> NoReturn:
+    # A skip on a dev box; on CI a runner that cannot carry the canary is a
+    # provisioning bug, never a quiet pass.
+    if os.environ.get("GITHUB_ACTIONS"):
+        pytest.fail(reason)
+    pytest.skip(reason)
+
+
+# Shadows the script's own `umask` with one pinned to 000. The most
+# permissive default ACL leaves a new folder exactly its creation's mode
+# argument, which is what umask 000 leaves: owner-only here is owner-only
+# under EVERY default ACL, on any filesystem, with no setfacl.
+_UMASK_000 = "umask() { builtin umask 000; }\nbuiltin umask 000\n"
 
 
 @pytest.mark.skipif(
@@ -3467,13 +3483,33 @@ class TestBringUpShOnARealShell:
         assert stat.S_IMODE((root / "sub").stat().st_mode) == 0o700
         assert (root / "sub" / ".env").read_bytes() == b"K=V\n"
 
-    def test_a_default_acl_cannot_widen_a_folder_created_on_the_way(self, rig):
+    @pytest.fixture(params=["umask-000-model", "real-acl"])
+    def ignored_umask(self, request, monkeypatch):
+        """What a default ACL on a parent does to a new folder: the umask
+        stops counting. ``umask-000-model`` is the deterministic gate (see
+        ``_UMASK_000``); ``real-acl`` is the canary that the model matches
+        the kernel. Returns the step that readies a parent folder."""
+        if request.param == "real-acl":
+            return _grant_by_default_acl
+        script = node_scripts.script
+
+        def blind(name: str) -> str:
+            head, sep, rest = script(name).partition("\nset -euo pipefail\n")
+            assert sep, f"{name}.sh has no `set -euo pipefail` line"
+            return head + sep + _UMASK_000 + rest
+
+        monkeypatch.setattr(node_scripts, "script", blind)
+        return lambda path: None
+
+    def test_a_default_acl_cannot_widen_a_folder_created_on_the_way(
+        self, rig, ignored_umask
+    ):
         # A default ACL on the parent makes the kernel ignore the umask: under
         # `umask 077` alone, sub/ and sub/deeper/ came out 0755, listable by
         # anyone. The file itself stays 0600 either way (mktemp).
         root = rig["root"]
         root.mkdir(parents=True)
-        _grant_by_default_acl(root)
+        ignored_umask(root)
         self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
         modes = [
             stat.S_IMODE(p.stat().st_mode)
@@ -3499,12 +3535,14 @@ class TestBringUpShOnARealShell:
         ]
         assert modes == [0o751, 0o755, 0o700]
 
-    def test_a_default_acl_cannot_widen_the_seeded_memory_folders(self, rig):
+    def test_a_default_acl_cannot_widen_the_seeded_memory_folders(
+        self, rig, ignored_umask
+    ):
         # The seed lands under ~/.claude, on a home that may carry a default
         # ACL: every folder the seed creates is 0700, and ~/.claude, already
         # there, keeps its own mode.
         home = Path.home()
-        _grant_by_default_acl(home)
+        ignored_umask(home)
         claude = home / ".claude"
         claude.mkdir()
         claude.chmod(0o755)
