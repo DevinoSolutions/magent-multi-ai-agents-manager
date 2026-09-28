@@ -71,6 +71,12 @@ if mode == "flood":
     said = next((r["stderr"] for m, r in replies if m in " ".join(args)), "")
     sys.stderr.buffer.write(said.encode("utf-8"))
     sys.stderr.flush()
+    if said:
+        # The words must be read before the flood reaches the cap, and stamped
+        # so on any clock: Windows' before Python 3.13 ticks every 15.6 ms, and
+        # a read that ties the cap counts as after it. The pause sets the
+        # order, not a race.
+        time.sleep(0.3)
     block = b"x" * 65536
     try:
         while True:
@@ -128,8 +134,8 @@ class FakeSsh:
 
     def set_mode(self, mode: str) -> None:
         """``"timeout"``: every call hangs silently for 5s. ``"flood"``: every
-        call writes a matching reply's stderr (if any), then streams stdout without
-        end and never exits on its own."""
+        call writes a matching reply's stderr (if any, then pauses 0.3s), then
+        streams stdout without end and never exits on its own."""
         (self.base / "mode.txt").write_text(mode, encoding="utf-8")
 
     def calls(self) -> list[FakeCall]:
