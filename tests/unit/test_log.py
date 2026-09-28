@@ -64,6 +64,75 @@ class TestGetLogger:
         assert not any(t.is_alive() for t in threads)
         assert len(logging.getLogger("magent.race").handlers) == 1
 
+    def test_a_thread_that_asks_mid_configuration_waits_for_the_handler(
+        self, monkeypatch
+    ):
+        # The unlocked fast path trusts the configured sentinel, so it must be
+        # set after the handler is attached: a thread that asks while the first
+        # caller is still attaching has to wait for the lock, not take a
+        # handler-less logger whose records miss the file.
+        real_lock = log._CONFIGURE_LOCK
+        reached = threading.Event()  # the asker is at the lock, or already done
+        askers: list[threading.Thread] = []
+
+        class _Lock:
+            def __enter__(self) -> None:
+                if threading.current_thread() in askers:
+                    reached.set()
+                real_lock.acquire()
+
+            def __exit__(self, *exc: object) -> None:
+                real_lock.release()
+
+        def ask() -> None:
+            log.get_logger("midway").warning("from the asker")
+            reached.set()
+
+        real_add = logging.Logger.addHandler
+
+        def add_handler(self: logging.Logger, handler: logging.Handler) -> None:
+            if self.name == "magent.midway" and not askers:
+                askers.append(threading.Thread(target=ask))
+                askers[0].start()
+                assert reached.wait(10)
+            real_add(self, handler)
+
+        monkeypatch.setattr(log, "_CONFIGURE_LOCK", _Lock())
+        monkeypatch.setattr(logging.Logger, "addHandler", add_handler)
+        log.get_logger("midway").warning("from the first caller")
+        askers[0].join(timeout=10)
+        assert not askers[0].is_alive()
+        text = (log.LOG_DIR / "midway.log").read_text(encoding="utf-8")
+        assert "from the first caller" in text
+        assert "from the asker" in text
+
+    def test_a_thread_that_asks_as_the_lock_is_released_attaches_nothing(
+        self, monkeypatch
+    ):
+        # ...and set inside the lock: a caller that arrives the instant the
+        # first one lets go must find the logger configured, not configure it
+        # a second time and write every record twice.
+        real_lock = log._CONFIGURE_LOCK
+        askers: list[threading.Thread] = []
+
+        class _Lock:
+            def __enter__(self) -> None:
+                real_lock.acquire()
+
+            def __exit__(self, *exc: object) -> None:
+                real_lock.release()
+                if not askers:
+                    askers.append(
+                        threading.Thread(target=log.get_logger, args=("released",))
+                    )
+                    askers[0].start()
+                    askers[0].join(timeout=10)
+
+        monkeypatch.setattr(log, "_CONFIGURE_LOCK", _Lock())
+        log.get_logger("released")
+        assert not askers[0].is_alive()
+        assert len(logging.getLogger("magent.released").handlers) == 1
+
     def test_mkdir_failure_falls_back_to_null_handler(self, monkeypatch):
         def _raise(*a, **k):
             raise OSError("read-only filesystem")
