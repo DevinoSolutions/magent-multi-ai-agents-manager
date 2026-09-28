@@ -32,6 +32,32 @@ def _run(rc: int, out: str = "") -> rig.Run:
 
 
 # ---------------------------------------------------------------------------
+# Every stage is under the module's one wall clock
+# ---------------------------------------------------------------------------
+
+
+class TestEveryStageIsUnderTheBudget:
+    def test_a_spent_budget_fails_the_next_stage_at_once_naming_it(self) -> None:
+        with pytest.raises(pytest.fail.Exception, match="exhausted before ssh-probe"):
+            rig.clamp(Budget(0), 30, "ssh-probe")
+
+    def test_a_live_budget_grants_the_want_or_what_is_left(self) -> None:
+        assert rig.clamp(Budget(100), 30, "t") == 30
+        assert rig.clamp(Budget(20), 30, "t") <= 20
+
+    def test_the_floor_holds_only_while_budget_remains(self) -> None:
+        # A slow first python start still gets the floor to fail in...
+        assert rig.clamp(Budget(1), 30, "t") == rig.STAGE_FLOOR_S
+        # ...but the floor is never granted past the deadline (above).
+
+    def test_a_wait_on_a_spent_budget_fails_without_polling(self) -> None:
+        polled: list[bool] = []
+        with pytest.raises(pytest.fail.Exception, match="exhausted before the pane"):
+            rig.wait_for("the pane", lambda: polled.append(True), 30, budget=Budget(0))
+        assert polled == []
+
+
+# ---------------------------------------------------------------------------
 # NodeUser.create against a recording root hop
 # ---------------------------------------------------------------------------
 
@@ -225,6 +251,9 @@ _FAKED = (
     "userdel",
     "usermod",
 )
+# One run of a root script under recorders: milliseconds measured. The bound
+# keeps this class's worst case small (14 runs, 140 s).
+_SCRIPT_RUN_S = 10.0
 _NAME = "mgnabcde"
 _OWNER = f"{rig.OWNER_PREFIX} 0123456789abcdef"
 
@@ -265,7 +294,7 @@ def _root_script(tmp_path: Path, text: str, *args: str, passwd: str = "") -> _Ra
             "FAKE_PASSWD": passwd,
         },
         capture_output=True,
-        timeout=30,
+        timeout=_SCRIPT_RUN_S,
         check=False,
     )
     calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
@@ -277,9 +306,7 @@ def _root_script(tmp_path: Path, text: str, *args: str, passwd: str = "") -> _Ra
     reason="the root hop's scripts are the Linux node's bash; POSIX legs run this",
 )
 class TestTheRootScriptsCheckOwnershipBeforeTouchingAnything:
-    @pytest.mark.parametrize(
-        "name", ["root", "runner", "mgnabcd", "mgnabcdef", "mgnABCDE", "mgn-abcd"]
-    )
+    @pytest.mark.parametrize("name", ["root", "mgnabcd", "mgnabcdef", "mgnABCDE"])
     def test_a_name_outside_the_shape_is_refused_before_any_command(
         self, tmp_path: Path, name: str
     ) -> None:

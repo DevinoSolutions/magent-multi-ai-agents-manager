@@ -35,6 +35,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from typing import TYPE_CHECKING
@@ -57,6 +58,7 @@ from tests.e2e._nodes_rig import (
     alive,
     all_calls_target,
     child_env,
+    clamp,
     install_stand_in,
     node_wire_or_skip,
     run_files,
@@ -77,6 +79,9 @@ if TYPE_CHECKING:
 pytestmark = [pytest.mark.nodes_real]
 
 _READY = re.compile(r"NODE-READY (\S+) (fresh|continue|resume)")
+# One local child (the stand-in, an env load): under a second measured. The
+# bound keeps the always-runnable half's worst case small (9 runs, 135 s).
+_LOCAL_RUN_S = 15.0
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +106,7 @@ def _agent(tmp_path: Path, repo: Path, *args: str, stdin: bytes = b"") -> Run:
         [sys.executable, str(repo / AGENT_DIR / "node_agent.py"), *args],
         tmp_path,
         "agent",
-        60,
+        _LOCAL_RUN_S,
         env=env,
         cwd=repo,
         stdin=stdin,
@@ -194,7 +199,7 @@ class TestTheStandInKeepsClaudesStartContract:
             [sys.executable, str(repo / AGENT_DIR / "node_agent.py")],
             tmp_path,
             "agent-canary",
-            60,
+            _LOCAL_RUN_S,
             env=env,
             cwd=repo,
         )
@@ -274,7 +279,7 @@ class TestEveryPcChildCarriesTheIsolationPins:
             [sys.executable, "-c", "from magent.env import MagentEnv; MagentEnv()"],
             tmp_path,
             "env-load",
-            60,
+            _LOCAL_RUN_S,
             env=child_env(tmp_path, sync=True),
             cwd=tmp_path,
         )
@@ -367,6 +372,7 @@ def _wait_start_count(rig: NodeRig, n: int) -> list[dict[str, object]]:
         f"the stand-in has started {n} time(s)",
         lambda: len(rig.starts()) >= n,
         30,
+        budget=rig.budget,
         explain=rig.diag,
     )
     return rig.starts()
@@ -722,6 +728,7 @@ class TestANodeHostsAProjectEndToEnd:
             "status reports the node sync daemon ok",
             lambda: _sync_state(rig) == "ok",
             30,
+            budget=rig.budget,
             explain=rig.diag,
             interval=1.0,
         )
@@ -731,6 +738,7 @@ class TestANodeHostsAProjectEndToEnd:
             "the daemon mirrored the new turn",
             lambda: _mirrored(rig, f"poke {tok}"),
             40,
+            budget=rig.budget,
             explain=rig.diag,
             interval=1.0,
         )
@@ -739,7 +747,12 @@ class TestANodeHostsAProjectEndToEnd:
         stopped = rig.magent("node", "sync", "--stop", tag="sync-stop")
         assert stopped.rc == 0, stopped.show()
         _said_line(rig, stopped, "Stopped the node sync daemon.")
-        wait_for(f"daemon pid {pid} gone", lambda: not alive(pid), 15)
+        wait_for(
+            f"daemon pid {pid} gone",
+            lambda: not alive(pid, rig.budget),
+            15,
+            budget=rig.budget,
+        )
         assert _sync_state(rig) == "stopped"
 
         # serve keeps a daemon running for a config with a node project.
@@ -758,12 +771,16 @@ class TestANodeHostsAProjectEndToEnd:
             "serve's supervisor started a node sync daemon",
             lambda: _sync_state(rig) == "ok",
             30,
+            budget=rig.budget,
             explain=rig.diag,
             interval=1.0,
         )
         for proc in rig.spawned:
             proc.kill()
-            proc.wait(timeout=30)
+            try:
+                proc.wait(timeout=clamp(rig.budget, 30, "serve exit"))
+            except subprocess.TimeoutExpired:
+                pytest.fail(f"serve pid {proc.pid} did not exit after a kill")
         stopped = rig.magent("node", "sync", "--stop", tag="sync-stop-serve")
         assert stopped.rc == 0, stopped.show()
         _said_line(rig, stopped, "Stopped the node sync daemon.")
@@ -801,6 +818,7 @@ class TestANodeHostsAProjectEndToEnd:
             "the bring-up started a node sync daemon",
             lambda: _sync_state(rig) == "ok",
             30,
+            budget=rig.budget,
             explain=rig.diag,
             interval=1.0,
         )
@@ -811,6 +829,11 @@ class TestANodeHostsAProjectEndToEnd:
         assert down.rc == 0, down.show() + rig.diag()
         _said_line(rig, down, "Stopped the node sync daemon")
         assert rig.session_rc() == 1, rig.diag()
-        wait_for(f"daemon pid {pid} gone", lambda: not alive(pid), 15)
+        wait_for(
+            f"daemon pid {pid} gone",
+            lambda: not alive(pid, rig.budget),
+            15,
+            budget=rig.budget,
+        )
         assert _sync_state(rig) == "stopped"
         assert rig.name not in rig.node_map()

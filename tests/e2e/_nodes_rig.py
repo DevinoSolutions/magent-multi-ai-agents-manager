@@ -34,11 +34,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from tests.e2e._pty import Budget
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
     from magent.nodes import Node
-    from tests.e2e._pty import Budget
 
 NICK = "loop"
 # One wall clock for a module's node stages (see _pty.Budget). The healthy D
@@ -46,10 +47,18 @@ NICK = "loop"
 # sits well above this, so a slow stage lands as a FAILURE with its output,
 # never a cancel.
 NODES_BUDGET_S = 300.0
+# The least a stage gets while any budget remains (see clamp).
+STAGE_FLOOR_S = 5.0
 # Teardown gets its own allowance, whatever the module's budget has left: a
 # user that is never deleted is a leak on the runner, and the timeouts below
 # must still fire when the module budget is spent.
 CLEANUP_TIMEOUT_S = 60.0
+# One diag() call: its reads share DIAG_S while the module budget lasts and
+# DIAG_FLOOR_S after it (a failure is usually read after the budget ran out),
+# each read at most DIAG_READ_S. A read with no time left is skipped, named.
+DIAG_S = 30.0
+DIAG_FLOOR_S = 10.0
+DIAG_READ_S = 10.0
 GATE_VAR = "MDTEST_NODES_REAL"
 SSH_VARS = ("MDTEST_SSH_PORT", "MDTEST_SSH_KEY", "MDTEST_SSH_HOST")
 STUB = Path("/usr/local/bin/claude")
@@ -220,10 +229,15 @@ def node_wire_or_skip() -> Wire:
 # ---------------------------------------------------------------------------
 
 
-def clamp(budget: Budget, want: float) -> float:
-    """A stage timeout: ``want``, or what is left of ``budget``, floored at 5s
-    so an exhausted budget still yields a stage that fails with its output."""
-    return max(5.0, budget.clamp(want))
+def clamp(budget: Budget, want: float, tag: str) -> float:
+    """A stage timeout: ``want``, or what is left of ``budget``, floored at
+    ``STAGE_FLOOR_S`` while any budget remains -- a slow first python start
+    still gets to fail with its output. Once the budget is spent the stage
+    FAILS here, naming itself: the floor is not granted again to every stage
+    after the deadline."""
+    if budget.remaining() <= 0:
+        pytest.fail(f"budget exhausted before {tag}")
+    return max(STAGE_FLOOR_S, budget.clamp(want))
 
 
 def token(n: int = 6) -> str:
@@ -311,13 +325,16 @@ def run_files(
 def wait_for(
     what: str,
     check: Callable[[], object],
-    timeout: float,
+    want: float,
     *,
+    budget: Budget,
     explain: Callable[[], str] = lambda: "",
     interval: float = 0.5,
 ) -> object:
     """Poll ``check`` until it is truthy, or FAIL naming ``what`` and whatever
-    ``explain`` adds. Bounded: at most ``timeout`` plus one check."""
+    ``explain`` adds. Bounded: ``want`` clamped to ``budget``, plus one check
+    (itself clamped where it runs a child)."""
+    timeout = clamp(budget, want, what)
     deadline = time.monotonic() + timeout
     while True:
         got = check()
@@ -364,7 +381,7 @@ class Remote:
             ["ssh", *SSH_OPTS, self.target, remote],
             self.out_dir,
             f"ssh-{tag}",
-            clamp(self.budget, want),
+            clamp(self.budget, want, f"ssh-{tag}"),
         )
 
     def script(
@@ -377,7 +394,7 @@ class Remote:
             ["ssh", *SSH_OPTS, self.target, remote],
             self.out_dir,
             f"ssh-{tag}",
-            timeout or clamp(self.budget, want),
+            timeout or clamp(self.budget, want, f"ssh-{tag}"),
             stdin=text.encode("utf-8"),
         )
 
@@ -781,7 +798,7 @@ class NodeRig:
             ["git", *_GIT_IDENT, *args],
             self.out,
             "git",
-            clamp(self.budget, want),
+            clamp(self.budget, want, f"git {args[0]}"),
             env=git_env(self.wire),
             cwd=cwd,
         )
@@ -863,7 +880,7 @@ class NodeRig:
             [sys.executable, "-m", "magent", "--config", str(pc.cfg), *args],
             self.out,
             f"magent-{tag}",
-            clamp(self.budget, want),
+            clamp(self.budget, want, f"magent-{tag}"),
             env=self.env(pc, sync=sync),
             cwd=self.base,
         )
@@ -982,7 +999,8 @@ class NodeRig:
                 f"poke {tok}".encode() in data
                 for data in self.node_transcripts().values()
             ),
-            clamp(self.budget, 30),
+            30,
+            budget=self.budget,
             explain=self.diag,
         )
 
@@ -1013,18 +1031,25 @@ class NodeRig:
 
     def diag(self) -> str:
         """What a failed stage needs to be read: the node's sessions, the
-        stand-in's log, the PC logs and the shim's calls. Never raises; each
-        read is independently bounded, whatever the budget has left."""
+        stand-in's log, the PC logs and the shim's calls. Never raises. The
+        node reads share one allowance (``DIAG_S``, or ``DIAG_FLOOR_S`` once
+        the module budget is spent), so a wedged sshd costs a failure at most
+        that long; a read with nothing left is skipped, named."""
         parts: list[str] = []
+        allowance = Budget(max(DIAG_FLOOR_S, min(DIAG_S, self.budget.remaining())))
 
         def node(title: str, argv: Sequence[str]) -> None:
+            timeout = allowance.clamp(DIAG_READ_S)
+            if timeout <= 0:
+                parts.append(f"--- node: {title} ---\n(skipped: diag allowance spent)")
+                return
             try:
                 remote = "bash -c " + shlex.quote(shlex.join(argv))
                 done = subprocess.run(
                     ["ssh", *SSH_OPTS, self.node.target, remote],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
-                    timeout=20,
+                    timeout=timeout,
                     check=False,
                 )
                 text = (done.stdout + done.stderr).decode("utf-8", "replace")
@@ -1075,11 +1100,15 @@ class NodeRig:
         tmux server, its stand-ins and its sessions with it. Returns what
         could not be cleaned, for the fixture to fail on."""
         problems: list[str] = []
+        # The PC side shares ONE allowance, so teardown has a fixed bound; the
+        # user delete keeps its own, so a wedged PC-side stop can never cost
+        # the node its cleanup. Each step gets at least a second.
+        pc_side = Budget(CLEANUP_TIMEOUT_S)
         for proc in self.spawned:
             if proc.poll() is None:
                 proc.kill()
                 try:
-                    proc.wait(timeout=CLEANUP_TIMEOUT_S)
+                    proc.wait(timeout=max(1.0, pc_side.clamp(10)))
                 except subprocess.TimeoutExpired:
                     problems.append(f"pid {proc.pid} did not die")
         for pc in self.pcs:
@@ -1092,7 +1121,7 @@ class NodeRig:
                     ],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
-                    timeout=CLEANUP_TIMEOUT_S,
+                    timeout=max(1.0, pc_side.clamp(30)),
                     env=self.env(pc),
                     cwd=self.base,
                     check=False,
@@ -1126,7 +1155,7 @@ def _kill(pid: int) -> None:
         return
 
 
-def alive(pid: int) -> bool:
+def alive(pid: int, budget: Budget) -> bool:
     """Whether ``pid`` is a live process on this machine (a zombie counts:
     the daemon is detached, so no one here will reap it -- ``ps`` tells)."""
     if not _alive(pid):
@@ -1135,7 +1164,7 @@ def alive(pid: int) -> bool:
         ["ps", "-o", "stat=", "-p", str(pid)],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=clamp(budget, 10, f"ps {pid}"),
         check=False,
     ).stdout.strip()
     return bool(state) and not state.startswith("Z")
