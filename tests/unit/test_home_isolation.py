@@ -15,6 +15,7 @@ needs pins. These assert on the real seams the redirect uses -- a real
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -113,6 +114,101 @@ class TestToolCachesSurviveTheRedirect:
         # future non-linux browser leg does not inherit a guess.
         monkeypatch.setattr(sys, "platform", platform)
         assert _playwright_browsers_path() == REAL_HOME.joinpath(*tail)
+
+
+# Windows PowerShell, the shell the Session-0 hand-off launcher really runs.
+_POWERSHELL = shutil.which("powershell.exe") if sys.platform == "win32" else None
+
+# The same lookup .NET's GetFolderPath makes, from a child that has no startup
+# side effects of its own. KF_FLAG_DEFAULT (0) verifies the folder exists, so a
+# missing one is an HRESULT rather than a path.
+_KNOWN_FOLDER_CHILD = """
+import ctypes, sys, uuid
+guid = (ctypes.c_char * 16).from_buffer_copy(uuid.UUID(sys.argv[1]).bytes_le)
+path = ctypes.c_wchar_p()
+hr = ctypes.windll.shell32.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(path))
+print(path.value if hr == 0 else f"HRESULT 0x{hr & 0xFFFFFFFF:08X}")
+ctypes.windll.ole32.CoTaskMemFree(path)
+"""
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="the Windows known-folder API; POSIX has none"
+)
+class TestTheTmpHomeResolvesItsKnownFolders:
+    """A redirected USERPROFILE moves the Windows known folders with it --
+    but only if the profile tree they name exists.
+
+    Against an EMPTY tmp home, .NET's ``GetFolderPath('LocalApplicationData')``
+    inside a powershell.exe child answers ``''``: it resolves the folder under
+    the redirected profile, finds no ``AppData\\Local`` there, and gives up.
+    PowerShell builds its ModuleAnalysisCache path from that answer, so the
+    path turns CWD-relative, and a real hand-off launcher that lived ~12s past
+    module analysis wrote ``Microsoft\\Windows\\PowerShell\\ModuleAnalysisCache``
+    into pytest's cwd: the repo checkout, one ``git add -A`` from a commit.
+
+    These pin the resolution itself, not the cache flush, which is
+    timer-driven and was never seen under ~12s. powershell.exe creates
+    ``AppData\\Roaming`` on its own at startup (measured), so its
+    ApplicationData answer is right even against an empty home; the direct
+    Win32 lookup has no such side effect, so it is the pin that holds each
+    folder to the fixture.
+    """
+
+    @pytest.mark.skipif(_POWERSHELL is None, reason="powershell.exe not on PATH")
+    @pytest.mark.parametrize("folder", ["LocalApplicationData", "ApplicationData"])
+    def test_a_powershell_child_resolves_it_inside_the_tmp_home(self, tmp_path, folder):
+        assert _POWERSHELL is not None  # narrowed by the skipif above
+        r = subprocess.run(
+            [
+                _POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f"[Environment]::GetFolderPath('{folder}')",
+            ],
+            # Not the checkout: at red, this child must not be the one that
+            # drops a cache into it.
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert r.returncode == 0, r.stderr
+        resolved = r.stdout.strip()
+        assert resolved, (
+            f"GetFolderPath('{folder}') is empty under the tmp home, so anything "
+            "PowerShell derives from it is relative to the CWD"
+        )
+        assert Path(resolved).is_relative_to(Path.home()), (
+            f"{folder} resolved to {resolved}, outside the tmp home {Path.home()}"
+        )
+
+    @pytest.mark.parametrize(
+        ("folder", "folder_id"),
+        [
+            ("LocalAppData", "F1B32785-6FBA-4FCF-9D55-7B8E7F157091"),
+            ("RoamingAppData", "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D"),
+        ],
+    )
+    def test_the_win32_lookup_resolves_it_inside_the_tmp_home(
+        self, tmp_path, folder, folder_id
+    ):
+        r = subprocess.run(
+            [sys.executable, "-c", _KNOWN_FOLDER_CHILD, folder_id],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert r.returncode == 0, r.stderr
+        resolved = r.stdout.strip()
+        assert Path(resolved).is_relative_to(Path.home()), (
+            f"SHGetKnownFolderPath({folder}) answered {resolved!r}; wanted a "
+            f"path inside the tmp home {Path.home()}"
+        )
 
 
 class TestTheTripwireFires:
