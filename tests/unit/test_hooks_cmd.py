@@ -504,6 +504,8 @@ class TestASettingsFileMagentCannotUnderstand:
 
 # A settings.json install can read and wire, holding a key it must not leak.
 _VALID = b"{" + _ENV + b'"model": "keep-me"}'
+# Planted as its mtime: far enough in the past that any touch shows.
+_OLD_MTIME_NS = 10**18
 
 
 class TestASettingsFileMagentCannotWrite:
@@ -518,6 +520,7 @@ class TestASettingsFileMagentCannotWrite:
         settings = tmp_path / "claude" / "settings.json"
         settings.parent.mkdir()
         settings.write_bytes(_VALID)
+        os.utime(settings, ns=(_OLD_MTIME_NS, _OLD_MTIME_NS))
         return settings
 
     @staticmethod
@@ -530,6 +533,9 @@ class TestASettingsFileMagentCannotWrite:
         )
         assert _where_the_secret_survives(result.exception) == []
         assert settings.read_bytes() == _VALID
+        # The writability probe opens the file r+b and closes it: no
+        # truncation, no write, so not even the mtime moves.
+        assert settings.stat().st_mtime_ns == _OLD_MTIME_NS
         assert [p.name for p in settings.parent.iterdir()] == ["settings.json"]
 
     def test_a_failed_replace_removes_the_temp_file(
