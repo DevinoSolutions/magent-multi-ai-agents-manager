@@ -431,6 +431,24 @@ class TestTextWithNoUtf8FormIsRefusedAtLoad:
             load_config(path)
         assert str(exc.value) == _refusal(where)
 
+    @pytest.mark.parametrize(
+        ("where", "config"),
+        [
+            ("a key in the config", {_LONE: _LONE, **_one(), "baseDir": _LONE}),
+            (
+                "projects[0].title",
+                {"projects": [{"path": "a", "title": _LONE}, {"path": _LONE}]},
+            ),
+        ],
+        ids=["a-key-before-its-value", "an-earlier-list-item"],
+    )
+    def test_the_first_offending_string_in_the_file_is_the_one_named(
+        self, tmp_config, where, config
+    ):
+        with pytest.raises(ConfigError) as exc:
+            load_config(tmp_config(config))
+        assert str(exc.value) == _refusal(where)
+
 
 class TestAttentionSettings:
     def test_defaults_when_absent(self, tmp_config):
