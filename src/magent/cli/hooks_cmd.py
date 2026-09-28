@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import time
 from pathlib import Path
 
@@ -202,14 +203,26 @@ def _write_settings(path: Path, data: dict[str, object]) -> str | None:
     read-only file as freely as over any other (a rename is the directory's
     business), so the replace alone would overwrite a settings.json the user
     made read-only -- and hand it back writable.
+
+    The replacement keeps the old file's mode. A new file is born with the
+    umask's, so a 0600 settings.json -- keys in its "env" block -- would come
+    back 0644; the temp file is born owner-only instead, so the keys are never
+    in a file anyone else can open, and given the old mode just before the
+    replace. A first install keeps the umask default.
     """
     tmp = path.with_suffix(".tmp")
     try:
-        if path.exists():
+        existing = path.stat() if path.exists() else None
+        if existing is not None:
             with path.open("r+b"):
                 pass
+            # Born here: a leftover temp file would bring its own mode.
+            tmp.unlink(missing_ok=True)
+            tmp.touch(mode=0o600)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        if existing is not None:
+            os.chmod(tmp, stat.S_IMODE(existing.st_mode))
         os.replace(tmp, path)
     except OSError as exc:
         with contextlib.suppress(OSError):

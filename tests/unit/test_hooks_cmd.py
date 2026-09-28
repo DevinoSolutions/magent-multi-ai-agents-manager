@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -560,6 +561,26 @@ class TestASettingsFileMagentCannotWrite:
         assert temp_files == [("settings.tmp", True)]
         self._assert_refused_untouched(result, settings)
 
+    def test_a_failed_chmod_removes_the_temp_file(self, runner, tmp_path, monkeypatch):
+        # Handing the temp file the old mode is part of the write: its
+        # failure is refused the same way, not carried on without the mode.
+        settings = self._plant(tmp_path)
+        real_chmod = os.chmod
+        temp_files = []
+
+        def chmod(path, mode, *args, **kwargs):
+            if Path(path).name != "settings.tmp":
+                return real_chmod(path, mode, *args, **kwargs)
+            temp_files.append(Path(path).is_file())
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(os, "chmod", chmod)
+
+        result = _install(runner, settings)
+
+        assert temp_files == [True]
+        self._assert_refused_untouched(result, settings)
+
     def test_a_read_only_file_is_refused_untouched(self, runner, tmp_path):
         settings = self._plant(tmp_path)
         # 0444 on POSIX; on Windows it sets the read-only attribute.
@@ -598,6 +619,76 @@ class TestASettingsFileMagentCannotWrite:
         finally:
             settings.chmod(0o644)
         self._assert_refused_untouched(result, settings)
+
+
+_POSIX_MODES = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows has no POSIX mode bits: chmod only sets the read-only attribute",
+)
+
+
+class TestARewrittenSettingsFileKeepsItsMode:
+    """install replaces settings.json with a new file, and a new file is born
+    with the umask's mode: a 0600 settings.json -- keys in its "env" block --
+    came back 0644. The replacement keeps the old mode, and the keys never sit
+    in a temp file anyone else can open."""
+
+    @_POSIX_MODES
+    @pytest.mark.parametrize("mode", [0o600, 0o640, 0o644], ids=oct)
+    def test_install_keeps_the_files_mode(self, runner, tmp_path, mode):
+        settings = tmp_path / "settings.json"
+        settings.write_bytes(_VALID)
+        settings.chmod(mode)
+
+        result = _install(runner, settings)
+
+        assert result.exit_code == 0, result.output
+        assert "Wired" in result.stdout
+        assert stat.S_IMODE(settings.stat().st_mode) == mode
+
+    @_POSIX_MODES
+    def test_a_first_install_keeps_the_umask_default(self, runner, tmp_path):
+        born = tmp_path / "born.json"
+        born.write_text("{}", encoding="utf-8")  # the umask default, measured
+        settings = tmp_path / "settings.json"
+
+        result = _install(runner, settings)
+
+        assert result.exit_code == 0, result.output
+        assert stat.S_IMODE(settings.stat().st_mode) == stat.S_IMODE(
+            born.stat().st_mode
+        )
+
+    @_POSIX_MODES
+    @pytest.mark.parametrize("leftover", [False, True], ids=["fresh", "leftover"])
+    def test_the_temp_file_is_owner_only_until_it_takes_the_mode(
+        self, runner, tmp_path, monkeypatch, leftover
+    ):
+        settings = tmp_path / "settings.json"
+        settings.write_bytes(_VALID)
+        settings.chmod(0o600)
+        if leftover:
+            # A temp file an older magent left behind, readable by anyone.
+            stale = tmp_path / "settings.tmp"
+            stale.write_bytes(b"{}")
+            stale.chmod(0o644)
+        real_chmod = os.chmod
+        seen = []
+
+        def chmod(path, mode, *args, **kwargs):
+            if Path(path).name == "settings.tmp":
+                # The keys are written by now: nobody but the owner may read.
+                others = stat.S_IMODE(os.stat(path).st_mode) & 0o077
+                seen.append((oct(others), oct(mode)))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "chmod", chmod)
+
+        result = _install(runner, settings)
+
+        assert result.exit_code == 0, result.output
+        assert seen == [("0o0", "0o600")]
+        assert stat.S_IMODE(settings.stat().st_mode) == 0o600
 
 
 class TestStatus:
