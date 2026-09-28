@@ -6085,6 +6085,9 @@ class TestSetupShUnderRealBash:
             "did",
             "id_ed25519 made owner-only: it was 0644, now 0600",
         )
+        assert _report(r).keys() == {
+            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        }
         assert r.returncode == 0, r.stderr
 
     @pytest.mark.parametrize(
@@ -6130,6 +6133,7 @@ class TestSetupShUnderRealBash:
             "did",
             "id_ed25519 made owner-only (0600): its earlier mode could not be read",
         )
+        assert b"Operation not permitted" not in r.stdout + r.stderr
         assert r.returncode == 0, r.stderr
 
     @pytest.mark.parametrize(
@@ -6166,6 +6170,8 @@ class TestSetupShUnderRealBash:
         r = _run_setup(env)
         assert self._row(r, "node-key:amin") == ("fail", detail)
         assert set(_report(r).keys()) == set()
+        # magent's words, never chmod's.
+        assert b"Operation not permitted" not in r.stdout + r.stderr
         assert r.returncode == 1
         ran = _keygen_calls(state)[len(before) :]
         if existing:
@@ -6192,6 +6198,39 @@ class TestSetupShUnderRealBash:
         r = _run_setup(env)
         assert victim.stat().st_mode & 0o777 == 0o644
         assert victim.read_bytes() == b"x\n"
+        assert _rows(r)["node-key:amin"] == "fail"
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
+    def test_a_dangling_symlinked_node_key_is_never_written_through(self, tmp_path):
+        # `-h` is true for a dangling link too: ssh-keygen would otherwise
+        # write the new private key wherever the link points.
+        state, env = _setup_box(tmp_path)
+        target = tmp_path / "elsewhere" / "planted"
+        target.parent.mkdir()
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        (ssh_dir / "id_ed25519").symlink_to(target)
+        r = _run_setup(env)
+        assert not target.exists()
+        assert _keygen_calls(state) == []
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            "amin's .ssh or its id_ed25519 is a symlink; magent does not write through it",
+        )
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
+    def test_a_directory_named_like_the_node_key_keeps_its_mode(self, tmp_path):
+        # `-f`, not `-e`: chmod 600 would take a directory's x bit.
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        blocker = ssh_dir / "id_ed25519"
+        blocker.mkdir()
+        blocker.chmod(0o755)
+        r = _run_setup(env)
+        assert blocker.stat().st_mode & 0o777 == 0o755
         assert _rows(r)["node-key:amin"] == "fail"
         assert set(_report(r).keys()) == set()
         assert r.returncode == 1
