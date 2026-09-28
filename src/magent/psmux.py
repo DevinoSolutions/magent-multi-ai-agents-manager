@@ -652,26 +652,65 @@ def pane_cwd(name: str, psmux: str | None = None) -> str:
         return (result.stdout or "").strip() if result.returncode == 0 else ""
 
 
-def capture_pane(name: str, psmux: str | None = None) -> str:
-    """Return the active pane's visible text, or ``""``. Same guards as
-    ``pane_cwd``: bounded, decode-tolerant, and never raises."""
+# How long one `capture-pane` gets to answer. The bound is there for a WEDGED
+# psmux, which answers nothing at all for as long as the machine stays up --
+# unbounded, `peek` / `sessions --json` / `send` would hang with it. It is NOT
+# a liveness verdict: a merely slow control command on a loaded box has been
+# measured past 3s (see ``SEND_KEYS_TIMEOUT_S``), so running out this clock
+# says "unread", never "no pane". Read at call time, so a test can widen it.
+CAPTURE_PANE_TIMEOUT_S = 3.0
+
+
+@dataclass(frozen=True)
+class PaneCapture:
+    """One ``capture-pane``: the text, and whether the clock ran out first.
+
+    ``timed_out`` is the distinction ``capture_pane``'s bare string cannot
+    carry. ``text == ""`` with ``timed_out=False`` is an ANSWER (an empty pane,
+    a dead socket, an unlaunchable binary); with ``timed_out=True`` nothing is
+    known about the pane at all -- the session may be live and busy.
+    """
+
+    text: str
+    timed_out: bool
+
+
+def read_pane(name: str, psmux: str | None = None) -> PaneCapture:
+    """Capture the active pane's visible text, telling a timeout apart.
+
+    Same guards as ``pane_cwd``: bounded (``CAPTURE_PANE_TIMEOUT_S``),
+    decode-tolerant, and never raises.
+    """
     binary = psmux or find_psmux()
     if not binary:
-        return ""
+        return PaneCapture(text="", timed_out=False)
     try:
         result = subprocess.run(
             [binary, "-L", name, "capture-pane", "-p", "-t", name],
             capture_output=True,
-            timeout=3,
+            timeout=CAPTURE_PANE_TIMEOUT_S,
             encoding="utf-8",
             errors="replace",
             check=False,
             creationflags=_SPAWN_FLAGS,
         )
+    except subprocess.TimeoutExpired:
+        return PaneCapture(text="", timed_out=True)
     except (OSError, subprocess.SubprocessError):
-        return ""
-    else:
-        return (result.stdout or "") if result.returncode == 0 else ""
+        return PaneCapture(text="", timed_out=False)
+    text = (result.stdout or "") if result.returncode == 0 else ""
+    return PaneCapture(text=text, timed_out=False)
+
+
+def capture_pane(name: str, psmux: str | None = None) -> str:
+    """Return the active pane's visible text, or ``""``.
+
+    For callers that only POLL for text to appear (a timed-out read is simply
+    "not yet"). Anything that REPORTS on a pane -- a state, a delivery
+    verdict, a tail -- must use ``read_pane``, because here a timeout and an
+    empty pane are the same ``""``.
+    """
+    return read_pane(name, psmux).text
 
 
 # Foreground commands that mean "this pane is sitting at a prompt with no

@@ -294,6 +294,14 @@ class TestAgainstARealFakePsmuxBinary:
     """End-to-end through a genuine on-disk fake psmux executable: the literal
     text and the slash-command reach a real process exactly as typed."""
 
+    @pytest.fixture(autouse=True)
+    def _patient_capture(self, monkeypatch):
+        # The capture budget in these tests only. The fake is a Python shim;
+        # on a loaded Windows box its start alone has overrun the product's 3s,
+        # and a green parse then failed as "nopane". What a capture timeout
+        # DOES is pinned below with its own, tiny budget.
+        monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 60.0)
+
     def test_paste_and_enter_reaches_the_binary(self, tmp_path, monkeypatch):
         monkeypatch.setattr(time, "sleep", lambda *_: None)
         fake = make_fake_psmux(tmp_path)
@@ -316,6 +324,15 @@ class TestAgainstARealFakePsmuxBinary:
         fake = make_fake_psmux(tmp_path, pane=f"PS> claude\nOpus 5 {MID} max")
         state = fleet.read_state("api", psmux_bin=fake.path)
         assert state == {"state": "idle", "model": "Opus 5", "effort": "max"}
+
+    def test_a_pane_slower_than_the_budget_reads_timeout_not_nopane(
+        self, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, pane=f"PS> claude\nOpus 5 {MID} max")
+        fake.set_capture_delay(1.5)
+        monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 0.3)
+        state = fleet.read_state("api", psmux_bin=fake.path)
+        assert state == {"state": "timeout", "model": None, "effort": None}
 
 
 if __name__ == "__main__":  # pragma: no cover
