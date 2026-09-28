@@ -187,7 +187,10 @@ capture() {
 # outright: a default ACL on a parent makes the kernel ignore the umask for a
 # new folder (GitHub's runner homes carry one), and `mkdir -p -m` gives the
 # mode to the last folder only. A folder already there is the node's own and
-# keeps its mode.
+# keeps its mode -- one that appears between the walk and the mkdir too:
+# another bring-up (one person's second PC) made it, as `mkdir -p` shrugged
+# off. mkdir's own words stay off the screen; a caller that gets 1 says why
+# in the script's.
 mkdir_private() {
   local dir=$1
   local -a made=()
@@ -196,7 +199,7 @@ mkdir_private() {
     capture dir dirname -- "$dir" || return 1
   done
   for dir in "${made[@]}"; do
-    mkdir -m 700 -- "$dir" || return 1
+    mkdir -m 700 -- "$dir" 2>/dev/null || [ -d "$dir" ] || return 1
   done
   [ -d "$1" ]
 }

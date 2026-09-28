@@ -492,6 +492,9 @@ time.sleep(90)
 
 # A child that leaves that grandchild behind, waits for its pid file (so the
 # teardown never finds it missing), says argv[2] on stderr, then floods stdout.
+# When the reader stops at the cap the child leaves WITHOUT a word: Python's
+# BrokenPipeError traceback would land on stderr after argv[2], racing the
+# kill, and glue itself to a half-written last line.
 _HELD_STDERR_CHILD = (
     f"GRANDCHILD = {_HELD_STDERR_GRANDCHILD!r}\n"
     """\
@@ -508,11 +511,30 @@ while not os.path.exists(sys.argv[1]) and time.monotonic() < deadline:
 sys.stderr.write(sys.argv[2])
 sys.stderr.flush()
 block = b"x" * 65536
-while True:
-    sys.stdout.buffer.write(block)
-    sys.stdout.flush()
+try:
+    while True:
+        sys.stdout.buffer.write(block)
+        sys.stdout.flush()
+except OSError:
+    os._exit(1)
 """
 )
+
+# A child with no grandchild that says argv[1] on stderr, then floods stdout.
+# When the reader stops at the cap it keeps stderr open and waits: the stream
+# ends only when the kill reaches it, as ssh's own stderr does.
+_KILLED_STDERR_CHILD = """\
+import sys, time
+sys.stderr.write(sys.argv[1])
+sys.stderr.flush()
+block = b"x" * 65536
+try:
+    while True:
+        sys.stdout.buffer.write(block)
+        sys.stdout.flush()
+except OSError:
+    time.sleep(60)
+"""
 
 
 class TestTheReplyIsBoundedInMemory:
@@ -661,6 +683,32 @@ class TestTheReplyIsBoundedInMemory:
         error, _ = self._flood_past_a_held_stderr(tmp_path)
         assert "boom: disk full" in error.stderr_tail.splitlines()[1:]
 
+    @pytest.fixture(params=["as-it-comes", "pipe-closed-first", "kill-read-first"])
+    def kill_order(self, request, monkeypatch):
+        """What comes first after the cap. ``pipe-closed-first`` holds the kill
+        back, so the child always writes into the pipe the reader closed first
+        -- the order a loaded box produced, where the child's words must still
+        be just what it said. ``kill-read-first`` lets the kill land in full
+        before _spawn goes on: a stream the kill ended has been read to its
+        end, and looks just like one that ended on its own to any question
+        asked after the kill."""
+        kill = remote_mux._kill
+        if request.param == "pipe-closed-first":
+
+            def late_kill(proc: subprocess.Popen[bytes]) -> None:
+                time.sleep(1.5)
+                kill(proc)
+
+            monkeypatch.setattr(remote_mux, "_kill", late_kill)
+        elif request.param == "kill-read-first":
+
+            def settled_kill(proc: subprocess.Popen[bytes]) -> None:
+                kill(proc)
+                time.sleep(0.5)
+
+            monkeypatch.setattr(remote_mux, "_kill", settled_kill)
+
+    @pytest.mark.usefixtures("kill_order")
     def test_a_stderr_held_open_mid_line_never_hands_over_the_fragment(self, tmp_path):
         # The stream is still open, so its last line may be half-written: only
         # whole lines are the child's words, and the row shows the last one.
@@ -673,23 +721,58 @@ class TestTheReplyIsBoundedInMemory:
         assert "writing blo" not in error.stderr_tail
         assert launch._node_error_text(error) == "boom: disk full"
 
+    @pytest.mark.usefixtures("kill_order")
     def test_a_stderr_held_open_before_a_whole_line_gives_no_reason(self, tmp_path):
         # No line has ended yet: the cap is the whole story, never a fragment.
         error, _ = self._flood_past_a_held_stderr(tmp_path, said="writing blo")
         assert error.stderr_tail == f"reply exceeded {CAP} bytes"
         assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
 
+    @pytest.mark.usefixtures("kill_order")
+    def test_a_stderr_the_kill_ended_mid_line_never_hands_over_the_fragment(self):
+        # No grandchild: the kill ends the stream, as it ends ssh's own. That
+        # is no end of the child's saying -- the kill cut it off wherever it
+        # was -- so the half line goes just as from a stream still open. The
+        # base interpreter, for the reason the next pin gives.
+        python = getattr(sys, "_base_executable", sys.executable)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux._spawn(
+                [
+                    python,
+                    "-I",
+                    "-c",
+                    _KILLED_STDERR_CHILD,
+                    "boom: disk full\nwriting blo",
+                ],
+                timeout_s=60,
+                input_bytes=None,
+                check=True,
+                shown=("child",),
+                label="test child",
+                quiet=True,
+                max_stdout_bytes=CAP,
+            )
+        assert exc.value.over_cap
+        lines = exc.value.stderr_tail.splitlines()
+        assert lines[0] == f"reply exceeded {CAP} bytes"
+        assert "boom: disk full" in lines[1:]
+        assert "writing blo" not in exc.value.stderr_tail
+        assert launch._node_error_text(exc.value) == "boom: disk full"
+
     def test_a_stderr_that_ended_keeps_its_last_line_without_a_newline(self):
-        # An ENDED stream was not cut off mid-write, so its last line is whole
-        # even unterminated: only a stream still open is trimmed. The base
+        # A stream that ended BEFORE the kill was not cut off mid-write, so its
+        # last line is whole even unterminated: any other is trimmed. The child
+        # pauses after closing it, so the stream has ended well before the
+        # flood can reach the cap: the pause sets the order, not a race. The base
         # interpreter, not sys.executable: on Windows that is a venv launcher
         # holding its own copy of the pipe, so the stream would end only once
         # the kill reached through it.
         child = (
-            "import os, sys\n"
+            "import os, sys, time\n"
             "sys.stderr.write('boom: disk full')\n"
             "sys.stderr.flush()\n"
             "os.close(2)\n"
+            "time.sleep(0.2)\n"
             "block = b'x' * 65536\n"
             "while True:\n"
             "    sys.stdout.buffer.write(block)\n"
@@ -2835,6 +2918,29 @@ case $cmd in
     umask > "$state/umask"
     { echo "cwd=$cwd"; echo "env=$env"; echo "cmd=$*"; } > "$state/sessions/$name"
     exit 0 ;;
+  set | setw | rename-window)
+    # A -t here is a PANE/WINDOW target, as real tmux reads it: `=sid` with no
+    # colon is no session at all (measured: "no such session: =sid", exit 1),
+    # and only a live session takes the option. What it took goes to
+    # applied.log -- the decoration's `|| true` hides every refusal.
+    target=
+    prev=
+    for arg; do
+      [ "$prev" = -t ] && target=$arg
+      prev=$arg
+    done
+    if [ -n "$target" ]; then
+      case $target in
+        *:*) ;;
+        *) echo "no such session: $target" >&2; exit 1 ;;
+      esac
+      name=${target%%:*}
+      if [ ! -f "$state/sessions/${name#=}" ]; then
+        echo "can't find session: ${name#=}" >&2; exit 1
+      fi
+    fi
+    echo "$cmd $*" >> "$state/applied.log"
+    exit 0 ;;
   *) exit 0 ;;
 esac
 """
@@ -2891,6 +2997,15 @@ class TestTheScriptLiterals:
             assert "mkdir_private " in body
             assert "umask" not in body
             assert "mkdir " not in body
+
+    def test_a_folder_that_appears_meanwhile_is_already_there(self):
+        # Another bring-up may make a folder between the walk and the mkdir:
+        # that is "already there", not a failure, and mkdir's words stay off
+        # the screen (the rig proves both on a real shell).
+        helper = _shell_function(node_scripts._read("bring_up"), "mkdir_private")
+        assert 'mkdir -m 700 -- "$dir" 2>/dev/null || [ -d "$dir" ] || return 1' in (
+            helper
+        )
 
     def test_the_archive_is_never_extracted_with_absolute_names(self):
         text = node_scripts._read("bring_up")
@@ -2991,6 +3106,49 @@ def _no_real_acl(reason: str) -> NoReturn:
 _UMASK_000 = "umask() { builtin umask 000; }\nbuiltin umask 000\n"
 
 
+# The mkdir shims of test_node_recall.py (integ-G, fa44f46), same shapes.
+def _mkdir_shim(tmp_path: Path, monkeypatch, body: str) -> None:
+    """A ``mkdir`` ahead of the real one on PATH. ``body`` runs with the
+    folder private_dir asked for in $last and the real mkdir in $real."""
+    real = shutil.which("mkdir")
+    assert real is not None
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "mkdir"
+    shim.write_text(
+        f"#!/bin/sh\nreal={shlex.quote(real)}\nfor last; do :; done\n{body}",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
+
+
+# Another install makes the folder first -- 0700, as its private_dir would
+# -- so this one's mkdir finds it there and fails: the race mkdir -p hid.
+_LOSES_THE_RACE = (
+    '"$real" -m 700 -- "$last" || exit 2\n'
+    "echo \"mkdir: cannot create directory '$last': File exists\" >&2\n"
+    "exit 1\n"
+)
+
+
+def _refuses(folder: str) -> str:
+    """A mkdir that fails on ``folder`` and leaves nothing there, and is the
+    real one for every other folder."""
+    return (
+        f'case "$last" in {shlex.quote(folder)})\n'
+        "  echo \"mkdir: cannot create directory '$last': Permission denied\" >&2\n"
+        "  exit 1 ;;\n"
+        "esac\n"
+        'exec "$real" "$@"\n'
+    )
+
+
+# bring_up.sh's mkdir_private is its only `mkdir -m`: every other mkdir there
+# (the scratch folder beside the payload) is the real one.
+_ONLY_MKDIR_PRIVATE = '[ "$1" = -m ] || exec "$real" "$@"\n'
+
+
 @pytest.mark.skipif(
     sys.platform != "linux", reason="nodes are Linux; real bash/git/tar"
 )
@@ -3047,6 +3205,12 @@ class TestBringUpShOnARealShell:
 
     def _log(self, rig):
         return (rig["state"] / "calls.log").read_text(encoding="utf-8")
+
+    def _applied(self, rig):
+        """What the fake tmux TOOK: the set/setw/rename-window calls a live
+        session accepted. ``calls.log`` has every call, refused or not."""
+        path = rig["state"] / "applied.log"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def _push_raw(self, rig, payload: bytes):
         root = str(rig["root"])
@@ -3124,7 +3288,7 @@ class TestBringUpShOnARealShell:
         assert result.attached_existing is True
         assert not rig["root"].exists()
         assert "new-session" not in self._log(rig)
-        assert "status-left-length 18" in self._log(rig)
+        assert "set -t =api: status-left-length 18\n" in self._applied(rig)
 
     def test_a_second_bring_up_fast_forwards_to_origin(self, rig):
         clone, state = rig["clone"], rig["state"]
@@ -3412,13 +3576,50 @@ class TestBringUpShOnARealShell:
         assert f"magent: {said}" in info.value.stderr_tail
 
     def test_the_decoration_brands_the_node(self, rig):
+        # Read from what the fake tmux TOOK, never from what was sent: every
+        # decoration line is `|| true`, so a target tmux refuses (a bare
+        # `=sid` on set/setw/rename-window) left this rig green on calls.log.
         remote_mux.bring_up(rig["node"], rig["recipe"])
-        log = self._log(rig)
+        applied = self._applied(rig)
         assert (
-            "-L magent set -t =api: status-left #[bold,fg=green] magent #[default]@second"
-            in log
+            "set -t =api: status-left #[bold,fg=green] magent #[default]@second"
+            in applied
         )
-        assert "-L magent set -t =api: status-left-length 18" in log
+        assert "set -t =api: status-left-length 18\n" in applied
+        # All eight option commands landed, not only the two named above.
+        sent = [
+            " ".join(argv[3:])
+            for argv in remote_mux.decoration_args("api", "second", False)
+            if argv[3] in ("set", "setw", "rename-window")
+        ]
+        assert len(sent) == 8
+        assert applied.splitlines() == sent
+
+    def test_the_fake_tmux_reads_a_target_as_tmux_does(self, rig):
+        # The rig's judge of the decoration. A session command takes a bare
+        # `=sid`; set/setw/rename-window read -t as a PANE/WINDOW target and
+        # refuse one (tmux 3.4: "no such session: =api", exit 1), taking the
+        # exact session only as `=sid:`.
+        (rig["state"] / "sessions" / "api").write_bytes(b"cmd=x\n")
+
+        def tmux(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["tmux", "-L", "magent", *args],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        assert tmux("has-session", "-t", "=api").returncode == 0
+        assert tmux("has-session", "-t", "=web").returncode == 1
+        refused = tmux("set", "-t", "=api", "status-left", "X")
+        assert (refused.returncode, refused.stderr) == (1, "no such session: =api\n")
+        assert tmux("setw", "-t", "=api", "automatic-rename", "off").returncode == 1
+        assert tmux("rename-window", "-t", "=api", "api").returncode == 1
+        assert tmux("set", "-t", "=web:", "status-left", "X").returncode == 1
+        assert self._applied(rig) == ""
+        assert tmux("set", "-t", "=api:", "status-left", "X").returncode == 0
+        assert self._applied(rig) == "set -t =api: status-left X\n"
 
     def test_an_encoded_name_outside_the_alphabet_is_exit_2(self, rig):
         with pytest.raises(RemoteError) as info:
@@ -3695,6 +3896,80 @@ class TestBringUpShOnARealShell:
         ]
         assert modes == [0o755, 0o700, 0o700, 0o700]
         assert stat.S_IMODE((store / "memory" / "MEMORY.md").stat().st_mode) == 0o600
+
+    def test_a_folder_another_bring_up_made_first_is_not_a_refusal(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # One person's two PCs bring up at once on a fresh node: every folder
+        # the walk found missing, the other mkdir_private made (0700) a moment
+        # before this mkdir ran. mkdir -p shrugged that off; so must this, and
+        # mkdir's "File exists" never reaches the screen.
+        root = rig["root"]
+        root.mkdir(parents=True)
+        _mkdir_shim(tmp_path, monkeypatch, _ONLY_MKDIR_PRIVATE + _LOSES_THE_RACE)
+        result = self._push_raw(
+            rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n"))
+        )
+        assert result.returncode == 0
+        assert b"mkdir" not in result.stderr
+        assert json.loads(result.stdout)["shipped"] == ["sub/deeper/.env"]
+        modes = [
+            stat.S_IMODE(p.stat().st_mode)
+            for p in (
+                root / "sub",
+                root / "sub" / "deeper",
+                root / "sub" / "deeper" / ".env",
+            )
+        ]
+        assert modes == [0o700, 0o700, 0o600]
+
+    def test_a_seed_folder_another_bring_up_made_first_is_not_a_refusal(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The seed's walk, from a home with no ~/.claude yet, loses the same
+        # race on every folder: the bring-up goes on and the seed lands.
+        _mkdir_shim(tmp_path, monkeypatch, _ONLY_MKDIR_PRIVATE + _LOSES_THE_RACE)
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        claude = Path.home() / ".claude"
+        memory = claude / "projects" / rig["enc"] / "memory"
+        assert (memory / "MEMORY.md").read_bytes() == b"- remember\n"
+        modes = [
+            stat.S_IMODE(p.stat().st_mode)
+            for p in (claude, claude / "projects", memory.parent, memory)
+        ]
+        assert modes == [0o700] * 4
+
+    def test_a_folder_that_cannot_be_made_is_refused_in_the_scripts_words(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # A mkdir that really fails, and leaves nothing: the push dies with
+        # exit 5 and the script's own line, mkdir's words off the screen, and
+        # nothing written.
+        root = rig["root"]
+        root.mkdir(parents=True)
+        _mkdir_shim(tmp_path, monkeypatch, _refuses(f"{root}/sub"))
+        with pytest.raises(RemoteError) as info:
+            self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
+        assert info.value.rc == 5
+        assert (
+            info.value.stderr_tail
+            == "magent: cannot create a folder for sub/deeper/.env"
+        )
+        assert _tree(root) == []
+
+    def test_a_seed_folder_that_cannot_be_made_is_refused_in_the_scripts_words(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The seed's own refusal: exit 5 before any session starts, the
+        # script's own line, and no memory written.
+        dest = Path.home() / ".claude" / "projects" / rig["enc"] / "memory"
+        _mkdir_shim(tmp_path, monkeypatch, _refuses(str(dest)))
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 5
+        assert info.value.stderr_tail == f"magent: cannot create {dest}"
+        assert not dest.exists()
+        assert not (rig["state"] / "sessions" / "api").exists()
 
     def test_a_failed_decoration_still_starts_the_session(self, rig):
         # The one step allowed to fail: a bare status line is not a failed
