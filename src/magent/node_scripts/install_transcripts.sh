@@ -72,11 +72,12 @@ under_a_file() {
 # whose private_dir made it: success, as mkdir -p had it. Any other failure
 # -- no folder, or one made that the chmod could not restrict -- is said in
 # this script's words (mkdir's stay off the screen) and returns 1; each
-# caller refuses with exit 5.
+# caller refuses with exit 5. chmod's -- comes before the mode: BSD chmod
+# (macOS) stops reading options at the mode, so a -- after it is a file.
 private_dir() {
   [ -d "$1" ] && return 0
   if mkdir -m 700 -- "$1" 2>/dev/null; then
-    chmod 700 -- "$1" && return 0
+    chmod -- 700 "$1" && return 0
     printf 'install_transcripts.sh: cannot restrict folder %s to its owner; no file installed\n' \
       "$1" >&2
   elif [ -d "$1" ]; then
