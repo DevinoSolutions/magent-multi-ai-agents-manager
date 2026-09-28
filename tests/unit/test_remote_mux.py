@@ -21,6 +21,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import types
 from importlib import resources
@@ -822,6 +823,32 @@ class TestTheReplyIsBoundedInMemory:
         assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
         if kill_order in _KILL_WAITS:
             assert _COMPLAINT in str(error)
+
+    @pytest.mark.parametrize(
+        "ending", ["killed", "dies-at-the-pipe", "complains-at-the-pipe"]
+    )
+    def test_a_stderr_whose_end_ties_the_cap_is_trimmed(self, monkeypatch, ending):
+        # A coarse clock (Windows' before Python 3.13 ticks every 15.6 ms)
+        # stamps the cap and the stream's end alike. Which came first is then
+        # unknown, and a tie trims. Each thread's first reading here is 0.0
+        # and every later one 1000.0: on any clock, the words read first come
+        # before the cap, and the end -- or a complaint at the pipe -- ties it.
+        first: set[int] = set()
+
+        def monotonic() -> float:
+            if threading.get_ident() in first:
+                return 1000.0
+            first.add(threading.get_ident())
+            return 0.0
+
+        monkeypatch.setattr(
+            remote_mux, "time", types.SimpleNamespace(monotonic=monotonic)
+        )
+        error = self._flood_past_a_plain_stderr("boom: disk full\nwriting blo", ending)
+        assert error.stderr_tail.splitlines()[0] == f"reply exceeded {CAP} bytes"
+        assert "boom: disk full" in error.stderr_tail.splitlines()[1:]
+        assert "writing blo" not in error.stderr_tail
+        assert "Broken pipe" not in error.stderr_tail
 
     def test_a_stderr_that_ended_keeps_its_last_line_without_a_newline(self):
         # A stream that ended BEFORE the cap was not cut off mid-write, so its
