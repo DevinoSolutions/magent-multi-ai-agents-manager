@@ -275,7 +275,8 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
     ``os.replace``) is retried ``_BUSY_RETRIES`` times ``_BUSY_SLEEP_S`` apart,
     then re-raised; any other ``OSError``, and a torn, non-object or too
     deeply nested file (``ValueError``), propagate. So does ONE malformed
-    entry: a ``ValueError`` naming the file, the entry's key and why. An
+    entry: a ``ValueError`` naming the file, the entry's key and why
+    (``malformed_entry`` reads the key back off it). An
     entry that cannot be read is a hand edit or corruption, the same class as
     a torn file -- dropped, it read as "not placed" to every caller of this
     read, and the next ``update_node_map`` wrote the map back without it.
@@ -287,10 +288,25 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
     return _load_node_map(strict=True)
 
 
+# G-MERGE: MalformedMapEntry carries a refused entry's key for status's "node sync paused" (round-2 ruling 3); keep it at the K/F merges
+class MalformedMapEntry(ValueError):
+    """Why ONE node-map entry could not be read, carrying its key. It is the
+    ``__cause__`` of the ``ValueError`` ``load_node_map_strict`` raises for
+    that entry, never the error itself: every surface names that refusal
+    ``ValueError``, the torn file's family, and a surface that shows the entry
+    asks ``malformed_entry`` for the key. The key is the file's, anything at
+    all: a screen shows it only through ``node_sync.printable``."""
+
+    def __init__(self, project: str, why: str) -> None:
+        super().__init__(why)
+        self.project = project
+
+
 def _load_node_map(*, strict: bool) -> dict[str, NodeMapEntry]:
     """The one parse behind both readers. A whole-file failure raises either
-    way; a malformed entry raises when ``strict``, and otherwise is dropped
-    alone with one nodes.log WARNING naming its key and why."""
+    way; a malformed entry raises when ``strict`` -- a ``ValueError`` whose
+    cause, a ``MalformedMapEntry``, carries the key -- and otherwise is
+    dropped alone with one nodes.log WARNING naming its key and why."""
     for attempt in range(_BUSY_RETRIES + 1):
         try:
             text = NODE_MAP_PATH.read_text(encoding="utf-8")
@@ -320,7 +336,9 @@ def _load_node_map(*, strict: bool) -> dict[str, NodeMapEntry]:
         except ValueError as exc:
             why = f"{NODE_MAP_PATH}: entry {project!r} is malformed: {exc}"
             if strict:
-                raise ValueError(why) from exc
+                cause = MalformedMapEntry(str(project), str(exc))
+                cause.__cause__ = exc
+                raise ValueError(why) from cause
             get_logger("nodes").warning(
                 "node map: %s; skipped by a best-effort read", why
             )
@@ -356,6 +374,15 @@ def map_unread_text(exc: BaseException) -> str:
     error's own text names the map's path and the parser's words, which go
     to nodes.log, never the screen."""
     return f"{MAP_UNREAD} ({type(exc).__name__})"
+
+
+# G-MERGE: malformed_entry names the entry status's "node sync paused" line shows (round-2 ruling 3); keep it at the K/F merges
+def malformed_entry(exc: BaseException) -> str | None:
+    """The key of the one entry that made a strict read refuse the map (the
+    error's cause is a ``MalformedMapEntry``), or None for any other refusal:
+    a torn, busy or non-object file names no entry."""
+    cause = exc.__cause__
+    return cause.project if isinstance(cause, MalformedMapEntry) else None
 
 
 def write_node_map(entries: Mapping[str, NodeMapEntry]) -> None:
@@ -1639,7 +1666,13 @@ def node_session_state(
     return "live" if sid in snap.sessions else "dead"
 
 
-def session_rows(config: MagentConfig, *, now: float) -> list[dict[str, object]]:
+# G-MERGE: on_unreadable hands status the map's error for "node sync paused" (round-2 ruling 3); keep it at the K/F merges
+def session_rows(
+    config: MagentConfig,
+    *,
+    now: float,
+    on_unreadable: Callable[[OSError | ValueError], None] | None = None,
+) -> list[dict[str, object]]:
     """One row per node project, config order: ``name``, ``session``,
     ``node`` (the nick; None for an ``auto`` project not yet placed, or whose
     placement cannot be read) and ``state`` (``NODE_SESSION_STATES``). An
@@ -1651,13 +1684,17 @@ def session_rows(config: MagentConfig, *, now: float) -> list[dict[str, object]]
     non-object map would read as "nothing was ever placed" and turn a live
     session dead. A map this PC cannot read says nothing about any row -- the
     node AND the sid come from it -- so every row reads ``stale``, the same
-    law as an unreachable node, and the reason goes to nodes.log."""
+    law as an unreachable node, and the reason goes to nodes.log.
+    ``on_unreadable``, when given, is handed that error too: ``status``
+    names a paused node sync with it."""
     try:
         entries: dict[str, NodeMapEntry] | None = load_node_map_strict()
     except (OSError, ValueError) as exc:
         get_logger("nodes").warning(
             "node map unreadable; every node session reads stale: %s", exc
         )
+        if on_unreadable is not None:
+            on_unreadable(exc)
         entries = None
     interval = config.settings.node_sync.pull_interval_s
     rows: list[dict[str, object]] = []

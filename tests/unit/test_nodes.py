@@ -303,6 +303,11 @@ class TestTheNodeMap:
         assert str(node_map) in text
         assert "'db'" in text
         assert why in text
+        # Round-2 ruling 3: still exactly the ValueError every surface
+        # names, and its cause carries the key, for status to name the
+        # entry the node sync is paused on.
+        assert type(caught.value) is ValueError
+        assert nodes.malformed_entry(caught.value) == "db"
 
     def test_every_dropped_key_is_one_warning(self, node_map, nodes_warnings):
         node_map.parent.mkdir(parents=True)
@@ -3114,8 +3119,10 @@ class TestSessionRows:
             ProjectConfig(path=str(tmp_path / "api"), node="auto"),
             ProjectConfig(path=str(tmp_path / "web"), node="second"),
         )
-        healthy = nodes.session_rows(config, now=1010.0)
+        seen: list[BaseException] = []
+        healthy = nodes.session_rows(config, now=1010.0, on_unreadable=seen.append)
         assert [r["state"] for r in healthy] == ["live", "live"]
+        assert seen == []
         if damage == "torn":
             text = node_map.read_text(encoding="utf-8")
             node_map.write_text(text[: len(text) // 2], encoding="utf-8")
@@ -3131,9 +3138,17 @@ class TestSessionRows:
             )
             monkeypatch.setattr(nodes.time, "sleep", lambda s: None)
         with caplog.at_level("WARNING", logger="magent.nodes"):
-            rows = nodes.session_rows(config, now=1010.0)
+            rows = nodes.session_rows(config, now=1010.0, on_unreadable=seen.append)
         assert rows == [
             {"name": "api", "session": "api", "node": None, "state": "stale"},
             {"name": "web", "session": "web", "node": "second", "state": "stale"},
         ]
         assert "node map unreadable" in caplog.text
+        # Round-2 ruling 3: the caller is handed the error too -- status
+        # names a paused node sync with it -- and only a malformed entry
+        # names a key.
+        cls = "PermissionError" if damage == "busy" else "ValueError"
+        assert [type(e).__name__ for e in seen] == [cls]
+        assert [nodes.malformed_entry(e) for e in seen] == [
+            "web" if damage == "malformed-entry" else None
+        ]

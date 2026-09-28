@@ -229,6 +229,8 @@ To own the listener's lifetime yourself, set `MAGENT_HOTKEY_SUPERVISOR=0`; `stat
 
 A session brought up again on the same node continues its newest conversation there (`claude --continue`); only a recall picks a conversation by id.
 
+A `node-map.json` magent cannot read, torn or with one malformed entry, pauses the node sync: no node is pulled until the file reads again. `magent status` shows `node sync paused` under Nodes, naming the malformed entry, with the file to fix or move aside, and `status --json` carries it as `node_sync_paused`. The exit code does not change: among the node checks only a stale sync daemon degrades it. A map that is only busy (another process is writing it) is not a pause.
+
 ## Usage
 
 Run `magent` with no arguments for the interactive menu:

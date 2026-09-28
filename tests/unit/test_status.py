@@ -396,6 +396,7 @@ class TestJson:
             "psmux_sessions": [],
             "psmux_session0": 0,
             "node_sessions": [],
+            "node_sync_paused": None,
         }
 
     def test_degraded_emits_parseable_status_and_exit_3(
@@ -423,6 +424,7 @@ class TestJson:
             "psmux_sessions": [],
             "psmux_session0": 0,
             "node_sessions": [],
+            "node_sync_paused": None,
         }
 
 
@@ -1882,6 +1884,210 @@ class TestAStaleNodeSyncDaemonDegradesStatus:
             assert (
                 status_mod._is_degraded({**healthy, "node_sync": state}) is degraded
             ), state
+
+
+# One readable node-map entry, as update_node_map writes it.
+_MAP_ENTRY = {
+    "nick": "second",
+    "sid": "api",
+    "placed_ts": 1.0,
+    "attached_existing": False,
+    "remote_root": "/home/amin/magent/api",
+}
+
+
+class TestANodeMapTheSyncCannotReadIsShownAsSyncPaused:
+    """Round-2 ruling 3: a node map the sync cannot read -- one malformed
+    entry makes the strict read refuse the whole file -- pauses every pull
+    (node_sync's _map_unreadable dials no node). Visible, never silent:
+    status names the pause, the entry through node_sync.printable and the
+    repair, and --json carries it additively. A busy map is a moment the next
+    tick retries, not a pause. The exit is unchanged: among the node checks
+    only a stale daemon degrades (_node_sync_state)."""
+
+    @pytest.fixture(autouse=True)
+    def _sync_expected(self, monkeypatch, tmp_path):
+        from magent import nodes
+
+        TestAStaleNodeSyncDaemonDegradesStatus._switch(monkeypatch, "1")
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+
+    @staticmethod
+    def _config(tmp_config, tmp_path):
+        (tmp_path / "api").mkdir(exist_ok=True)
+        return tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "api"), "title": "api", "node": "auto"}
+                ],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+            }
+        )
+
+    @staticmethod
+    def _write_map(raw):
+        from magent import nodes
+
+        nodes.NODE_MAP_PATH.write_text(json.dumps(raw), encoding="utf-8")
+
+    def _malformed(self, key="api"):
+        # placed_ts is not a time: _map_entry refuses the entry.
+        self._write_map({key: {**_MAP_ENTRY, "placed_ts": "soon"}})
+
+    @staticmethod
+    def _status(runner, cfgpath, *extra):
+        return runner.invoke(cli.main, ["--config", cfgpath, "status", *extra])
+
+    def test_a_malformed_entry_names_the_pause_the_entry_and_the_repair(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import nodes
+
+        cfgpath = self._config(tmp_config, tmp_path)
+        self._malformed()
+
+        result = self._status(runner, cfgpath)
+
+        assert result.exit_code == 0, result.output
+        assert (
+            "node sync paused  (the node map could not be read (ValueError):"
+            " entry 'api' is malformed; nothing is pulled from any node)"
+        ) in result.stdout
+        assert (
+            f"Repair: fix entry 'api' in {nodes.NODE_MAP_PATH}, or move the file"
+            " aside  (nodes.log says what is wrong)"
+        ) in result.stdout
+        # The why is nodes.log's: the screen has our words, the class, the key.
+        assert "not a finite number" not in result.output
+        # The row still says unknown, never unplaced.
+        assert "(node unknown)" in result.stdout
+        assert "(not placed)" not in result.stdout
+
+    @pytest.mark.parametrize(
+        ("key", "shown"),
+        [("\x1b[2Jevil", "?[2Jevil"), ("\u00e9vil\u200b", "?vil?")],
+        ids=["escape", "non-ascii"],
+    )
+    def test_the_entry_reaches_the_screen_only_as_printable_ascii(
+        self, runner, tmp_config, tmp_path, key, shown
+    ):
+        # The key is whatever the file holds. CliRunner strips ANSI, so a raw
+        # escape would read as "evil": the pin is the '?' printable put there.
+        cfgpath = self._config(tmp_config, tmp_path)
+        self._malformed(key)
+
+        result = self._status(runner, cfgpath)
+        as_json = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 0, result.output
+        assert f"entry '{shown}' is malformed" in result.stdout
+        assert f"fix entry '{shown}' in" in result.stdout
+        assert json.loads(as_json.stdout)["node_sync_paused"] == {
+            "error": "ValueError",
+            "entry": shown,
+        }
+
+    def test_a_torn_map_is_a_pause_that_names_no_entry(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import nodes
+
+        cfgpath = self._config(tmp_config, tmp_path)
+        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+
+        result = self._status(runner, cfgpath)
+
+        assert result.exit_code == 0, result.output
+        assert (
+            "node sync paused  (the node map could not be read (ValueError);"
+            " nothing is pulled from any node)"
+        ) in result.stdout
+        assert (
+            f"Repair: fix {nodes.NODE_MAP_PATH}, or move it aside"
+            "  (nodes.log says what is wrong)"
+        ) in result.stdout
+        assert "is malformed" not in result.output
+
+    def test_a_busy_map_is_a_moment_not_a_pause(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # Another process's write in flight: the next tick retries it. Its
+        # rows still read unknown, never unplaced (inv-unknown).
+        from magent import nodes
+
+        def busy() -> dict[str, nodes.NodeMapEntry]:
+            raise PermissionError(13, "The process cannot access the file")
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        cfgpath = self._config(tmp_config, tmp_path)
+
+        result = self._status(runner, cfgpath)
+        as_json = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 0, result.output
+        assert "node sync paused" not in result.stdout
+        assert "(node unknown)" in result.stdout
+        assert json.loads(as_json.stdout)["node_sync_paused"] is None
+
+    def test_with_the_sync_switched_off_nothing_is_paused(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # No daemon is expected, so none is paused.
+        TestAStaleNodeSyncDaemonDegradesStatus._switch(monkeypatch, "0")
+        cfgpath = self._config(tmp_config, tmp_path)
+        self._malformed()
+
+        result = self._status(runner, cfgpath)
+        payload = json.loads(self._status(runner, cfgpath, "--json").stdout)
+
+        assert result.exit_code == 0, result.output
+        assert "node sync paused" not in result.stdout
+        assert (payload["node_sync"], payload["node_sync_paused"]) == ("off", None)
+
+    def test_a_readable_map_shows_no_pause(self, runner, tmp_config, tmp_path):
+        cfgpath = self._config(tmp_config, tmp_path)
+        self._write_map({"api": _MAP_ENTRY})
+
+        result = self._status(runner, cfgpath)
+        as_json = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 0, result.output
+        assert "node sync paused" not in result.stdout
+        assert json.loads(as_json.stdout)["node_sync_paused"] is None
+
+    @pytest.mark.parametrize(
+        ("damage", "paused"),
+        [
+            ("malformed", {"error": "ValueError", "entry": "api"}),
+            ("torn", {"error": "ValueError", "entry": None}),
+        ],
+    )
+    def test_json_carries_the_pause_additively_and_keeps_the_exit(
+        self, runner, tmp_config, tmp_path, damage, paused
+    ):
+        from magent import nodes
+
+        cfgpath = self._config(tmp_config, tmp_path)
+        if damage == "malformed":
+            self._malformed()
+        else:
+            nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+
+        result = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["node_sync_paused"] == paused
+        assert payload["node_sync"] == "stopped"
+        assert payload["node_sessions"] == [
+            {"name": "api", "session": "api", "node": None, "state": "stale"}
+        ]
 
 
 def _hold_lock_file(path: Path) -> int:

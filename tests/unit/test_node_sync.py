@@ -1597,10 +1597,23 @@ class TestMarksMoveOnlyAfterAPull:
 
 
 def _make_unreadable(state: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Torn on disk, or intact but still locked after the strict read's
-    retries (a Windows reader racing a replace)."""
+    """Torn on disk, one entry the strict read refuses, or intact but still
+    locked after the strict read's retries (a Windows reader racing a
+    replace)."""
     if state == "torn":
         nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        return
+    if state == "malformed":
+        # Round-2 ruling 3: one malformed entry makes the whole map
+        # unreadable, so it pauses the sync exactly as a torn file does.
+        entry = {
+            "nick": "second",
+            "sid": "api",
+            "placed_ts": "soon",
+            "attached_existing": False,
+            "remote_root": "~/magent/api",
+        }
+        nodes.NODE_MAP_PATH.write_text(json.dumps({"api": entry}), encoding="utf-8")
         return
 
     def busy() -> dict[str, NodeMapEntry]:
@@ -1610,7 +1623,12 @@ def _make_unreadable(state: str, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 _UNREADABLE = pytest.mark.parametrize(
-    ("state", "cls"), [("torn", "ValueError"), ("busy", "PermissionError")]
+    ("state", "cls"),
+    [
+        ("torn", "ValueError"),
+        ("malformed", "ValueError"),
+        ("busy", "PermissionError"),
+    ],
 )
 
 
@@ -1674,6 +1692,8 @@ class TestAnUnreadableMapPullsNothing:
         )
         if state == "torn":
             assert f"{nodes.NODE_MAP_PATH}: Expecting" in warnings[0]
+        elif state == "malformed":
+            assert f"{nodes.NODE_MAP_PATH}: entry 'api' is malformed" in (warnings[0])
         else:
             assert "The process cannot access the file" in warnings[0]
         # Readable again: one line says so, and the pull resumes from the
