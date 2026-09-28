@@ -823,6 +823,45 @@ class TestUpJsonConfigError:
         assert payload["error"]
 
 
+class TestUpRefusesTextWithNoUtf8Form:
+    """F-SUR-1: a title with no UTF-8 form is a config error for `up` too --
+    refused at load, before any psmux read, not at the first echo of its sid."""
+
+    _REFUSAL = (
+        "projects[0].title has text with no UTF-8 form (UnicodeEncodeError):"
+        " 'api\\ud83d'"
+    )
+
+    def _run(self, runner, tmp_path, monkeypatch, *args):
+        def _unreached(*a, **k):
+            raise AssertionError("a refused config must never reach psmux")
+
+        monkeypatch.setattr("magent.launch.psmux_status", _unreached)
+        monkeypatch.setattr("magent.launch.bring_up_psmux", _unreached)
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [
+                        {"path": "api", "title": "api\ud83d", "color": "#22c55e"}
+                    ],
+                }
+            )
+        )
+        return runner.invoke(cli.main, ["--config", str(cfg), "up", *args])
+
+    def test_json_gets_the_config_error_envelope(self, runner, tmp_path, monkeypatch):
+        result = self._run(runner, tmp_path, monkeypatch, "--json")
+        assert result.exit_code == 1
+        assert json.loads(result.stdout) == {"ok": False, "error": self._REFUSAL}
+
+    def test_plain_gets_the_error_line(self, runner, tmp_path, monkeypatch):
+        result = self._run(runner, tmp_path, monkeypatch)
+        assert result.exit_code == 1
+        assert result.stderr == f"Error: {self._REFUSAL}\n"
+
+
 # The `projects` shape psmux_status returns (up --json serializes every key).
 _PROJECT_ROWS = [
     {
