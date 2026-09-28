@@ -3471,6 +3471,8 @@ class TestTextWithNoUtf8FormReachesTheRowInOurWords:
         # writes it as escape text on disk; a strict one would drop the line.
         from magent import log
 
+        # real_node's get_logger made LOG_DIR already. That was safe: conftest's
+        # autouse _isolate_magent_home, which points LOG_DIR here, runs first.
         assert log.LOG_DIR.is_relative_to(tmp_path)
         titled = dataclasses.replace(api, title="api\ud83d")
         assert not launch.bring_up_node_project(_config(titled), titled).ok

@@ -4734,30 +4734,45 @@ class TestTextWithNoUtf8FormLeavesOnlyItsItemUnread:
         assert _unread_row("the plugin list") in report.lines
         assert json.loads(data["mcp_servers.json"]) == {"ok": _HTTP}
 
-    def test_a_step_already_unread_keeps_its_own_class_and_its_one_note(self, fake_ssh):
-        # A scope a wrapper built (plan K) can arrive with a step unread for
-        # its own reason AND such text in that step's item. The row names the
-        # file's real class, once; the item is emptied all the same.
-        own = (
-            "the plugin list: could not be read (JSONDecodeError), so nothing "
-            "from it ships this time"
+    def test_a_step_already_unread_keeps_its_own_class_and_its_one_note(
+        self, fake_ssh, tmp_path
+    ):
+        # The real reader gets here: a known_marketplaces.json that does not
+        # parse leaves plugins unread while settings.enabledPlugins still
+        # lists the id. The row keeps the reader's class and its one note,
+        # under the reader's label; the item is emptied all the same.
+        home = tmp_path / "pc"
+        (home / ".claude" / "plugins").mkdir(parents=True)
+        (home / ".claude" / "settings.json").write_text(
+            '{"enabledPlugins": {"p\\ud83d@mkt": true}, "model": "opus"}',
+            encoding="ascii",
         )
-        report = self._provision(
-            _scope(
-                settings={"model": "opus"},
-                plugins=("p\ud83d@mkt",),
-                marketplaces={"mkt": "https://h/x.git"},
-                notes=(own,),
-                unread={"plugins": "JSONDecodeError"},
-            )
+        (home / ".claude" / "plugins" / "known_marketplaces.json").write_text(
+            "{not json", encoding="ascii"
         )
-        manifest, data = _applied(fake_ssh, report)
-        assert manifest["unread"] == {"plugins": "JSONDecodeError"}
+        scope = _walked(home)
+        assert scope.unread == {"plugins": "JSONDecodeError"}
+        assert "p\ud83d@mkt" in scope.plugins
+        report = self._provision(scope)
+        manifest, _ = _applied(fake_ssh, report)
+        assert manifest["unread"] == {
+            "plugins": "JSONDecodeError",
+            "settings": "UnicodeEncodeError",
+        }
         assert (manifest["plugins"], manifest["marketplaces"]) == ([], {})
-        assert json.loads(data["settings.json"]) == {"model": "opus"}
+        assert _unread_row("settings.json") in report.lines
         assert [
-            line for line in report.lines if line.detail.startswith("the plugin list")
-        ] == [ScriptLine("skip", "scope", own)]
+            line
+            for line in report.lines
+            if line.detail.startswith(("plugins/", "the plugin list"))
+        ] == [
+            ScriptLine(
+                "skip",
+                "scope",
+                "plugins/known_marketplaces.json: could not be read "
+                "(JSONDecodeError), so nothing from it ships this time",
+            )
+        ]
 
     def test_valid_non_ascii_text_ships_byte_for_byte_as_before(self, fake_ssh):
         # The fix changes no bytes: a node's stored digest still matches.

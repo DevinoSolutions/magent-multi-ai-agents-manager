@@ -784,11 +784,11 @@ _ITEM_SOURCES = {
 def _no_utf8_at(value: object) -> tuple[str, ...] | None:
     """The key path to the first string in ``value``, in the item's own
     order -- a key or a value -- that has no UTF-8 form, or None when every
-    one has. json reads a
-    ``\\udXXX`` escape into a lone surrogate, which has none. Tested the
-    sink's own way (``str.encode``), so this can never disagree with
-    ``_digest``. The path is keys only, each through ``_named``: never a
-    value. An explicit stack, like ``_nests_deeper_than``."""
+    one has. json reads a ``\\udXXX`` escape into a lone surrogate, which
+    has none. Tested the sink's own way (``str.encode``), so this can never
+    disagree with ``_digest``. The path is keys only, each through
+    ``_named``: never a value. An explicit stack, like
+    ``_nests_deeper_than``."""
     stack: list[tuple[object, tuple[str, ...]]] = [(value, ())]
     while stack:
         item, path = stack.pop()
