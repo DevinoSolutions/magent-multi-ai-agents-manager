@@ -112,11 +112,11 @@ _HANDOFF_EXIT_GRACE_S = 15.0
 # file appeared were a sharing violation, a sub-millisecond window on an idle
 # box and an unbounded one on a loaded runner). Treating that read as final
 # reported "unreadable exit code ''" for commands that had succeeded, on five
-# windows-latest CI runs. Only a well-formed integer ends the wait; this bounds
-# the wait on an rc.txt that never becomes one (a launcher that wrote no value,
-# a file something keeps locked). It errs long because a false answer here is a
-# succeeded bring-up reported as failed, while the cost of a long one falls only
-# on an rc.txt that is broken anyway.
+# windows-latest CI runs. Only a complete (newline-terminated) integer ends the
+# wait; this bounds the wait on an rc.txt that never becomes one (a launcher
+# that wrote no value, a file something keeps locked). It errs long because a
+# false answer here is a succeeded bring-up reported as failed, while the cost
+# of a long one falls only on an rc.txt that is broken anyway.
 _HANDOFF_RC_GRACE_S = 10.0
 # How long to keep retrying the scratch-directory delete after success. The
 # launcher (powershell.exe) still holds the two redirect files open for the few
@@ -210,8 +210,9 @@ def _handoff_script(
       pid.txt is the "it really started" signal the start-grace check reads;
       rc.txt is the completion signal, and the redirections are closed by the
       time it is written, so a reader that sees it can never read a
-      half-written out.txt. "Sees it" means reads an INTEGER from it:
-      ``Set-Content`` creates each file before it writes the value.
+      half-written out.txt. "Sees it" means reads a complete INTEGER from it
+      (see ``_recorded_int``): ``Set-Content`` creates each file before it
+      writes the value.
     """
     command_line = subprocess.list2cmdline(argv[1:])
     return "\n".join(
@@ -262,48 +263,91 @@ def _one_line(text: str, limit: int = 200) -> str:
     return lines[-1][:limit] if lines else ""
 
 
-def _read_recorded_int(path: Path) -> int | None:
-    """The integer the launcher recorded in ``path`` (its pid.txt or rc.txt),
-    or None until it has written one.
+def _recorded_int(raw: str) -> int | None:
+    """What the launcher recorded, as an integer -- or None if it is not one
+    YET.
 
-    None covers every "not yet": the file is absent, present but empty, or
-    present but still held by the writer (``Set-Content`` creates the file
-    before it writes the value and refuses readers until it closes, and this
-    poll reads every 250ms). All of them mean "no answer yet", never "it
-    failed"; only a well-formed integer is an answer.
+    Complete means newline-terminated: ``Set-Content`` ends every value with
+    one (``7`` lands as ``7\\r\\n``), so a value without it may be a prefix --
+    the ``1`` of ``12`` -- and a prefix must never be final. The one rule
+    every read of pid.txt and rc.txt goes through.
     """
-    raw = _read_handoff_text(path).strip()
+    if not raw.endswith("\n"):
+        return None
     try:
-        return int(raw)
+        return int(raw.strip())
     except ValueError:
         return None
 
 
-def _unreadable_exit_code(
+def _read_recorded_int(path: Path) -> int | None:
+    """The integer the launcher recorded in ``path`` (its pid.txt or rc.txt),
+    or None until it has written one.
+
+    None covers every "not yet": the file is absent, present but empty,
+    present but still held by the writer (``Set-Content`` creates the file
+    before it writes the value and refuses readers until it closes, and this
+    poll reads every 250ms), or present with a value that is not complete. All
+    of them mean "no answer yet", never "it failed"; only a complete integer
+    (see ``_recorded_int``) is an answer.
+    """
+    return _recorded_int(_read_handoff_text(path))
+
+
+def _handoff_finished(out: Path, err: Path, work: Path, rc: int) -> HandoffResult:
+    """The command's own exit code came back: the hand-off itself worked,
+    whatever the command decided, so its scratch directory goes."""
+    stdout, stderr = _read_handoff_text(out), _read_handoff_text(err)
+    _remove_scratch(work)
+    return HandoffResult(rc=rc, stdout=stdout, stderr=stderr)
+
+
+def _settle_exit_code(
     files: tuple[Path, Path, Path, Path], task: str, work: Path, waited_s: float
 ) -> HandoffResult:
-    """The answer for an rc.txt that is there but never became an integer.
+    """The last word on an rc.txt the poll has stopped waiting on.
 
-    Its own answer, distinct from the other three: not "never started" and not
+    One more read, and it is decisive: an exit code that became complete since
+    the poll's last look is the answer, like any other. Otherwise this is the
+    fourth answer, distinct from the other three: not "never started" and not
     "lost its child" (the launcher got as far as its exit code), and not "may
     still be running" (rc.txt is written after WaitForExit, so the command is
     done). The command FINISHED and we cannot say how, so no exit code is
-    fabricated -- but its output, complete by now, is relayed. What the last
-    read saw goes in ``detail``: a held file and a launcher that wrote no value
-    are different bugs.
+    fabricated -- but its output, complete by now, is relayed.
+
+    ``detail`` names what that read saw, in our words: a file still held by
+    its writer and a launcher that wrote no value are different bugs. The OS's
+    own text for a failed read goes to the log, not the screen.
     """
     out, err, _pid, rc_file = files
     try:
-        seen = repr(rc_file.read_text(encoding="utf-8", errors="replace").strip())
+        raw = rc_file.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        seen = f"unreadable ({exc.strerror or exc})"
+        get_logger("launch").warning(
+            "session-0 hand-off %s: rc.txt unreadable after %.1fs: %s",
+            task,
+            waited_s,
+            exc,
+        )
+        why = (
+            "was still held by the writer"
+            if isinstance(exc, PermissionError)
+            else "could not be read"
+        )
+        seen = f"{why} ({type(exc).__name__})"
+    else:
+        rc = _recorded_int(raw)
+        if rc is not None:
+            return _handoff_finished(out, err, work, rc)
+        text = raw.strip()
+        seen = f"held {text[:40]!r}, not a complete exit code" if text else "was empty"
     return HandoffResult(
         rc=None,
         stdout=_read_handoff_text(out),
         stderr=_read_handoff_text(err),
         detail=(
             f"the desktop command finished but its exit code never became "
-            f"readable within {waited_s:.1f}s (rc.txt: {seen}); task {task}, "
+            f"readable within {waited_s:.1f}s -- rc.txt {seen}; task {task}, "
             f"scratch left at {work}"
         ),
     )
@@ -1201,9 +1245,9 @@ class WindowsPlatform(Platform):
         ever write one.
 
         rc.txt existing is not the exit code being written (see
-        ``_HANDOFF_RC_GRACE_S``): only a well-formed integer ends the wait, and
+        ``_HANDOFF_RC_GRACE_S``): only a complete integer ends the wait, and
         an rc.txt that stays anything else past that grace -- or past the
-        budget -- is a fourth answer of its own.
+        budget -- is a fourth answer of its own (``_settle_exit_code``).
         """
         out, err, pid_file, rc_file = files
         deadline = time.monotonic() + timeout_s
@@ -1214,10 +1258,7 @@ class WindowsPlatform(Platform):
         while True:
             rc = _read_recorded_int(rc_file)
             if rc is not None:
-                stdout, stderr = _read_handoff_text(out), _read_handoff_text(err)
-                # The hand-off itself worked, whatever the command decided.
-                _remove_scratch(work)
-                return HandoffResult(rc=rc, stdout=stdout, stderr=stderr)
+                return _handoff_finished(out, err, work, rc)
             # Read first, THEN check the budget: an exit code that landed
             # during the last sleep is the answer, not a timeout.
             if time.monotonic() >= deadline:
@@ -1225,12 +1266,15 @@ class WindowsPlatform(Platform):
             if rc_file.exists():
                 # The launcher is mid-Set-Content: the file is there and the
                 # value is not yet. Not a lost child either -- the launcher got
-                # as far as its exit code -- so the pid checks below are moot.
+                # as far as its exit code -- so the pid checks below are moot,
+                # and running them would be wrong: a child gone longer than the
+                # exit grace whose launcher is only now writing rc.txt is the
+                # loaded-runner success path, not a lost child.
                 if rc_seen_since is None:
                     rc_seen_since = time.monotonic()
                 waited = time.monotonic() - rc_seen_since
                 if waited >= _HANDOFF_RC_GRACE_S:
-                    return _unreadable_exit_code(files, task, work, waited)
+                    return _settle_exit_code(files, task, work, waited)
                 time.sleep(_HANDOFF_POLL_S)
                 continue
             pid = _read_recorded_int(pid_file)
@@ -1271,9 +1315,10 @@ class WindowsPlatform(Platform):
             time.sleep(_HANDOFF_POLL_S)
         if rc_file.exists():
             # The budget ran out mid-write: the command is done (rc.txt lands
-            # after WaitForExit), so this is not "may still be running".
+            # after WaitForExit), so this is not "may still be running" -- and
+            # the settling read may yet find the code complete.
             waited = 0.0 if rc_seen_since is None else time.monotonic() - rc_seen_since
-            return _unreadable_exit_code(files, task, work, waited)
+            return _settle_exit_code(files, task, work, waited)
         # Deliberately NO kill. A bring-up still running on the desktop past
         # our budget is doing the work that was asked for, and the pid we hold
         # is a number Windows recycles freely -- killing it could take out an

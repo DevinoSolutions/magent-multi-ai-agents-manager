@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -205,6 +206,24 @@ class TestTheRelay:
 
         assert rc == 1
         assert "schtasks not found" in capsys.readouterr().err
+
+    def test_a_command_that_ran_is_never_reported_as_unrun(self, capsys):
+        # The fourth answer is about a command that DID run on the desktop, so
+        # the caller's own words must stay true for it -- exactly this line.
+        detail = (
+            "the desktop command finished but its exit code never became "
+            "readable within 10.0s -- rc.txt was empty; task T, scratch left at S"
+        )
+        plat = FakePlatform(
+            supports_handoff=True, handoff_result=HandoffResult(rc=None, detail=detail)
+        )
+
+        rc = relay_handoff(plat, ["x"], timeout_s=5)
+
+        assert rc == 1
+        assert capsys.readouterr().err.splitlines() == [
+            f"  x hand-off failed: {detail} (see ~/.magent/logs/launch.log on this host)"
+        ]
 
 
 class TestThePlatformDefaults:
@@ -604,8 +623,10 @@ class _HeldExitCode:
     ``locked`` holds it with no sharing, so a reader gets a sharing violation --
     which is what Windows PowerShell measurably does (298 of 300 first reads
     after the file appeared). ``shared`` holds a zero-byte file a reader CAN
-    open, and reads as empty: the other half of the same window. ``_winapi``
-    and not ``open()``, because Python's own open always shares.
+    open, and reads as empty: the other half of the same window. ``partial``
+    is ``shared`` with the first digit of a longer value already written and
+    no line end yet. ``_winapi`` and not ``open()``, because Python's own open
+    always shares.
     """
 
     def __init__(self, path: Path, mode: str) -> None:
@@ -616,12 +637,18 @@ class _HeldExitCode:
         self._handle: int | None = _winapi.CreateFile(
             str(path), _winapi.GENERIC_WRITE, share, _winapi.NULL, _CREATE_ALWAYS, 0, 0
         )
+        if mode == "partial":
+            self.write("1")
 
-    def finish(self, text: str) -> None:
-        """Write the value and close -- the moment Set-Content returns."""
+    def write(self, text: str) -> None:
+        """Write without closing -- the writer is still mid-value."""
         if self._handle is not None:
             self._winapi.WriteFile(self._handle, text.encode("ascii"))
-            self.close()
+
+    def finish(self, text: str) -> None:
+        """Write the rest and close -- the moment Set-Content returns."""
+        self.write(text)
+        self.close()
 
     def close(self) -> None:
         if self._handle is not None:
@@ -639,7 +666,8 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
     for a command that had succeeded: ``assert None == 7`` in
     ``test_the_command_really_runs_and_its_streams_come_back``, on five CI runs
     of unrelated PRs. The pid.txt read already knew that "present but not an
-    integer" means "not yet".
+    integer" means "not yet"; both now also require the line end Set-Content
+    writes after the value, so a prefix is never final either.
 
     Driven through the poll directly, against real files, with no scheduler at
     all: the window is opened on purpose and held for a known number of poll
@@ -734,20 +762,101 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
         assert result.rc == 7
         assert result.detail == ""
 
-    @pytest.mark.parametrize("mode", ["locked", "shared"])
+    def test_an_exit_code_that_lands_after_the_last_read_still_counts(
+        self, handoff, hold, monkeypatch
+    ):
+        # The budget runs out with rc.txt still held at the poll's final read,
+        # and Set-Content returns an instant later. The read the poll gives up
+        # with is decisive: a code complete by then is the answer, not
+        # something to print in `detail` and throw away.
+        from magent.platform import windows
+
+        work, files, clock = handoff
+        held = hold(files[3], "locked")
+        real_read = windows._read_recorded_int
+
+        def poll_read(path: Path) -> int | None:
+            value = real_read(path)
+            if path == files[3] and clock.now >= 0.5:
+                held.finish("7\r\n")
+            return value
+
+        monkeypatch.setattr("magent.platform.windows._read_recorded_int", poll_read)
+
+        result = self._await(work, files, timeout_s=0.5)
+
+        assert result.rc == 7, result.detail
+        assert result.detail == ""
+
+    def test_a_partial_exit_code_is_not_yet_an_answer(self, handoff, hold):
+        # The "1" of "12": a value without the line end Set-Content writes
+        # after it may be a prefix, and a prefix must never be final.
+        work, files, clock = handoff
+        rc_file = files[3]
+        held = hold(rc_file, "partial")
+        assert rc_file.read_text(encoding="utf-8") == "1"
+
+        def launcher(tick: int) -> None:
+            if tick == 3:
+                held.finish("2\r\n")
+
+        clock.on_tick = launcher
+
+        result = self._await(work, files, timeout_s=60)
+
+        assert result.rc == 12, result.detail
+        assert clock.ticks >= 3
+
+    def test_a_present_exit_code_is_never_mistaken_for_a_lost_child(
+        self, handoff, hold
+    ):
+        from magent.platform.windows import _HANDOFF_EXIT_GRACE_S, _HANDOFF_POLL_S
+
+        work, files, clock = handoff
+        # The child died at t=0. rc.txt appears just inside the exit grace and
+        # Set-Content returns just after it -- the loaded-runner shape that
+        # grace exists for. A poll that ran the pid checks while the file was
+        # there would call this a lost child at the grace, mid-write.
+        created = round((_HANDOFF_EXIT_GRACE_S - 0.5) / _HANDOFF_POLL_S)
+        held: list[_HeldExitCode] = []
+
+        def launcher(tick: int) -> None:
+            if tick == created:
+                held.append(hold(files[3], "locked"))
+            if tick == created + 4:
+                held[0].finish("7\r\n")
+
+        clock.on_tick = launcher
+
+        result = self._await(work, files, timeout_s=60)
+
+        assert result.rc == 7, result.detail
+        assert clock.now > _HANDOFF_EXIT_GRACE_S
+
+    # What the last read saw, in our words: a held file, a launcher that wrote
+    # no value, and a value cut short are different bugs.
+    _SEEN: ClassVar[dict[str, str]] = {
+        "locked": "rc.txt was still held by the writer (PermissionError)",
+        "shared": "rc.txt was empty",
+        "partial": "rc.txt held '1', not a complete exit code",
+    }
+
+    @pytest.mark.parametrize("mode", ["locked", "shared", "partial"])
     def test_an_exit_code_that_never_becomes_readable_is_its_own_answer(
         self, handoff, hold, mode
     ):
+        from magent.platform.windows import _HANDOFF_RC_GRACE_S
+
         work, files, clock = handoff
         hold(files[3], mode)  # ...and never finishes.
 
         result = self._await(work, files, timeout_s=60)
 
-        self._assert_unreadable_answer(result, work)
+        self._assert_unreadable_answer(result, work, mode, _HANDOFF_RC_GRACE_S)
         # A short grace, not the caller's whole budget.
         assert clock.now < 60
 
-    @pytest.mark.parametrize("mode", ["locked", "shared"])
+    @pytest.mark.parametrize("mode", ["locked", "shared", "partial"])
     def test_a_budget_that_runs_out_mid_write_gets_the_same_answer(
         self, handoff, hold, mode
     ):
@@ -756,15 +865,18 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
 
         result = self._await(work, files, timeout_s=0.5)
 
-        self._assert_unreadable_answer(result, work)
+        self._assert_unreadable_answer(result, work, mode, 0.5)
         assert clock.now >= 0.5
 
-    def _assert_unreadable_answer(self, result, work):
+    def _assert_unreadable_answer(self, result, work, mode, waited):
         assert result.rc is None
         # rc.txt exists only after WaitForExit, so the command FINISHED: not
         # "may still be running", and no fabricated exit code either.
         assert result.timed_out is False
-        assert "never became readable" in result.detail
+        assert f"never became readable within {waited:.1f}s -- " in result.detail
+        assert self._SEEN[mode] in result.detail
+        # Our words on screen; the OS's own text goes to the log.
+        assert "Permission denied" not in result.detail
         # ...and none of the other three answers.
         assert "never started" not in result.detail
         assert "without an exit code" not in result.detail
