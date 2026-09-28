@@ -281,6 +281,8 @@ _EVERY_STRING: list[tuple[str, dict[str, object]]] = [
     ("settings.defaultTool", {**_one(), "settings": {"defaultTool": _LONE}}),
     ("settings.ssh.shell", {**_one(), "settings": {"ssh": {"shell": _LONE}}}),
     ("settings.tools.probe", {**_one(), "settings": {"tools": {"probe": _LONE}}}),
+    # The path is escape text too: a valid accented key on the way is shown so.
+    ("settings.tools.caf\\xe9", {**_one(), "settings": {"tools": {"café": _LONE}}}),
     ("a key in settings.tools", {**_one(), "settings": {"tools": {_LONE: "x"}}}),
     ("projects[0].path", _one(path=_LONE, title="t")),
     ("projects[0].group", _one(group=_LONE)),
