@@ -4734,13 +4734,40 @@ class TestTextWithNoUtf8FormLeavesOnlyItsItemUnread:
         assert _unread_row("the plugin list") in report.lines
         assert json.loads(data["mcp_servers.json"]) == {"ok": _HTTP}
 
-    def test_a_step_already_unread_keeps_its_own_class_and_its_one_note(
+    def test_a_step_already_unread_keeps_its_own_class_and_its_one_note(self, fake_ssh):
+        # user_scope reaches this (the next test), and so does a scope a
+        # wrapper builds (plan K). Built here, with marketplaces the reader
+        # would have emptied. The row names the file's real class, once,
+        # under the file's label; the item is emptied all the same.
+        own = (
+            "plugins/known_marketplaces.json: could not be read (JSONDecodeError), "
+            "so nothing from it ships this time"
+        )
+        report = self._provision(
+            _scope(
+                settings={"model": "opus"},
+                plugins=("p\ud83d@mkt",),
+                marketplaces={"mkt": "https://h/x.git"},
+                notes=(own,),
+                unread={"plugins": "JSONDecodeError"},
+            )
+        )
+        manifest, data = _applied(fake_ssh, report)
+        assert manifest["unread"] == {"plugins": "JSONDecodeError"}
+        assert (manifest["plugins"], manifest["marketplaces"]) == ([], {})
+        assert json.loads(data["settings.json"]) == {"model": "opus"}
+        assert [
+            line
+            for line in report.lines
+            if line.detail.startswith(("plugins/", "the plugin list"))
+        ] == [ScriptLine("skip", "scope", own)]
+
+    def test_a_walked_plugin_list_already_unread_keeps_the_readers_note(
         self, fake_ssh, tmp_path
     ):
-        # The real reader gets here: a known_marketplaces.json that does not
-        # parse leaves plugins unread while settings.enabledPlugins still
-        # lists the id. The row keeps the reader's class and its one note,
-        # under the reader's label; the item is emptied all the same.
+        # A known_marketplaces.json that does not parse leaves plugins unread,
+        # while settings.enabledPlugins still lists the id. The reader's note
+        # is the only plugin row: none is added under the filter's label.
         home = tmp_path / "pc"
         (home / ".claude" / "plugins").mkdir(parents=True)
         (home / ".claude" / "settings.json").write_text(
@@ -4750,21 +4777,20 @@ class TestTextWithNoUtf8FormLeavesOnlyItsItemUnread:
         (home / ".claude" / "plugins" / "known_marketplaces.json").write_text(
             "{not json", encoding="ascii"
         )
+        _write_json(home / ".claude.json", {"mcpServers": {"ok": _HTTP}})
         scope = _walked(home)
         assert scope.unread == {"plugins": "JSONDecodeError"}
         assert "p\ud83d@mkt" in scope.plugins
         report = self._provision(scope)
-        manifest, _ = _applied(fake_ssh, report)
+        manifest, data = _applied(fake_ssh, report)
         assert manifest["unread"] == {
             "plugins": "JSONDecodeError",
             "settings": "UnicodeEncodeError",
         }
         assert (manifest["plugins"], manifest["marketplaces"]) == ([], {})
-        assert _unread_row("settings.json") in report.lines
+        assert "settings.json" not in data
         assert [
-            line
-            for line in report.lines
-            if line.detail.startswith(("plugins/", "the plugin list"))
+            line for line in report.lines if line.detail.startswith("plugins/")
         ] == [
             ScriptLine(
                 "skip",
@@ -4773,6 +4799,11 @@ class TestTextWithNoUtf8FormLeavesOnlyItsItemUnread:
                 "(JSONDecodeError), so nothing from it ships this time",
             )
         ]
+        assert not [
+            line for line in report.lines if line.detail.startswith("the plugin list")
+        ]
+        assert _unread_row("settings.json") in report.lines
+        assert json.loads(data["mcp_servers.json"]) == {"ok": _HTTP}
 
     def test_valid_non_ascii_text_ships_byte_for_byte_as_before(self, fake_ssh):
         # The fix changes no bytes: a node's stored digest still matches.
