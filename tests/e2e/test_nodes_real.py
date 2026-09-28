@@ -523,6 +523,17 @@ class TestANodeHostsAProjectEndToEnd:
         assert entry.get("cwd") == rig.remote_dir, entry
         rig.passed.add("D7")
 
+    # Strict, so the fix reaching this branch's base turns it red (XPASS) and
+    # forces this marker out instead of letting it rot. Only the assertion
+    # itself is the expected failure: a timeout or a broken wire still fails.
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "decoration_args targets =sid, needs =sid: -- fix pending on "
+            "feat/nodes-integ"
+        ),
+    )
     def test_d07b_the_session_wears_the_node_brand(self, rig: NodeRig) -> None:
         # Its own test, so a cosmetic miss cannot skip the journey behind it.
         # The session's OWN options, read without -g: a session that never got
