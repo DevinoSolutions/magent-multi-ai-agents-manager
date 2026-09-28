@@ -1344,13 +1344,16 @@ The price is one lock + one open/close per record: **13 µs → 235 µs** on thi
 box. These are lifecycle logs at a few records a second, not a request stream,
 so the cost is unobservable and the correctness is not.
 
-Two loudness rules ride along, both stricter than the stdlib's. A rotation that
+Three loudness rules ride along, all stricter than the stdlib's. A rotation that
 still fails **writes the record anyway** and reports the rotation failure through
 `handleError` (the stdlib drops the record instead). A lock that cannot be taken
 within `_LOCK_TIMEOUT_S` degrades to an unlocked write — keeping the record,
 which is the whole point — and says so once per process **in the log file
 itself**, because that is the only channel a detached daemon has and reaching for
-`get_logger` from inside a handler would recurse.
+`get_logger` from inside a handler would recurse. And a record that cannot be
+encoded — a filename carrying a lone surrogate — **lands escaped, never
+dropped**: the stream is opened with `errors="backslashreplace"`, where the
+stdlib's strict default prints `--- Logging error ---` and loses the record.
 
 The public seam is unchanged (`get_logger(name)`, one handler, still a
 `RotatingFileHandler`, still `<name>.log` + `<name>.log.N`), so no consumer
