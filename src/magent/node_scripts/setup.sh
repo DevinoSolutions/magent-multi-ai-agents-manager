@@ -252,7 +252,12 @@ user_node_key() {
         ;;
     esac
   fi
-  if [ -f "$id.pub" ]; then
+  # A dangling .pub link reads as no .pub (`-f` is false): the derive and the
+  # generation below would create its target. A live link is only read.
+  if [ -h "$id.pub" ] && [ ! -e "$id.pub" ]; then
+    say fail "node-key:$u" "$u's id_ed25519.pub is a dangling symlink; magent does not write through it${made:+; $made}"
+    return 1
+  elif [ -f "$id.pub" ]; then
     # A .pub alone would send GitHub a key this node cannot clone with.
     if [ ! -f "$id" ]; then
       say fail "node-key:$u" "id_ed25519.pub in ~/.ssh has no private key beside it; remove the .pub and rerun"
