@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 
@@ -50,6 +51,25 @@ class TestCliFlags:
         )
         assert result.returncode != 0
         assert "No config found" in result.stderr or "config" in result.stderr.lower()
+
+    def test_a_name_the_piped_stdout_cannot_hold_prints_as_an_escape(self, tmp_path):
+        # A redirected Windows stdout is the ANSI code page with strict
+        # errors. PYTHONIOENCODING forces that on the CHILD so every OS's leg
+        # runs this, not only Windows. One CJK project name used to end the
+        # command with rc 1 and a UnicodeEncodeError traceback.
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps({"projects": [{"path": str(tmp_path / "café 中文")}]})
+        )
+        result = subprocess.run(
+            [sys.executable, "-m", "magent", "--config", str(cfg), "config", "show"],
+            capture_output=True,
+            env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+        )
+        assert result.returncode == 0, result.stderr
+        # The accent is cp1252's own byte, as before; only what cp1252 lacks
+        # is escaped.
+        assert b"caf\xe9 \\u4e2d\\u6587" in result.stdout
 
     def test_invalid_json_exits_nonzero(self, tmp_path):
         bad = tmp_path / "bad.json"

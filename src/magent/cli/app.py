@@ -18,6 +18,30 @@ from magent.init_config import write_config
 from magent.paths import find_config
 
 
+def _escape_unencodable_output() -> None:
+    """Print a character stdout cannot encode as an escape, never a crash.
+
+    On Windows a redirected stdout -- a pipe, a file, the Session-0 hand-off's
+    out.txt, the ssh channel `magent attach` reads -- is the ANSI code page
+    with strict errors, so one project name or path it could not hold raised
+    UnicodeEncodeError out of click.echo and exited 1; `up` got that far only
+    after its sessions existed. Only the error handler changes: everything the
+    stream could already encode is written byte-for-byte as before, and the
+    rest becomes ``\\u4e2d``, as stderr already does. This process only --
+    nothing is inherited and no environment is touched.
+
+    The ``--json`` emitters keep json.dumps's ensure_ascii default, so their
+    output is ASCII and never reaches this handler; ensure_ascii=False would
+    print ``\\U0001f600``, which is not a JSON escape.
+
+    ``sys.stdout`` is None under pythonw, and a substitute stream may have no
+    ``reconfigure``; both are left alone.
+    """
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(errors="backslashreplace")
+
+
 @click.group(invoke_without_command=True)
 @click.option("--go", is_flag=True, help="Skip interactive menu, launch + tile")
 @click.option("--retile-all", is_flag=True, help="Re-tile every matching window")
@@ -84,6 +108,7 @@ def main(
     attach_no_mux: bool,
 ) -> None:
     """Open every project in its own terminal and auto-tile across all monitors."""
+    _escape_unencodable_output()
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
 

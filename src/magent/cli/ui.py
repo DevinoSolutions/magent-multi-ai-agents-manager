@@ -123,7 +123,9 @@ def _force_utf8_console() -> None:
     """Make stdout render UTF-8 (block chars for the QR, box glyphs) on Windows
     consoles that default to a legacy code page. Best-effort: the expected
     OS/attribute errors (redirected stdout, missing console) are suppressed so a
-    cosmetic failure never crashes the CLI; an unexpected error still surfaces."""
+    cosmetic failure never crashes the CLI; an unexpected error still surfaces.
+    ``errors`` is passed again because reconfiguring the encoding alone resets
+    it to strict, undoing the entry point's escape (app.py)."""
     if sys.platform != "win32":
         return
     with contextlib.suppress(OSError, AttributeError):
@@ -133,7 +135,7 @@ def _force_utf8_console() -> None:
     with contextlib.suppress(OSError, AttributeError, ValueError):
         reconfigure = getattr(sys.stdout, "reconfigure", None)
         if reconfigure is not None:
-            reconfigure(encoding="utf-8")
+            reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
 def _print_qr(url: str) -> None:

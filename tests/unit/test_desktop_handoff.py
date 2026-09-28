@@ -432,6 +432,28 @@ class TestRunOnDesktopOnWindows:
         assert result.rc == 0, result.detail
         assert result.stdout.strip() == "café"
 
+    def test_a_character_the_code_page_lacks_never_crashes_the_copy(
+        self, fake_schtasks, tmp_path
+    ):
+        # The REAL entry point as the desktop copy. It used to die on
+        # UnicodeEncodeError partway through its output, and for `up` that
+        # was after the sessions existed: rc 1 and a traceback over a
+        # bring-up that had worked. The accent the code page holds comes back
+        # as itself, the character it lacks as an escape.
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps({"projects": [{"path": str(tmp_path / "café 中")}]}),
+            encoding="utf-8",
+        )
+
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-m", "magent", "--config", str(cfg), "config", "show"],
+            timeout_s=60,
+        )
+
+        assert result.rc == 0, result.stderr
+        assert "café \\u4e2d" in result.stdout
+
     def test_the_child_can_never_hand_off_again(self, fake_schtasks):
         # A hand-off that landed in Session 0 again and handed off in turn
         # would be a recursion whose every level writes a scheduled task.

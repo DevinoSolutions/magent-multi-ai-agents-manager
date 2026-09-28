@@ -12,6 +12,7 @@ import json
 import time
 
 import pytest
+from click.testing import CliRunner
 
 from magent import cli
 from tests.unit._fake_psmux import make_fake_psmux
@@ -323,6 +324,25 @@ class TestPeek:
         assert f"Fable 5.1 {MID} high" in out
         assert "? prompt" in out
         assert out.encode("cp1252")  # the whole point: it can now be written
+
+    def test_peek_keeps_its_question_marks_under_the_entry_escape(
+        self, tmp_config, tmp_path, monkeypatch
+    ):
+        # The entry point escapes what stdout cannot encode, but a pane is the
+        # AGENT's screen and peek is a lossy glance: _stdout_safe still turns
+        # the caret into "?" before the stream ever sees it, rather than into
+        # an escape nobody asked to read.
+        fake = make_fake_psmux(tmp_path, pane=f"{CARET} prompt", live=["caramel"])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel"])
+
+        result = CliRunner(charset="cp1252").invoke(
+            cli.main, ["--config", cfg, "peek", "caramel"]
+        )
+
+        assert result.exit_code == 0, result.exception
+        assert "? prompt" in result.stdout
+        assert "\\u276f" not in result.stdout
 
     def test_a_utf8_stdout_keeps_every_glyph(self, monkeypatch):
         from magent.cli import fleet_cmd
