@@ -765,6 +765,7 @@ class TestTheReplyIsBoundedInMemory:
     def test_a_stderr_held_open_mid_line_never_hands_over_the_fragment(self, tmp_path):
         # The stream is still open, so its last line may be half-written: only
         # whole lines are the child's words -- the log's; the row is the cap.
+        # The half line is cut from the words, never lost: after_cap has it.
         error, _ = self._flood_past_a_held_stderr(
             tmp_path, said="boom: disk full\nwriting blo"
         )
@@ -772,6 +773,7 @@ class TestTheReplyIsBoundedInMemory:
         assert lines[0] == f"reply exceeded {CAP} bytes"
         assert "boom: disk full" in lines[1:]
         assert "writing blo" not in error.stderr_tail
+        assert "writing blo" in error.after_cap
         assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
 
     @pytest.mark.usefixtures("kill_order")
@@ -779,6 +781,7 @@ class TestTheReplyIsBoundedInMemory:
         # No line has ended yet: the cap is the whole story, never a fragment.
         error, _ = self._flood_past_a_held_stderr(tmp_path, said="writing blo")
         assert error.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert "writing blo" in error.after_cap
         assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
 
     @staticmethod
@@ -818,6 +821,7 @@ class TestTheReplyIsBoundedInMemory:
         assert lines[0] == f"reply exceeded {CAP} bytes"
         assert "boom: disk full" in lines[1:]
         assert "writing blo" not in error.stderr_tail
+        assert "writing blo" in error.after_cap
         assert "Broken pipe" not in error.stderr_tail
         assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
         if ending == "complains-at-the-pipe" and kill_order in _KILL_WAITS:
@@ -858,6 +862,7 @@ class TestTheReplyIsBoundedInMemory:
         assert error.stderr_tail.splitlines()[0] == f"reply exceeded {CAP} bytes"
         assert "boom: disk full" in error.stderr_tail.splitlines()[1:]
         assert "writing blo" not in error.stderr_tail
+        assert "writing blo" in error.after_cap
         assert "Broken pipe" not in error.stderr_tail
 
     def test_a_stderr_that_ended_keeps_its_last_line_without_a_newline(self):
