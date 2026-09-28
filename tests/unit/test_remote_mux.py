@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import types
 from importlib import resources
 from pathlib import Path
 from typing import NoReturn
@@ -491,10 +492,11 @@ time.sleep(90)
 """
 
 # A child that leaves that grandchild behind, waits for its pid file (so the
-# teardown never finds it missing), says argv[2] on stderr, then floods stdout.
-# When the reader stops at the cap the child leaves WITHOUT a word: Python's
-# BrokenPipeError traceback would land on stderr after argv[2], racing the
-# kill, and glue itself to a half-written last line.
+# teardown never finds it missing), says argv[2] on stderr, pauses so the
+# reader holds it before the flood starts (the pause sets the order, not a
+# race), then floods stdout. When the reader stops at the cap the child leaves
+# WITHOUT a word: Python's BrokenPipeError traceback would land on stderr
+# after argv[2], racing the kill, and glue itself to a half-written last line.
 _HELD_STDERR_CHILD = (
     f"GRANDCHILD = {_HELD_STDERR_GRANDCHILD!r}\n"
     """\
@@ -510,6 +512,7 @@ while not os.path.exists(sys.argv[1]) and time.monotonic() < deadline:
     time.sleep(0.01)
 sys.stderr.write(sys.argv[2])
 sys.stderr.flush()
+time.sleep(0.3)
 block = b"x" * 65536
 try:
     while True:
@@ -520,15 +523,20 @@ except OSError:
 """
 )
 
-# A child with no grandchild that says argv[1] on stderr, then floods stdout.
-# When the reader stops at the cap, argv[2] says how its stderr ends: "killed"
-# keeps it open and waits, so it ends only when the kill reaches it, as ssh's
-# own stderr does; "dies-at-the-pipe" leaves at once without a word, ending it
-# ON ITS OWN -- but after the cap, as a writer killed by SIGPIPE does.
+# A child with no grandchild that says argv[1] on stderr, pauses as the one
+# above does, then floods stdout. When the reader stops at the cap, argv[2]
+# says how its stderr ends: "killed" keeps it open and waits, so it ends only
+# when the kill reaches it, as ssh's own stderr does; "dies-at-the-pipe"
+# leaves at once without a word, ending it ON ITS OWN -- but after the cap, as
+# a writer killed by SIGPIPE does; "complains-at-the-pipe" says a whole line
+# first, as a writer that ignores SIGPIPE does: pull.sh's python3 prints a
+# BrokenPipeError traceback, and the Windows ssh client was measured passing
+# it on after the cap.
 _PLAIN_STDERR_CHILD = """\
 import os, sys, time
 sys.stderr.write(sys.argv[1])
 sys.stderr.flush()
+time.sleep(0.3)
 block = b"x" * 65536
 try:
     while True:
@@ -537,8 +545,16 @@ try:
 except OSError:
     if sys.argv[2] == "killed":
         time.sleep(60)
+    if sys.argv[2] == "complains-at-the-pipe":
+        sys.stderr.write("BrokenPipeError: [Errno 32] Broken pipe\\n")
+        sys.stderr.flush()
     os._exit(1)
 """
+
+_COMPLAINT = "BrokenPipeError: [Errno 32] Broken pipe"
+# The kill orders that hold the kill back long enough for a complaining child
+# to say its line: under the others the kill may reach it first.
+_KILL_WAITS = ("pipe-closed-first", "main-late")
 
 
 class TestTheReplyIsBoundedInMemory:
@@ -690,7 +706,7 @@ class TestTheReplyIsBoundedInMemory:
     @pytest.fixture(
         params=["as-it-comes", "pipe-closed-first", "kill-read-first", "main-late"]
     )
-    def kill_order(self, request, monkeypatch):
+    def kill_order(self, request, monkeypatch) -> str:
         """What comes first after the cap. ``pipe-closed-first`` holds the kill
         back, so the child always writes into the pipe the reader closed first
         -- the order a loaded box produced, where the child's words must still
@@ -700,7 +716,8 @@ class TestTheReplyIsBoundedInMemory:
         asked after the kill. ``main-late`` holds _spawn back once the cap is
         passed, before it kills anything: a writer that dies at the closed
         pipe has ended its stream ON ITS OWN by then -- after the cap, which
-        no question about "ended yet?" can tell from before it."""
+        no question about "ended yet?" can tell from before it. Returns the
+        order's name, for a pin whose words exist only when the kill waits."""
         kill = remote_mux._kill
         if request.param == "pipe-closed-first":
 
@@ -731,6 +748,7 @@ class TestTheReplyIsBoundedInMemory:
                 return done
 
             monkeypatch.setattr(remote_mux, "_finish", late_finish)
+        return request.param
 
     @pytest.mark.usefixtures("kill_order")
     def test_a_stderr_held_open_mid_line_never_hands_over_the_fragment(self, tmp_path):
@@ -752,27 +770,15 @@ class TestTheReplyIsBoundedInMemory:
         assert error.stderr_tail == f"reply exceeded {CAP} bytes"
         assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
 
-    @pytest.mark.usefixtures("kill_order")
-    @pytest.mark.parametrize("ending", ["killed", "dies-at-the-pipe"])
-    def test_a_stderr_that_ended_after_the_cap_never_hands_over_the_fragment(
-        self, ending
-    ):
-        # No grandchild: the stream ends after the cap, by the kill (as ssh's
-        # own does) or by the writer dying at the pipe the cap closed. Neither
-        # is the end of the child's saying -- it was cut off wherever it was
-        # -- so the half line goes just as from a stream still open. The base
-        # interpreter, for the reason the next pin gives.
+    @staticmethod
+    def _flood_past_a_plain_stderr(said: str, ending: str) -> RemoteError:
+        """_PLAIN_STDERR_CHILD's over-cap error after it said ``said`` and
+        ended as ``ending``. The base interpreter, for the reason pin (c)
+        gives."""
         python = getattr(sys, "_base_executable", sys.executable)
         with pytest.raises(RemoteError) as exc:
             remote_mux._spawn(
-                [
-                    python,
-                    "-I",
-                    "-c",
-                    _PLAIN_STDERR_CHILD,
-                    "boom: disk full\nwriting blo",
-                    ending,
-                ],
+                [python, "-I", "-c", _PLAIN_STDERR_CHILD, said, ending],
                 timeout_s=60,
                 input_bytes=None,
                 check=True,
@@ -782,11 +788,40 @@ class TestTheReplyIsBoundedInMemory:
                 max_stdout_bytes=CAP,
             )
         assert exc.value.over_cap
-        lines = exc.value.stderr_tail.splitlines()
+        return exc.value
+
+    @pytest.mark.parametrize(
+        "ending", ["killed", "dies-at-the-pipe", "complains-at-the-pipe"]
+    )
+    def test_a_stderr_that_ended_after_the_cap_never_hands_over_the_fragment(
+        self, kill_order, ending
+    ):
+        # No grandchild: the stream ends after the cap, by the kill (as ssh's
+        # own does) or by the writer at the pipe the cap closed -- dying, or
+        # complaining first. None is the end of the child's saying -- it was
+        # cut off wherever it was -- so the half line goes just as from a
+        # stream still open, and a complaint about the closed pipe, a whole
+        # line or not, is no reason either: the log's, never the row's.
+        error = self._flood_past_a_plain_stderr("boom: disk full\nwriting blo", ending)
+        lines = error.stderr_tail.splitlines()
         assert lines[0] == f"reply exceeded {CAP} bytes"
         assert "boom: disk full" in lines[1:]
-        assert "writing blo" not in exc.value.stderr_tail
-        assert launch._node_error_text(exc.value) == "boom: disk full"
+        assert "writing blo" not in error.stderr_tail
+        assert "Broken pipe" not in error.stderr_tail
+        assert launch._node_error_text(error) == "boom: disk full"
+        if ending == "complains-at-the-pipe" and kill_order in _KILL_WAITS:
+            assert _COMPLAINT in str(error)  # what launch logs
+
+    def test_an_error_printed_after_a_big_stdout_is_the_logs_not_the_rows(
+        self, kill_order
+    ):
+        # Nothing said before the flood, a whole line after it: the reason is
+        # the cap alone, and the words are still in the log's copy.
+        error = self._flood_past_a_plain_stderr("", "complains-at-the-pipe")
+        assert error.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
+        if kill_order in _KILL_WAITS:
+            assert _COMPLAINT in str(error)
 
     def test_a_stderr_that_ended_keeps_its_last_line_without_a_newline(self):
         # A stream that ended BEFORE the cap was not cut off mid-write, so its
@@ -843,6 +878,50 @@ class TestTheReplyIsBoundedInMemory:
         drain.join(5)
         assert not drain.is_alive()
         assert drain.data() == b"more\n"
+
+    def test_the_drain_parts_what_it_holds_by_when_each_read_came(self):
+        # Each read carries its own time, so what came before a moment and
+        # what came at or after it part cleanly -- one stamp for the whole
+        # buffer could not -- and the tail's cap (4 bytes) trims the oldest
+        # bytes first. The sleeps outlast a coarse clock's tick.
+        r, w = os.pipe()
+        drain = remote_mux._Drain(os.fdopen(r, "rb"), 4, tail=True)
+        drain.start()
+        try:
+            os.write(w, b"aaa")
+            deadline = time.monotonic() + 5
+            while drain._held < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.05)
+            at = time.monotonic()
+            time.sleep(0.05)
+            os.write(w, b"bbb")
+        finally:
+            os.close(w)
+        drain.join(5)
+        assert not drain.is_alive()
+        assert drain.split(at) == (b"a", b"bbb")
+        assert drain.data() == b""
+
+    def test_a_read_stamped_the_same_instant_as_the_cap_counts_as_after(
+        self, monkeypatch
+    ):
+        # A coarse clock (Windows' before Python 3.13) can stamp a read and
+        # the cap alike. Which came first is then unknown, and unknown is
+        # after: a line left out of the reason, never another's kept in it.
+        monkeypatch.setattr(
+            remote_mux, "time", types.SimpleNamespace(monotonic=lambda: 7.0)
+        )
+        r, w = os.pipe()
+        drain = remote_mux._Drain(os.fdopen(r, "rb"), 16, tail=True)
+        drain.start()
+        try:
+            os.write(w, b"boom: disk full\n")
+        finally:
+            os.close(w)
+        drain.join(5)
+        assert not drain.is_alive()
+        assert drain.split(7.0) == (b"", b"boom: disk full\n")
 
     def test_the_drain_drops_what_it_held_once_over_the_cap(self):
         # Two writes, so the first cap's worth is HELD before the byte that
