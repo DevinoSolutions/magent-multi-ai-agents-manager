@@ -112,6 +112,60 @@ class TestAForgottenConfigFlagStaysInTmp:
             assert not found.is_relative_to(REAL_APPDATA), found
 
 
+# What a POSIX login (or a CI runner) typically exports: the real home's own
+# config dir. Moving HOME does not move an explicit XDG_CONFIG_HOME.
+_REAL_LOOKING_XDG_CONFIG_HOME = REAL_HOME / ".config"
+
+
+@pytest.fixture(scope="class")
+def _exported_xdg_config_home():
+    # Class-scoped, so it runs BEFORE conftest's function-scoped redirect: the
+    # variable is genuinely ambient when the redirect fires, the way a shell
+    # export is.
+    previous = os.environ.get("XDG_CONFIG_HOME")
+    os.environ["XDG_CONFIG_HOME"] = str(_REAL_LOOKING_XDG_CONFIG_HOME)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = previous
+
+
+@pytest.mark.usefixtures("_exported_xdg_config_home")
+class TestAnExportedXdgConfigHomeStaysInTmp:
+    """The POSIX half of the forgotten-``--config`` door.
+
+    On Linux ``env.config_base()`` is ``env.xdg_config_home()``: an exported
+    ``XDG_CONFIG_HOME`` wins over ``~/.config``, so moving HOME leaves a
+    forgotten ``--config`` resolving the developer's (or runner's) real
+    ``$XDG_CONFIG_HOME/magent/config.json``. ``vscode_storage_base()`` reads
+    the same variable. The Linux branch is forced here so the pin holds on
+    every OS, including the Windows box it is developed on.
+    """
+
+    def test_xdg_config_home_is_the_tmp_homes_config_dir(self):
+        resolved = env.xdg_config_home()
+        assert resolved == Path.home() / ".config"
+        assert not resolved.is_relative_to(_REAL_LOOKING_XDG_CONFIG_HOME)
+
+    def test_the_linux_config_bases_resolve_inside_the_tmp_home(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        for base in (env.config_base(), env.vscode_storage_base()):
+            assert base == Path.home() / ".config", base
+
+    def test_find_config_without_a_flag_on_linux_resolves_inside_the_tmp_home(
+        self, tmp_path, monkeypatch
+    ):
+        # A neutral cwd, as in the APPDATA pin: this is about the fallback.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sys, "platform", "linux")
+        found = paths.find_config(None)
+        assert found == Path.home() / ".config" / "magent" / "config.json"
+        assert not found.is_relative_to(_REAL_LOOKING_XDG_CONFIG_HOME), found
+
+
 class TestToolCachesSurviveTheRedirect:
     """A redirected home moves every tool cache keyed off ``~``, not just
     magent's own state -- and a cache the CI job populated in the runner's real
