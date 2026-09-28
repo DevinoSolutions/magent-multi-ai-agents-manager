@@ -1914,6 +1914,31 @@ private socket (CI's Windows platform leg only),
 `tests/platform/test_real_psmux.py::
 test_real_pane_reads_idle_only_while_nothing_it_launched_runs`.
 
+### magent's stdout escapes rather than raises (2026-09-28)
+
+A redirected Windows stdout (a pipe, a file, the Session-0 hand-off's
+`out.txt`, the ssh channel `magent attach` reads) is the ANSI code page with a
+handler that raises. One CJK or emoji project name ended a command with a
+`UnicodeEncodeError` and rc 1, and `up` got that far only after its sessions
+existed. The entry point (`cli/app.py::_escape_unencodable_output`) now gives
+stdout one error handler, `magent.escape`. What the code page holds is written
+byte-for-byte as before. A lone U+DC80..U+DCFF is written back as the byte
+surrogateescape decoded it from, so a POSIX path that is not UTF-8 still prints
+as that path. Everything else prints as its `\u4e2d` escape. stderr needs
+nothing: Python already gives it backslashreplace.
+
+Only the error handler changes, never the encoding: a parent that reads magent
+in its locale encoding (the hand-off's `_read_handoff_text` falls back to
+`mbcs`, a Python caller uses `text=True`) must keep getting that encoding. Only
+a stream still on a born-with handler (`strict`, `surrogateescape`) is changed;
+a handler somebody chose is kept. It is not `PYTHONIOENCODING` set for the
+hand-off child, because every process that child spawns, the fleet included,
+would inherit it, and magent's child-environment policy is strip-only
+(`env.spawn_child_env`). Known limit: a UTF-16/32 stdout, which only an explicit
+`PYTHONIOENCODING` gives, still raises on a lone U+DC80..U+DCFF. Pins:
+`tests/unit/test_stdout_escape.py`, `tests/e2e/test_cli_flags.py`, and the real
+hand-off runs in `tests/unit/test_desktop_handoff.py`.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
