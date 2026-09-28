@@ -1145,12 +1145,22 @@ class TestSample:
         # rc 0: the node answered; the answer was malformed.
         assert exc.value.rc == 0
 
-    def test_a_reply_nested_too_deeply_is_a_remote_error_not_a_crash(self, fake_ssh):
+    def test_a_reply_nested_too_deeply_is_a_remote_error_not_a_crash(self, monkeypatch):
         # json.loads answers deep nesting with RecursionError, not ValueError;
         # 200k '[' is far inside the reply cap and still the node's bad answer.
-        fake_ssh.set_reply("bash -s", stdout="[" * 200_000)
-        with pytest.raises(RemoteError, match="not a load sample") as exc:
+        # A parsing test: run_script hands sample() the reply, no fake ssh.
+        def fake_run_script(
+            node: Node, script: str, args: list[str], *, timeout_s: float, stdin=None
+        ) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.CompletedProcess([], 0, b"[" * 200_000, b"")
+
+        monkeypatch.setattr(remote_mux, "run_script", fake_run_script)
+        # Both caught, so an escaped RecursionError fails the assertion
+        # below, not the test by exception.
+        with pytest.raises((RemoteError, RecursionError)) as exc:
             remote_mux.sample(NODE)
+        assert isinstance(exc.value, RemoteError), repr(exc.value)
+        assert "not a load sample" in exc.value.stderr_tail
         assert exc.value.rc == 0
         assert isinstance(exc.value.__cause__, RecursionError)
 
