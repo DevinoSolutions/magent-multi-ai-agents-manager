@@ -421,6 +421,10 @@ printf '%s %s\\n' "$(id -u "$u")" "$home"
 _BOOTSTRAP_USER = """set -eu
 port=$1
 ssh-keygen -q -t ed25519 -N '' -C magent-e2e-node -f "$HOME/.ssh/id_ed25519"
+# ssh-keygen's 0600 is umask 077 over an open(0644), and a default ACL on the
+# parent overrides the umask: the hosted runner's homes carry ACLs, the key
+# came out 0644 there, and ssh refused to load it for the clone.
+chmod 600 "$HOME/.ssh/id_ed25519"
 cat "$HOME/.ssh/id_ed25519.pub" >> "$HOME/.ssh/authorized_keys"
 ssh-keyscan -p "$port" localhost > "$HOME/.ssh/known_hosts" 2>/dev/null || true
 if [ ! -s "$HOME/.ssh/known_hosts" ]; then
