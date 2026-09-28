@@ -5756,6 +5756,7 @@ SETUP_TOOLS = (
     "mktemp",
     "sleep",
     "timeout",
+    "stat",  # setup.sh reads the node key's mode; so does the fake ssh-keygen
 )
 
 # Each shim is `#!<bash>` + `STATE=<dir>` + its body. The state directory is
@@ -5842,6 +5843,7 @@ chmod +x "$HOME/.local/bin/claude"
 EOF
 """,
     "ssh-keygen": """
+echo "$*" >> "$STATE/keygen.log"
 f=""; c=""; y=""
 while [ "$#" -gt 0 ]; do
   case "$1" in -f) f=$2; shift ;; -C) c=$2; shift ;; -y) y=1 ;; esac
@@ -5849,11 +5851,20 @@ while [ "$#" -gt 0 ]; do
 done
 if [ -n "$y" ]; then
   if [ -e "$STATE/keygen-y-fail" ]; then echo "Load key \\"$f\\": invalid format" >&2; exit 255; fi
+  # sshkey_perm_ok: a key its group or others can read is refused, not loaded.
+  m=$(stat -c %a "$f") || exit 255
+  if [ $((8#$m & 8#077)) -ne 0 ]; then echo "Load key \\"$f\\": bad permissions" >&2; exit 255; fi
   printf 'ssh-ed25519 AAAAFAKENODEKEY %s\\n' "$(cut -d' ' -f4- "$f")"
   exit 0
 fi
 if [ -e "$f" ]; then echo "$f already exists. Overwrite (y/n)?" >&2; exit 1; fi
+# The mode of ~/.ssh while the key is written: an open key is guarded only by
+# its directory until setup chmods it.
+stat -c %a "${f%/*}" > "$STATE/keygen-dir-mode"
 printf 'FAKE PRIVATE KEY %s\\n' "$c" > "$f"
+# keygen-acl: OpenSSH >= 8.2 writes the key as umask 077 over open(0644), and a
+# default ACL on ~/.ssh overrides the umask (measured on a hosted runner: 0644).
+[ ! -e "$STATE/keygen-acl" ] || chmod 644 "$f"
 printf 'ssh-ed25519 AAAAFAKENODEKEY %s\\n' "$c" > "$f.pub"
 """,
     "hostname": "echo devino-second\n",
@@ -5941,6 +5952,43 @@ def _existing_user(state: Path, name: str, *, uid: int | None = None) -> Path:
     home = state / "home" / name
     home.mkdir(parents=True, exist_ok=True)
     return home
+
+
+def _fails_on_the_node_key(
+    tmp_path: Path, tool: str, pattern: str = "*/.ssh/id_ed25519"
+) -> None:
+    """``tool`` fails for an argument matching the shell ``pattern`` (the node
+    key, or ``*/.ssh`` for its directory) and is the real one for any other:
+    the shims come first on the fake box's PATH. The other shims see it too:
+    the fake ssh-keygen's ``-y`` stats the key."""
+    real = shutil.which(tool)
+    assert real is not None, f"{tool} is not on this runner"
+    shim = tmp_path / "shims" / tool
+    shim.write_text(
+        f"#!{BASH}\n"
+        f'for a; do case "$a" in {pattern})\n'
+        f'  echo "{tool}: $a: Operation not permitted" >&2; exit 1 ;; esac; done\n'
+        f'exec {shlex.quote(real)} "$@"\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    shim.chmod(0o755)
+
+
+def _keygen_calls(state: Path) -> list[str]:
+    """Every argv the fake ssh-keygen was run with, in order."""
+    log = state / "keygen.log"
+    return log.read_text("utf-8").splitlines() if log.exists() else []
+
+
+def _authorized_ssh_dir(state: Path, mode: int) -> Path:
+    """amin's ~/.ssh at ``mode``, already authorizing this PC's key: setup's
+    authorized_keys step skips it, so leaves the mode as it found it."""
+    ssh_dir = _existing_user(state, "amin") / ".ssh"
+    ssh_dir.mkdir()
+    (ssh_dir / "authorized_keys").write_text(PC_KEY + "\n", encoding="utf-8")
+    ssh_dir.chmod(mode)
+    return ssh_dir
 
 
 @POSIX_BASH
@@ -6356,6 +6404,54 @@ class TestSetupShUnderRealBash:
             "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
         }
 
+    def test_a_pub_without_its_private_key_is_a_fail_row_not_a_key(self, tmp_path):
+        # Its `key` row would register on GitHub a key whose private half is
+        # not on the node: setup would say ok on a node that cannot clone. The
+        # user's .pub is left as it was, and no key is generated beside it.
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        pub = ssh_dir / "id_ed25519.pub"
+        pub.write_bytes(b"ssh-ed25519 AAAAOLDKEY old@box\n")
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            (
+                "id_ed25519.pub in ~/.ssh has no private key beside it;"
+                " remove the .pub and rerun"
+            ),
+        )
+        assert set(_report(r).keys()) == set()
+        assert pub.read_bytes() == b"ssh-ed25519 AAAAOLDKEY old@box\n"
+        assert not (ssh_dir / "id_ed25519").exists()
+        assert _keygen_calls(state) == []
+        assert r.returncode == 1
+
+    def test_a_directory_at_the_key_path_beside_a_pub_is_a_fail_row(self, tmp_path):
+        # `-f`, not `-e`: a directory is no private key either, so its .pub
+        # would reach GitHub the same way.
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        blocker = ssh_dir / "id_ed25519"
+        blocker.mkdir()
+        blocker.chmod(0o755)
+        pub = ssh_dir / "id_ed25519.pub"
+        pub.write_bytes(b"ssh-ed25519 AAAAOLDKEY old@box\n")
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            (
+                "id_ed25519.pub in ~/.ssh has no private key beside it;"
+                " remove the .pub and rerun"
+            ),
+        )
+        assert set(_report(r).keys()) == set()
+        assert blocker.stat().st_mode & 0o777 == 0o755
+        assert pub.read_bytes() == b"ssh-ed25519 AAAAOLDKEY old@box\n"
+        assert _keygen_calls(state) == []
+        assert r.returncode == 1
+
     # -- mutation killers (cq-F13) --------------------------------------------
 
     def test_a_failed_installer_download_fails_claude_and_keeps_the_key(self, tmp_path):
@@ -6410,6 +6506,323 @@ class TestSetupShUnderRealBash:
         assert _rows(r)["node-key:amin"] == "fail"
         assert not (ssh_dir / "id_ed25519.pub").exists()
         assert set(_report(r).keys()) == set()
+
+    # -- the node key under a default ACL (F-ACL-1) ----------------------------
+
+    def test_the_node_key_is_owner_only_even_when_keygen_leaves_it_open(self, tmp_path):
+        # ssh-keygen leaves the key 0644 under a default ACL (keygen-acl), and
+        # ssh then refuses it: the node could never clone.
+        state, env = _setup_box(tmp_path)
+        (state / "keygen-acl").touch()
+        r = _run_setup(env)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
+        assert ssh_dir.stat().st_mode & 0o777 == 0o700
+        assert _rows(r)["node-key:amin"] == "did"
+        assert _report(r).keys() == {
+            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        }
+        assert r.returncode == 0, r.stderr
+
+    def test_a_rerun_repairs_an_open_node_key(self, tmp_path):
+        # A key an earlier setup left open is made private BEFORE the lost .pub
+        # is derived from it: `ssh-keygen -y` refuses an open key, as ssh does.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        (ssh_dir / "id_ed25519").chmod(0o644)
+        (ssh_dir / "id_ed25519.pub").unlink()
+        r = _run_setup(env)
+        assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
+        assert self._row(r, "node-key:amin") == (
+            "did",
+            (
+                "id_ed25519.pub derived again from the private key in ~/.ssh;"
+                " id_ed25519 made owner-only: it was 0644, now 0600"
+            ),
+        )
+        assert _report(r).keys() == {
+            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        }
+        assert r.returncode == 0, r.stderr
+
+    def test_a_rerun_repairs_an_open_node_key_whose_pub_is_intact(self, tmp_path):
+        # Every run, not only the runs that derive: the skip branch reads no
+        # key, and would leave it open for good. The row says it was repaired.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        (ssh_dir / "id_ed25519").chmod(0o644)
+        r = _run_setup(env)
+        assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
+        assert self._row(r, "node-key:amin") == (
+            "did",
+            "id_ed25519 made owner-only: it was 0644, now 0600",
+        )
+        assert _report(r).keys() == {
+            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        }
+        assert r.returncode == 0, r.stderr
+
+    @pytest.mark.parametrize(
+        ("lose_pub", "row"),
+        [
+            (False, ("skip", "id_ed25519 already in ~/.ssh")),
+            (
+                True,
+                (
+                    "did",
+                    "id_ed25519.pub derived again from the private key in ~/.ssh",
+                ),
+            ),
+        ],
+        ids=["pub-intact", "pub-lost"],
+    )
+    def test_an_owner_only_node_key_is_not_reported_repaired(
+        self, tmp_path, lose_pub, row
+    ):
+        # Rows say what happened: a key already at 0600 needed no repair.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        if lose_pub:
+            (ssh_dir / "id_ed25519.pub").unlink()
+        r = _run_setup(env)
+        assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
+        assert self._row(r, "node-key:amin") == row
+        assert r.returncode == 0, r.stderr
+
+    @pytest.mark.parametrize(
+        ("mode", "detail"),
+        [
+            (0o400, "id_ed25519 set to 0600 (it was 0400, already owner-only)"),
+            (0o700, "id_ed25519 set to 0600 (it was 0700, already owner-only)"),
+            (0o000, "id_ed25519 set to 0600 (it was 0000, already owner-only)"),
+            (0o040, "id_ed25519 made owner-only: it was 0040, now 0600"),
+            (0o604, "id_ed25519 made owner-only: it was 0604, now 0600"),
+        ],
+        ids=["0400", "0700", "0000", "0040", "0604"],
+    )
+    def test_the_repair_row_says_whether_the_key_was_open(self, tmp_path, mode, detail):
+        # Only a key its group or others could read was exposed; any other
+        # mode is set to 0600 with no word of exposure. The old mode reads four
+        # digits wide: stat's %a drops leading zeros.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        key = state / "home" / "amin" / ".ssh" / "id_ed25519"
+        key.chmod(mode)
+        r = _run_setup(env)
+        assert key.stat().st_mode & 0o777 == 0o600
+        assert self._row(r, "node-key:amin") == ("did", detail)
+        assert r.returncode == 0, r.stderr
+
+    def test_a_node_key_whose_mode_cannot_be_read_is_never_reported_clean(
+        self, tmp_path
+    ):
+        # The key IS 0600 here, but setup cannot tell: it chmods anyway and
+        # reports a repair, because an unknown mode never reads as a skip.
+        # The .pub stays: the stat shim also fails the fake ssh-keygen's own
+        # stat, so a derive (-y) here would fail for a shim reason.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        _fails_on_the_node_key(tmp_path, "stat")
+        r = _run_setup(env)
+        key = state / "home" / "amin" / ".ssh" / "id_ed25519"
+        assert key.stat().st_mode & 0o777 == 0o600
+        assert self._row(r, "node-key:amin") == (
+            "did",
+            "id_ed25519 made owner-only (0600): its earlier mode could not be read",
+        )
+        assert b"Operation not permitted" not in r.stdout + r.stderr
+        assert r.returncode == 0, r.stderr
+
+    def test_a_repair_is_reported_even_when_the_derive_then_fails(self, tmp_path):
+        # The chmod has already run, and the next run reads 0600: this row is
+        # the only one that can say the key was open.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        key = state / "home" / "amin" / ".ssh" / "id_ed25519"
+        key.chmod(0o644)
+        (key.parent / "id_ed25519.pub").unlink()
+        (state / "keygen-y-fail").touch()
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            (
+                f'ssh-keygen -y: Load key "{key}": invalid format;'
+                " id_ed25519 made owner-only: it was 0644, now 0600"
+            ),
+        )
+        assert key.stat().st_mode & 0o777 == 0o600
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
+    def test_a_repair_is_reported_even_when_ssh_keygen_is_missing(self, tmp_path):
+        state, env = _setup_box(tmp_path, without=("ssh-keygen",))
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        key = ssh_dir / "id_ed25519"
+        key.write_bytes(b"FAKE PRIVATE KEY x\n")
+        key.chmod(0o644)
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            (
+                "ssh-keygen is not installed (Debian/Ubuntu package openssh-client);"
+                " id_ed25519 made owner-only: it was 0644, now 0600"
+            ),
+        )
+        assert key.stat().st_mode & 0o777 == 0o600
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
+    @pytest.mark.parametrize(
+        ("existing", "detail"),
+        [
+            (
+                True,
+                (
+                    "could not make ~/.ssh/id_ed25519 owner-only (0600);"
+                    " ssh refuses an open key"
+                ),
+            ),
+            (
+                False,
+                (
+                    "could not make the new ~/.ssh/id_ed25519 owner-only (0600);"
+                    " ssh refuses an open key"
+                ),
+            ),
+        ],
+        ids=["an-existing-key", "a-new-key"],
+    )
+    def test_a_failed_node_key_chmod_is_a_fail_row_and_nothing_runs_after_it(
+        self, tmp_path, existing, detail
+    ):
+        state, env = _setup_box(tmp_path)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        if existing:
+            _run_setup(env)
+            (ssh_dir / "id_ed25519").chmod(0o644)
+            (ssh_dir / "id_ed25519.pub").unlink()
+        before = _keygen_calls(state)
+        _fails_on_the_node_key(tmp_path, "chmod")
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == ("fail", detail)
+        assert set(_report(r).keys()) == set()
+        # magent's words, never chmod's.
+        assert b"Operation not permitted" not in r.stdout + r.stderr
+        assert r.returncode == 1
+        ran = _keygen_calls(state)[len(before) :]
+        if existing:
+            # No derive over a key that is still open.
+            assert ran == []
+            assert not (ssh_dir / "id_ed25519.pub").exists()
+        else:
+            # Only the generation, which comes before its chmod; never a -y.
+            (call,) = ran
+            assert "-y" not in call.split()
+
+    def test_a_symlinked_node_key_never_reaches_its_target(self, tmp_path):
+        # chmod follows a link: magent does not change a file it did not make.
+        state, env = _setup_box(tmp_path)
+        victim = tmp_path / "victim-key"
+        victim.write_bytes(b"x\n")
+        victim.chmod(0o644)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        (ssh_dir / "id_ed25519").symlink_to(victim)
+        (ssh_dir / "id_ed25519.pub").write_text(
+            "ssh-ed25519 AAAAFAKENODEKEY me@box\n", encoding="utf-8"
+        )
+        r = _run_setup(env)
+        assert victim.stat().st_mode & 0o777 == 0o644
+        assert victim.read_bytes() == b"x\n"
+        assert _rows(r)["node-key:amin"] == "fail"
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
+    def test_a_dangling_symlinked_node_key_is_never_written_through(self, tmp_path):
+        # `-h` is true for a dangling link too: ssh-keygen would otherwise
+        # write the new private key wherever the link points.
+        state, env = _setup_box(tmp_path)
+        target = tmp_path / "elsewhere" / "planted"
+        target.parent.mkdir()
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        (ssh_dir / "id_ed25519").symlink_to(target)
+        r = _run_setup(env)
+        assert not target.exists()
+        assert _keygen_calls(state) == []
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            "amin's .ssh or its id_ed25519 is a symlink; magent does not write through it",
+        )
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
+    def test_a_directory_named_like_the_node_key_keeps_its_mode(self, tmp_path):
+        # `-f`, not `-e`: chmod 600 would take a directory's x bit.
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        blocker = ssh_dir / "id_ed25519"
+        blocker.mkdir()
+        blocker.chmod(0o755)
+        r = _run_setup(env)
+        assert blocker.stat().st_mode & 0o777 == 0o755
+        assert _rows(r)["node-key:amin"] == "fail"
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
+    @pytest.mark.parametrize("mode", [0o755, 0o777], ids=["0755", "0777"])
+    def test_ssh_is_owner_only_before_the_node_key_is_generated_in_it(
+        self, tmp_path, mode
+    ):
+        # The new key is open until its chmod (keygen-acl), and meanwhile only
+        # its directory keeps others out. `mkdir -p` under a default ACL makes
+        # ~/.ssh 0777, and an authorized_keys already in it leaves it be.
+        state, env = _setup_box(tmp_path)
+        (state / "keygen-acl").touch()
+        ssh_dir = _authorized_ssh_dir(state, mode)
+        r = _run_setup(env)
+        assert _rows(r)["authorized_keys:amin"] == "skip"
+        assert (state / "keygen-dir-mode").read_text("utf-8") == "700\n"
+        assert ssh_dir.stat().st_mode & 0o777 == 0o700
+        assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
+        assert _rows(r)["node-key:amin"] == "did"
+        assert _report(r).keys() == {
+            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        }
+        assert r.returncode == 0, r.stderr
+
+    def test_an_ssh_dir_that_cannot_be_made_owner_only_gets_no_node_key(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _authorized_ssh_dir(state, 0o755)
+        _fails_on_the_node_key(tmp_path, "chmod", "*/.ssh")
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            "could not make ~/.ssh owner-only (0700) for the new key",
+        )
+        assert _keygen_calls(state) == []
+        assert not (ssh_dir / "id_ed25519").exists()
+        assert set(_report(r).keys()) == set()
+        assert b"Operation not permitted" not in r.stdout + r.stderr
+        assert r.returncode == 1
+
+    def test_an_ssh_path_that_is_a_file_gets_magents_own_fail_row(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        (_existing_user(state, "amin") / ".ssh").write_bytes(b"x\n")
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            "could not make ~/.ssh owner-only (0700) for the new key",
+        )
+        assert _keygen_calls(state) == []
+        assert set(_report(r).keys()) == set()
+        assert b"File exists" not in r.stdout + r.stderr
+        assert r.returncode == 1
 
     # -- bounded version probes (impl-F14) -------------------------------------
 

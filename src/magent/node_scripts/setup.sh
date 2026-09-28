@@ -216,27 +216,70 @@ user_claude() {
 
 # Never a second node key over the first: GitHub may already hold it. A lost
 # .pub is derived again from the private key.
+# The key is chmod 600 on every run and again once generated: ssh-keygen's 0600
+# is umask 077 over open(0644) (OpenSSH >= 8.2), which a default ACL on ~/.ssh
+# overrides, and ssh (and `ssh-keygen -y`) refuses a key others can read.
+# Until that chmod, only ~/.ssh keeps others from a new key, so ~/.ssh is made
+# 0700 first: `mkdir -p` under that same ACL makes it 0777.
 # shellcheck disable=SC2317  # invoked through `declare -f` in run_user_phase
 user_node_key() {
-  local u=$1 out pub ssh="$HOME/.ssh" id="$HOME/.ssh/id_ed25519"
-  if [ -h "$ssh" ]; then
-    say fail "node-key:$u" "$u's .ssh is a symlink; magent does not write through it"
+  local u=$1 out pub mode pad made="" ssh="$HOME/.ssh" id="$HOME/.ssh/id_ed25519"
+  if [ -h "$ssh" ] || [ -h "$id" ]; then
+    say fail "node-key:$u" "$u's .ssh or its id_ed25519 is a symlink; magent does not write through it"
     return 1
   fi
+  # The row says whether the chmod changed anything (GNU stat: nodes are
+  # Debian/Ubuntu). A mode stat cannot read is a repair, never a clean skip.
+  # A fail row after it carries the note too: the next run reads 0600.
+  if [ -f "$id" ]; then
+    mode=$(stat -c %a "$id" 2>/dev/null) || mode=""
+    if ! chmod 600 "$id" 2>/dev/null; then
+      say fail "node-key:$u" "could not make ~/.ssh/id_ed25519 owner-only (0600); ssh refuses an open key"
+      return 1
+    fi
+    # %a drops leading zeros (0 for 0000): the old mode reads four digits
+    # wide, and only a group or other bit (the last two) was an exposure.
+    pad=000$mode
+    case $mode in
+      600) ;;
+      "") made="id_ed25519 made owner-only (0600): its earlier mode could not be read" ;;
+      *)
+        if [ "${pad: -2}" = 00 ]; then
+          made="id_ed25519 set to 0600 (it was ${pad: -4}, already owner-only)"
+        else
+          made="id_ed25519 made owner-only: it was ${pad: -4}, now 0600"
+        fi
+        ;;
+    esac
+  fi
   if [ -f "$id.pub" ]; then
-    say skip "node-key:$u" "id_ed25519 already in ~/.ssh"
+    # A .pub alone would send GitHub a key this node cannot clone with.
+    if [ ! -f "$id" ]; then
+      say fail "node-key:$u" "id_ed25519.pub in ~/.ssh has no private key beside it; remove the .pub and rerun"
+      return 1
+    elif [ -n "$made" ]; then
+      say did "node-key:$u" "$made"
+    else
+      say skip "node-key:$u" "id_ed25519 already in ~/.ssh"
+    fi
   elif ! command -v ssh-keygen >/dev/null 2>&1; then
-    say fail "node-key:$u" "ssh-keygen is not installed (Debian/Ubuntu package openssh-client)"
+    say fail "node-key:$u" "ssh-keygen is not installed (Debian/Ubuntu package openssh-client)${made:+; $made}"
     return 1
   elif [ -f "$id" ]; then
     if ! out=$(ssh-keygen -y -P "" -f "$id" 2>&1 > "$id.pub"); then
       rm -f -- "$id.pub"
-      say fail "node-key:$u" "ssh-keygen -y: ${out##*$'\n'}"
+      say fail "node-key:$u" "ssh-keygen -y: ${out##*$'\n'}${made:+; $made}"
       return 1
     fi
-    say did "node-key:$u" "id_ed25519.pub derived again from the private key in ~/.ssh"
-  elif out=$( { { [ -d "$ssh" ] || mkdir -m 700 "$ssh"; } &&
-      ssh-keygen -q -t ed25519 -N "" -C "magent@$(hostname)" -f "$id"; } 2>&1 ); then
+    say did "node-key:$u" "id_ed25519.pub derived again from the private key in ~/.ssh${made:+; $made}"
+  elif ! { { [ -d "$ssh" ] || mkdir -m 700 "$ssh"; } && chmod 700 "$ssh"; } 2>/dev/null; then
+    say fail "node-key:$u" "could not make ~/.ssh owner-only (0700) for the new key"
+    return 1
+  elif out=$(ssh-keygen -q -t ed25519 -N "" -C "magent@$(hostname)" -f "$id" 2>&1); then
+    if ! chmod 600 "$id" 2>/dev/null; then
+      say fail "node-key:$u" "could not make the new ~/.ssh/id_ed25519 owner-only (0600); ssh refuses an open key"
+      return 1
+    fi
     say did "node-key:$u" "id_ed25519 generated in ~/.ssh (the private key never leaves this node)"
   else
     say fail "node-key:$u" "ssh-keygen: ${out##*$'\n'}"
