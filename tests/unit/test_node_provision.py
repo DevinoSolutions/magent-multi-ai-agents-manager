@@ -6600,13 +6600,15 @@ class TestSetupShUnderRealBash:
             (0o000, "id_ed25519 set to 0600 (it was 0000, already owner-only)"),
             (0o040, "id_ed25519 made owner-only: it was 0040, now 0600"),
             (0o604, "id_ed25519 made owner-only: it was 0604, now 0600"),
+            (0o4644, "id_ed25519 made owner-only: it was 4644, now 0600"),
         ],
-        ids=["0400", "0700", "0000", "0040", "0604"],
+        ids=["0400", "0700", "0000", "0040", "0604", "4644"],
     )
     def test_the_repair_row_says_whether_the_key_was_open(self, tmp_path, mode, detail):
         # Only a key its group or others could read was exposed; any other
         # mode is set to 0600 with no word of exposure. The old mode reads four
-        # digits wide: stat's %a drops leading zeros.
+        # digits wide: stat's %a drops leading zeros, and a setuid key's first
+        # digit is its own (an owner may set S_ISUID on its own file).
         state, env = _setup_box(tmp_path)
         _run_setup(env)
         key = state / "home" / "demo" / ".ssh" / "id_ed25519"
@@ -6672,6 +6674,35 @@ class TestSetupShUnderRealBash:
                 " id_ed25519 made owner-only: it was 0644, now 0600"
             ),
         )
+        assert key.stat().st_mode & 0o777 == 0o600
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
+    @pytest.mark.parametrize(
+        "derive_fails", [False, True], ids=["keygen-missing", "derive-fails"]
+    )
+    def test_a_fail_row_over_an_owner_only_key_carries_no_note(
+        self, tmp_path, derive_fails
+    ):
+        # A key already at 0600 had no repair to report: the row ends at the
+        # failure's own words, with no "; " after them.
+        state, env = _setup_box(
+            tmp_path, without=() if derive_fails else ("ssh-keygen",)
+        )
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        key = ssh_dir / "id_ed25519"
+        key.write_bytes(b"FAKE PRIVATE KEY x\n")
+        key.chmod(0o600)
+        if derive_fails:
+            (state / "keygen-y-fail").touch()
+            detail = f'ssh-keygen -y: Load key "{key}": invalid format'
+        else:
+            detail = (
+                "ssh-keygen is not installed (Debian/Ubuntu package openssh-client)"
+            )
+        r = _run_setup(env)
+        assert self._row(r, "node-key:demo") == ("fail", detail)
         assert key.stat().st_mode & 0o777 == 0o600
         assert set(_report(r).keys()) == set()
         assert r.returncode == 1
