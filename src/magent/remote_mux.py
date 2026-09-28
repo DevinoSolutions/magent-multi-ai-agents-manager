@@ -476,11 +476,17 @@ def _spawn(
             )
         reason = f"reply exceeded {max_stdout_bytes} bytes"
         # What the child said before it flooded is the likely cause. stderr
-        # gets the reap bound to end, and what it delivered is reported either
-        # way: a grandchild may hold it open long after the child is gone, and
-        # the words already read are no less the child's.
+        # gets the reap bound to end -- time too for words already in the pipe
+        # to be read -- and what it delivered is reported either way: a
+        # grandchild may hold it open long after the child is gone, and the
+        # words already read are no less the child's. A stream still open may
+        # end mid-line, though, and a fragment is no reason: only whole lines
+        # are kept. Asked BEFORE the handover, so a stream that ends between
+        # the two is trimmed, never a half-line kept.
         err.join(_REAP_TIMEOUT_S)
-        said = _tail(err.data())
+        ended = not err.is_alive()
+        held = err.data()
+        said = _tail(held if ended else held[: held.rfind(b"\n") + 1])
         # Killed mid-call, so the remote may still be running; but the node
         # answered, so it is not unreachable (timed_out stays False).
         raise RemoteError(

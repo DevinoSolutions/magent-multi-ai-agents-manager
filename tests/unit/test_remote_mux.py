@@ -28,7 +28,7 @@ from typing import NoReturn
 
 import pytest
 
-from magent import attach_client, log, node_scripts, nodes, psmux, remote_mux
+from magent import attach_client, launch, log, node_scripts, nodes, psmux, remote_mux
 from magent.attach_client import SSH_CONNECTION_OPTS
 from magent.nodes import LoadSample, Node, NodeConfigError, Recipe, RepoSpec
 from magent.remote_mux import RemoteError
@@ -491,8 +491,7 @@ time.sleep(90)
 """
 
 # A child that leaves that grandchild behind, waits for its pid file (so the
-# teardown never finds it missing), says one line on stderr, then floods
-# stdout.
+# teardown never finds it missing), says argv[2] on stderr, then floods stdout.
 _HELD_STDERR_CHILD = (
     f"GRANDCHILD = {_HELD_STDERR_GRANDCHILD!r}\n"
     """\
@@ -506,7 +505,7 @@ subprocess.Popen(
 deadline = time.monotonic() + 30
 while not os.path.exists(sys.argv[1]) and time.monotonic() < deadline:
     time.sleep(0.01)
-sys.stderr.write("boom: disk full\\n")
+sys.stderr.write(sys.argv[2])
 sys.stderr.flush()
 block = b"x" * 65536
 while True:
@@ -621,16 +620,18 @@ class TestTheReplyIsBoundedInMemory:
         assert lines[0] == f"reply exceeded {CAP} bytes"
         assert "boom: disk full" in lines[1:]
 
-    def _flood_past_a_held_stderr(self, tmp_path) -> tuple[RemoteError, float]:
-        """_HELD_STDERR_CHILD's over-cap error, and how long it took. The
-        teardown kills the grandchild's own pid, once, and only if the
-        grandchild wrote it."""
+    def _flood_past_a_held_stderr(
+        self, tmp_path, said: str = "boom: disk full\n"
+    ) -> tuple[RemoteError, float]:
+        """_HELD_STDERR_CHILD's over-cap error after it said ``said``, and how
+        long it took. The teardown kills the grandchild's own pid, once, and
+        only if the grandchild wrote it."""
         pidfile = tmp_path / "grandchild.pid"
         started = time.monotonic()
         try:
             with pytest.raises(RemoteError) as exc:
                 remote_mux._spawn(
-                    [sys.executable, "-c", _HELD_STDERR_CHILD, str(pidfile)],
+                    [sys.executable, "-c", _HELD_STDERR_CHILD, str(pidfile), said],
                     timeout_s=60,
                     input_bytes=None,
                     check=True,
@@ -659,6 +660,55 @@ class TestTheReplyIsBoundedInMemory:
         # where kill() takes cmd.exe and the interpreter behind it holds stderr.
         error, _ = self._flood_past_a_held_stderr(tmp_path)
         assert "boom: disk full" in error.stderr_tail.splitlines()[1:]
+
+    def test_a_stderr_held_open_mid_line_never_hands_over_the_fragment(self, tmp_path):
+        # The stream is still open, so its last line may be half-written: only
+        # whole lines are the child's words, and the row shows the last one.
+        error, _ = self._flood_past_a_held_stderr(
+            tmp_path, said="boom: disk full\nwriting blo"
+        )
+        lines = error.stderr_tail.splitlines()
+        assert lines[0] == f"reply exceeded {CAP} bytes"
+        assert "boom: disk full" in lines[1:]
+        assert "writing blo" not in error.stderr_tail
+        assert launch._node_error_text(error) == "boom: disk full"
+
+    def test_a_stderr_held_open_before_a_whole_line_gives_no_reason(self, tmp_path):
+        # No line has ended yet: the cap is the whole story, never a fragment.
+        error, _ = self._flood_past_a_held_stderr(tmp_path, said="writing blo")
+        assert error.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
+
+    def test_a_stderr_that_ended_keeps_its_last_line_without_a_newline(self):
+        # An ENDED stream was not cut off mid-write, so its last line is whole
+        # even unterminated: only a stream still open is trimmed. The base
+        # interpreter, not sys.executable: on Windows that is a venv launcher
+        # holding its own copy of the pipe, so the stream would end only once
+        # the kill reached through it.
+        child = (
+            "import os, sys\n"
+            "sys.stderr.write('boom: disk full')\n"
+            "sys.stderr.flush()\n"
+            "os.close(2)\n"
+            "block = b'x' * 65536\n"
+            "while True:\n"
+            "    sys.stdout.buffer.write(block)\n"
+            "    sys.stdout.flush()\n"
+        )
+        python = getattr(sys, "_base_executable", sys.executable)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux._spawn(
+                [python, "-I", "-c", child],
+                timeout_s=60,
+                input_bytes=None,
+                check=True,
+                shown=("child",),
+                label="test child",
+                quiet=True,
+                max_stdout_bytes=CAP,
+            )
+        assert exc.value.over_cap
+        assert launch._node_error_text(exc.value) == "boom: disk full"
 
     def test_the_drain_hands_over_what_arrived_before_the_stream_ends(self):
         # A data() taken mid-read is what has arrived, and the read goes on
