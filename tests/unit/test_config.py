@@ -359,10 +359,15 @@ class TestTextWithNoUtf8FormIsRefusedAtLoad:
     @pytest.mark.parametrize(
         ("where", "config"), _EVERY_STRING, ids=[w for w, _ in _EVERY_STRING]
     )
-    def test_every_string_in_the_document_is_covered(self, tmp_config, where, config):
+    def test_every_string_in_the_document_is_covered(
+        self, capsys, tmp_config, where, config
+    ):
         with pytest.raises(ConfigError) as exc:
             load_config(tmp_config(config))
         assert str(exc.value) == _refusal(where)
+        # Nothing is echoed first: an unknown-key warning carrying the text
+        # would hit a strict console stream and put the codec's words back.
+        assert capsys.readouterr().err == ""
 
     def test_the_refusal_is_ascii_and_never_the_codecs_words(self, tmp_config):
         # The refusal must print on the very streams the raw text crashed, so
