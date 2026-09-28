@@ -108,6 +108,20 @@ class TestLoadConfig:
         with pytest.raises(ValueError, match="valid JSON"):
             load_config(str(p))
 
+    def test_nesting_deeper_than_json_can_read_is_refused_in_our_words(self, tmp_path):
+        # Past json.loads' own ceiling (~1,000 levels on 3.10/3.11, ~3,000 on
+        # 3.12/3.13, the C stack on 3.14) it raises RecursionError, which used
+        # to reach the user as a traceback.
+        p = tmp_path / "deep.json"
+        p.write_text(
+            '{"projects": ' + "[" * 1_000_000 + "]" * 1_000_000 + "}",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(str(p))
+        assert str(exc.value) == "Config is nested too deeply to read"
+        assert isinstance(exc.value.__cause__, RecursionError)
+
     def test_file_not_found_raises(self):
         with pytest.raises(FileNotFoundError):
             load_config("/nonexistent/config.json")
