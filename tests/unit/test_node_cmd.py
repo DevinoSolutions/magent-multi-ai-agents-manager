@@ -476,7 +476,13 @@ class TestNodePlan:
         result = runner.invoke(cli.main, ["--config", cfg, "node", "plan", "api"])
 
         assert result.exit_code == 0
-        assert "api  auto -> (node unknown)" in result.stdout
+        # The words themselves, as printed: a reason reworded into the
+        # no-data text would read an unknown map as no load data.
+        assert (
+            "api  auto -> (node unknown)  (the node map could not be read,"
+            " so where it runs is unknown)"
+        ) in result.stdout
+        assert "no node has load samples" not in result.stdout
         assert "@second" not in result.stdout
         # The refusal a launch would print, as the same failure line.
         assert "x api: the node map could not be read" in result.stdout
