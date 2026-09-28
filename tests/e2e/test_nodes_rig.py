@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from magent.launch import node_sync_argv
 from tests.e2e import _nodes_rig as rig
 from tests.e2e._pty import Budget
 
@@ -254,12 +255,21 @@ def _cmdline(*argv: str) -> bytes:
     return b"".join(a.encode("utf-8") + b"\0" for a in argv)
 
 
+def _daemon_cmdline(config: str) -> bytes:
+    """The cmdline of the daemon the product spawns: ``node sync -d`` and
+    serve's supervisor both build it with ``launch.node_sync_argv``. A pin
+    built from it follows that argv; a hand-built one would stay green while
+    the rig stopped recognizing the real daemon."""
+    return _cmdline(*node_sync_argv(config))
+
+
 class TestTeardownKillsOnlyThisPcsSyncDaemon:
-    def test_this_pcs_daemon_matches_as_given_or_resolved(self, tmp_path: Path) -> None:
+    def test_the_products_own_daemon_matches_as_given_or_resolved(
+        self, tmp_path: Path
+    ) -> None:
         cfg = tmp_path / "a.config.json"
         for spelled in (str(cfg), os.path.realpath(cfg)):
-            line = _cmdline("/usr/bin/python3", "-m", "magent", "--config", spelled)
-            assert rig.is_sync_daemon(line + _cmdline("node", "sync"), cfg)
+            assert rig.is_sync_daemon(_daemon_cmdline(spelled), cfg)
 
     @pytest.mark.parametrize(
         "argv",
@@ -560,9 +570,7 @@ class TestCloseKillsOnlyWhatItOwns:
         problems, killed = self._close(
             tmp_path,
             monkeypatch,
-            cmdline=lambda cfg: _cmdline(
-                "/usr/bin/python3", "-m", "magent", "--config", str(cfg), "node", "sync"
-            ),
+            cmdline=lambda cfg: _daemon_cmdline(str(cfg)),
         )
         assert killed == [_DAEMON_PID]
         assert problems == [f"sync daemon pid {_DAEMON_PID} survived --stop (killed)"]
@@ -591,9 +599,7 @@ class TestCloseKillsOnlyWhatItOwns:
         monkeypatch.setattr(rig, "alive", lambda pid, budget: pid == _DAEMON_PID)
         monkeypatch.setattr(rig, "_cmdline", lambda pid: _cmdline("/sbin/init"))
         assert built.live_daemon() is None
-        ours = _cmdline(
-            "/usr/bin/python3", "-m", "magent", "--config", str(pc.cfg), "node", "sync"
-        )
+        ours = _daemon_cmdline(str(pc.cfg))
         monkeypatch.setattr(rig, "_cmdline", lambda pid: ours)
         assert built.live_daemon() == _DAEMON_PID
 
