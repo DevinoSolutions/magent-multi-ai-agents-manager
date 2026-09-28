@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -35,6 +36,7 @@ from magent.launch import (
 )
 from magent.platform import HandoffResult, Platform
 from tests.conftest import FakePlatform
+from tests.unit._jobhook import KillOnSpawn
 from tests.unit._ps_parse import argument_of, parse_file
 from tests.unit._ps_parse import parse as parse_powershell
 
@@ -287,6 +289,10 @@ elif mode == "/run":
             # Started, but slow to reach Start-Process (a loaded box): the
             # launcher is alive, so /Query says Running, and no pid.txt yet.
             spec = f'"{sys.executable}" -c "import time; time.sleep({late})" && {spec}'
+        # A job.txt sidecar names a job object the TEST created: the task is
+        # started suspended, put in that job, and only then resumed, so every
+        # process it creates is announced to the test's watcher (_jobhook).
+        job_file = here / "job.txt"
         launcher = subprocess.Popen(
             spec,
             shell=True,
@@ -294,7 +300,19 @@ elif mode == "/run":
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=0x00000004 if job_file.exists() else 0,  # CREATE_SUSPENDED
         )
+        if job_file.exists():
+            import ctypes
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenJobObjectW.restype = ctypes.c_void_p
+            job = k32.OpenJobObjectW(0x1F001F, False, job_file.read_text(encoding="utf-8"))
+            handle = ctypes.c_void_p(int(launcher._handle))
+            if not job or not k32.AssignProcessToJobObject(ctypes.c_void_p(job), handle):
+                launcher.kill()
+                sys.exit(4)
+            ctypes.WinDLL("ntdll").NtResumeProcess(handle)
         (here / f"{name}.pid").write_text(str(launcher.pid), encoding="utf-8")
 elif mode == "/query":
     # Real schtasks prints a table; only the status word is ever read. Like
@@ -394,6 +412,20 @@ def _scratch_root(bin_dir: Path) -> Path:
     return bin_dir.parent / "systemp" / "magent-handoff"
 
 
+@pytest.fixture
+def rcprobe(tmp_path) -> list[str]:
+    """A command whose process the job hook can pick out by image name: a
+    private copy of cmd.exe, so nothing else in the tree is ever called
+    ``rcprobe.exe``, whose own exit code (7) equals the one the hook forces."""
+    import ctypes  # win-only: ctypes.windll doesn't exist off Windows
+
+    buffer = ctypes.create_unicode_buffer(260)
+    assert ctypes.windll.kernel32.GetSystemDirectoryW(buffer, 260), "no system dir"
+    exe = tmp_path / "rcprobe.exe"
+    shutil.copyfile(Path(buffer.value) / "cmd.exe", exe)
+    return [str(exe), "/c", "exit", "7"]
+
+
 def _calls(bin_dir: Path) -> list[list[str]]:
     log = bin_dir / "calls.jsonl"
     if not log.exists():
@@ -475,6 +507,29 @@ class TestRunOnDesktopOnWindows:
         assert result.timed_out is False
         assert "hello out" in result.stdout
         assert "hello err" in result.stderr
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="run.ps1 re-opens the child by pid after Start-Process; fixed next",
+    )
+    def test_a_child_gone_before_the_launcher_looks_still_reports_its_code(
+        self, fake_schtasks, rcprobe
+    ):
+        # The measured null: a command that exits before the launcher's next
+        # statement leaves nothing a by-pid OpenProcess can read its exit code
+        # from, and the hand-off reported "failed" for a bring-up that worked.
+        # Not a timing hope: the job hook kills the command with 7 the instant
+        # CreateProcess resumed it, so on every run it is gone before the
+        # launcher does anything else. Only a launcher still holding the handle
+        # CreateProcess gave it can read the 7.
+        with KillOnSpawn("rcprobe.exe", 7) as hook:
+            (fake_schtasks / "job.txt").write_text(hook.name, encoding="utf-8")
+            result = self._plat().run_on_desktop(rcprobe, timeout_s=60)
+
+        # First that the construction happened -- one probe seen, one killed
+        # after its resume -- or a green rc proves nothing about the race.
+        assert (hook.killed, hook.kill_ok) == (1, 1)
+        assert result.rc == 7, result.detail
 
     def test_the_child_can_never_hand_off_again(self, fake_schtasks):
         # A hand-off that landed in Session 0 again and handed off in turn
