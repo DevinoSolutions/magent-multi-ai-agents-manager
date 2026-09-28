@@ -126,6 +126,10 @@ finishes and paste in the matching `CHANGELOG.md` section.
 > as a pre-release that never becomes **Latest**. PyPI and `pip` treat the
 > version as a pre-release too: a plain `pip install` skips it, so testers need
 > `pip install --pre magent-multi-ai-agents-manager` or an exact `==X.Y.0rc1`.
+> In `CHANGELOG.md` an rc gets its own section, headed like a final one
+> (`## [X.Y.0rc1] - YYYY-MM-DD`, plus its link reference). The final `X.Y.0`
+> section summarizes everything since the last final release; the rc sections
+> stay as history.
 
 ---
 
