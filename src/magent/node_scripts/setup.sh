@@ -243,7 +243,11 @@ user_node_key() {
     esac
   fi
   if [ -f "$id.pub" ]; then
-    if [ -n "$made" ]; then
+    # A .pub alone would send GitHub a key this node cannot clone with.
+    if [ ! -f "$id" ]; then
+      say fail "node-key:$u" "id_ed25519.pub in ~/.ssh has no private key beside it; remove the .pub and rerun"
+      return 1
+    elif [ -n "$made" ]; then
       say did "node-key:$u" "$made"
     else
       say skip "node-key:$u" "id_ed25519 already in ~/.ssh"
