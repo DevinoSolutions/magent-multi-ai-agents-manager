@@ -1068,18 +1068,31 @@ class TestAMalformedPcFileIsANoteNotACrash:
 
     # Past the bound it is refused before json parses it -- far past it too,
     # where json's own answer (RecursionError, JSONDecodeError or a whole
-    # parse) would depend on the interpreter's C stack.
+    # parse) would depend on the interpreter's C stack. The spy is what makes
+    # "before" hold on every stack: a parse-then-refuse gives the same
+    # verdict through the walk's backstop wherever json gets to the end.
     @pytest.mark.parametrize("depth", [65, 500, 100_000])
     def test_a_file_nested_too_deep_is_refused_before_it_is_walked(
-        self, tmp_path, depth
+        self, tmp_path, monkeypatch, depth
     ):
         why = "nested deeper than 64 levels"
-        home = _pc_home(tmp_path)
+        deep = '{"a":' * depth + "1" + "}" * depth
+        # A sibling file that does parse: the spy is seen to be wired.
+        claude_json = {"mcpServers": {}}
+        home = _pc_home(tmp_path, claude_json=claude_json)
         (home / ".claude").mkdir()
-        (home / ".claude" / "settings.json").write_text(
-            '{"a":' * depth + "1" + "}" * depth, encoding="utf-8"
-        )
+        (home / ".claude" / "settings.json").write_text(deep, encoding="utf-8")
+        parsed: list[object] = []
+        real_loads = json.loads
+
+        def spy(text, *args, **kwargs):
+            parsed.append(text)
+            return real_loads(text, *args, **kwargs)
+
+        monkeypatch.setattr(nodes.json, "loads", spy)
         scope = nodes.user_scope(home)
+        assert json.dumps(claude_json) in parsed
+        assert deep not in parsed
         assert scope.settings == {}
         assert scope.unread == {"settings": why, "plugins": why}
         assert scope.notes == (
