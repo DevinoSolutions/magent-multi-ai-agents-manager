@@ -452,7 +452,7 @@ def _render_status(config_file: Path) -> StatusReport:
     # Node sessions (PR-D): read from the sync daemon's last pull, never over
     # ssh -- a stale row is a node this PC has not heard from, not a dead one.
     # heavy subsystem: in-body per policy
-    from magent import nodes
+    from magent import node_sync, nodes
 
     # G-MERGE: the map's error comes back for the pause line (round-2 ruling 3)
     map_errors: list[OSError | ValueError] = []
@@ -476,8 +476,11 @@ def _render_status(config_file: Path) -> StatusReport:
         # without one is an auto project behind an unreadable node map.
         unplaced = "(not placed)" if state == "dead" else "(node unknown)"
         node = f"@{node_row['node']}" if node_row["node"] else unplaced
+        # The sid is the node map's, whatever the file holds: printable
+        # ASCII only on this screen, as recall shows it.
+        sid = node_sync.printable(str(node_row["session"]))
         click.echo(
-            f"    {node_row['session']}  {style(node, fg='blue')}  {style(state, fg=tint[state])}"
+            f"    {sid}  {style(node, fg='blue')}  {style(state, fg=tint[state])}"
         )
     if paused is not None:
         # Degraded (exit 3), like a stale daemon: every row above is frozen

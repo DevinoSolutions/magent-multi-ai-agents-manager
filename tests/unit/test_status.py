@@ -1646,6 +1646,48 @@ class TestStatusShowsNodeSessions:
         assert "api-old" in result.stdout
         assert "live" in result.stdout
 
+    @pytest.mark.parametrize(
+        ("sid", "shown"),
+        [("api\x1b[31mold", "api?[31mold"), ("\u00e9pi\u200b", "?pi?")],
+        ids=["escape", "non-ascii"],
+    )
+    def test_the_maps_sid_reaches_the_screen_only_as_printable_ascii(
+        self, runner, tmp_config, tmp_path, monkeypatch, sid, shown
+    ):
+        # The sid is whatever the node map holds. CliRunner strips ANSI, so a
+        # raw escape would read as "apiold": the pin is the '?' printable put
+        # there.
+        from magent import nodes
+
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": time.time(), "sessions": [sid]}
+        )
+        nodes.update_node_map(
+            "api",
+            nodes.NodeMapEntry(
+                nick="second",
+                sid=sid,
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="/home/amin/magent/api",
+            ),
+        )
+        cfgpath = self._config(tmp_config, tmp_path)
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+        as_json = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+
+        nodes_block = result.stdout.split("Nodes", 1)[1]
+        assert f"    {shown}  @second" in nodes_block
+        # --json is the map's value, and json.dumps escapes it: no raw
+        # control byte reaches the terminal either way.
+        assert "\x1b" not in as_json.stdout
+        assert json.loads(as_json.stdout)["node_sessions"][0]["session"] == sid
+
     def test_an_unreadable_node_map_reads_stale_never_dead(
         self, runner, tmp_config, tmp_path, monkeypatch
     ):
