@@ -803,6 +803,44 @@ class TestNodePush:
             if r.name == "magent.nodes"
         )
 
+    def test_push_with_a_malformed_map_entry_is_unknown_not_unplaced(
+        self, runner, tmp_config, api_dir, one_repo, shipped, caplog
+    ):
+        # Round-2 ruling: an entry the map cannot read makes the map
+        # unreadable. Dropped, api read as "not placed yet".
+        nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        nodes.NODE_MAP_PATH.write_text(
+            json.dumps(
+                {
+                    "api": {
+                        "nick": "second",
+                        "sid": "api",
+                        "remote_root": "~/magent/api",
+                        "placed_ts": 1.0,
+                        "attached_existing": "yes",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        log.get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "auto")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
+
+        assert result.exit_code == 1
+        assert shipped == []
+        assert "the node map could not be read (ValueError)" in result.stderr
+        assert "so where api runs is unknown" in result.stderr
+        assert "not placed yet" not in result.stderr
+        assert "malformed" not in result.output
+        assert any(
+            "'api'" in r.getMessage() and "attached_existing" in r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes"
+        )
+
     def test_push_of_a_project_with_no_repo_names_the_recipe_refusal(
         self, runner, tmp_config, api_dir, no_states, shipped
     ):

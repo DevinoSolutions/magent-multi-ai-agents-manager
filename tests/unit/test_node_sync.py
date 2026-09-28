@@ -232,12 +232,15 @@ class TestStateStores:
     @pytest.mark.parametrize("nick", ["../x", "\x1b[31mx"], ids=["traversal", "escape"])
     def test_a_nick_config_would_refuse_is_no_store_and_no_label(self, placed, nick):
         # The label is what `magent watch` prints; the dir is under NODES_DIR.
+        # Round 2: the entry is malformed, so the map is unreadable -- the
+        # error the engine holds its last records on, as for a torn map.
         nodes.write_node_map(
             {"api": _entry("second", "api"), "evil": _entry(nick, "evil")}
         )
-        assert node_sync.state_stores() == [
-            ("api", "@second", nodes.state_dir("second", "api")),
-        ]
+        with pytest.raises(ValueError) as caught:
+            node_sync.state_stores()
+        assert "'evil'" in str(caught.value)
+        assert "\x1b" not in str(caught.value)
 
 
 class TestTheNodeLock:
@@ -2897,7 +2900,12 @@ class TestTheFinalPull:
         assert fake_ssh.calls() == []
 
     @pytest.mark.parametrize(
-        ("state", "cls"), [("torn", "ValueError"), ("busy", "PermissionError")]
+        ("state", "cls"),
+        [
+            ("torn", "ValueError"),
+            ("malformed-entry", "ValueError"),
+            ("busy", "PermissionError"),
+        ],
     )
     def test_an_unreadable_map_raises_and_is_never_read_as_never_placed(
         self, placed, fake_ssh, monkeypatch, state, cls
@@ -2908,6 +2916,11 @@ class TestTheFinalPull:
         before = _seed_marks(api=(10.0, "/home/amin/magent/api"))
         if state == "torn":
             nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        elif state == "malformed-entry":
+            # Round-2 ruling: dropped, api's entry read as "never placed".
+            raw = json.loads(nodes.NODE_MAP_PATH.read_text(encoding="utf-8"))
+            raw["api"]["nick"] = "../x"
+            nodes.NODE_MAP_PATH.write_text(json.dumps(raw), encoding="utf-8")
         else:
             # Intact on disk, but still locked after the strict read's
             # retries (a Windows reader racing a replace).

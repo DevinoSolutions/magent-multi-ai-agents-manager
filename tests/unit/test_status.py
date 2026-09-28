@@ -2569,7 +2569,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert sent == []
         assert dialed == [("third", "my-web")]
 
-    @pytest.mark.parametrize("state", ["torn", "busy"])
+    @pytest.mark.parametrize("state", ["torn", "busy", "malformed-entry"])
     def test_an_unreadable_map_is_a_survivor_line_not_nothing_to_stop(
         self, runner, tmp_config, monkeypatch, tmp_path, state
     ):
@@ -2577,6 +2577,13 @@ class TestDownStopsNodeSessionsWhereTheyRun:
 
         if state == "torn":
             nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        elif state == "malformed-entry":
+            # Round-2 ruling: dropped, web read as never placed and `down`
+            # found nothing to stop while its node session ran on.
+            self._hold("web", "third")
+            raw = json.loads(nodes.NODE_MAP_PATH.read_text(encoding="utf-8"))
+            raw["web"]["attached_existing"] = "yes"
+            nodes.NODE_MAP_PATH.write_text(json.dumps(raw), encoding="utf-8")
         else:
             # Intact on disk, but another process has it open (Windows).
             self._hold("web", "third")

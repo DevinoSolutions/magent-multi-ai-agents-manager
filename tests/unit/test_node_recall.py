@@ -12,6 +12,7 @@ of a transcript IS its session id; subagent logs (agent-*.jsonl, anything under
 from __future__ import annotations
 
 import io
+import json
 import logging
 import math
 import os
@@ -2657,8 +2658,9 @@ class TestRecallReadsTheNodeMapAsUntrusted:
     def test_a_nick_config_would_refuse_reaches_no_path_and_no_screen(
         self, runner, api_repo, tmp_config, node_answers, monkeypatch, nick
     ):
-        # Ruling Decision 1 (a): a bad nick is a malformed entry, so the
-        # project reads as not placed -- and the nick is never joined or shown.
+        # Ruling Decision 1 (a): a bad nick is a malformed entry. Round 2: a
+        # malformed entry makes the map unreadable -- unknown, never "not
+        # placed" -- and the nick is still never joined or shown.
         joined: list[str] = []
         real_node_dir = nodes.node_dir
 
@@ -2668,6 +2670,7 @@ class TestRecallReadsTheNodeMapAsUntrusted:
 
         monkeypatch.setattr(nodes, "node_dir", _node_dir)
         nodes.update_node_map("api", entry(nick))
+        before = nodes.NODE_MAP_PATH.read_bytes()
         cfg = tmp_config(
             config_json(
                 ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
@@ -2676,14 +2679,52 @@ class TestRecallReadsTheNodeMapAsUntrusted:
 
         result = _recall(runner, cfg, "--local")
 
-        assert result.exit_code == 2
-        assert "not placed on a node" in result.stderr
+        assert result.exit_code == 1, result.output
+        assert f"x {_map_fix_line('ValueError')}" in result.stderr
+        assert "not placed" not in result.output
         screen = result.stdout + result.stderr
         assert nick not in screen
         assert "\x1b" not in screen
         assert nick not in joined
         assert node_answers == []
         assert not _claude_dir(api_repo).exists()
+        assert nodes.NODE_MAP_PATH.read_bytes() == before
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("attached_existing", "yes"), ("placed_ts", True), ("sid", 7)],
+        ids=["flag", "timestamp", "sid"],
+    )
+    def test_a_malformed_entry_is_unknown_never_not_placed(
+        self, runner, api_repo, tmp_config, node_answers, caplog, field, value
+    ):
+        # Round-2 ruling: dropped, the entry read as "not placed" (exit 2) and
+        # the next map write erased it. The map is unreadable instead: the
+        # class and the repair on screen, the key and why in nodes.log.
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        nodes.update_node_map("api", entry("second"))
+        raw = json.loads(nodes.NODE_MAP_PATH.read_text(encoding="utf-8"))
+        raw["api"][field] = value
+        nodes.NODE_MAP_PATH.write_text(json.dumps(raw), encoding="utf-8")
+        before = nodes.NODE_MAP_PATH.read_bytes()
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 1, result.output
+        assert f"x {_map_fix_line('ValueError')}" in result.stderr
+        assert "not placed" not in result.output
+        # The why is nodes.log's, never the screen's (the tmp path itself
+        # carries this test's name, so the pin is the log line's own phrase).
+        assert "is malformed" not in result.output
+        logs = _node_logs(caplog)
+        assert any("'api'" in m and field in m for m in logs), logs
+        assert node_answers == []
+        assert nodes.NODE_MAP_PATH.read_bytes() == before
 
     def test_a_remote_root_the_seam_refuses_is_a_note_not_a_traceback(
         self, runner, api_repo, tmp_config, monkeypatch

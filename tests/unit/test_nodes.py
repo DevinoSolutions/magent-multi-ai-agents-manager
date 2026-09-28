@@ -6,6 +6,7 @@ import dataclasses
 import errno
 import importlib.util
 import json
+import logging
 import os
 import shutil
 import stat
@@ -18,7 +19,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from magent import config, nodes, psmux, remote_mux
+from magent import config, log, nodes, psmux, remote_mux
 from magent.config import (
     DEFAULT_TOOLS,
     MagentConfig,
@@ -187,6 +188,50 @@ def node_map(tmp_path, monkeypatch):
     return path
 
 
+def _map_with_db(path: Path, bad: str) -> None:
+    """A map holding ENTRY as "api" and the raw JSON text ``bad`` as "db"."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f'{{"api": {_entry_text("1727200000.0")}, "db": {bad}}}', encoding="utf-8"
+    )
+
+
+@pytest.fixture
+def nodes_warnings(caplog):
+    """nodes.log's WARNING lines, read after the act."""
+    log.get_logger("nodes")  # sets the level; caplog must come after
+    caplog.set_level(logging.WARNING, logger="magent.nodes")
+    return lambda: [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "magent.nodes" and r.levelno == logging.WARNING
+    ]
+
+
+# A malformed entry, as raw JSON text, and the word nodes.log's reason names.
+_MALFORMED = [
+    ('{"nick": "third"}', "sid"),
+    (_entry_text("true"), "placed_ts"),
+    (_entry_text("NaN"), "placed_ts"),
+    (_entry_text("Infinity"), "placed_ts"),
+    (_entry_text("-Infinity"), "placed_ts"),
+    (_entry_text("1e400"), "placed_ts"),
+    # float() of a 309+-digit int raises OverflowError, not inf.
+    (_entry_text("1" + "0" * 400), "placed_ts"),
+    ('"second"', "not a JSON object"),
+]
+_MALFORMED_IDS = [
+    "partial",
+    "bool-ts",
+    "nan",
+    "inf",
+    "-inf",
+    "1e400",
+    "huge-int",
+    "text",
+]
+
+
 class TestTheNodeMap:
     def test_what_is_written_reads_back(self, node_map):
         other = dataclasses.replace(
@@ -231,63 +276,84 @@ class TestTheNodeMap:
         node_map.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
         assert nodes.read_node_map() == {}
 
-    @pytest.mark.parametrize(
-        "bad",
-        [
-            '{"nick": "third"}',
-            _entry_text("true"),
-            _entry_text("NaN"),
-            _entry_text("Infinity"),
-            _entry_text("-Infinity"),
-            _entry_text("1e400"),
-            # float() of a 309+-digit int raises OverflowError, not inf.
-            _entry_text("1" + "0" * 400),
-        ],
-        ids=["partial", "bool-ts", "nan", "inf", "-inf", "1e400", "huge-int"],
-    )
-    def test_a_malformed_entry_is_dropped_alone(self, node_map, bad):
+    @pytest.mark.parametrize(("bad", "why"), _MALFORMED, ids=_MALFORMED_IDS)
+    def test_a_malformed_entry_is_dropped_alone_and_logged(
+        self, node_map, nodes_warnings, bad, why
+    ):
+        # Round-2 ruling: the best-effort read keeps the rest, and one WARNING
+        # names the key (repr) and why it was dropped.
+        _map_with_db(node_map, bad)
+        assert nodes.read_node_map() == {"api": ENTRY}
+        (line,) = nodes_warnings()
+        assert "'db'" in line
+        assert why in line
+
+    @pytest.mark.parametrize(("bad", "why"), _MALFORMED, ids=_MALFORMED_IDS)
+    def test_the_strict_read_refuses_a_map_with_a_malformed_entry(
+        self, node_map, bad, why
+    ):
+        # Round-2 ruling: dropped, the entry read as "not placed" to every
+        # strict caller and the next update wrote the map back without it. It
+        # is corruption, like a torn file: the whole map is unreadable, and
+        # the error names the file, the key and why.
+        _map_with_db(node_map, bad)
+        with pytest.raises(ValueError) as caught:
+            nodes.load_node_map_strict()
+        text = str(caught.value)
+        assert str(node_map) in text
+        assert "'db'" in text
+        assert why in text
+
+    def test_every_dropped_key_is_one_warning(self, node_map, nodes_warnings):
         node_map.parent.mkdir(parents=True)
         node_map.write_text(
-            f'{{"api": {_entry_text("1727200000.0")}, "db": {bad}}}',
+            json.dumps(
+                {"api": dataclasses.asdict(ENTRY), "db": {"nick": "x"}, "web": 7}
+            ),
             encoding="utf-8",
         )
         assert nodes.read_node_map() == {"api": ENTRY}
-        assert nodes.load_node_map_strict() == {"api": ENTRY}
+        lines = nodes_warnings()
+        assert len(lines) == 2, lines
+        assert "'db'" in lines[0]
+        assert "'web'" in lines[1]
 
     @pytest.mark.parametrize(
         "nick",
         ["../x", "\x1b[31mx", "", "Second", "sevenxx", "a/b", "a b"],
         ids=["traversal", "escape", "empty", "upper", "too-long", "slash", "space"],
     )
-    def test_a_nick_config_would_refuse_drops_the_entry(self, node_map, nick):
+    def test_a_nick_config_would_refuse_is_a_malformed_entry(
+        self, node_map, nodes_warnings, nick
+    ):
         # Ruling Decision 1 (a): the nick is joined into a path under
         # NODES_DIR and printed as @<nick>, so config's rule is the map's rule.
-        bad = json.dumps({**dataclasses.asdict(ENTRY), "nick": nick})
-        node_map.parent.mkdir(parents=True)
-        node_map.write_text(
-            f'{{"api": {_entry_text("1727200000.0")}, "db": {bad}}}',
-            encoding="utf-8",
-        )
+        # Round 2: dropped and logged by the best-effort read, refused by the
+        # strict one -- repr'd in both, so no raw escape reaches nodes.log.
+        _map_with_db(node_map, json.dumps({**dataclasses.asdict(ENTRY), "nick": nick}))
         assert nodes.read_node_map() == {"api": ENTRY}
-        assert nodes.load_node_map_strict() == {"api": ENTRY}
+        with pytest.raises(ValueError) as caught:
+            nodes.load_node_map_strict()
+        (line,) = nodes_warnings()
+        for text in (line, str(caught.value)):
+            assert "'db'" in text
+            assert "nick" in text
+            assert "\x1b" not in text
 
     def test_the_nick_rule_is_configs_own_not_a_copy(self):
         assert nodes._NODE_NICK_RE is config._NODE_NICK_RE
 
     @pytest.mark.parametrize("attached", [1, 0, "yes", "false", None, [], {}], ids=repr)
-    def test_an_attached_flag_that_is_not_a_bool_drops_the_entry(
+    def test_an_attached_flag_that_is_not_a_bool_is_a_malformed_entry(
         self, node_map, attached
     ):
         # cq-G9 P13: bool is the one shape; 1 or "yes" is corruption, not a
         # truthy guess, and a missing flag is no entry at all.
         bad = json.dumps({**dataclasses.asdict(ENTRY), "attached_existing": attached})
-        node_map.parent.mkdir(parents=True)
-        node_map.write_text(
-            f'{{"api": {_entry_text("1727200000.0")}, "db": {bad}}}',
-            encoding="utf-8",
-        )
+        _map_with_db(node_map, bad)
         assert nodes.read_node_map() == {"api": ENTRY}
-        assert nodes.load_node_map_strict() == {"api": ENTRY}
+        with pytest.raises(ValueError, match="attached_existing"):
+            nodes.load_node_map_strict()
 
     def test_a_hand_written_v1_file_reads_back(self, node_map):
         # Every other read test builds its input from asdict(ENTRY), which
@@ -535,6 +601,21 @@ class TestTheMapWriterNeverGuesses:
         with pytest.raises(ValueError):
             nodes.update_node_map("web", ENTRY)
         assert node_map.read_text(encoding="utf-8") == torn
+
+    def test_a_map_with_a_malformed_entry_is_refused_not_erased(self, node_map):
+        # Round-2 ruling: when the strict read dropped a malformed entry, the
+        # next unrelated update wrote the map back without it -- gone for good.
+        text = json.dumps(
+            {
+                "api": dataclasses.asdict(ENTRY),
+                "db": {**dataclasses.asdict(ENTRY), "nick": "../x"},
+            }
+        )
+        node_map.parent.mkdir(parents=True)
+        node_map.write_text(text, encoding="utf-8")
+        with pytest.raises(ValueError):
+            nodes.update_node_map("web", ENTRY)
+        assert node_map.read_text(encoding="utf-8") == text
 
     def test_an_empty_map_file_is_refused_naming_the_file(self, node_map):
         # What a crash between an unsynced write and the replace leaves: the
@@ -3013,7 +3094,7 @@ class TestSessionRows:
         ]
 
     @pytest.mark.parametrize(
-        "damage", ["torn", "not-an-object", "busy"], ids=lambda d: d
+        "damage", ["torn", "not-an-object", "malformed-entry", "busy"], ids=lambda d: d
     )
     def test_an_unreadable_map_reads_every_row_stale_never_dead(
         self, node_map, tmp_path, monkeypatch, caplog, damage
@@ -3040,6 +3121,10 @@ class TestSessionRows:
             node_map.write_text(text[: len(text) // 2], encoding="utf-8")
         elif damage == "not-an-object":
             node_map.write_text("[]", encoding="utf-8")
+        elif damage == "malformed-entry":
+            raw = json.loads(node_map.read_text(encoding="utf-8"))
+            raw["web"]["attached_existing"] = "yes"
+            node_map.write_text(json.dumps(raw), encoding="utf-8")
         else:
             monkeypatch.setattr(
                 nodes, "NODE_MAP_PATH", _Busy([PermissionError(13, "busy")] * 100)

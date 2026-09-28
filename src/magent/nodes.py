@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import reprlib
 import stat
 import tempfile
 import threading
@@ -214,20 +215,36 @@ def _epoch(value: object) -> float | None:
     return out if math.isfinite(out) else None
 
 
-def _map_entry(raw: object) -> NodeMapEntry | None:
+def _shown(value: object) -> str:
+    """A bad field's value as nodes.log shows it: a bounded repr, so a torn or
+    hostile value can neither flood the log nor put a raw escape in it."""
+    return reprlib.repr(value)
+
+
+def _map_text(raw: Mapping[str, object], field: str) -> str:
+    value = raw.get(field)
+    if not isinstance(value, str):
+        raise ValueError(f"{field} is {_shown(value)}, not a string")  # noqa: TRY004  # reason: a malformed entry is corrupt DATA, the same family as a torn file's JSONDecodeError; callers catch one type for every bad map
+    return value
+
+
+def _map_entry(raw: object) -> NodeMapEntry:
+    """One node-map value as an entry, or ValueError saying why it is not one
+    -- the reason ``_load_node_map`` names with the entry's key."""
     if not isinstance(raw, dict):
-        return None
-    nick, sid, root = raw.get("nick"), raw.get("sid"), raw.get("remote_root")
-    ts, attached = raw.get("placed_ts"), raw.get("attached_existing")
-    if not (isinstance(nick, str) and isinstance(sid, str) and isinstance(root, str)):
-        return None
+        raise ValueError(f"not a JSON object but {_shown(raw)}")  # noqa: TRY004  # reason: corrupt DATA, as in _map_text
+    nick, sid = _map_text(raw, "nick"), _map_text(raw, "sid")
+    root = _map_text(raw, "remote_root")
     # The nick becomes a path under NODES_DIR and a word on the screen: one
     # config's own rule refuses ("../x", an escape sequence) is corruption.
     if not _NODE_NICK_RE.fullmatch(nick):
-        return None
+        raise ValueError(f"nick {_shown(nick)} is not a node nick")
+    ts, attached = raw.get("placed_ts"), raw.get("attached_existing")
     placed_ts = _epoch(ts)
-    if placed_ts is None or not isinstance(attached, bool):
-        return None
+    if placed_ts is None:
+        raise ValueError(f"placed_ts {_shown(ts)} is not a finite number")
+    if not isinstance(attached, bool):
+        raise ValueError(f"attached_existing {_shown(attached)} is not true or false")  # noqa: TRY004  # reason: corrupt DATA, as in _map_text
     target, cwd = raw.get("target", ""), raw.get("cwd", "")
     return NodeMapEntry(
         nick=nick,
@@ -257,13 +274,23 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
     is momentarily locked (``PermissionError``: the Windows reader racing an
     ``os.replace``) is retried ``_BUSY_RETRIES`` times ``_BUSY_SLEEP_S`` apart,
     then re-raised; any other ``OSError``, and a torn, non-object or too
-    deeply nested file (``ValueError``), propagate. A malformed ENTRY is still
-    dropped alone.
+    deeply nested file (``ValueError``), propagate. So does ONE malformed
+    entry: a ``ValueError`` naming the file, the entry's key and why. An
+    entry that cannot be read is a hand edit or corruption, the same class as
+    a torn file -- dropped, it read as "not placed" to every caller of this
+    read, and the next ``update_node_map`` wrote the map back without it.
 
     PR-D's ``update_node_map`` MUST read through this for its
     read-modify-write: an unreadable map read as ``{}`` and written back would
     erase every placement. Code that only needs a best-effort answer calls
     ``read_node_map``."""
+    return _load_node_map(strict=True)
+
+
+def _load_node_map(*, strict: bool) -> dict[str, NodeMapEntry]:
+    """The one parse behind both readers. A whole-file failure raises either
+    way; a malformed entry raises when ``strict``, and otherwise is dropped
+    alone with one nodes.log WARNING naming its key and why."""
     for attempt in range(_BUSY_RETRIES + 1):
         try:
             text = NODE_MAP_PATH.read_text(encoding="utf-8")
@@ -288,24 +315,34 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
         raise ValueError(f"{NODE_MAP_PATH}: not a JSON object")  # noqa: TRY004  # reason: a non-object file is corrupt DATA, the same family as the JSONDecodeError (a ValueError) a torn file raises; callers catch one type for every bad file
     out: dict[str, NodeMapEntry] = {}
     for project, value in raw.items():
-        entry = _map_entry(value)
+        try:
+            entry = _map_entry(value)
+        except ValueError as exc:
+            why = f"{NODE_MAP_PATH}: entry {project!r} is malformed: {exc}"
+            if strict:
+                raise ValueError(why) from exc
+            get_logger("nodes").warning(
+                "node map: %s; skipped by a best-effort read", why
+            )
+            continue
         # A key out of json.loads is always str: this isinstance narrows the
         # type for ty, it does not tolerate anything.
-        if isinstance(project, str) and entry is not None:
+        if isinstance(project, str):
             out[project] = entry
     return out
 
 
 def read_node_map() -> dict[str, NodeMapEntry]:
-    """``node-map.json`` keyed by project name, tolerantly: whatever
-    ``load_node_map_strict`` raises -- a map still busy after its retries, a
+    """``node-map.json`` keyed by project name, tolerantly: whatever makes
+    the whole file unreadable -- a map still busy after its retries, a
     torn write, a file that is not a JSON object, one nested too deep for
     ``json.loads`` (``RecursionError``, which is not a ``ValueError``) -- reads
-    as ``{}``. The map is a record of where things landed, and a bad one must
-    never stop a launch or an F2 press. Never write back what this returns; see
-    ``load_node_map_strict``."""
+    as ``{}``. A malformed entry is dropped alone, and nodes.log gets one
+    WARNING per dropped key. The map is a record of where things landed, and a
+    bad one must never stop a launch or an F2 press. Never write back what this
+    returns; see ``load_node_map_strict``."""
     try:
-        return load_node_map_strict()
+        return _load_node_map(strict=False)
     except (OSError, ValueError, RecursionError):
         return {}
 
@@ -440,10 +477,11 @@ def update_node_map(
     `down` clearing the placement it just killed passes the entry it read, so
     a placement a concurrent `up` recorded meanwhile survives.
 
-    Reads through ``load_node_map_strict``: a torn or unreadable map raises
-    (ValueError / OSError) and is left as it is, never read as ``{}`` and
-    written back over every placement. Raises LockHeld when another writer
-    holds the map for longer than ``wait_s``."""
+    Reads through ``load_node_map_strict``: a torn or unreadable map, or one
+    holding a malformed entry, raises (ValueError / OSError) and is left as it
+    is, never read as ``{}`` -- or without that entry -- and written back over
+    every placement. Raises LockHeld when another writer holds the map for
+    longer than ``wait_s``."""
     with map_lock(wait_s):
         _sweep_stale_temps()
         current = load_node_map_strict()
