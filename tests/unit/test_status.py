@@ -142,6 +142,8 @@ class TestJsonInvalidConfig:
 _NO_UTF8_REFUSAL = (
     "projects[0].title has text with no UTF-8 form (UnicodeEncodeError): 'api\\ud83d'"
 )
+# A live OSC 0 (set the window title) and SGR 31 (red), as a config can spell.
+_ESC_SEQUENCES = "\x1b]0;x\x07\x1b[31m"
 
 
 class TestTextWithNoUtf8FormIsAConfigError:
@@ -173,6 +175,53 @@ class TestTextWithNoUtf8FormIsAConfigError:
         assert result.exit_code == 1
         assert result.stderr == f"Error: {_NO_UTF8_REFUSAL}\n"
         assert result.stdout == ""
+
+    @pytest.mark.parametrize(
+        ("config", "refusal"),
+        [
+            (
+                {"projects": [{"path": "api", "title": _ESC_SEQUENCES + "api\ud83d"}]},
+                (
+                    "projects[0].title has text with no UTF-8 form (UnicodeEncodeError):"
+                    " '\\x1b]0;x\\x07\\x1b[31mapi\\ud83d'"
+                ),
+            ),
+            (
+                {
+                    "settings": {"tools": {_ESC_SEQUENCES + "red": "api\ud83d"}},
+                    "projects": [{"path": "api"}],
+                },
+                (
+                    "settings.tools.\\x1b]0;x\\x07\\x1b[31mred has text with no UTF-8"
+                    " form (UnicodeEncodeError): 'api\\ud83d'"
+                ),
+            ),
+            (
+                {"projects": [{"path": "api", "title": "C:\\Users\\api\ud83d"}]},
+                (
+                    "projects[0].title has text with no UTF-8 form (UnicodeEncodeError):"
+                    " 'C:\\\\Users\\\\api\\ud83d'"
+                ),
+            ),
+        ],
+        ids=["in-the-value", "in-the-field-path", "a-backslash-is-doubled"],
+    )
+    def test_control_characters_reach_stderr_as_escape_text(
+        self, runner, tmp_config, monkeypatch, config, refusal
+    ):
+        # The refusal quotes text already known to be broken. An ESC or BEL in
+        # it reached a real terminal live (an OSC 0 title change, SGR red), so
+        # controls are escaped like the surrogate is; a backslash doubles, as
+        # the JSON file itself spells it, so a literal "\ud83d" folder name
+        # cannot read like the lone surrogate.
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"version": 3, **config}), "status"]
+        )
+        assert result.exit_code == 1
+        assert result.stderr == f"Error: {refusal}\n"
+        assert all(" " <= c <= "~" for c in result.stderr.rstrip("\n"))
 
 
 class TestStatusLines:
