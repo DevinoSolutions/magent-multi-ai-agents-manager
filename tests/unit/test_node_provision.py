@@ -6183,6 +6183,30 @@ class TestSetupShUnderRealBash:
         assert self._row(r, "node-key:amin") == row
         assert r.returncode == 0, r.stderr
 
+    @pytest.mark.parametrize(
+        ("mode", "detail"),
+        [
+            (0o400, "id_ed25519 set to 0600 (it was 0400, already owner-only)"),
+            (0o700, "id_ed25519 set to 0600 (it was 0700, already owner-only)"),
+            (0o000, "id_ed25519 set to 0600 (it was 0000, already owner-only)"),
+            (0o040, "id_ed25519 made owner-only: it was 0040, now 0600"),
+            (0o604, "id_ed25519 made owner-only: it was 0604, now 0600"),
+        ],
+        ids=["0400", "0700", "0000", "0040", "0604"],
+    )
+    def test_the_repair_row_says_whether_the_key_was_open(self, tmp_path, mode, detail):
+        # Only a key its group or others could read was exposed; any other
+        # mode is set to 0600 with no word of exposure. The old mode reads four
+        # digits wide: stat's %a drops leading zeros.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        key = state / "home" / "amin" / ".ssh" / "id_ed25519"
+        key.chmod(mode)
+        r = _run_setup(env)
+        assert key.stat().st_mode & 0o777 == 0o600
+        assert self._row(r, "node-key:amin") == ("did", detail)
+        assert r.returncode == 0, r.stderr
+
     def test_a_node_key_whose_mode_cannot_be_read_is_never_reported_clean(
         self, tmp_path
     ):
