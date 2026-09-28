@@ -26,6 +26,7 @@ from magent import (
     node_scripts,
     node_sync,
     nodes,
+    psmux,
     remote_mux,
 )
 from magent.config import (
@@ -47,6 +48,8 @@ if TYPE_CHECKING:
 # The real body, captured before any NodeRig replaces it: the tests below put
 # it back to drive the whole chain through THE fake ssh.
 real_provision_node = remote_mux.provision_node
+real_bring_up = remote_mux.bring_up
+real_decorate = remote_mux.decorate
 
 _TOOLS = {"claude": "claude --continue"}
 # What a final pull that brought the last turn home returns: None is
@@ -3390,3 +3393,118 @@ class TestTheBringUpProvisionsFirst:
         assert "would provision second" in capsys.readouterr().out
         assert rig.provisioned == []
         assert fake_ssh.calls() == []
+
+
+class TestTextWithNoUtf8FormReachesTheRowInOurWords:
+    """A command or a project title with no UTF-8 form (json reads a
+    ``\\udXXX`` escape into one) cannot be framed for the node. The row says
+    so in our words and the class; the codec's own words -- Python's, naming
+    the character and its position -- are nodes.log's, at WARNING, and no
+    line is an ERROR. The real bring-up and decoration run, through THE fake
+    ssh."""
+
+    @pytest.fixture
+    def real_node(self, rig, fake_ssh, monkeypatch, caplog):
+        from magent.log import get_logger
+
+        monkeypatch.setattr(remote_mux, "bring_up", real_bring_up)
+        monkeypatch.setattr(remote_mux, "decorate", real_decorate)
+        monkeypatch.setattr(remote_mux, "PROBE_TIMEOUT_S", 60.0)
+        monkeypatch.setattr(psmux, "code_on_path", lambda: False)
+        fake_ssh.set_reply("printenv HOME", stdout="/home/amin\n")
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        return fake_ssh
+
+    @staticmethod
+    def _logged(caplog) -> list[str]:
+        records = [r for r in caplog.records if r.name == "magent.nodes"]
+        assert [r for r in records if r.levelno >= logging.ERROR] == []
+        return [r.getMessage() for r in records]
+
+    @staticmethod
+    def _nothing_sent(fake_ssh) -> None:
+        # The HOME probe, if it ran, is the only call: a refusal hoisted
+        # before it passes too.
+        calls = [" ".join(c.argv) for c in fake_ssh.calls()]
+        assert [c for c in calls if "printenv HOME" not in c] == []
+
+    def test_a_command_with_no_utf_8_form(self, real_node, api, caplog):
+        base = _config(api)
+        config = dataclasses.replace(
+            base,
+            settings=dataclasses.replace(
+                base.settings, tools={"claude": "claude --continue \ud83d"}
+            ),
+        )
+        outcome = launch.bring_up_node_project(config, api)
+        assert (outcome.ok, outcome.error) == (
+            False,
+            (
+                "the project's repo, node folder or command has text with no "
+                "UTF-8 form (UnicodeEncodeError)"
+            ),
+        )
+        (failed,) = self._logged(caplog)
+        assert "bring-up of api failed: " in failed
+        assert failed.endswith("surrogates not allowed")
+        self._nothing_sent(real_node)
+
+    def test_a_title_with_no_utf_8_form(self, real_node, api, caplog):
+        titled = dataclasses.replace(api, title="api\ud83d")
+        outcome = launch.bring_up_node_project(_config(titled), titled)
+        assert (outcome.ok, outcome.error) == (
+            False,
+            (
+                "the project's session name has text with no UTF-8 form "
+                "(UnicodeEncodeError)"
+            ),
+        )
+        (failed,) = self._logged(caplog)
+        assert failed.endswith("surrogates not allowed")
+        self._nothing_sent(real_node)
+
+    def test_the_failed_line_lands_escaped_in_nodes_log(
+        self, real_node, api, tmp_path, capsys
+    ):
+        # The sid reaches that WARNING raw (%s). f512ba7's handler is what
+        # writes it as escape text on disk; a strict one would drop the line.
+        from magent import log
+
+        # real_node's get_logger made LOG_DIR already. That was safe: conftest's
+        # autouse _isolate_magent_home, which points LOG_DIR here, runs first.
+        assert log.LOG_DIR.is_relative_to(tmp_path)
+        titled = dataclasses.replace(api, title="api\ud83d")
+        assert not launch.bring_up_node_project(_config(titled), titled).ok
+        path = log.LOG_DIR / "nodes.log"
+        logged = path.read_text(encoding="utf-8") if path.exists() else ""
+        lines = [line for line in logged.splitlines() if "bring-up of" in line]
+        assert len(lines) == 1, logged
+        assert " WARNING " in lines[0]
+        assert (
+            "node second: bring-up of api\\ud83d failed: the project's session "
+            "name has text with no UTF-8 form (UnicodeEncodeError): "
+        ) in lines[0]
+        assert "Logging error" not in capsys.readouterr().err
+
+    def test_attaching_to_a_session_so_named_still_attaches(
+        self, real_node, rig, api, tmp_path, caplog
+    ):
+        # Decoration is cosmetic: one that cannot be sent never fails the
+        # attach it rides, and never reaches the row.
+        titled = dataclasses.replace(api, title="api\ud83d")
+        _hold("api\ud83d")
+        rig.live = True
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        outcome = launch.bring_up_node_project(_config(titled), titled)
+        assert (outcome.ok, outcome.attached_existing, outcome.error) == (
+            True,
+            True,
+            None,
+        )
+        assert not [w for w in outcome.warnings if "codec" in w]
+        (message,) = self._logged(caplog)
+        assert message.startswith(
+            "decoration of 'api\\ud83d' on second not sent (UnicodeEncodeError): "
+        )
+        assert real_node.calls() == []

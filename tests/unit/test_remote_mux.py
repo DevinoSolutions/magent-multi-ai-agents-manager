@@ -1581,6 +1581,46 @@ class TestANodeSessionIsDecoratedLikeALocalOne:
         fake_ssh.set_reply("bash -s", rc=255)
         assert remote_mux.decorate(NODE, "api", "second") is False
 
+    # The script names the session, and a project title with no UTF-8 form
+    # cannot be sent. Cosmetic like every decoration failure: False, never
+    # raised, with the class and the codec's words in nodes.log alone.
+    def test_a_session_name_with_no_utf_8_form_is_false_and_sends_nothing(
+        self, fake_ssh, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(psmux, "code_on_path", lambda: False)
+        caplog.set_level("WARNING", logger="magent.nodes")
+        try:
+            answer: bool | UnicodeError = remote_mux.decorate(
+                NODE, "api\ud83d", "second"
+            )
+        except UnicodeError as e:
+            answer = e
+        assert answer is False
+        assert fake_ssh.calls() == []
+        (record,) = [r for r in caplog.records if r.name == "magent.nodes"]
+        assert record.levelno == logging.WARNING
+        message = record.getMessage()
+        assert message.startswith(
+            "decoration of 'api\\ud83d' on second not sent (UnicodeEncodeError): "
+        )
+        assert message.endswith("surrogates not allowed")
+
+    # Already so before the pass above, pinned with it: a decoration's own
+    # failure logs the program it ran, never this PC's path to the client.
+    def test_a_decoration_that_times_out_logs_the_program_never_its_path(
+        self, fake_ssh, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(psmux, "code_on_path", lambda: False)
+        monkeypatch.setattr(remote_mux, "SCRIPT_TIMEOUT_S", 1.0)
+        fake_ssh.set_mode("timeout")
+        caplog.set_level("WARNING", logger="magent.nodes")
+        assert remote_mux.decorate(NODE, "api", "second") is False
+        (message,) = [
+            r.getMessage() for r in caplog.records if r.name == "magent.nodes"
+        ]
+        assert message.startswith("node call timed out after 1.0s: ssh ")
+        assert str(fake_ssh.path) not in caplog.text
+
 
 _SENTINEL = b"\n__MAGENT_PAYLOAD__\n"
 _ROOT = "/home/amin/magent/api"
@@ -1910,6 +1950,31 @@ class TestTheBringUpStaysInsideItsFolders:
         with pytest.raises(ValueError, match="control character"):
             remote_mux._archive_name(rel)
 
+    # A name that is not UTF-8 on disk reaches here as lone surrogates: tar
+    # would write \udc80 as the byte 0x80 -- another name on the node -- and
+    # cannot write \ud800 at all.
+    @pytest.mark.parametrize("rel", ["cfg\ud800.env", "a/lo\udc80.env"])
+    def test_an_archive_name_with_no_utf_8_form_is_refused(self, rel):
+        with pytest.raises(ValueError, match="no UTF-8 form"):
+            remote_mux._archive_name(rel)
+
+    # NTFS takes both names; Linux takes only \udc80 (the byte 0x80).
+    @pytest.mark.parametrize("name", ["cfg\ud800.env", "cfg\udc80.env"])
+    def test_a_push_file_with_no_utf_8_name_is_refused_before_any_ssh(
+        self, node_home, tmp_path, name
+    ):
+        _answers(node_home)
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        pushed = recipe.local_root / name
+        try:
+            pushed.write_bytes(b"K=V\n")
+        except (OSError, UnicodeError):
+            pytest.skip("this filesystem refuses a name that is not Unicode")
+        with pytest.raises(ValueError, match="no UTF-8 form"):
+            remote_mux.bring_up(NODE, dataclasses.replace(recipe, push_files=(pushed,)))
+        assert node_home.calls() == []
+
     @pytest.mark.parametrize("root", ["magent/api", "-oProxyCommand=x/api"])
     def test_a_node_root_that_is_not_absolute_is_refused_before_the_script(
         self, node_home, tmp_path, root
@@ -1930,6 +1995,43 @@ class TestTheBringUpStaysInsideItsFolders:
         with pytest.raises(NodeConfigError, match="absolute"):
             remote_mux.push_files(NODE, _recipe(tmp_path, remote_root="-rf"))
         assert len(node_home.calls()) == 1
+
+
+class TestTextWithNoUtf8FormIsRefusedInOurWords:
+    """The header and the decoration script frame config values (a command,
+    a project title) as UTF-8. One with no UTF-8 form is a ValueError in our
+    words and the class -- the row a user reads -- with the codec's own
+    words chained for nodes.log. Nothing was sent: the HOME probe, if it
+    ran, is the only call (a refusal hoisted before it passes too)."""
+
+    @staticmethod
+    def _nothing_sent(node_home) -> None:
+        home = _wrapped(["printenv", "HOME"])
+        assert [c.argv[-1] for c in node_home.calls() if c.argv[-1] != home] == []
+
+    def test_a_command_with_no_utf_8_form(self, node_home, tmp_path):
+        _answers(node_home)
+        with pytest.raises(ValueError) as info:
+            remote_mux.bring_up(
+                NODE, _recipe(tmp_path, command="claude --continue \ud83d")
+            )
+        assert str(info.value) == (
+            "the project's repo, node folder or command has text with no "
+            "UTF-8 form (UnicodeEncodeError)"
+        )
+        assert isinstance(info.value.__cause__, UnicodeEncodeError)
+        self._nothing_sent(node_home)
+
+    def test_a_session_name_with_no_utf_8_form(self, node_home, tmp_path):
+        _answers(node_home)
+        with pytest.raises(ValueError) as info:
+            remote_mux.bring_up(NODE, _recipe(tmp_path, sid="api\ud83d"))
+        assert str(info.value) == (
+            "the project's session name has text with no UTF-8 form "
+            "(UnicodeEncodeError)"
+        )
+        assert isinstance(info.value.__cause__, UnicodeEncodeError)
+        self._nothing_sent(node_home)
 
 
 def _in_thread(fn, *, timeout_s: float = 20.0) -> BaseException | None:
@@ -2509,7 +2611,38 @@ class TestMemoryNeverFollowsALink:
         assert [n for n in _members(stdin) if n.startswith("memory/")] == [
             "memory/MEMORY.md"
         ]
-        assert "caf\\udce9.md skipped: " in _nodes_log()
+        # The name is refused before the file is ever read, cap or not.
+        assert "caf\\udce9.md cannot be named on the node" in _nodes_log()
+        assert "Logging error" not in capsys.readouterr().err
+
+    def test_a_memory_file_with_no_utf_8_name_stays_behind(
+        self, node_home, tmp_path, capsys
+    ):
+        # NTFS takes both names; Linux only \udc80 (the byte 0x80), which tar
+        # would ship under another name; APFS neither.
+        assert log.LOG_DIR.is_relative_to(tmp_path)
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        escaped = {"hi\ud800.md": "hi\\ud800.md", "lo\udc80.md": "lo\\udc80.md"}
+        made: list[str] = []
+        for name in escaped:
+            try:
+                (recipe.memory_dir / name).write_bytes(b"m\n")
+            except (OSError, UnicodeError):
+                continue
+            made.append(name)
+        if not made:
+            pytest.skip("this filesystem refuses every name that is not Unicode")
+        try:
+            stdin: bytes | UnicodeError = self._bring_up(node_home, recipe)
+        except UnicodeError as e:
+            stdin = e
+        assert isinstance(stdin, bytes), f"the bring-up raised {type(stdin).__name__}"
+        assert [n for n in _members(stdin) if n.startswith("memory/")] == [
+            "memory/MEMORY.md"
+        ]
+        for name in made:
+            assert f"{escaped[name]} cannot be named on the node" in _nodes_log()
         assert "Logging error" not in capsys.readouterr().err
 
 
