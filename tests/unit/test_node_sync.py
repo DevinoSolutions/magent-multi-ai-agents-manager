@@ -374,6 +374,41 @@ class TestTheDaemonsPidFile:
         )
         assert node_sync._PID_PATH.exists()
 
+    def test_a_daemon_between_its_lock_and_its_pid_is_waited_for_and_killed(
+        self, daemon_lock, monkeypatch
+    ):
+        # The daemon takes its lock, then writes its pid (run_sync_loop). A
+        # stop in between waits for the pid instead of calling it stuck.
+        naps: list[float] = []
+
+        def sleep(s: float) -> None:
+            naps.append(s)
+            if len(naps) == 5:
+                _record_pid(4242)
+
+        kills: list[int] = []
+        monkeypatch.setattr(
+            node_sync, "pid_alive", lambda pid: pid == 4242 and not kills
+        )
+        monkeypatch.setattr(node_sync, "_kill", lambda pid: kills.append(pid) or True)
+        write_heartbeat(node_sync.HEARTBEAT_NAME)
+        assert node_sync.stop_daemon(sleep=sleep, now=lambda: sum(naps)) is True
+        assert kills == [4242]
+        assert naps == [node_sync.STOP_POLL_S] * 5
+        assert not node_sync._PID_PATH.exists()
+        assert heartbeat_age(node_sync.HEARTBEAT_NAME) is None
+
+    def test_a_daemon_whose_pid_never_comes_is_not_stopped_by_the_deadline(
+        self, daemon_lock, monkeypatch
+    ):
+        kills: list[int] = []
+        monkeypatch.setattr(node_sync, "_kill", lambda pid: kills.append(pid) or True)
+        naps: list[float] = []
+        assert node_sync.stop_daemon(sleep=naps.append, now=lambda: sum(naps)) is False
+        assert kills == []
+        assert set(naps) == {node_sync.STOP_POLL_S}
+        assert sum(naps) == pytest.approx(node_sync.STOP_SETTLE_S, abs=0.11)
+
 
 class TestTheImportLaw:
     def test_node_sync_never_imports_cli_launch_or_upload_server(self):

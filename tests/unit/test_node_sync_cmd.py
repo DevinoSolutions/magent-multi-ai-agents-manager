@@ -205,15 +205,24 @@ class TestNodeSync:
         assert result.stdout == "  - Node sync daemon was not running.\n"
 
     def test_a_daemon_whose_pid_is_unknown_is_not_reported_as_nothing_running(
-        self, runner, daemon_lock
+        self, runner, monkeypatch, daemon_lock
     ):
         """stop_daemon() is False both for "nothing ran" and for "a daemon
         holds the lock and could not be stopped"; only the lock tells them
-        apart. With no pid file there is nothing to kill."""
+        apart. With no pid file by the end of the settle there is nothing to
+        kill."""
+        real_stop = node_sync.stop_daemon
+        naps: list[float] = []
+        monkeypatch.setattr(
+            node_sync,
+            "stop_daemon",
+            lambda: real_stop(sleep=naps.append, now=lambda: sum(naps)),
+        )
         result = runner.invoke(cli.main, ["node", "sync", "--stop"])
         assert result.exit_code == 1, result.output
         assert "was not running" not in result.stdout
         assert "Could not stop the node sync daemon (pid unknown)." in result.stdout
+        assert sum(naps) == pytest.approx(node_sync.STOP_SETTLE_S, abs=0.11)
 
     def test_a_refused_kill_is_not_reported_as_nothing_running(
         self, runner, monkeypatch, daemon_lock, stranger
