@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -274,6 +275,28 @@ def _one(**fields: object) -> dict[str, object]:
     }
 
 
+def _deep_config(tmp_path: Path, leaf: str) -> tuple[str, str]:
+    """A config whose unknown ``projects[0].note`` holds ``leaf`` (JSON text)
+    under more containers than the recursion limit, alternating list and
+    object; and the where-label that reaches the leaf. Built as text because
+    json.dumps recurses and cannot write it."""
+    pairs = sys.getrecursionlimit() // 2 + 100
+    note = '[{"n": ' * pairs + leaf + "}]" * pairs
+    text = (
+        f'{{"version": {SCHEMA_VERSION}, "projects":'
+        f' [{{"path": "api", "color": "{_C}", "note": {note}}}]}}'
+    )
+    try:
+        json.loads(text)
+    except RecursionError:
+        # 3.10/3.11 count json's own nesting against the same limit, so a file
+        # this deep never loaded there and never reaches the walk.
+        pytest.skip("json.loads refuses this depth itself on this Python")
+    cfg_file = tmp_path / "magent.config.json"
+    cfg_file.write_text(text, encoding="utf-8")
+    return str(cfg_file), "projects[0].note" + "[0].n" * pairs
+
+
 # Every string config.py reads -- each becomes a path, a session name, a window
 # title, an argv or a listing row -- plus the keys and values it only warns about.
 _EVERY_STRING: list[tuple[str, dict[str, object]]] = [
@@ -390,6 +413,23 @@ class TestTextWithNoUtf8FormIsRefusedAtLoad:
             command,
         )
         assert proj.color is not None
+
+    def test_nesting_deeper_than_the_recursion_limit_still_loads(
+        self, capsys, tmp_path
+    ):
+        # json.loads accepts it (3.12+), and it always loaded with the unknown
+        # key's warning; a walk that recursed turned it into a traceback.
+        path, _ = _deep_config(tmp_path, '"ok"')
+        assert load_config(path).projects[0].path == "api"
+        assert capsys.readouterr().err == (
+            "Warning: unknown config key: projects[0].note\n"
+        )
+
+    def test_a_lone_surrogate_at_that_depth_is_refused_with_its_path(self, tmp_path):
+        path, where = _deep_config(tmp_path, '"api\\ud83d"')
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value) == _refusal(where)
 
 
 class TestAttentionSettings:
