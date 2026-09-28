@@ -396,12 +396,23 @@ class Remote:
         return base64.b64decode(run.out.strip())
 
 
+# The GECOS field of every node user this harness creates: this prefix and a
+# per-run token. The name only has the right SHAPE; the stamp is what proves
+# this run made the user, and the delete refuses any user without it.
+OWNER_PREFIX = "magent-e2e"
+# _CREATE_USER's exits before useradd runs: nothing was created, so a failure
+# with one of these deletes nothing (an existing user is someone else's).
+_BAD_NAME, _EXISTS = 2, 3
+# _DELETE_USER's exit for a user whose stamp is not this run's.
+_NOT_OURS = 5
+
 _CREATE_USER = f"""set -eu
 u=$1
 key=$2
-case $u in {_USER_CASE}) ;; *) echo "refusing to create $u" >&2; exit 2 ;; esac
-if getent passwd "$u" >/dev/null; then echo "$u already exists" >&2; exit 3; fi
-useradd --create-home --shell /bin/bash "$u"
+owner=$3
+case $u in {_USER_CASE}) ;; *) echo "refusing to create $u" >&2; exit {_BAD_NAME} ;; esac
+if getent passwd "$u" >/dev/null; then echo "$u already exists" >&2; exit {_EXISTS}; fi
+useradd --create-home --shell /bin/bash --comment "$owner" "$u"
 # '*' is no password, not a LOCKED one ('!'): sshd refuses pubkey logins to a
 # locked account when PAM is off.
 usermod -p '*' "$u"
@@ -434,11 +445,18 @@ fi
 mkdir -p "$HOME/origin"
 """
 
+# The ownership check runs first and needs only getent and bash builtins:
+# nothing is killed, found or deleted before it has passed.
 _DELETE_USER = f"""set -u
 u=$1
-case $u in {_USER_CASE}) ;; *) echo "refusing to delete $u" >&2; exit 2 ;; esac
-uid=$(id -u "$u" 2>/dev/null) || exit 0
-home=$(getent passwd "$u" | cut -d: -f6)
+owner=$2
+case $u in {_USER_CASE}) ;; *) echo "refusing to delete $u" >&2; exit {_BAD_NAME} ;; esac
+entry=$(getent passwd "$u") || exit 0
+IFS=: read -r _ _ uid _ gecos home _ <<< "$entry"
+if [ "$gecos" != "$owner" ]; then
+  echo "refusing to delete $u: stamped '$gecos', not this run's" >&2
+  exit {_NOT_OURS}
+fi
 loginctl terminate-user "$u" >/dev/null 2>&1 || true
 for _ in 1 2 3 4 5 6; do
   pkill -KILL -u "$uid" 2>/dev/null || true
@@ -466,6 +484,9 @@ class NodeUser:
     until F lands on this line (then F1 drives the product's own setup)."""
 
     name: str
+    # The GECOS stamp this run wrote (OWNER_PREFIX + a token): the delete
+    # refuses a user that does not carry it.
+    owner: str
     uid: str
     home: str
     root: Remote
@@ -482,34 +503,67 @@ class NodeUser:
             )
         pub = Path(f"{wire.key}.pub").read_text(encoding="utf-8").strip()
         name = f"mgn{secrets.token_hex(3)[:5]}"
-        made = root.script(_CREATE_USER, name, pub, tag="useradd", want=60)
-        if made.rc != 0:
-            # A useradd that got part of the way still leaves a user behind.
-            gone = root.script(
-                _DELETE_USER, name, tag="userdel", timeout=CLEANUP_TIMEOUT_S
-            )
+        owner = f"{OWNER_PREFIX} {secrets.token_hex(8)}"
+        try:
+            made = root.script(_CREATE_USER, name, pub, owner, tag="useradd", want=60)
+        except BaseException:
+            # A timeout: the useradd may have finished on the far side of it.
+            _discard(root, name, owner)
+            raise
+        if made.rc in (_BAD_NAME, _EXISTS):
             pytest.fail(
-                f"could not create the node user {name}\n{made.show()}\n"
-                f"cleanup:\n{gone.show()}"
+                f"the root hop refused to create {name}; nothing was created, "
+                f"so nothing is deleted\n{made.show()}"
             )
-        uid, home = made.out.strip().splitlines()[-1].split(" ", 1)
-        user = cls(
-            name=name,
-            uid=uid,
-            home=home,
-            root=root,
-            login=Remote(f"{name}@{wire.host}", out_dir, budget),
-        )
-        boot = user.login.script(_BOOTSTRAP_USER, wire.port, tag="bootstrap")
-        if boot.rc != 0:
-            user.delete()
-            pytest.fail(f"could not bootstrap the node user {name}\n{boot.show()}")
+        # From here a user carrying this run's stamp may exist: any way out
+        # (a failure, a timeout, an answer that does not parse) deletes it.
+        try:
+            if made.rc != 0:
+                pytest.fail(f"could not create the node user {name}\n{made.show()}")
+            lines = made.out.strip().splitlines()
+            answer = re.fullmatch(r"(\d+) (/.+)", lines[-1] if lines else "")
+            if answer is None:
+                pytest.fail(f"useradd's answer is not '<uid> <home>'\n{made.show()}")
+            uid, home = answer.groups()
+            user = cls(
+                name=name,
+                owner=owner,
+                uid=uid,
+                home=home,
+                root=root,
+                login=Remote(f"{name}@{wire.host}", out_dir, budget),
+            )
+            boot = user.login.script(_BOOTSTRAP_USER, wire.port, tag="bootstrap")
+            if boot.rc != 0:
+                pytest.fail(f"could not bootstrap the node user {name}\n{boot.show()}")
+        except BaseException:
+            _discard(root, name, owner)
+            raise
         return user
 
     def delete(self) -> Run:
         return self.root.script(
-            _DELETE_USER, self.name, tag="userdel", timeout=CLEANUP_TIMEOUT_S
+            _DELETE_USER,
+            self.name,
+            self.owner,
+            tag="userdel",
+            timeout=CLEANUP_TIMEOUT_S,
         )
+
+
+def _discard(root: Remote, name: str, owner: str) -> None:
+    """Delete the user a failed ``create`` may have left, by its stamp. Its
+    own failure goes to stderr, never up: the create's failure is the one
+    the report is about, and it is re-raised as it was."""
+    try:
+        gone = root.script(
+            _DELETE_USER, name, owner, tag="userdel", timeout=CLEANUP_TIMEOUT_S
+        )
+    except pytest.fail.Exception as exc:
+        sys.stderr.write(f"cleanup of node user {name} failed: {exc}\n")
+        return
+    if gone.rc != 0:
+        sys.stderr.write(f"cleanup of node user {name} failed:\n{gone.show()}\n")
 
 
 # ---------------------------------------------------------------------------
