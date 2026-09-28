@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -392,7 +393,9 @@ class TestNodeSync:
         assert (
             "still starting (launcher pid 4242) -- see ~/.magent/logs/nodes.log"
         ) in result.stdout
-        assert len(slept) == node_cmd._START_POLLS  # waited out the budget first
+        # The whole ~10 s budget waited out first, not a poll less (a cold
+        # child measured 2.5-13 s), and then given up rather than hung.
+        assert 10.0 <= math.fsum(slept) < 10.5
         assert signals == []  # a slow child is not a failed one: never killed
 
     @pytest.mark.parametrize("seconds", [6.0, 9.0])

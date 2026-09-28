@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 # ~10 s nominal, returning as soon as it appears or the child exits. A cold
 # child spends seconds importing before it takes the lock (measured 2.5-13 s
 # on a loaded desktop); one still alive at the deadline is "still starting".
+# G-MERGE: _START_POLLS is 100 on the G line (a cold child measured 2.5-13 s before it records its pid; 20 polls, 2 s, reported a slow start as a failure); keep it at the K/F merges
 _START_POLLS = 100
 _START_POLL_S = 0.1
 
