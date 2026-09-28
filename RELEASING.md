@@ -103,8 +103,10 @@ From an up-to-date `main` (or a release branch that will be merged):
 
 That's it. On the tag push the workflow will:
 
-1. **build** — `python -m build` produces the sdist + wheel and `twine check
-   --strict` validates the metadata.
+1. **build** — `python -m build` produces the sdist + wheel, `twine check
+   --strict` validates the metadata, and the tag must equal (PEP 440) the
+   version inside both built artifacts, or the run stops before anything is
+   published.
 2. **smoke** — installs the built wheel into a clean, no-extras venv on Linux,
    Windows, and macOS and runs `magent --version` / `magent --help`.
 3. **publish** — after any required-reviewer approval, uploads the sdist + wheel
@@ -117,9 +119,9 @@ release step is required. For a curated changelog, edit the Release after the ru
 finishes and paste in the matching `CHANGELOG.md` section.
 
 > **Pre-releases** use the same steps with a PEP 440 pre-release version: set
-> `version = "X.Y.0rc1"` in `pyproject.toml` and tag `vX.Y.0rc1` (the tag and
-> the version must match — the pipeline publishes the `pyproject.toml` version,
-> not the tag). The `build` job classifies the tag with `packaging`
+> `version = "X.Y.0rc1"` in `pyproject.toml` and tag `vX.Y.0rc1` (PyPI gets the
+> `pyproject.toml` version, not the tag, so a `vX.Y.0rc1` tag over a `X.Y.0`
+> build fails the `build` job). The `build` job classifies the tag with `packaging`
 > (`a`/`b`/`rc`/`.dev` all count), and `github-release` then marks the Release
 > as a pre-release that never becomes **Latest**. PyPI and `pip` treat the
 > version as a pre-release too: a plain `pip install` skips it, so testers need
@@ -151,6 +153,9 @@ on `v*` tags — so a dispatch is always safe, whatever the `dry_run` value.
   environment (`pypi`). All four must match exactly.
 - **Publish waits and never runs** — a Required reviewer must approve the `pypi`
   environment deployment (Actions run page → **Review deployments**).
+- **`tag vX does not match the built version Y`** — the tag and `pyproject.toml`
+  disagree; nothing was published. Fix the version (and `uv lock`), commit, then
+  delete and re-push the tag.
 - **`File already exists` from PyPI** — that version was already uploaded. PyPI
   is immutable; bump to a new version and tag again.
 - **`uv lock --check` fails in CI** — you bumped the version without running
