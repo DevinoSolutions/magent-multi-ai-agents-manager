@@ -159,12 +159,25 @@ def get_env() -> MagentEnv:
     if _cached_env is None:
         try:
             _cached_env = MagentEnv(_env_file=ENV_FILE)
-        except (UnicodeDecodeError, OSError) as exc:
-            raise _env_file_unusable(exc) from exc
+        except UnicodeDecodeError as exc:
+            problem = f"is not valid UTF-8 ({type(exc).__name__}); re-save it as UTF-8"
+        except OSError as exc:
+            problem = (
+                f"could not be read ({type(exc).__name__}); close any program "
+                "holding it open and check you can read it"
+            )
+        else:
+            return _cached_env
+        # Raised here, past the except blocks, and from None: a decode error
+        # carries the whole file in ``.object`` and its frames hold it as
+        # locals, so chaining it -- or raising while it is still being handled,
+        # which chains it as __context__ -- would hand every secret in the file
+        # to Sentry's exception serializer.
+        raise _env_file_unusable(problem) from None
     return _cached_env
 
 
-def _env_file_unusable(exc: UnicodeDecodeError | OSError) -> ValidationError:
+def _env_file_unusable(problem: str) -> ValidationError:
     """ENV_FILE could not be used, as a ValidationError naming the file.
 
     The dotenv read raises UnicodeDecodeError for a file that is not UTF-8 and
@@ -178,14 +191,11 @@ def _env_file_unusable(exc: UnicodeDecodeError | OSError) -> ValidationError:
     reads the file only when it ``is_file()``.)
 
     Our words and the exception's class only -- never the offending bytes or
-    the decode position; the caller chains the original for Sentry. The empty
-    ``loc`` makes ``validation_error_items`` show the message as-is, and the
-    one ``{message}`` key keeps a brace in the path literal.
+    the decode position, which is why this takes the words and not the
+    exception. The empty ``loc`` makes ``validation_error_items`` show the
+    message as-is, and the one ``{message}`` key keeps a brace in the path
+    literal.
     """
-    if isinstance(exc, UnicodeDecodeError):
-        problem = f"is not valid UTF-8 ({type(exc).__name__}); re-save it as UTF-8"
-    else:
-        problem = f"could not be read ({type(exc).__name__})"
     message = f"{ENV_FILE} {problem}"
     return ValidationError.from_exception_data(
         MagentEnv.__name__,

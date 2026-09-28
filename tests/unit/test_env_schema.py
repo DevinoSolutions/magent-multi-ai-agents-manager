@@ -549,6 +549,49 @@ class TestEnvFileIsMagentsOwn:
 
 
 _NOT_UTF8 = b"MAGENT_LOG_LEVEL=\xff\xfe\n"
+# A secret in a .env that fails to decode, to prove none of the file rides out
+# on the error: the decode error's ``.object`` is the whole file, and the codec
+# frames on its traceback hold it as locals.
+_SECRET = b"sentinel-secret-5c1e"
+_SECRET_NOT_UTF8 = (
+    b"MAGENT_SENTRY_DSN=https://" + _SECRET + b"@sentry.invalid/1\n" + _NOT_UTF8
+)
+
+
+def _everything_the_error_carries(exc: ValidationError) -> list[object]:
+    """Each value a serializer could reach from ``exc``: its inputs, then every
+    link of its chain -- __cause__ AND __context__, suppressed or not -- with
+    that link's args, its decode ``object``, and each local of each frame on
+    its traceback."""
+    found: list[object] = [error["input"] for error in exc.errors()]
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        link = pending.pop()
+        if link is None or id(link) in seen:
+            continue
+        seen.add(id(link))
+        found += [*link.args, getattr(link, "object", None)]
+        tb = link.__traceback__
+        while tb is not None:
+            found += list(tb.tb_frame.f_locals.values())
+            tb = tb.tb_next
+        pending += [link.__cause__, link.__context__]
+    return found
+
+
+def _assert_nothing_of_the_file_travels(exc: ValidationError) -> None:
+    assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
+    # Raised outside the except block, so nothing was being handled to chain.
+    assert exc.__context__ is None
+    leaked = [
+        value
+        for value in _everything_the_error_carries(exc)
+        if (isinstance(value, bytes) and _SECRET in value)
+        or (isinstance(value, str) and _SECRET.decode() in value)
+    ]
+    assert leaked == []
 
 
 @contextlib.contextmanager
@@ -587,7 +630,7 @@ class TestAnUnusableEnvFile:
         # Every get_env() call site catches ValidationError, several of them to
         # degrade to a default (logging must never crash the process it
         # observes). A new exception type would be a traceback at each one.
-        env_module.ENV_FILE.write_bytes(_NOT_UTF8)
+        env_module.ENV_FILE.write_bytes(_SECRET_NOT_UTF8)
 
         with pytest.raises(ValidationError) as caught:
             env_module.get_env()
@@ -601,11 +644,12 @@ class TestAnUnusableEnvFile:
                 ),
             )
         ]
-        # Chained, so the real cause survives for Sentry.
-        assert isinstance(caught.value.__cause__, UnicodeDecodeError)
+        _assert_nothing_of_the_file_travels(caught.value)
 
     def test_an_unreadable_file_raises_it_too(self) -> None:
-        env_module.ENV_FILE.write_text("MAGENT_LOG_LEVEL=DEBUG\n", encoding="utf-8")
+        env_module.ENV_FILE.write_bytes(
+            b"MAGENT_SENTRY_DSN=https://" + _SECRET + b"@sentry.invalid/1\n"
+        )
 
         with (
             _read_denied(env_module.ENV_FILE),
@@ -614,9 +658,15 @@ class TestAnUnusableEnvFile:
             env_module.get_env()
 
         assert env_module.validation_error_items(caught.value) == [
-            ("", f"{env_module.ENV_FILE} could not be read (PermissionError)")
+            (
+                "",
+                (
+                    f"{env_module.ENV_FILE} could not be read (PermissionError); "
+                    "close any program holding it open and check you can read it"
+                ),
+            )
         ]
-        assert isinstance(caught.value.__cause__, PermissionError)
+        _assert_nothing_of_the_file_travels(caught.value)
 
     def test_a_directory_is_skipped_like_a_missing_file(
         self, monkeypatch: pytest.MonkeyPatch
@@ -627,6 +677,15 @@ class TestAnUnusableEnvFile:
         monkeypatch.setenv("MAGENT_LOG_LEVEL", "DEBUG")
 
         assert env_module.get_env().log_level == "DEBUG"
+
+    def test_a_directory_lets_every_command_run(self) -> None:
+        # The same silent skip at the CLI: no refusal, no warning.
+        env_module.ENV_FILE.mkdir()
+
+        result = CliRunner().invoke(cli.main, ["docs"])
+
+        assert result.exit_code == 0
+        assert result.stderr == ""
 
     def test_the_refusal_is_exactly_our_words(self) -> None:
         # The whole of stderr: one item line -- no stray ": " from the empty
@@ -657,8 +716,29 @@ class TestAnUnusableEnvFile:
 
         assert result.exit_code == 1
         assert isinstance(result.exception, SystemExit)
+        assert result.stdout == ""
         assert result.stderr == (
-            f"{path} could not be read (PermissionError)\n"
+            f"{path} could not be read (PermissionError); close any program "
+            "holding it open and check you can read it\n"
+            f"Fix the environment variable(s) above (see .env.example; "
+            f"env file: {path}).\n"
+        )
+
+    def test_doctor_is_refused_at_the_door_too(self) -> None:
+        # Today `magent doctor` cannot run under an invalid environment at
+        # all: the group callback refuses before the command is reached, so
+        # its own env check never gets to report. Pinned as it stands, with
+        # the refusal's exact words.
+        env_module.ENV_FILE.write_bytes(_NOT_UTF8)
+        path = env_module.ENV_FILE
+
+        result = CliRunner().invoke(cli.main, ["doctor"])
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert result.stdout == ""
+        assert result.stderr == (
+            f"{path} is not valid UTF-8 (UnicodeDecodeError); re-save it as UTF-8\n"
             f"Fix the environment variable(s) above (see .env.example; "
             f"env file: {path}).\n"
         )
