@@ -322,6 +322,8 @@ _EVERY_STRING: list[tuple[str, dict[str, object]]] = [
     ("a key in the config", {**_one(), _LONE: 1}),
     ("a key in projects[0]", {"projects": [{"path": "api", _LONE: 1}]}),
     ("projects[0].note", _one(note=_LONE)),
+    # No known field nests a list directly in a list; an unknown value can.
+    ("junk[0][0]", {**_one(), "junk": [[_LONE]]}),
 ]
 
 
