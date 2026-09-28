@@ -1118,6 +1118,43 @@ _DEFAULT_ACL_RWX_FOR_ALL = struct.pack("<I", 2) + b"".join(
 )
 
 
+def _mkdir_shim(tmp_path: Path, monkeypatch, body: str) -> None:
+    """A ``mkdir`` ahead of the real one on PATH. ``body`` runs with the
+    folder private_dir asked for in $last and the real mkdir in $real."""
+    real = shutil.which("mkdir")
+    assert real is not None
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "mkdir"
+    shim.write_text(
+        f"#!/bin/sh\nreal={shlex.quote(real)}\nfor last; do :; done\n{body}",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
+
+
+# Another install makes the folder first -- 0700, as its private_dir would
+# -- so this one's mkdir finds it there and fails: the race mkdir -p hid.
+_LOSES_THE_RACE = (
+    '"$real" -m 700 -- "$last" || exit 2\n'
+    "echo \"mkdir: cannot create directory '$last': File exists\" >&2\n"
+    "exit 1\n"
+)
+
+
+def _refuses(folder: str) -> str:
+    """A mkdir that fails on ``folder`` and leaves nothing there, and is the
+    real one for every other folder."""
+    return (
+        f'case "$last" in {shlex.quote(folder)})\n'
+        "  echo \"mkdir: cannot create directory '$last': Permission denied\" >&2\n"
+        "  exit 1 ;;\n"
+        "esac\n"
+        'exec "$real" "$@"\n'
+    )
+
+
 # Everything under the node home's ~/.claude after a good install of that tar.
 _LANDED_OWNER_ONLY = {
     ".claude": "0o700",
@@ -1140,7 +1177,10 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
     a default ACL on the node user's home makes the kernel ignore it. What
     lands is owner-only by an explicit mode, whatever modes the payload
     carries: every payload item is chmodded before it moves, and every folder
-    the script makes is private_dir's."""
+    the script makes is private_dir's. private_dir keeps what mkdir -p
+    tolerated -- a folder another install made first is not a failure --
+    and a folder it really cannot make is refused as exit 5, in the
+    script's own words: mkdir's never reach the screen."""
 
     @staticmethod
     def _modes(home: Path) -> dict[str, str]:
@@ -1195,16 +1235,76 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
     def test_a_home_that_does_not_exist_is_not_made_and_nothing_lands(
         self, monkeypatch, tmp_path
     ):
-        # The one parent private_dir does not make: the home itself. It
-        # fails (set -e), where mkdir -p used to make the home too.
+        # The one parent private_dir does not make: the home itself. A node
+        # user with no home is a broken account, so the install refuses,
+        # where mkdir -p used to make the home too.
         home = tmp_path / "nodehome"
 
         done = _node_run(
             _as_if_under_a_default_acl(self._call(monkeypatch)), home, umask=0
         )
 
-        assert done.returncode == 1
+        assert done.returncode == 5
+        assert (
+            done.stderr
+            == (
+                f"install_transcripts.sh: cannot make folder {home}/.claude;"
+                " no file installed\n"
+            ).encode()
+        )
         assert not home.exists()
+
+    def test_a_mkdir_that_lost_the_race_to_another_install_is_not_a_failure(
+        self, monkeypatch, tmp_path
+    ):
+        # Two first-ever recalls onto a fresh node user (a double tap, two
+        # panes): every folder this install asks for, the other one made a
+        # moment earlier. mkdir -p shrugged that off; private_dir must too.
+        home = tmp_path / "nodehome"
+        home.mkdir()
+        _mkdir_shim(tmp_path, monkeypatch, _LOSES_THE_RACE)
+
+        done = _node_run(self._call(monkeypatch), home)
+
+        assert done.returncode == 0, done.stderr
+        assert self._modes(home) == _LANDED_OWNER_ONLY
+        assert b"mkdir" not in done.stderr
+        dest = home / ".claude" / "projects" / _ENCODED
+        assert (dest / f"{SESSION_ID}.jsonl").read_text(encoding="utf-8") == (
+            _PULLED_JSONL
+        )
+
+    @pytest.mark.parametrize(
+        "rel",
+        [
+            ".claude",
+            ".claude/projects",
+            f".claude/projects/{_ENCODED}",
+            f".claude/projects/{_ENCODED}/{SESSION_ID}/subagents",
+        ],
+    )
+    def test_a_folder_that_cannot_be_made_is_refused_in_the_scripts_words(
+        self, monkeypatch, tmp_path, rel
+    ):
+        # Each place private_dir runs: a mkdir that fails and leaves no
+        # folder refuses the install before any file is placed, and mkdir's
+        # own words stay off the screen.
+        home = tmp_path / "nodehome"
+        home.mkdir()
+        refused = f"{home}/{rel}"
+        _mkdir_shim(tmp_path, monkeypatch, _refuses(refused))
+
+        done = _node_run(self._call(monkeypatch), home)
+
+        assert done.returncode == 5
+        assert (
+            done.stderr
+            == (
+                f"install_transcripts.sh: cannot make folder {refused};"
+                " no file installed\n"
+            ).encode()
+        )
+        assert [p for p in home.rglob("*") if not p.is_dir()] == []
 
     @pytest.mark.skipif(
         sys.platform != "linux", reason="a POSIX default ACL xattr is Linux's"
@@ -1343,7 +1443,7 @@ class TestTheInstallResultAndRefusals:
 
     @pytest.mark.parametrize(
         ("rc", "words"),
-        [(2, "alphabet"), (3, "payload"), (4, "symlink")],
+        [(2, "alphabet"), (3, "payload"), (4, "symlink"), (5, "folder")],
     )
     def test_each_refusal_is_named(self, monkeypatch, tmp_path, rc, words):
         self._fake(monkeypatch, rc=rc)

@@ -26,7 +26,8 @@
 #
 # Exit codes: 2 the name is outside the encoder's alphabet; 3 the payload is
 # missing or broken; 4 the destination (or a directory inside it the payload
-# needs) is a symlink, which could point anywhere.
+# needs) is a symlink, which could point anywhere; 5 a folder it needs could
+# not be made (a node user with no home, say), before any file is placed.
 #
 # The name was computed by magent's one encoder (nodes.encoded_project_dir);
 # this script only refuses anything outside that encoder's alphabet, so a bad
@@ -65,8 +66,21 @@ under_a_file() {
 
 # Make folder $1 owner-only unless it is there already (the node's own is
 # left as it is); its parent must exist. A default ACL can only narrow
-# mkdir's mode, never widen it, and the chmod makes it exact.
-private_dir() { [ -d "$1" ] || { mkdir -m 700 -- "$1" && chmod 700 -- "$1"; }; }
+# mkdir's mode, never widen it, and the chmod makes it exact. A mkdir that
+# fails with the folder there after all lost a race to another install,
+# whose private_dir made it: success, as mkdir -p had it. Any other failure
+# is said in this script's words (mkdir's stay off the screen) and returns
+# 1; each caller refuses with exit 5.
+private_dir() {
+  [ -d "$1" ] && return 0
+  if mkdir -m 700 -- "$1" 2>/dev/null; then
+    chmod 700 -- "$1" && return 0
+  elif [ -d "$1" ]; then
+    return 0
+  fi
+  printf 'install_transcripts.sh: cannot make folder %s; no file installed\n' "$1" >&2
+  return 1
+}
 
 main() {
   local name="${1:-}" projects dest src rel target
@@ -83,8 +97,8 @@ main() {
     printf 'install_transcripts.sh: %s is a symlink; not installing through it\n' "$dest" >&2
     return 4
   fi
-  private_dir "$HOME/.claude"
-  private_dir "$projects"
+  private_dir "$HOME/.claude" || return 5
+  private_dir "$projects" || return 5
   tmp="$(mktemp -d "$projects/.magent-install.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT
   if ! magent_payload | tar --no-same-owner --no-same-permissions -xf - -C "$tmp"; then
@@ -105,7 +119,7 @@ main() {
     fi
   done < <(find "$tmp" -mindepth 1 -type d -print0)
 
-  private_dir "$dest"
+  private_dir "$dest" || return 5
   while IFS= read -r -d '' src; do
     rel="${src#"$tmp"/}"
     if under_a_file "$dest" "$rel"; then
@@ -113,7 +127,8 @@ main() {
     elif [ -e "$dest/$rel" ] && [ ! -d "$dest/$rel" ]; then
       printf 'KEPT\t%s\n' "$rel"  # a file where the payload has a directory
     else
-      private_dir "$dest/$rel"  # its parent came earlier: find lists it first
+      # Its parent came earlier: find lists a folder before what is in it.
+      private_dir "$dest/$rel" || return 5
     fi
   done < <(find "$tmp" -mindepth 1 -type d -print0)
 
