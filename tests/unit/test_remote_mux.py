@@ -2800,6 +2800,29 @@ case $cmd in
     umask > "$state/umask"
     { echo "cwd=$cwd"; echo "env=$env"; echo "cmd=$*"; } > "$state/sessions/$name"
     exit 0 ;;
+  set | setw | rename-window)
+    # A -t here is a PANE/WINDOW target, as real tmux reads it: `=sid` with no
+    # colon is no session at all (measured: "no such session: =sid", exit 1),
+    # and only a live session takes the option. What it took goes to
+    # applied.log -- the decoration's `|| true` hides every refusal.
+    target=
+    prev=
+    for arg; do
+      [ "$prev" = -t ] && target=$arg
+      prev=$arg
+    done
+    if [ -n "$target" ]; then
+      case $target in
+        *:*) ;;
+        *) echo "no such session: $target" >&2; exit 1 ;;
+      esac
+      name=${target%%:*}
+      if [ ! -f "$state/sessions/${name#=}" ]; then
+        echo "can't find session: ${name#=}" >&2; exit 1
+      fi
+    fi
+    echo "$cmd $*" >> "$state/applied.log"
+    exit 0 ;;
   *) exit 0 ;;
 esac
 """
@@ -3013,6 +3036,12 @@ class TestBringUpShOnARealShell:
     def _log(self, rig):
         return (rig["state"] / "calls.log").read_text(encoding="utf-8")
 
+    def _applied(self, rig):
+        """What the fake tmux TOOK: the set/setw/rename-window calls a live
+        session accepted. ``calls.log`` has every call, refused or not."""
+        path = rig["state"] / "applied.log"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
     def _push_raw(self, rig, payload: bytes):
         root = str(rig["root"])
         return remote_mux.run_script(
@@ -3089,7 +3118,7 @@ class TestBringUpShOnARealShell:
         assert result.attached_existing is True
         assert not rig["root"].exists()
         assert "new-session" not in self._log(rig)
-        assert "status-left-length 18" in self._log(rig)
+        assert "set -t =api: status-left-length 18\n" in self._applied(rig)
 
     def test_a_second_bring_up_fast_forwards_to_origin(self, rig):
         clone, state = rig["clone"], rig["state"]
@@ -3340,13 +3369,50 @@ class TestBringUpShOnARealShell:
         assert f"magent: {said}" in info.value.stderr_tail
 
     def test_the_decoration_brands_the_node(self, rig):
+        # Read from what the fake tmux TOOK, never from what was sent: every
+        # decoration line is `|| true`, so a target tmux refuses (a bare
+        # `=sid` on set/setw/rename-window) left this rig green on calls.log.
         remote_mux.bring_up(rig["node"], rig["recipe"])
-        log = self._log(rig)
+        applied = self._applied(rig)
         assert (
-            "-L magent set -t =api: status-left #[bold,fg=green] magent #[default]@second"
-            in log
+            "set -t =api: status-left #[bold,fg=green] magent #[default]@second"
+            in applied
         )
-        assert "-L magent set -t =api: status-left-length 18" in log
+        assert "set -t =api: status-left-length 18\n" in applied
+        # All eight option commands landed, not only the two named above.
+        sent = [
+            " ".join(argv[3:])
+            for argv in remote_mux.decoration_args("api", "second", False)
+            if argv[3] in ("set", "setw", "rename-window")
+        ]
+        assert len(sent) == 8
+        assert applied.splitlines() == sent
+
+    def test_the_fake_tmux_reads_a_target_as_tmux_does(self, rig):
+        # The rig's judge of the decoration. A session command takes a bare
+        # `=sid`; set/setw/rename-window read -t as a PANE/WINDOW target and
+        # refuse one (tmux 3.4: "no such session: =api", exit 1), taking the
+        # exact session only as `=sid:`.
+        (rig["state"] / "sessions" / "api").write_bytes(b"cmd=x\n")
+
+        def tmux(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["tmux", "-L", "magent", *args],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        assert tmux("has-session", "-t", "=api").returncode == 0
+        assert tmux("has-session", "-t", "=web").returncode == 1
+        refused = tmux("set", "-t", "=api", "status-left", "X")
+        assert (refused.returncode, refused.stderr) == (1, "no such session: =api\n")
+        assert tmux("setw", "-t", "=api", "automatic-rename", "off").returncode == 1
+        assert tmux("rename-window", "-t", "=api", "api").returncode == 1
+        assert tmux("set", "-t", "=web:", "status-left", "X").returncode == 1
+        assert self._applied(rig) == ""
+        assert tmux("set", "-t", "=api:", "status-left", "X").returncode == 0
+        assert self._applied(rig) == "set -t =api: status-left X\n"
 
     def test_an_encoded_name_outside_the_alphabet_is_exit_2(self, rig):
         with pytest.raises(RemoteError) as info:
