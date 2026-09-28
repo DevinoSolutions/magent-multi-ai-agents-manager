@@ -170,17 +170,18 @@ capture() {
 # mode to the last folder only. A folder already there is the node's own and
 # keeps its mode -- one that appears between the walk and the mkdir too:
 # another bring-up (one person's second PC) made it, as `mkdir -p` shrugged
-# off. mkdir's own words stay off the screen; a caller that gets 1 says why
-# in the script's.
+# off, and mkdir's "File exists" is dropped. A real failure keeps mkdir's
+# words (nodes.log's), and a caller that gets 1 says why in the script's,
+# last -- the line the row shows.
 mkdir_private() {
-  local dir=$1
+  local dir=$1 why
   local -a made=()
   while [ ! -e "$dir" ] && [ ! -h "$dir" ]; do
     made=("$dir" "${made[@]}")
     capture dir dirname -- "$dir" || return 1
   done
   for dir in "${made[@]}"; do
-    mkdir -m 700 -- "$dir" 2>/dev/null || [ -d "$dir" ] || return 1
+    why=$(mkdir -m 700 -- "$dir" 2>&1) || [ -d "$dir" ] || { printf '%s\n' "$why" >&2; return 1; }
   done
   [ -d "$1" ]
 }

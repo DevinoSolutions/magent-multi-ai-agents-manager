@@ -211,7 +211,11 @@ class RemoteError(RuntimeError):
       over-cap reply is a node that answered, too much, so it is False there.
     - ``over_cap``: did the reply pass the stdout cap? Then ``stderr_tail``'s
       FIRST line is magent's own ``reply exceeded N bytes`` and the child's
-      words follow it.
+      words from before the cap follow it. What stderr said after the cap,
+      and a half line the cap cut, is ``after_cap`` instead: never a reason,
+      so never in the tail, but in the message (``str``) for the log.
+    - ``row_text``: what may a screen row say? The text its one line is taken
+      from -- see the property.
 
     A spawn failure sets none of them."""
 
@@ -223,15 +227,16 @@ class RemoteError(RuntimeError):
         *,
         timed_out: bool = False,
         over_cap: bool = False,
+        after_cap: str = "",
     ) -> None:
         self.rc = rc
         self.stderr_tail = stderr_tail
         self.command_redacted = command_redacted
         self.timed_out = timed_out
         self.over_cap = over_cap
-        super().__init__(
-            f"{shlex.join(command_redacted)} failed (rc={rc}): {stderr_tail}"
-        )
+        self.after_cap = after_cap
+        said = f"{shlex.join(command_redacted)} failed (rc={rc}): {stderr_tail}"
+        super().__init__(f"{said}\nafter the cap: {after_cap}" if after_cap else said)
 
     @property
     def outcome_unknown(self) -> bool:
@@ -241,6 +246,15 @@ class RemoteError(RuntimeError):
         and neither stops a non-tty remote command. False does not cover an
         rc 255 transport drop, which may also have run (see the class)."""
         return self.timed_out or self.over_cap
+
+    @property
+    def row_text(self) -> str:
+        """The text a screen row takes its one line from: ``stderr_tail``,
+        where a node script writes its reason last -- but over the cap only
+        magent's own ``reply exceeded N bytes``. The cap is why the call
+        failed, and what the child said around it is the log's: remote tool
+        noise, or a complaint at the pipe the cap closed."""
+        return self.stderr_tail.split("\n", 1)[0] if self.over_cap else self.stderr_tail
 
 
 @functools.lru_cache(maxsize=1)
@@ -327,7 +341,11 @@ class _Drain(threading.Thread):
     finished. ``data`` HANDS OVER what is held and forgets it -- a second call
     returns only what arrived since -- and may be taken before the thread has
     finished, as what has arrived so far: a grandchild can hold a pipe open
-    long after the child is gone."""
+    long after the child is gone. ``over_at`` and ``ended_at`` stamp, on the
+    monotonic clock, the read that passed the cap and the end of the read --
+    so one drain can say whether its stream ended before another's cap -- and
+    each chunk held carries the time of its own read, so ``split`` can part
+    what was read before another drain's cap from what came after it."""
 
     def __init__(self, pipe: IO[bytes] | None, cap: int, *, tail: bool) -> None:
         super().__init__(daemon=True)
@@ -336,9 +354,11 @@ class _Drain(threading.Thread):
         self._tail = tail
         # _chunks and _held are shared with a data() taken mid-read.
         self._lock = threading.Lock()
-        self._chunks: deque[bytes] = deque()
+        self._chunks: deque[tuple[float, bytes]] = deque()
         self._held = 0
         self.over = False
+        self.over_at: float | None = None
+        self.ended_at: float | None = None
 
     def run(self) -> None:
         if self._pipe is None:
@@ -348,6 +368,8 @@ class _Drain(threading.Thread):
             with contextlib.suppress(OSError):
                 self._read(self._pipe.fileno())
         finally:
+            # After the last chunk is held: all this drain will ever hold.
+            self.ended_at = time.monotonic()
             with contextlib.suppress(OSError):
                 self._pipe.close()
 
@@ -358,20 +380,32 @@ class _Drain(threading.Thread):
             with self._lock:
                 if not self._tail and self._held + len(chunk) > self._cap:
                     self.over = True
+                    self.over_at = time.monotonic()
                     self._chunks.clear()
                     self._held = 0
                     return
-                self._chunks.append(chunk)
+                self._chunks.append((time.monotonic(), chunk))
                 self._held += len(chunk)
-                while self._tail and self._held - len(self._chunks[0]) >= self._cap:
-                    self._held -= len(self._chunks.popleft())
+                while self._tail and self._held - len(self._chunks[0][1]) >= self._cap:
+                    self._held -= len(self._chunks.popleft()[1])
 
     def data(self) -> bytes:
+        return b"".join(self.split(None))
+
+    def split(self, at: float | None) -> tuple[bytes, bytes]:
+        """``data``, parted at ``at``: what was read before it, and what was
+        read at it or after -- a tie is after, and so is everything when
+        ``at`` is None."""
         with self._lock:
-            held = b"".join(self._chunks)
+            chunks = list(self._chunks)
             self._chunks.clear()
             self._held = 0
-        return held[-self._cap :] if self._tail else held
+        held = b"".join(chunk for _, chunk in chunks)
+        cut = sum(len(chunk) for t, chunk in chunks if at is not None and t < at)
+        if self._tail:
+            dropped = max(0, len(held) - self._cap)
+            held, cut = held[dropped:], max(0, cut - dropped)
+        return held[:cut], held[cut:]
 
 
 def _feed(pipe: IO[bytes], data: bytes) -> None:
@@ -512,10 +546,6 @@ def _spawn(
             timed_out=True,
         )
     if out.over:
-        # Had stderr ended on its OWN? Asked before the kill: after it every
-        # stream has ended, and one the kill ended was cut off wherever the
-        # writer was -- mid-line, just like one still held open.
-        ended = not err.is_alive()
         _kill(proc)
         if not quiet:
             get_logger("nodes").warning(
@@ -529,14 +559,27 @@ def _spawn(
         # gets the reap bound to end -- time too for words already in the pipe
         # to be read -- and what it delivered is reported either way: a
         # grandchild may hold it open long after the child is gone, and the
-        # words already read are no less the child's. Only a stream that ended
-        # before the kill is whole to its last byte; any other may stop
-        # mid-line, and a fragment is no reason: only its whole lines are
-        # kept. One that ends on its own between the question and the kill is
-        # trimmed too -- a last line omitted, never a half-line kept.
+        # words already read are no less the child's. But only words read
+        # BEFORE the cap can be the reason: a writer complaining at the pipe
+        # the cap closed is no cause, however whole its lines (pull.sh's
+        # python3 prints a BrokenPipeError traceback there, and the Windows
+        # ssh client was measured passing it on). And only a stream that ended
+        # before the cap is whole to its last byte: the child had finished
+        # saying it. One that ended after -- by the kill, or by a writer dead
+        # at the pipe -- or is still open may stop mid-line, and a fragment is
+        # no reason: only its whole lines are kept. The drains' own clocks say
+        # which came first, read by read; a tie counts as after -- a last line
+        # omitted, never another's kept. What the reason leaves out rides in
+        # the error's message, for the log.
         err.join(_REAP_TIMEOUT_S)
-        held = err.data()
-        said = _tail(held if ended else held[: held.rfind(b"\n") + 1])
+        held, after = err.split(out.over_at)
+        ended = (
+            err.ended_at is not None
+            and out.over_at is not None
+            and err.ended_at < out.over_at
+        )
+        words = held if ended else held[: held.rfind(b"\n") + 1]
+        said = _tail(words)
         # Killed mid-call, so the remote may still be running; but the node
         # answered, so it is not unreachable (timed_out stays False).
         raise RemoteError(
@@ -544,6 +587,7 @@ def _spawn(
             f"{reason}\n{said}" if said else reason,
             shown,
             over_cap=True,
+            after_cap=_tail(held[len(words) :] + after),
         )
     stderr = err.data()
     if check and proc.returncode != 0:

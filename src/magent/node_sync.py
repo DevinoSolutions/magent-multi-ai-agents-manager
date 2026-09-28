@@ -629,16 +629,27 @@ def printable(text: str) -> str:
     return _CONTROL.sub("?", text).encode("ascii", "replace").decode("ascii")
 
 
+def escaped(text: str) -> str:
+    """``text`` as one line for the log, where ``printable`` would drop
+    characters: each one outside printable ASCII becomes its escape -- a
+    newline ``\\n``, ESC ``\\x1b``, U+FFFD (what a byte that was not UTF-8
+    decoded to) ``\\ufffd``. A node's words in nodes.log must neither split a
+    record nor write to a terminal tailing it."""
+    return "".join(
+        c if " " <= c <= "~" else c.encode("unicode_escape").decode("ascii")
+        for c in text
+    )
+
+
 def _classify(e: remote_mux.RemoteError) -> tuple[str, str]:
     """UNREACHABLE only when the node could not be reached (ssh's transport rc
     255) or never answered (``timed_out``). Every other rc-None error -- a
     reply over the cap, a local ssh that would not start -- is FAILED.
 
-    The detail is stderr's last line, except over the cap: there the child's
-    last words follow magent's ``reply exceeded N bytes``, and the cap is why
-    the pull failed, so that first line wins."""
-    text = e.stderr_tail.split("\n", 1)[0] if e.over_cap else e.stderr_tail
-    detail = _last_line(text) or f"rc={e.rc}"
+    The detail is the last line of ``row_text``: stderr's, except over the
+    cap, where it is magent's ``reply exceeded N bytes`` -- the rule every
+    node row shares."""
+    detail = _last_line(e.row_text) or f"rc={e.rc}"
     if e.timed_out or e.rc == SSH_TRANSPORT_RC:
         return UNREACHABLE, detail
     return FAILED, detail

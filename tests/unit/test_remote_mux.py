@@ -21,6 +21,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import types
 from importlib import resources
@@ -153,6 +154,16 @@ class TestRemoteError:
         # the flag is what node_sync reads as "the node did not answer".
         assert RemoteError(None, "", ()).timed_out is False
         assert RemoteError(None, "", (), timed_out=True).timed_out is True
+
+    def test_a_row_reads_the_whole_tail_but_over_the_cap_only_the_cap(self):
+        # Over the cap the child's words are the log's; the flag decides it,
+        # never the wording, and nothing is dropped from the error itself.
+        tail = "reply exceeded 8 bytes\nboom: disk full"
+        over = RemoteError(None, tail, ("ssh",), over_cap=True)
+        assert over.row_text == "reply exceeded 8 bytes"
+        assert over.stderr_tail == tail
+        assert "boom: disk full" in str(over)
+        assert RemoteError(1, tail, ("ssh",)).row_text == tail
 
 
 class TestTheSshResolver:
@@ -492,10 +503,11 @@ time.sleep(90)
 """
 
 # A child that leaves that grandchild behind, waits for its pid file (so the
-# teardown never finds it missing), says argv[2] on stderr, then floods stdout.
-# When the reader stops at the cap the child leaves WITHOUT a word: Python's
-# BrokenPipeError traceback would land on stderr after argv[2], racing the
-# kill, and glue itself to a half-written last line.
+# teardown never finds it missing), says argv[2] on stderr, pauses so the
+# reader holds it before the flood starts (the pause sets the order, not a
+# race), then floods stdout. When the reader stops at the cap the child leaves
+# WITHOUT a word: Python's BrokenPipeError traceback would land on stderr
+# after argv[2], racing the kill, and glue itself to a half-written last line.
 _HELD_STDERR_CHILD = (
     f"GRANDCHILD = {_HELD_STDERR_GRANDCHILD!r}\n"
     """\
@@ -511,6 +523,7 @@ while not os.path.exists(sys.argv[1]) and time.monotonic() < deadline:
     time.sleep(0.01)
 sys.stderr.write(sys.argv[2])
 sys.stderr.flush()
+time.sleep(0.3)
 block = b"x" * 65536
 try:
     while True:
@@ -521,21 +534,38 @@ except OSError:
 """
 )
 
-# A child with no grandchild that says argv[1] on stderr, then floods stdout.
-# When the reader stops at the cap it keeps stderr open and waits: the stream
-# ends only when the kill reaches it, as ssh's own stderr does.
-_KILLED_STDERR_CHILD = """\
-import sys, time
+# A child with no grandchild that says argv[1] on stderr, pauses as the one
+# above does, then floods stdout. When the reader stops at the cap, argv[2]
+# says how its stderr ends: "killed" keeps it open and waits, so it ends only
+# when the kill reaches it, as ssh's own stderr does; "dies-at-the-pipe"
+# leaves at once without a word, ending it ON ITS OWN -- but after the cap, as
+# a writer killed by SIGPIPE does; "complains-at-the-pipe" says a whole line
+# first, as a writer that ignores SIGPIPE does: pull.sh's python3 prints a
+# BrokenPipeError traceback, and the Windows ssh client was measured passing
+# it on after the cap.
+_PLAIN_STDERR_CHILD = """\
+import os, sys, time
 sys.stderr.write(sys.argv[1])
 sys.stderr.flush()
+time.sleep(0.3)
 block = b"x" * 65536
 try:
     while True:
         sys.stdout.buffer.write(block)
         sys.stdout.flush()
 except OSError:
-    time.sleep(60)
+    if sys.argv[2] == "killed":
+        time.sleep(60)
+    if sys.argv[2] == "complains-at-the-pipe":
+        sys.stderr.write("BrokenPipeError: [Errno 32] Broken pipe\\n")
+        sys.stderr.flush()
+    os._exit(1)
 """
+
+_COMPLAINT = "BrokenPipeError: [Errno 32] Broken pipe"
+# The kill orders that hold the kill back long enough for a complaining child
+# to say its line: under the others the kill may reach it first.
+_KILL_WAITS = ("pipe-closed-first", "main-late")
 
 
 class TestTheReplyIsBoundedInMemory:
@@ -684,15 +714,21 @@ class TestTheReplyIsBoundedInMemory:
         error, _ = self._flood_past_a_held_stderr(tmp_path)
         assert "boom: disk full" in error.stderr_tail.splitlines()[1:]
 
-    @pytest.fixture(params=["as-it-comes", "pipe-closed-first", "kill-read-first"])
-    def kill_order(self, request, monkeypatch):
+    @pytest.fixture(
+        params=["as-it-comes", "pipe-closed-first", "kill-read-first", "main-late"]
+    )
+    def kill_order(self, request, monkeypatch) -> str:
         """What comes first after the cap. ``pipe-closed-first`` holds the kill
         back, so the child always writes into the pipe the reader closed first
         -- the order a loaded box produced, where the child's words must still
         be just what it said. ``kill-read-first`` lets the kill land in full
         before _spawn goes on: a stream the kill ended has been read to its
         end, and looks just like one that ended on its own to any question
-        asked after the kill."""
+        asked after the kill. ``main-late`` holds _spawn back once the cap is
+        passed, before it kills anything: a writer that dies at the closed
+        pipe has ended its stream ON ITS OWN by then -- after the cap, which
+        no question about "ended yet?" can tell from before it. Returns the
+        order's name, for a pin whose words exist only when the kill waits."""
         kill = remote_mux._kill
         if request.param == "pipe-closed-first":
 
@@ -708,11 +744,28 @@ class TestTheReplyIsBoundedInMemory:
                 time.sleep(0.5)
 
             monkeypatch.setattr(remote_mux, "_kill", settled_kill)
+        elif request.param == "main-late":
+            finish = remote_mux._finish
+
+            def late_finish(
+                proc: subprocess.Popen[bytes],
+                out: remote_mux._Drain,
+                err: remote_mux._Drain,
+                timeout_s: float,
+            ) -> bool:
+                done = finish(proc, out, err, timeout_s)
+                if out.over:
+                    time.sleep(1.0)
+                return done
+
+            monkeypatch.setattr(remote_mux, "_finish", late_finish)
+        return request.param
 
     @pytest.mark.usefixtures("kill_order")
     def test_a_stderr_held_open_mid_line_never_hands_over_the_fragment(self, tmp_path):
         # The stream is still open, so its last line may be half-written: only
-        # whole lines are the child's words, and the row shows the last one.
+        # whole lines are the child's words -- the log's; the row is the cap.
+        # The half line is cut from the words, never lost: after_cap has it.
         error, _ = self._flood_past_a_held_stderr(
             tmp_path, said="boom: disk full\nwriting blo"
         )
@@ -720,31 +773,26 @@ class TestTheReplyIsBoundedInMemory:
         assert lines[0] == f"reply exceeded {CAP} bytes"
         assert "boom: disk full" in lines[1:]
         assert "writing blo" not in error.stderr_tail
-        assert launch._node_error_text(error) == "boom: disk full"
+        assert "writing blo" in error.after_cap
+        assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
 
     @pytest.mark.usefixtures("kill_order")
     def test_a_stderr_held_open_before_a_whole_line_gives_no_reason(self, tmp_path):
         # No line has ended yet: the cap is the whole story, never a fragment.
         error, _ = self._flood_past_a_held_stderr(tmp_path, said="writing blo")
         assert error.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert "writing blo" in error.after_cap
         assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
 
-    @pytest.mark.usefixtures("kill_order")
-    def test_a_stderr_the_kill_ended_mid_line_never_hands_over_the_fragment(self):
-        # No grandchild: the kill ends the stream, as it ends ssh's own. That
-        # is no end of the child's saying -- the kill cut it off wherever it
-        # was -- so the half line goes just as from a stream still open. The
-        # base interpreter, for the reason the next pin gives.
+    @staticmethod
+    def _flood_past_a_plain_stderr(said: str, ending: str) -> RemoteError:
+        """_PLAIN_STDERR_CHILD's over-cap error after it said ``said`` and
+        ended as ``ending``. The base interpreter, for the reason pin (c)
+        gives."""
         python = getattr(sys, "_base_executable", sys.executable)
         with pytest.raises(RemoteError) as exc:
             remote_mux._spawn(
-                [
-                    python,
-                    "-I",
-                    "-c",
-                    _KILLED_STDERR_CHILD,
-                    "boom: disk full\nwriting blo",
-                ],
+                [python, "-I", "-c", _PLAIN_STDERR_CHILD, said, ending],
                 timeout_s=60,
                 input_bytes=None,
                 check=True,
@@ -754,26 +802,83 @@ class TestTheReplyIsBoundedInMemory:
                 max_stdout_bytes=CAP,
             )
         assert exc.value.over_cap
-        lines = exc.value.stderr_tail.splitlines()
+        return exc.value
+
+    @pytest.mark.parametrize(
+        "ending", ["killed", "dies-at-the-pipe", "complains-at-the-pipe"]
+    )
+    def test_a_stderr_that_ended_after_the_cap_never_hands_over_the_fragment(
+        self, kill_order, ending
+    ):
+        # No grandchild: the stream ends after the cap, by the kill (as ssh's
+        # own does) or by the writer at the pipe the cap closed -- dying, or
+        # complaining first. None is the end of the child's saying -- it was
+        # cut off wherever it was -- so the half line goes just as from a
+        # stream still open, and a complaint about the closed pipe, a whole
+        # line or not, is no reason either: the log's, never the row's.
+        error = self._flood_past_a_plain_stderr("boom: disk full\nwriting blo", ending)
+        lines = error.stderr_tail.splitlines()
         assert lines[0] == f"reply exceeded {CAP} bytes"
         assert "boom: disk full" in lines[1:]
-        assert "writing blo" not in exc.value.stderr_tail
-        assert launch._node_error_text(exc.value) == "boom: disk full"
+        assert "writing blo" not in error.stderr_tail
+        assert "writing blo" in error.after_cap
+        assert "Broken pipe" not in error.stderr_tail
+        assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
+        if ending == "complains-at-the-pipe" and kill_order in _KILL_WAITS:
+            assert _COMPLAINT in str(error)  # what launch logs
+
+    def test_an_error_printed_after_a_big_stdout_is_the_logs_not_the_rows(
+        self, kill_order
+    ):
+        # Nothing said before the flood, a whole line after it: the reason is
+        # the cap alone, and the words are still in the log's copy.
+        error = self._flood_past_a_plain_stderr("", "complains-at-the-pipe")
+        assert error.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
+        if kill_order in _KILL_WAITS:
+            assert _COMPLAINT in str(error)
+
+    @pytest.mark.parametrize(
+        "ending", ["killed", "dies-at-the-pipe", "complains-at-the-pipe"]
+    )
+    def test_a_stderr_whose_end_ties_the_cap_is_trimmed(self, monkeypatch, ending):
+        # A coarse clock (Windows' before Python 3.13 ticks every 15.6 ms)
+        # stamps the cap and the stream's end alike. Which came first is then
+        # unknown, and a tie trims. Each thread's first reading here is 0.0
+        # and every later one 1000.0: on any clock, the words read first come
+        # before the cap, and the end -- or a complaint at the pipe -- ties it.
+        first: set[int] = set()
+
+        def monotonic() -> float:
+            if threading.get_ident() in first:
+                return 1000.0
+            first.add(threading.get_ident())
+            return 0.0
+
+        monkeypatch.setattr(
+            remote_mux, "time", types.SimpleNamespace(monotonic=monotonic)
+        )
+        error = self._flood_past_a_plain_stderr("boom: disk full\nwriting blo", ending)
+        assert error.stderr_tail.splitlines()[0] == f"reply exceeded {CAP} bytes"
+        assert "boom: disk full" in error.stderr_tail.splitlines()[1:]
+        assert "writing blo" not in error.stderr_tail
+        assert "writing blo" in error.after_cap
+        assert "Broken pipe" not in error.stderr_tail
 
     def test_a_stderr_that_ended_keeps_its_last_line_without_a_newline(self):
-        # A stream that ended BEFORE the kill was not cut off mid-write, so its
+        # A stream that ended BEFORE the cap was not cut off mid-write, so its
         # last line is whole even unterminated: any other is trimmed. The child
         # pauses after closing it, so the stream has ended well before the
-        # flood can reach the cap: the pause sets the order, not a race. The base
-        # interpreter, not sys.executable: on Windows that is a venv launcher
-        # holding its own copy of the pipe, so the stream would end only once
-        # the kill reached through it.
+        # flood can reach the cap: the pause sets the order, not a race. The
+        # base interpreter, not sys.executable: on Windows that is a venv
+        # launcher holding its own copy of the pipe, so the stream would end
+        # only once the kill reached through it.
         child = (
             "import os, sys, time\n"
             "sys.stderr.write('boom: disk full')\n"
             "sys.stderr.flush()\n"
             "os.close(2)\n"
-            "time.sleep(0.2)\n"
+            "time.sleep(0.3)\n"
             "block = b'x' * 65536\n"
             "while True:\n"
             "    sys.stdout.buffer.write(block)\n"
@@ -792,7 +897,8 @@ class TestTheReplyIsBoundedInMemory:
                 max_stdout_bytes=CAP,
             )
         assert exc.value.over_cap
-        assert launch._node_error_text(exc.value) == "boom: disk full"
+        assert exc.value.stderr_tail.splitlines()[1:] == ["boom: disk full"]
+        assert launch._node_error_text(exc.value) == f"reply exceeded {CAP} bytes"
 
     def test_the_drain_hands_over_what_arrived_before_the_stream_ends(self):
         # A data() taken mid-read is what has arrived, and the read goes on
@@ -815,6 +921,50 @@ class TestTheReplyIsBoundedInMemory:
         drain.join(5)
         assert not drain.is_alive()
         assert drain.data() == b"more\n"
+
+    def test_the_drain_parts_what_it_holds_by_when_each_read_came(self):
+        # Each read carries its own time, so what came before a moment and
+        # what came at or after it part cleanly -- one stamp for the whole
+        # buffer could not -- and the tail's cap (4 bytes) trims the oldest
+        # bytes first. The sleeps outlast a coarse clock's tick.
+        r, w = os.pipe()
+        drain = remote_mux._Drain(os.fdopen(r, "rb"), 4, tail=True)
+        drain.start()
+        try:
+            os.write(w, b"aaa")
+            deadline = time.monotonic() + 5
+            while drain._held < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.05)
+            at = time.monotonic()
+            time.sleep(0.05)
+            os.write(w, b"bbb")
+        finally:
+            os.close(w)
+        drain.join(5)
+        assert not drain.is_alive()
+        assert drain.split(at) == (b"a", b"bbb")
+        assert drain.data() == b""
+
+    def test_a_read_stamped_the_same_instant_as_the_cap_counts_as_after(
+        self, monkeypatch
+    ):
+        # A coarse clock (Windows' before Python 3.13) can stamp a read and
+        # the cap alike. Which came first is then unknown, and unknown is
+        # after: a line left out of the reason, never another's kept in it.
+        monkeypatch.setattr(
+            remote_mux, "time", types.SimpleNamespace(monotonic=lambda: 7.0)
+        )
+        r, w = os.pipe()
+        drain = remote_mux._Drain(os.fdopen(r, "rb"), 16, tail=True)
+        drain.start()
+        try:
+            os.write(w, b"boom: disk full\n")
+        finally:
+            os.close(w)
+        drain.join(5)
+        assert not drain.is_alive()
+        assert drain.split(7.0) == (b"", b"boom: disk full\n")
 
     def test_the_drain_drops_what_it_held_once_over_the_cap(self):
         # Two writes, so the first cap's worth is HELD before the byte that
@@ -3192,12 +3342,14 @@ class TestTheScriptLiterals:
 
     def test_a_folder_that_appears_meanwhile_is_already_there(self):
         # Another bring-up may make a folder between the walk and the mkdir:
-        # that is "already there", not a failure, and mkdir's words stay off
-        # the screen (the rig proves both on a real shell).
+        # that is "already there", not a failure, and its "File exists" is
+        # dropped. A real failure keeps mkdir's words, above the line its
+        # caller dies with (the rig proves all three on a real shell).
         helper = _shell_function(node_scripts._read("bring_up"), "mkdir_private")
-        assert 'mkdir -m 700 -- "$dir" 2>/dev/null || [ -d "$dir" ] || return 1' in (
-            helper
-        )
+        assert (
+            'why=$(mkdir -m 700 -- "$dir" 2>&1) || [ -d "$dir" ] ||'
+            " { printf '%s\\n' \"$why\" >&2; return 1; }"
+        ) in helper
 
     def test_the_archive_is_never_extracted_with_absolute_names(self):
         text = node_scripts._read("bring_up")
@@ -3330,6 +3482,18 @@ def _refuses(folder: str) -> str:
     return (
         f'case "$last" in {shlex.quote(folder)})\n'
         "  echo \"mkdir: cannot create directory '$last': Permission denied\" >&2\n"
+        "  exit 1 ;;\n"
+        "esac\n"
+        'exec "$real" "$@"\n'
+    )
+
+
+def _refuses_in_raw_bytes(folder: str) -> str:
+    """``_refuses``, with a reason that carries a terminal-title sequence and
+    two bytes that are not UTF-8."""
+    return (
+        f'case "$last" in {shlex.quote(folder)})\n'
+        "  printf 'mkdir: \\033]0;x\\007denied \\377\\376\\n' >&2\n"
         "  exit 1 ;;\n"
         "esac\n"
         'exec "$real" "$@"\n'
@@ -4098,31 +4262,60 @@ class TestBringUpShOnARealShell:
         self, rig, tmp_path, monkeypatch
     ):
         # A mkdir that really fails, and leaves nothing: the push dies with
-        # exit 5 and the script's own line, mkdir's words off the screen, and
-        # nothing written.
+        # exit 5 and the script's own line last, mkdir's reason above it --
+        # nodes.log's, never the row's -- and nothing written.
         root = rig["root"]
         root.mkdir(parents=True)
         _mkdir_shim(tmp_path, monkeypatch, _refuses(f"{root}/sub"))
         with pytest.raises(RemoteError) as info:
             self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
         assert info.value.rc == 5
-        assert (
-            info.value.stderr_tail
-            == "magent: cannot create a folder for sub/deeper/.env"
+        lines = info.value.stderr_tail.splitlines()
+        assert lines[-1] == "magent: cannot create a folder for sub/deeper/.env"
+        reason = f"mkdir: cannot create directory '{root}/sub': Permission denied"
+        assert reason in lines[:-1]
+        assert reason in str(info.value)  # what launch logs
+        assert launch._node_error_text(info.value) == (
+            "cannot create a folder for sub/deeper/.env"
         )
         assert _tree(root) == []
+
+    def test_a_refusals_raw_bytes_reach_the_error_and_never_the_row(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # mkdir's words are the node's own, whatever their bytes: $why hands
+        # them on whole -- the ESC sequence as it was, a byte that is not
+        # UTF-8 as U+FFFD -- for launch to log escaped, and the row is still
+        # the script's own line.
+        root = rig["root"]
+        root.mkdir(parents=True)
+        _mkdir_shim(tmp_path, monkeypatch, _refuses_in_raw_bytes(f"{root}/sub"))
+        with pytest.raises(RemoteError) as info:
+            self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
+        lines = info.value.stderr_tail.splitlines()
+        assert lines[-1] == "magent: cannot create a folder for sub/deeper/.env"
+        fffd = "\N{REPLACEMENT CHARACTER}"
+        assert f"mkdir: \x1b]0;x\x07denied {fffd}{fffd}" in lines[:-1]
+        assert launch._node_error_text(info.value) == (
+            "cannot create a folder for sub/deeper/.env"
+        )
 
     def test_a_seed_folder_that_cannot_be_made_is_refused_in_the_scripts_words(
         self, rig, tmp_path, monkeypatch
     ):
         # The seed's own refusal: exit 5 before any session starts, the
-        # script's own line, and no memory written.
+        # script's own line last with mkdir's reason above it, and no memory
+        # written.
         dest = Path.home() / ".claude" / "projects" / rig["enc"] / "memory"
         _mkdir_shim(tmp_path, monkeypatch, _refuses(str(dest)))
         with pytest.raises(RemoteError) as info:
             remote_mux.bring_up(rig["node"], rig["recipe"])
         assert info.value.rc == 5
-        assert info.value.stderr_tail == f"magent: cannot create {dest}"
+        lines = info.value.stderr_tail.splitlines()
+        assert lines[-1] == f"magent: cannot create {dest}"
+        reason = f"mkdir: cannot create directory '{dest}': Permission denied"
+        assert reason in lines[:-1]
+        assert launch._node_error_text(info.value) == f"cannot create {dest}"
         assert not dest.exists()
         assert not (rig["state"] / "sessions" / "api").exists()
 

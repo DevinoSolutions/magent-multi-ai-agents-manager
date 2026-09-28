@@ -1853,14 +1853,16 @@ def node_recipe(
 
 def _node_error_text(exc: Exception) -> str:
     """The one line a user sees for a failed node bring-up: a RemoteError's
-    last stderr line (bring_up.sh writes its reason there, prefixed
-    ``magent:``), an OSError's class (its message names a path on this PC;
-    ``nodes.log`` has it), anything else's message -- nodes' own words."""
+    last line of ``row_text`` (bring_up.sh writes its reason last, prefixed
+    ``magent:``; over the cap it is magent's own ``reply exceeded N bytes``,
+    and the child's words are nodes.log's), an OSError's class (its message
+    names a path on this PC; ``nodes.log`` has it), anything else's message
+    -- nodes' own words."""
     # heavy subsystem: in-body per policy
     from magent.remote_mux import RemoteError
 
     if isinstance(exc, RemoteError):
-        lines = exc.stderr_tail.strip().splitlines()
+        lines = exc.row_text.strip().splitlines()
         return lines[-1].removeprefix("magent: ") if lines else f"exit {exc.rc}"
     if isinstance(exc, OSError):
         return _local_error_text(exc)
@@ -2116,12 +2118,16 @@ def bring_up_node_project(
         # cannot be framed; OSError a local file that vanished mid-read, and
         # LockHeld (the map held past its wait). A plain ValueError may also be
         # a bug wearing an outcome, so it keeps its traceback in the log.
+        # A NodeConfigError names the OS error under it by class alone.
+        said = str(exc) if exc.__cause__ is None else f"{exc}: {exc.__cause__}"
         log.warning(
             "node %s: bring-up of %s failed: %s",
             nick or "?",
             sid,
-            # A NodeConfigError names the OS error under it by class alone.
-            exc if exc.__cause__ is None else f"{exc}: {exc.__cause__}",
+            # A RemoteError carries the node's own words, whatever their bytes.
+            node_sync.escaped(said)
+            if isinstance(exc, remote_mux.RemoteError)
+            else said,
             exc_info=isinstance(exc, ValueError)
             and not isinstance(exc, nodes.NodeConfigError),
         )
@@ -2389,11 +2395,14 @@ def _final_pull(
             # may abort the down.
             detail, reason = str(exc), _pull_error_text(exc)
             if isinstance(exc, remote_mux.RemoteError):
+                # The node's own words, whatever their bytes -- over the cap,
+                # this line is the only place they go.
+                detail = node_sync.escaped(detail)
                 # The pull's ssh call is quiet: a local ssh that would not
                 # start is its class alone, so this line adds the OS's words.
                 words = remote_mux.os_detail(exc)
                 if words:
-                    detail = f"{exc}: {words}"
+                    detail = f"{detail}: {words}"
             if isinstance(exc, node_sync.NodeMapUnreadable):
                 # Its own text is the shared sentence plus the MAP error's
                 # class (final_pull built it with nodes.map_unread_text): the
