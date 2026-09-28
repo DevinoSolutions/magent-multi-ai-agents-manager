@@ -47,6 +47,13 @@ NICK = "loop"
 # sits well above this, so a slow stage lands as a FAILURE with its output,
 # never a cancel.
 NODES_BUDGET_S = 300.0
+# How long a stage waits for the node sync daemon to come up (`node sync
+# -d`, serve's supervisor, a bring-up): two cold interpreters in a row, the
+# spawner and the daemon, and one daemon import alone was measured at
+# 2.5-13 s on a loaded desktop (cli/node_cmd._START_POLLS). It stays under
+# serve's supervise interval, so a daemon serve started is its FIRST
+# check's: a failed first check cannot be rescued by the next one.
+DAEMON_START_S = 30.0
 # The least a stage gets while any budget remains (see clamp).
 STAGE_FLOOR_S = 5.0
 # Teardown gets its own allowance, whatever the module's budget has left: a
@@ -1073,6 +1080,14 @@ class NodeRig:
         if run.rc != 0:
             pytest.fail(f"capture-pane of {self.sid} failed\n{run.show()}")
         return run.out
+
+    def clients(self) -> set[str]:
+        """The ttys of the clients attached to the node session; empty when
+        the read fails (a wait on it then fails, naming what it waited for)."""
+        run = self.tmux(
+            "list-clients", "-F", "#{client_tty}", "-t", f"={self.sid}", tag="clients"
+        )
+        return set(run.out.split()) if run.rc == 0 else set()
 
     def poke(self, tok: str) -> None:
         """Type ``poke <tok>`` into the node pane the way the fleet wire does

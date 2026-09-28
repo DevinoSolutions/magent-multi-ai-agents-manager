@@ -82,6 +82,13 @@ class TestEveryStageIsUnderTheBudget:
         timeout_s, budget_s = int(found.group(1)) * 60, rig.NODES_BUDGET_S
         assert budget_s * 3 <= timeout_s, (budget_s, timeout_s)
 
+    def test_a_daemon_start_wait_ends_before_serves_second_check(self) -> None:
+        # D15's serve stage must pass on the supervisor's FIRST check: a wait
+        # past the interval would let a second check rescue a failed first.
+        from magent.upload_server import NODE_SYNC_SUPERVISE_INTERVAL_S
+
+        assert rig.DAEMON_START_S < NODE_SYNC_SUPERVISE_INTERVAL_S
+
     def test_a_wait_on_a_spent_budget_fails_without_polling(self) -> None:
         polled: list[bool] = []
         with pytest.raises(pytest.fail.Exception, match="exhausted before the pane"):

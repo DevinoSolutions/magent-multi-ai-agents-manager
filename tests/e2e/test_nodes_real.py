@@ -48,6 +48,7 @@ from tests.e2e._nodes_rig import (
     AGENT_DIR,
     AWKWARD_DIR,
     CANARIES,
+    DAEMON_START_S,
     ENV_BYTES,
     NICK,
     NODES_BUDGET_S,
@@ -69,6 +70,12 @@ from tests.e2e._nodes_rig import (
     write_config,
 )
 from tests.e2e._pty import Budget
+from tests.e2e._ssh_helpers import (
+    UNROUTABLE,
+    emit_ci_warning,
+    free_port,
+    kill_ssh_carrying,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -142,6 +149,23 @@ def _transcript_dir(tmp_path: Path, repo: Path) -> Path:
     )
 
 
+def _starts(tmp_path: Path) -> list[dict[str, object]]:
+    """The stand-in's start records under ``tmp_path/home``, oldest first."""
+    log = tmp_path / "home" / ".magent-e2e" / "agent-log.jsonl"
+    if not log.is_file():
+        return []
+    lines = log.read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in lines if line]
+    return [r for r in records if r.get("event") == "start"]
+
+
+def _started(tmp_path: Path) -> tuple[object, object, object]:
+    """The last start record's mode, argv and session id."""
+    starts = _starts(tmp_path)
+    assert starts, "the stand-in wrote no start record"
+    return starts[-1]["mode"], starts[-1]["argv"], starts[-1]["session_id"]
+
+
 def _ready(run: Run) -> tuple[str, str]:
     found = _READY.search(run.out)
     assert found, run.show()
@@ -163,6 +187,7 @@ class TestTheStandInKeepsClaudesStartContract:
         assert run.rc == 0, run.show()
         sid, mode = _ready(run)
         assert mode == "fresh"
+        assert _started(tmp_path) == ("fresh", [], sid)
         assert "MARK-abc" in run.out, run.show()
         transcript = _transcript_dir(tmp_path, repo) / f"{sid}.jsonl"
         record = json.loads(transcript.read_text(encoding="utf-8").splitlines()[0])
@@ -182,20 +207,26 @@ class TestTheStandInKeepsClaudesStartContract:
         refused = _agent(tmp_path, repo, "--continue")
         assert refused.rc == 1, refused.show()
         assert "No conversation found to continue" in refused.out
+        # A refusal starts nothing.
+        assert _starts(tmp_path) == []
         first = _agent(tmp_path, repo, stdin=b"poke abc\n")
         sid, _ = _ready(first)
         again = _agent(tmp_path, repo, "--continue", stdin=b"exit\n")
         assert again.rc == 0, again.show()
         assert _ready(again) == (sid, "continue")
+        assert _started(tmp_path) == ("continue", ["--continue"], sid)
 
     def test_resume_takes_a_named_transcript_or_refuses(self, tmp_path: Path) -> None:
         repo = _agent_repo(tmp_path, "resume")
         refused = _agent(tmp_path, repo, "--resume", "nope")
         assert refused.rc == 1, refused.show()
         assert "No conversation found with session ID: nope" in refused.out
+        assert _starts(tmp_path) == []
         sid, _ = _ready(_agent(tmp_path, repo, stdin=b"poke abc\n"))
         again = _agent(tmp_path, repo, "--resume", sid, stdin=b"exit\n")
+        assert again.rc == 0, again.show()
         assert _ready(again) == (sid, "resume")
+        assert _started(tmp_path) == ("resume", ["--resume", sid], sid)
 
     def test_its_start_record_names_the_canaries_it_can_see(
         self, tmp_path: Path
@@ -323,8 +354,6 @@ class TestAnUnreachableNodeIsAFailedProbe:
     def test_has_session_answers_none_within_the_probe_bound(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from tests.e2e.test_ssh_real import _UNROUTABLE
-
         ssh_wire_or_skip()
         client = shutil.which("ssh")
         if client is None:
@@ -332,7 +361,7 @@ class TestAnUnreachableNodeIsAFailedProbe:
         # conftest's _no_real_ssh answers None for every test; this one IS
         # the real client, on the CI-only leg.
         monkeypatch.setattr(remote_mux, "find_ssh", lambda: client)
-        node = Node(nick=NICK, host=_UNROUTABLE, user="nobody", root="~/magent")
+        node = Node(nick=NICK, host=UNROUTABLE, user="nobody", root="~/magent")
         started = time.monotonic()
         got = remote_mux.has_session(node, "mgn-unroutable-d")
         took = time.monotonic() - started
@@ -491,15 +520,13 @@ class TestANodeHostsAProjectEndToEnd:
     def test_d06_the_launch_preview_names_the_node_and_creates_nothing(
         self, rig: NodeRig, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        from tests.e2e.test_ssh_real import _emit_ci_warning
-
         run = rig.magent("--go", "--dry-run", tag="go-dry-run")
         if run.rc == 2 and "No monitors detected" in run.said:
             # run_magent plans the monitor grid before it reads a project, so
             # with no X screen the preview stops before the node rows. The
             # nodes-e2e job provisions one (setup-virtual-displays); this is
             # the fallback for a runner where that did not take.
-            _emit_ci_warning(
+            emit_ci_warning(
                 capsys,
                 "nodes-e2e: --go --dry-run not exercised",
                 "no monitors, so the preview stops before node rows",
@@ -680,6 +707,7 @@ class TestANodeHostsAProjectEndToEnd:
         assert first.rc == 0, first.show()
         mirror = rig.mirror_dir()
         node_files = rig.node_transcripts()
+        assert node_files, rig.diag()
         for name, data in node_files.items():
             assert (mirror / name).read_bytes() == data, name
         assert _mirrored(rig, f"poke {tok_a}")
@@ -691,7 +719,9 @@ class TestANodeHostsAProjectEndToEnd:
         rig.poke(tok_b)
         second = rig.magent("node", "sync", "--once", tag="sync-once-b")
         assert second.rc == 0, second.show()
-        for name, data in rig.node_transcripts().items():
+        node_files = rig.node_transcripts()
+        assert node_files, rig.diag()
+        for name, data in node_files.items():
             assert (mirror / name).read_bytes() == data, name
         assert _mirrored(rig, f"poke {tok_b}")
         # A file older than the watermark was not pulled again.
@@ -708,7 +738,6 @@ class TestANodeHostsAProjectEndToEnd:
         _needs(rig, "D7")
         from magent.attach_client import remote_attach_command
         from tests.e2e._pty import Pty
-        from tests.e2e.test_ssh_real import _kill_ssh_carrying
 
         client = shutil.which(
             "magent-attach-client", path=os.path.dirname(sys.executable)
@@ -716,6 +745,9 @@ class TestANodeHostsAProjectEndToEnd:
         if client is None:
             pytest.fail("magent-attach-client is not installed beside this python")
         env = {**rig.env(rig.pcs[0]), "TERM": "xterm-256color"}
+        # Whatever is attached already (D9's second PC may be): the attach
+        # is up once a client that is not among these joins.
+        attached = rig.clients()
         pty = Pty(
             [
                 client,
@@ -729,7 +761,16 @@ class TestANodeHostsAProjectEndToEnd:
             budget=rig.budget,
         )
         try:
-            pty.expect("NODE-READY", 45)
+            wait_for(
+                "the attach client joined the node session",
+                lambda: rig.clients() - attached,
+                45,
+                budget=rig.budget,
+                explain=rig.diag,
+            )
+            # A fresh token, not the stand-in's NODE-READY: the attach draws
+            # only the pane's last screen, and the stages before this one
+            # may have scrolled that line away.
             before = token()
             pty.send_line(f"poke {before}")
             pty.expect(f"MARK-{before}", 30)
@@ -743,7 +784,10 @@ class TestANodeHostsAProjectEndToEnd:
             pty.expect(f"MARK-{after}", 30)
         finally:
             pty.close()
-            _kill_ssh_carrying(rig.sid)
+            kill_ssh_carrying(rig.sid, timeout=10.0)
+        # Typed through the pane, both pokes are turns, not just screen text.
+        assert rig.in_transcript(f"poke {before}"), rig.diag()
+        assert rig.in_transcript(f"poke {after}"), rig.diag()
         # The agent never restarted: a pane dropping is not a session dying.
         assert len(rig.starts()) == 1, rig.starts()
         assert rig.session_rc() == 0
@@ -766,8 +810,6 @@ class TestANodeHostsAProjectEndToEnd:
         rig.passed.add("D14")
 
     def test_d15_the_sync_daemon_runs_mirrors_and_stops(self, rig: NodeRig) -> None:
-        from tests.e2e.test_ssh_real import _free_port
-
         _needs(rig, "D10")
         _needs(rig, "D14")
         started = rig.magent("node", "sync", "-d", tag="sync-d", sync=True)
@@ -776,7 +818,7 @@ class TestANodeHostsAProjectEndToEnd:
         wait_for(
             "status reports the node sync daemon ok",
             lambda: _sync_state(rig) == "ok",
-            30,
+            DAEMON_START_S,
             budget=rig.budget,
             explain=rig.diag,
             interval=1.0,
@@ -805,7 +847,7 @@ class TestANodeHostsAProjectEndToEnd:
         assert _sync_state(rig) == "stopped"
 
         # serve keeps a daemon running for a config with a node project.
-        port = _free_port()
+        port = free_port()
         rig.spawn(
             [
                 sys.executable,
@@ -816,10 +858,13 @@ class TestANodeHostsAProjectEndToEnd:
             sync=True,
             tag="serve",
         )
+        # Not the design's 10 s: serve and then the daemon it spawns are two
+        # cold starts (see DAEMON_START_S). Under the supervise interval, so
+        # this is the first check's daemon.
         wait_for(
             "serve's supervisor started a node sync daemon",
             lambda: _sync_state(rig) == "ok",
-            30,
+            DAEMON_START_S,
             budget=rig.budget,
             explain=rig.diag,
             interval=1.0,
@@ -870,6 +915,12 @@ class TestANodeHostsAProjectEndToEnd:
     def test_d16_up_starts_the_daemon_and_down_all_stops_both(
         self, rig: NodeRig
     ) -> None:
+        """With ``sync=True`` (``MAGENT_NODE_SYNC=1``), like D15, though the
+        design names D15 alone: a bring-up starts the daemon only through
+        ``launch.ensure_node_sync``, which that pin gates, so at 0 ``up``
+        would start none and this stage would test nothing. ``down --all``
+        stops the daemon whatever the pin says; it carries the pin so the
+        stage runs as one PC, and ``status`` reads the daemon only under it."""
         _needs(rig, "D13")
         run = rig.magent("up", tag="up-with-sync", sync=True)
         assert run.rc == 0, run.show() + rig.diag()
@@ -877,7 +928,7 @@ class TestANodeHostsAProjectEndToEnd:
         wait_for(
             "the bring-up started a node sync daemon",
             lambda: _sync_state(rig) == "ok",
-            30,
+            DAEMON_START_S,
             budget=rig.budget,
             explain=rig.diag,
             interval=1.0,
