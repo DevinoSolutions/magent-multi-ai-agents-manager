@@ -6017,6 +6017,31 @@ class TestSetupShUnderRealBash:
         assert _keygen_calls(state) == []
         assert r.returncode == 1
 
+    def test_a_directory_at_the_key_path_beside_a_pub_is_a_fail_row(self, tmp_path):
+        # `-f`, not `-e`: a directory is no private key either, so its .pub
+        # would reach GitHub the same way.
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        blocker = ssh_dir / "id_ed25519"
+        blocker.mkdir()
+        blocker.chmod(0o755)
+        pub = ssh_dir / "id_ed25519.pub"
+        pub.write_bytes(b"ssh-ed25519 AAAAOLDKEY old@box\n")
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            (
+                "id_ed25519.pub in ~/.ssh has no private key beside it;"
+                " remove the .pub and rerun"
+            ),
+        )
+        assert set(_report(r).keys()) == set()
+        assert blocker.stat().st_mode & 0o777 == 0o755
+        assert pub.read_bytes() == b"ssh-ed25519 AAAAOLDKEY old@box\n"
+        assert _keygen_calls(state) == []
+        assert r.returncode == 1
+
     # -- mutation killers (cq-F13) --------------------------------------------
 
     def test_a_failed_installer_download_fails_claude_and_keeps_the_key(self, tmp_path):
