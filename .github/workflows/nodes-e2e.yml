@@ -59,6 +59,11 @@ jobs:
           # Fatal smokes: the root hop, and the tools a node user's login sees.
           ssh -o BatchMode=yes root@mdssh true
           ssh -o BatchMode=yes root@mdssh 'tmux -V && git --version && python3 --version && claude --version'
+      # An X screen for the launch preview (D6): run_magent plans the monitor
+      # grid before it reads any project, so a headless runner stops at "No
+      # monitors detected" before the node rows.
+      - name: Setup virtual displays
+        uses: ./.github/actions/setup-virtual-displays
       - name: Nodes e2e
         env:
           MDTEST_NODES_REAL: "1"

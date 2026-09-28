@@ -495,18 +495,22 @@ class TestANodeHostsAProjectEndToEnd:
 
         run = rig.magent("--go", "--dry-run", tag="go-dry-run")
         if run.rc == 2 and "No monitors detected" in run.said:
-            # A headless runner has no monitor to plan a grid on, and the
-            # preview stops there -- before the node rows. DESIGN.md known
-            # debt: "The node launch preview is not exercised on a headless
-            # runner".
+            # run_magent plans the monitor grid before it reads a project, so
+            # with no X screen the preview stops before the node rows. The
+            # nodes-e2e job provisions one (setup-virtual-displays); this is
+            # the fallback for a runner where that did not take.
             _emit_ci_warning(
                 capsys,
                 "nodes-e2e: --go --dry-run not exercised",
-                "headless runner: no monitors, so the preview stops before node rows",
+                "no monitors, so the preview stops before node rows",
             )
-            pytest.skip("headless runner: --go --dry-run stops at 'No monitors'")
+            pytest.skip("no monitor: --go --dry-run stops at 'No monitors'")
         assert run.rc == 0, run.show()
         _said_line(rig, run, f"@{NICK}")
+        # The preview's own rows: where the project would land, and the
+        # provisioning the real run does first.
+        _said_line(rig, run, f"-> {rig.user.name}@{rig.wire.host}:~/magent/{rig.name}")
+        _said_line(rig, run, f"would provision {NICK}")
         _assert_nothing_created(rig)
 
     def test_d07_up_starts_the_session_on_the_node(self, rig: NodeRig) -> None:
