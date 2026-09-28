@@ -624,6 +624,18 @@ def printable(text: str) -> str:
     return _CONTROL.sub("?", text).encode("ascii", "replace").decode("ascii")
 
 
+def escaped(text: str) -> str:
+    """``text`` as one line for the log, where ``printable`` would drop
+    characters: each one outside printable ASCII becomes its escape -- a
+    newline ``\\n``, ESC ``\\x1b``, U+FFFD (what a byte that was not UTF-8
+    decoded to) ``\\ufffd``. A node's words in nodes.log must neither split a
+    record nor write to a terminal tailing it."""
+    return "".join(
+        c if " " <= c <= "~" else c.encode("unicode_escape").decode("ascii")
+        for c in text
+    )
+
+
 def _classify(e: remote_mux.RemoteError) -> tuple[str, str]:
     """UNREACHABLE only when the node could not be reached (ssh's transport rc
     255) or never answered (``timed_out``). Every other rc-None error -- a

@@ -2067,12 +2067,16 @@ def bring_up_node_project(
         # cannot be framed; OSError a local file that vanished mid-read, and
         # LockHeld (the map held past its wait). A plain ValueError may also be
         # a bug wearing an outcome, so it keeps its traceback in the log.
+        # A NodeConfigError names the OS error under it by class alone.
+        said = str(exc) if exc.__cause__ is None else f"{exc}: {exc.__cause__}"
         log.warning(
             "node %s: bring-up of %s failed: %s",
             nick or "?",
             sid,
-            # A NodeConfigError names the OS error under it by class alone.
-            exc if exc.__cause__ is None else f"{exc}: {exc.__cause__}",
+            # A RemoteError carries the node's own words, whatever their bytes.
+            node_sync.escaped(said)
+            if isinstance(exc, remote_mux.RemoteError)
+            else said,
             exc_info=isinstance(exc, ValueError)
             and not isinstance(exc, nodes.NodeConfigError),
         )

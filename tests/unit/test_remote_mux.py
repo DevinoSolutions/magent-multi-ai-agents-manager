@@ -3140,6 +3140,18 @@ def _refuses(folder: str) -> str:
     )
 
 
+def _refuses_in_raw_bytes(folder: str) -> str:
+    """``_refuses``, with a reason that carries a terminal-title sequence and
+    two bytes that are not UTF-8."""
+    return (
+        f'case "$last" in {shlex.quote(folder)})\n'
+        "  printf 'mkdir: \\033]0;x\\007denied \\377\\376\\n' >&2\n"
+        "  exit 1 ;;\n"
+        "esac\n"
+        'exec "$real" "$@"\n'
+    )
+
+
 # bring_up.sh's mkdir_private is its only `mkdir -m`: every other mkdir there
 # (the scratch folder beside the payload) is the real one.
 _ONLY_MKDIR_PRIVATE = '[ "$1" = -m ] || exec "$real" "$@"\n'
@@ -3919,6 +3931,26 @@ class TestBringUpShOnARealShell:
             "cannot create a folder for sub/deeper/.env"
         )
         assert _tree(root) == []
+
+    def test_a_refusals_raw_bytes_reach_the_error_and_never_the_row(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # mkdir's words are the node's own, whatever their bytes: $why hands
+        # them on whole -- the ESC sequence as it was, a byte that is not
+        # UTF-8 as U+FFFD -- for launch to log escaped, and the row is still
+        # the script's own line.
+        root = rig["root"]
+        root.mkdir(parents=True)
+        _mkdir_shim(tmp_path, monkeypatch, _refuses_in_raw_bytes(f"{root}/sub"))
+        with pytest.raises(RemoteError) as info:
+            self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
+        lines = info.value.stderr_tail.splitlines()
+        assert lines[-1] == "magent: cannot create a folder for sub/deeper/.env"
+        fffd = "\N{REPLACEMENT CHARACTER}"
+        assert f"mkdir: \x1b]0;x\x07denied {fffd}{fffd}" in lines[:-1]
+        assert launch._node_error_text(info.value) == (
+            "cannot create a folder for sub/deeper/.env"
+        )
 
     def test_a_seed_folder_that_cannot_be_made_is_refused_in_the_scripts_words(
         self, rig, tmp_path, monkeypatch

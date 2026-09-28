@@ -388,31 +388,48 @@ class TestAFailureIsAnOutcomeNeverACrash:
         assert outcome.error.startswith("~/magent/api has uncommitted changes")
         assert nodes.read_node_map() == {}
 
-    def test_the_os_reason_above_a_refusal_is_logged_never_shown(
-        self, rig, api, caplog
+    def test_the_os_reason_above_a_refusal_is_logged_escaped_never_shown(
+        self, rig, api, caplog, capsys
     ):
         # bring_up.sh keeps a failed mkdir's words above the line it dies
-        # with: the row is the script's line alone, and nodes.log has both.
-        from magent.log import get_logger
+        # with, whatever their bytes: the row is the script's line alone, and
+        # nodes.log has both -- escaped, one line, nothing in it that writes
+        # to a terminal tailing the log.
+        from magent.log import LOG_DIR, get_logger
 
         get_logger("nodes")  # sets the level; caplog must come after
         caplog.set_level("WARNING", logger="magent.nodes")
-        reason = "mkdir: cannot create directory '/n/api/sub': Permission denied"
-        rig.error = RemoteError(
-            5,
-            f"{reason}\nmagent: cannot create a folder for sub/.env",
-            ("bring_up",),
+        said = (
+            b"mkdir: cannot create directory '/n/api/sub': \x1b]0;x\x07"
+            b"Permission denied \xff\xfe\n"
+            b"magent: cannot create a folder for sub/.env\n"
         )
+        # Through the real decode: a byte that is not UTF-8 is U+FFFD by then.
+        rig.error = RemoteError(5, remote_mux._tail(said), ("bring_up",))
         outcome = launch.bring_up_node_project(_config(api), api)
         assert outcome.error == "cannot create a folder for sub/.env"
-        logged = [
+        launch._echo_node_outcomes([outcome])
+        assert capsys.readouterr().out == (
+            "  x api: cannot create a folder for sub/.env\n"
+        )
+        escaped = (
+            r"mkdir: cannot create directory '/n/api/sub': \x1b]0;x\x07"
+            r"Permission denied \ufffd\ufffd\n"
+            "magent: cannot create a folder for sub/.env"
+        )
+        (logged,) = [
             r.getMessage()
             for r in caplog.records
             if r.name == "magent.nodes" and r.levelno == logging.WARNING
         ]
-        assert any(
-            reason in m and "cannot create a folder for sub/.env" in m for m in logged
-        )
+        assert escaped in logged
+        (line,) = [
+            line
+            for line in (LOG_DIR / "nodes.log").read_bytes().splitlines()
+            if b"bring-up of" in line
+        ]
+        assert escaped.encode("ascii") in line
+        assert all(0x20 <= byte < 0x7F for byte in line)
 
     def test_an_unreachable_node_is_an_outcome(self, rig, api):
         rig.error = RemoteError(
