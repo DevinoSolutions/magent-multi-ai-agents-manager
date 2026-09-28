@@ -1675,6 +1675,21 @@ the OS has nothing left to ask. `rc.txt` came back EMPTY on every run until
 that line existed, and the hand-off then reported an "unreadable exit code" for
 commands that had succeeded.
 
+A second one, on the reading side: `rc.txt` EXISTING is not the exit code being
+WRITTEN. `Set-Content` creates the file, then writes, and refuses readers until
+it closes -- measured, 298 of 300 first reads after the file appeared were a
+sharing violation. The poll treated that read as final and reported the same
+"unreadable exit code ''" for succeeded commands, a windows-latest unit flake
+on five unrelated PRs. So rc.txt goes through the same reader as pid.txt
+(`_read_recorded_int`), and only a COMPLETE integer ends the wait -- complete
+meaning ended by the newline `Set-Content` writes after every value, so the
+`1` of `12` can never be final. While rc.txt is present the lost-child check
+stands down: a launcher still writing it has not lost anything. A present
+rc.txt that stays anything else past `_HANDOFF_RC_GRACE_S` (10s) or the budget
+gets one last, decisive read, and failing that is its own answer -- the
+command finished and we cannot say how -- distinct from "never started",
+"lost its child" and "may still be running".
+
 **`schtasks` comes from the system directory, not PATH.** `run_on_desktop` is
 reached from an ssh login, and letting that login's PATH choose what runs as
 the logged-on user would turn a hand-off into an execution primitive for
@@ -1722,12 +1737,15 @@ otherwise bring up a different config's projects). It exports
 landed in Session 0 again cannot recurse -- a recursion whose every level
 writes a scheduled task. And it writes `pid.txt` the moment `Start-Process`
 returns and `rc.txt` only after `WaitForExit`, which is what lets the poll tell
-three failures apart: no pid after the start grace means Task Scheduler never
-ran the task, a pid that is gone with no rc means the launcher lost its child
-and nothing is coming, and neither is the caller's budget simply running out.
-On that last one the delegated child is deliberately NOT killed: a bring-up
-still running on the desktop is doing the work that was asked for, and the pid
-is a number Windows recycles freely.
+four failures apart: no pid after the start grace means Task Scheduler never
+ran the task; a pid that is gone with no rc.txt means the launcher lost its
+child and nothing is coming; an rc.txt that is there but never reads as a
+complete integer means the command finished and its exit code is lost (see the
+reading-side trap above -- rc.txt existing is not the code being written); and
+none of those is the caller's budget simply running out. On that last one the
+delegated child is deliberately NOT killed: a bring-up still running on the
+desktop is doing the work that was asked for, and the pid is a number Windows
+recycles freely.
 
 Diagnostics are the other half: `doctor`'s `psmux-session0` check and one
 `status` stderr line count psmux servers still stranded there (by image name
