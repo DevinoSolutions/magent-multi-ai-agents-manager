@@ -59,9 +59,16 @@ CLEANUP_TIMEOUT_S = 60.0
 DIAG_S = 30.0
 DIAG_FLOOR_S = 10.0
 DIAG_READ_S = 10.0
+# Lines of each log and of the pane a diag() shows.
+DIAG_TAIL = 80
 GATE_VAR = "MDTEST_NODES_REAL"
 SSH_VARS = ("MDTEST_SSH_PORT", "MDTEST_SSH_KEY", "MDTEST_SSH_HOST")
 STUB = Path("/usr/local/bin/claude")
+# What the nodes-e2e workflow installs as STUB, byte for byte.
+STUB_SRC = Path(__file__).with_name("_claude_stub.sh")
+# The only hostnames the node may resolve to: the rig runs useradd, userdel
+# and pkill as root there, so it must be this machine's loopback sshd.
+LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
 AGENT_DIR = ".magent-e2e"
 AGENT_SRC = Path(__file__).with_name("_node_agent.py")
 # CRLF and UTF-8: tar and the 0600 copy must carry these bytes untouched.
@@ -112,9 +119,10 @@ _STRIPPED = frozenset(
     }
 )
 _STRIPPED_PREFIXES = ("MAGENT_", "ANTHROPIC_", "CLAUDE_CODE_")
-# A disposable node user's name. The root hop re-checks it in bash before any
-# useradd or delete: a teardown can only ever remove a user this shape.
-USER_RE = re.compile(r"mgn[0-9a-f]{5}")
+# A disposable node user's name, as a bash `case` pattern: the root hop
+# re-checks it before any useradd or delete, so a teardown can only ever
+# remove a user this shape (and, past that, only one carrying this run's
+# stamp -- see _DELETE_USER).
 _USER_CASE = "mgn[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"
 
 
@@ -199,7 +207,9 @@ def node_wire_or_skip() -> Wire:
     """The gate of every node-hosting test: ``MDTEST_NODES_REAL=1`` (set only
     by the nodes-e2e workflow). Once it is on, a missing piece of the node is
     a provisioning bug and FAILS -- a runner without tmux, the stub or the
-    ssh wire must not read as coverage (the fleet-tier rule)."""
+    ssh wire must not read as coverage (the fleet-tier rule). So does a node
+    that is not this machine, or a stub that is not ours: "T1 is loopback
+    only" is checked, not assumed."""
     if os.environ.get(GATE_VAR) != "1":
         # No ci.yml selection reaches these tests (theirs all require the e2e
         # marker, which the journey lacks): only the nodes-e2e job collects
@@ -233,7 +243,46 @@ def node_wire_or_skip() -> Wire:
             f"{STUB} is missing: the nodes-e2e workflow installs "
             "tests/e2e/_claude_stub.sh there before this tier runs"
         )
-    return ssh_wire_or_skip()
+    if STUB.read_bytes() != STUB_SRC.read_bytes():
+        pytest.fail(
+            f"{STUB} is not tests/e2e/_claude_stub.sh: the node would run "
+            "some other claude than the stand-in"
+        )
+    wire = ssh_wire_or_skip()
+    hostname = ssh_config_hostname(wire.host)
+    if hostname not in LOOPBACK:
+        pytest.fail(
+            f"{SSH_VARS[2]}={wire.host} resolves to {hostname!r}, not this "
+            "machine's loopback: the rig creates and deletes users as root on "
+            "the node, so it runs against the loopback sshd only"
+        )
+    return wire
+
+
+def resolved_hostname(ssh_g: str) -> str | None:
+    """The ``hostname`` ``ssh -G`` resolved (lowercased), or None."""
+    for line in ssh_g.splitlines():
+        key, _, value = line.partition(" ")
+        if key.lower() == "hostname":
+            return value.strip().lower()
+    return None
+
+
+def ssh_config_hostname(host: str) -> str | None:
+    """Where ssh would dial for ``host``, after the mdssh alias: ``ssh -G``
+    reads the config and connects to nothing."""
+    try:
+        done = subprocess.run(
+            ["ssh", "-G", host],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return resolved_hostname(done.stdout) if done.returncode == 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -960,6 +1009,16 @@ class NodeRig:
         except (OSError, ValueError):
             return None
 
+    def live_daemon(self, pc: Pc | None = None) -> int | None:
+        """The pid of this PC's running ``node sync`` daemon, or None. The
+        pid file alone does not say: it outlives its process, and the pid
+        may have been recycled."""
+        pc = pc or self.pcs[0]
+        pid = self.daemon_pid(pc)
+        if pid is None or not alive(pid, self.budget):
+            return None
+        return pid if is_sync_daemon(_cmdline(pid), pc.cfg) else None
+
     def shim_calls(self) -> list[list[str]]:
         return read_shim(self.shim_log)
 
@@ -1001,6 +1060,20 @@ class NodeRig:
                 out[path.rsplit("/", 1)[-1]] = data
         return out
 
+    def in_transcript(self, text: str) -> bool:
+        """Whether any node transcript of this project holds ``text``."""
+        return any(text.encode() in data for data in self.node_transcripts().values())
+
+    def capture(self, *, tag: str) -> str:
+        """The node pane's text, its scrollback included. ``=sid:`` because
+        capture-pane takes a PANE target."""
+        run = self.tmux(
+            "capture-pane", "-p", "-J", "-S", "-", "-t", f"={self.sid}:", tag=tag
+        )
+        if run.rc != 0:
+            pytest.fail(f"capture-pane of {self.sid} failed\n{run.show()}")
+        return run.out
+
     def poke(self, tok: str) -> None:
         """Type ``poke <tok>`` into the node pane the way the fleet wire does
         (literal text, then a separate Enter), and wait for the stand-in to
@@ -1012,10 +1085,7 @@ class NodeRig:
                 pytest.fail(f"send-keys into {self.sid} failed\n{run.show()}")
         wait_for(
             f"the node transcript records 'poke {tok}'",
-            lambda: any(
-                f"poke {tok}".encode() in data
-                for data in self.node_transcripts().values()
-            ),
+            lambda: self.in_transcript(f"poke {tok}"),
             30,
             budget=self.budget,
             explain=self.diag,
@@ -1047,11 +1117,22 @@ class NodeRig:
     # -- diagnostics and teardown ------------------------------------------
 
     def diag(self) -> str:
-        """What a failed stage needs to be read: the node's sessions, the
-        stand-in's log, the PC logs and the shim's calls. Never raises. The
-        node reads share one allowance (``DIAG_S``, or ``DIAG_FLOOR_S`` once
-        the module budget is spent), so a wedged sshd costs a failure at most
-        that long; a read with nothing left is skipped, named."""
+        """What a failed stage needs to be read, since a CI-only failure has
+        no local repro: on the node, its sessions, the pane, the stand-in's
+        log, the user's processes, the state store and the transcripts; on
+        each PC, node-map.json, the pull marks, the mirror (sizes and
+        mtimes) and the log tails; and the shim's calls. Never raises.
+
+        The node reads share one allowance (``DIAG_S``, or ``DIAG_FLOOR_S``
+        once the module budget is spent), so a wedged sshd costs a failure at
+        most that long; a read with nothing left is skipped, named, and the
+        reads run most-telling first.
+
+        No redaction pass: nothing secret reaches these files today (the
+        canaries and ``.env`` are fixed test bytes, and the node user's key is
+        never read). A tier that gives a child a real credential needs one."""
+        from magent.attach_client import TMUX_SOCKET
+
         parts: list[str] = []
         allowance = Budget(max(DIAG_FLOOR_S, min(DIAG_S, self.budget.remaining())))
 
@@ -1074,12 +1155,24 @@ class NodeRig:
                 text = f"(unavailable: {exc})"
             parts.append(f"--- node: {title} ---\n{text}")
 
-        node("tmux sessions", ["tmux", "-L", "magent", "list-sessions"])
+        home = self.user.home
+        full_iso = "--time-style=full-iso"
+        node("tmux sessions", ["tmux", "-L", TMUX_SOCKET, "list-sessions"])
+        node(
+            "pane",
+            [
+                *("tmux", "-L", TMUX_SOCKET, "capture-pane", "-p", "-J"),
+                *("-S", f"-{DIAG_TAIL}", "-t", f"={self.sid}:"),
+            ],
+        )
         node(
             "agent log",
-            ["tail", "-n", "20", f"{self.user.home}/.magent-e2e/agent-log.jsonl"],
+            ["tail", "-n", str(DIAG_TAIL), f"{home}/.magent-e2e/agent-log.jsonl"],
         )
-        node("magent dir", ["ls", "-la", f"{self.user.home}/magent"])
+        node("processes", ["ps", "-o", "pid,etime,args", "-u", self.user.name])
+        node("state store", ["ls", "-la", full_iso, f"{home}/.magent/state"])
+        node("transcripts", ["ls", "-la", full_iso, self.node_projects_dir])
+        node("magent dir", ["ls", "-la", f"{home}/magent"])
         # The node reaches its own origin over ssh (the bring-up's clone, every
         # fetch). When that fails the product says only "git clone … failed";
         # git's own words and ssh -v say which half of the wire refused.
@@ -1103,19 +1196,31 @@ class NodeRig:
             ],
         )
         for i, pc in enumerate(self.pcs):
+            nodes_dir = pc.home / ".magent" / "nodes"
+            parts.append(
+                f"--- pc{i}: node-map.json ---\n"
+                + _text_or_why(nodes_dir / "node-map.json")
+            )
+            parts.append(
+                f"--- pc{i}: pull marks ---\n"
+                + _text_or_why(nodes_dir / NICK / "pull.json")
+            )
+            parts.append(f"--- pc{i}: mirror ---\n{_listing(self.mirror_dir(pc))}")
             for log in sorted((pc.home / ".magent" / "logs").glob("*.log")):
-                lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+                lines = _text_or_why(log).splitlines()
                 parts.append(
-                    f"--- pc{i}: {log.name} (tail) ---\n" + "\n".join(lines[-30:])
+                    f"--- pc{i}: {log.name} (tail) ---\n"
+                    + "\n".join(lines[-DIAG_TAIL:])
                 )
         parts.append(f"--- psmux shim calls ---\n{self.shim_calls()}")
         return "\n".join(parts)
 
     def close(self) -> list[str]:
-        """Kill every PC-side child this rig started (by pid), stop any sync
-        daemon a PC home holds, then delete the node user -- which takes its
-        tmux server, its stand-ins and its sessions with it. Returns what
-        could not be cleaned, for the fixture to fail on."""
+        """Kill every PC-side child this rig started (by its Popen), stop any
+        sync daemon a PC home holds, then delete the node user -- which takes
+        its tmux server, its stand-ins and its sessions with it. Returns what
+        could not be cleaned, a timed-out delete included, for the fixture to
+        fail on; never raises past a step, so every step runs."""
         problems: list[str] = []
         # The PC side shares ONE allowance, so teardown has a fixed bound; the
         # user delete keeps its own, so a wedged PC-side stop can never cost
@@ -1146,14 +1251,28 @@ class NodeRig:
             except subprocess.TimeoutExpired:
                 problems.append(f"node sync --stop timed out for {pc.home}")
             pid = self.daemon_pid(pc)
-            if pid is not None and _alive(pid):
-                problems.append(f"sync daemon pid {pid} survived --stop")
+            if pid is None or not _alive(pid):
+                continue
+            # A pid file outlives its process, and the pid may be recycled:
+            # only this PC's own `node sync` is ever killed (the product's
+            # stop_daemon does not trust the file either).
+            if is_sync_daemon(_cmdline(pid), pc.cfg):
+                problems.append(f"sync daemon pid {pid} survived --stop (killed)")
                 _kill(pid)
-        deleted = self.user.delete()
-        if deleted.rc != 0:
-            problems.append(
-                f"node user {self.user.name} not deleted:\n{deleted.show()}"
-            )
+            else:
+                problems.append(
+                    f"{pc.home}'s node-sync.pid names live pid {pid}, which is "
+                    "not this PC's node sync: left alone"
+                )
+        try:
+            deleted = self.user.delete()
+        except pytest.fail.Exception as exc:
+            problems.append(f"node user {self.user.name} not deleted: {exc}")
+        else:
+            if deleted.rc != 0:
+                problems.append(
+                    f"node user {self.user.name} not deleted:\n{deleted.show()}"
+                )
         return problems
 
 
@@ -1170,6 +1289,56 @@ def _kill(pid: int) -> None:
         os.kill(pid, 9)
     except OSError:
         return
+
+
+def _cmdline(pid: int) -> bytes:
+    """``/proc/<pid>/cmdline`` (the tier is Linux-only), or b"" when there is
+    none to read -- which matches nothing."""
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return b""
+
+
+def is_sync_daemon(cmdline: bytes, cfg: Path) -> bool:
+    """Whether a NUL-separated ``cmdline`` is the ``node sync`` daemon of the
+    PC whose config is ``cfg``: ``<python> -m magent --config <cfg> node
+    sync`` (``launch.node_sync_argv``), the config as given or resolved."""
+    argv = [a.decode("utf-8", "replace") for a in cmdline.split(b"\0") if a]
+    if argv[1:3] != ["-m", "magent"] or argv[-2:] != ["node", "sync"]:
+        return False
+    configs = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--config"]
+    return configs in ([str(cfg)], [os.path.realpath(cfg)])
+
+
+def _text_or_why(path: Path) -> str:
+    """A PC-side file for diag(): its text, or why there is none."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return "(absent)"
+    except OSError as exc:
+        return f"(unreadable: {exc})"
+
+
+def _listing(folder: Path) -> str:
+    """Every file under ``folder``: size, mtime (UTC, ms) and relative path."""
+    if not folder.is_dir():
+        return "(absent)"
+    rows: list[str] = []
+    for path in sorted(folder.rglob("*")):
+        try:
+            st = path.stat()
+        except OSError as exc:
+            rows.append(f"(unreadable: {exc})")
+            continue
+        if not path.is_file():
+            continue
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(st.st_mtime))
+        millis = st.st_mtime_ns // 1_000_000 % 1000
+        rel = path.relative_to(folder).as_posix()
+        rows.append(f"{st.st_size:>10}  {stamp}.{millis:03d}Z  {rel}")
+    return "\n".join(rows) or "(empty)"
 
 
 def alive(pid: int, budget: Budget) -> bool:
@@ -1191,6 +1360,15 @@ def lines_with(text: str, needle: str) -> list[str]:
     return [line for line in text.splitlines() if needle in line]
 
 
-def all_calls_target(calls: Iterable[list[str]], sid: str) -> bool:
-    """Every recorded psmux call names ``-L <sid>`` first."""
-    return all(call[:2] == ["-L", sid] for call in calls)
+# What psmux.stop_sessions issues: a liveness probe and a kill, nothing else.
+STOP_VERBS = frozenset({"has-session", "kill-server"})
+
+
+def only_stops(calls: Iterable[list[str]], sid: str) -> bool:
+    """Every recorded psmux call is ``-L <sid>`` and then a probe or a kill:
+    ``down`` may stop the local half of a node name, never type into it or
+    create it."""
+    return all(
+        call[:2] == ["-L", sid] and len(call) > 2 and call[2] in STOP_VERBS
+        for call in calls
+    )

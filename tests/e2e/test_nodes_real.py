@@ -56,11 +56,11 @@ from tests.e2e._nodes_rig import (
     NodeRig,
     Pc,
     alive,
-    all_calls_target,
     child_env,
     clamp,
     install_stand_in,
     node_wire_or_skip,
+    only_stops,
     run_files,
     schema_pins,
     ssh_wire_or_skip,
@@ -82,6 +82,25 @@ _READY = re.compile(r"NODE-READY (\S+) (fresh|continue|resume)")
 # One local child (the stand-in, an env load): under a second measured. The
 # bound keeps the always-runnable half's worst case small (9 runs, 135 s).
 _LOCAL_RUN_S = 15.0
+# The pin laws (CLAUDE.md), spelled out here rather than read back from
+# PIN_VALUES: a value flipped there -- a boost left on, a Session-0 refusal --
+# must turn D2 red, not agree with itself.
+_PIN_LAWS = {
+    "MAGENT_HOTKEY_SUPERVISOR": "0",
+    "MAGENT_UPLOAD_SUPERVISOR": "0",
+    "MAGENT_PSMUX_BOOST": "0",
+    "MAGENT_NODE_SYNC": "0",
+    "MAGENT_SESSION0_POLICY": "allow",
+    "MAGENT_MCP_RELAY": "0",
+    "MAGENT_ACCOUNT_ROUTING": "0",
+}
+# The pins tests/conftest.py also sets for every test: one source of truth.
+_CONFTEST_PINS = (
+    "MAGENT_UPLOAD_SUPERVISOR",
+    "MAGENT_PSMUX_BOOST",
+    "MAGENT_SESSION0_POLICY",
+    "MAGENT_NODE_SYNC",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -230,12 +249,18 @@ class TestEveryPcChildCarriesTheIsolationPins:
         )
         env = child_env(tmp_path)
         for pin in REQUIRED_PINS:
-            assert env[pin] == PIN_VALUES[pin], pin
+            assert env[pin] == _PIN_LAWS[pin], pin
         stray = sorted(
             k for k in env if k.upper().startswith("MAGENT_") and k.upper() not in known
         )
         # MagentEnv is extra="forbid": one stray name fails every CLI call.
         assert stray == []
+
+    def test_the_pin_values_are_the_laws_and_agree_with_conftest(self) -> None:
+        assert PIN_VALUES == _PIN_LAWS
+        # Read inside the test, where conftest's redirect has set them.
+        for pin in _CONFTEST_PINS:
+            assert os.environ.get(pin) == PIN_VALUES[pin], pin
 
     def test_the_home_family_and_the_canaries_are_set_and_tokens_are_not(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -396,6 +421,16 @@ def _mirrored(rig: NodeRig, needle: str) -> bool:
 
 def _sync_state(rig: NodeRig) -> object:
     return rig.status(tag="status-sync", sync=True).get("node_sync")
+
+
+def _session_option(rig: NodeRig, option: str) -> str:
+    """The session's own value of ``option``. A failed read FAILS (not an
+    AssertionError), so D7b's xfail excuses only a real value mismatch and
+    never a broken wire."""
+    run = rig.tmux("show-options", "-v", "-t", f"={rig.sid}:", option, tag=option)
+    if run.rc != 0:
+        pytest.fail(f"reading {option} off the node failed\n{run.show()}")
+    return run.out.rstrip("\n")
 
 
 def _stat(path: Path) -> tuple[int, int, int, int]:
@@ -566,12 +601,7 @@ class TestANodeHostsAProjectEndToEnd:
             "status-right": hints,
             "status-right-length": hints_len,
         }
-        got = {
-            option: rig.tmux(
-                "show-options", "-v", "-t", f"={rig.sid}:", option, tag=option
-            ).out.rstrip("\n")
-            for option in want
-        }
+        got = {option: _session_option(rig, option) for option in want}
         assert got == want
 
     def test_d08_a_second_up_attaches_and_starts_nothing(self, rig: NodeRig) -> None:
@@ -605,9 +635,17 @@ class TestANodeHostsAProjectEndToEnd:
         assert rig.sid not in as_json.out
 
         rig.reset_shim()
-        sent = rig.magent("send", rig.name, "hi", tag="send")
-        assert sent.rc != 0, sent.show()
+        tok = token()
+        sent = rig.magent("send", rig.name, f"poke {tok}", tag="send")
+        # `send` resolves local sessions only: a node name is "not found" (2),
+        # never a send that went somewhere and then failed to confirm (4).
+        assert sent.rc == 2, sent.show()
+        _said_line(rig, sent, f"no live session matches '{rig.name}'")
         assert not any("send-keys" in call for call in rig.shim_calls())
+        # Nor did the text reach the node: no turn, and not even typed.
+        assert [r for r in rig.agent_log() if r.get("tok") == tok] == []
+        assert not rig.in_transcript(f"poke {tok}")
+        assert tok not in rig.capture(tag="pane-after-send"), rig.diag()
 
         row = rig.node_row(rig.status(tag="status-before-sync"))
         assert row["node"] == NICK
@@ -721,11 +759,13 @@ class TestANodeHostsAProjectEndToEnd:
         assert last["mode"] == "continue", last
         assert "--continue" in str(last["argv"]), last
         assert last["session_id"] == first["session_id"]
+        rig.passed.add("D14")
 
     def test_d15_the_sync_daemon_runs_mirrors_and_stops(self, rig: NodeRig) -> None:
         from tests.e2e.test_ssh_real import _free_port
 
         _needs(rig, "D10")
+        _needs(rig, "D14")
         started = rig.magent("node", "sync", "-d", tag="sync-d", sync=True)
         assert started.rc == 0, started.show()
         _said_line(rig, started, "Node sync daemon")
@@ -795,6 +835,17 @@ class TestANodeHostsAProjectEndToEnd:
         self, rig: NodeRig
     ) -> None:
         _needs(rig, "D10")
+        _needs(rig, "D14")
+        # A live sync daemon pulls on its own: the final-pull check below
+        # would pass without down's pull.
+        pid = rig.live_daemon()
+        if pid is not None:
+            if "D15" not in rig.passed:
+                pytest.skip(
+                    f"prerequisite D15 did not pass and left sync daemon pid {pid} "
+                    "running: down's own final pull cannot be told apart from it"
+                )
+            pytest.fail(f"sync daemon pid {pid} still running after D15 stopped it")
         tok = token()
         rig.poke(tok)
         rig.reset_shim()
@@ -806,10 +857,10 @@ class TestANodeHostsAProjectEndToEnd:
         assert rig.session_rc() == 1, rig.diag()
         assert rig.name not in rig.node_map()
         # The local half of the name is probed and killed on its own socket,
-        # and nothing else is touched.
+        # and nothing else is touched or typed into.
         calls = rig.shim_calls()
         assert calls, "down never probed the local half of the name"
-        assert all_calls_target(calls, rig.sid), calls
+        assert only_stops(calls, rig.sid), calls
         rig.passed.add("D13")
 
     def test_d16_up_starts_the_daemon_and_down_all_stops_both(
