@@ -742,6 +742,8 @@ class TestThePowerShellQuoting:
         # PowerShell's own parser, never a run: the whole cwd must come back as
         # the ONE single-quoted -WorkingDirectory value, and no fragment of it
         # may parse as a command of its own.
+        # Tokenizer layer only (parse() over text we decoded ourselves); the
+        # file-decoding layer is ParseFile's every-single-quote/cwd-non-ascii-quote.
         from magent.platform.windows import _handoff_script
 
         cwd = rf"C:\work{quote}; Get-Date; {quote}x"
