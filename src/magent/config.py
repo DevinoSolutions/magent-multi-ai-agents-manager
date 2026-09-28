@@ -144,6 +144,9 @@ def _load_json_object(text: str) -> dict[str, object]:
         data = json.loads(text)
     except json.JSONDecodeError as e:
         raise ConfigError(f"Config is not valid JSON: {e}") from e
+    except RecursionError as e:
+        # json.loads' own nesting ceiling; its message is the interpreter's.
+        raise ConfigError("Config is nested too deeply to read") from e
     if not isinstance(data, dict):
         raise ConfigError("Config must be a JSON object")
     _refuse_text_with_no_utf8_form(data)
