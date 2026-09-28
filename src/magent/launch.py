@@ -190,9 +190,11 @@ def relay_handoff(plat: Platform, argv: list[str], *, timeout_s: float) -> int:
         )
         return 1
     if result.rc is None:
+        # "failed", not "could not run": some of these answers are about a
+        # command that DID run (it lost its child, or finished with an
+        # unreadable exit code), and `detail` says which.
         click.echo(
-            f"  {style('x', fg='red')} hand-off could not run on the desktop: "
-            f"{result.detail} "
+            f"  {style('x', fg='red')} hand-off failed: {result.detail} "
             "(see ~/.magent/logs/launch.log on this host)",
             err=True,
         )
