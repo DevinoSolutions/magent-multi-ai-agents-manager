@@ -980,6 +980,28 @@ class NodeRig:
             ["tail", "-n", "20", f"{self.user.home}/.magent-e2e/agent-log.jsonl"],
         )
         node("magent dir", ["ls", "-la", f"{self.user.home}/magent"])
+        # The node reaches its own origin over ssh (the bring-up's clone, every
+        # fetch). When that fails the product says only "git clone … failed";
+        # git's own words and ssh -v say which half of the wire refused.
+        node(
+            "git ls-remote origin",
+            [
+                "sh",
+                "-c",
+                f"git ls-remote {shlex.quote(self.origin_url)} 2>&1 | tail -n 10",
+            ],
+        )
+        node(
+            "ssh -v to its own origin",
+            [
+                "sh",
+                "-c",
+                (
+                    "ssh -v -o BatchMode=yes -o ConnectTimeout=5 "
+                    f"-p {shlex.quote(self.wire.port)} localhost true 2>&1 | tail -n 25"
+                ),
+            ],
+        )
         for i, pc in enumerate(self.pcs):
             for log in sorted((pc.home / ".magent" / "logs").glob("*.log")):
                 lines = log.read_text(encoding="utf-8", errors="replace").splitlines()

@@ -340,9 +340,11 @@ def _needs(rig: NodeRig, stage: str) -> None:
         pytest.skip(f"prerequisite {stage} did not pass; its own failure is the report")
 
 
-def _said_line(run: Run, text: str) -> None:
+def _said_line(rig: NodeRig, run: Run, text: str) -> None:
+    # The rig's diagnostics too: a bring-up that failed on the node still
+    # exits 0 (a top-up), so this line is often the first to see it.
     assert any(text in line for line in run.said.splitlines()), (
-        f"no line says {text!r}\n{run.show()}"
+        f"no line says {text!r}\n{run.show()}{rig.diag()}"
     )
 
 
@@ -426,9 +428,9 @@ class TestANodeHostsAProjectEndToEnd:
             dirty = rig.magent("up", tag="up-dirty")
         finally:
             tracked.write_bytes(original)
-        _said_line(dirty, f"x {rig.sid}: ")
-        _said_line(dirty, "uncommitted changes")
-        _said_line(dirty, "--allow-dirty")
+        _said_line(rig, dirty, f"x {rig.sid}: ")
+        _said_line(rig, dirty, "uncommitted changes")
+        _said_line(rig, dirty, "--allow-dirty")
         _assert_nothing_created(rig)
 
         rig.git("commit", "-q", "--allow-empty", "-m", "local only", cwd=pc.repo)
@@ -436,8 +438,8 @@ class TestANodeHostsAProjectEndToEnd:
             unpushed = rig.magent("up", tag="up-unpushed")
         finally:
             rig.git("reset", "-q", "--hard", "HEAD~1", cwd=pc.repo)
-        _said_line(unpushed, f"x {rig.sid}: ")
-        _said_line(unpushed, "git push -u origin main")
+        _said_line(rig, unpushed, f"x {rig.sid}: ")
+        _said_line(rig, unpushed, "git push -u origin main")
         _assert_nothing_created(rig)
 
     def test_d06_the_launch_preview_names_the_node_and_creates_nothing(
@@ -458,7 +460,7 @@ class TestANodeHostsAProjectEndToEnd:
             )
             pytest.skip("headless runner: --go --dry-run stops at 'No monitors'")
         assert run.rc == 0, run.show()
-        _said_line(run, f"@{NICK}")
+        _said_line(rig, run, f"@{NICK}")
         _assert_nothing_created(rig)
 
     def test_d07_up_starts_the_session_on_the_node(self, rig: NodeRig) -> None:
@@ -466,8 +468,8 @@ class TestANodeHostsAProjectEndToEnd:
         rig.reset_shim()
         run = rig.magent("up", tag="up-first")
         assert run.rc == 0, run.show() + rig.diag()
-        _said_line(run, f"+ {rig.sid} @{NICK} started")
-        _said_line(run, "Brought up 1 session(s)")
+        _said_line(rig, run, f"+ {rig.sid} @{NICK} started")
+        _said_line(rig, run, "Brought up 1 session(s)")
         # A node project never reaches the local multiplexer.
         assert rig.shim_calls() == []
 
@@ -566,7 +568,7 @@ class TestANodeHostsAProjectEndToEnd:
         rig.reset_shim()
         run = rig.magent("up", tag="up-again")
         assert run.rc == 0, run.show()
-        _said_line(run, f"+ {rig.sid} @{NICK} attached")
+        _said_line(rig, run, f"+ {rig.sid} @{NICK} attached")
         assert rig.shim_calls() == []
         assert len(rig.starts()) == 1, rig.starts()
         assert rig.session_rc() == 0
@@ -576,7 +578,7 @@ class TestANodeHostsAProjectEndToEnd:
         pc_b = rig.second_pc()
         run = rig.magent("up", tag="up-pc-b", pc=pc_b)
         assert run.rc == 0, run.show() + rig.diag()
-        _said_line(run, f"+ {rig.sid} @{NICK} attached")
+        _said_line(rig, run, f"+ {rig.sid} @{NICK} attached")
         assert len(rig.starts()) == 1, rig.starts()
         entry = rig.node_map(pc_b).get(rig.name)
         assert entry is not None
@@ -603,7 +605,7 @@ class TestANodeHostsAProjectEndToEnd:
 
         once = rig.magent("node", "sync", "--once", tag="sync-once-first")
         assert once.rc == 0, once.show() + rig.diag()
-        _said_line(once, f"+ @{NICK}  ok")
+        _said_line(rig, once, f"+ @{NICK}  ok")
         row = rig.node_row(rig.status(tag="status-after-sync"))
         assert row["state"] == "live", row
         rig.passed.add("D10")
@@ -702,7 +704,7 @@ class TestANodeHostsAProjectEndToEnd:
 
         run = rig.magent("up", tag="up-restart")
         assert run.rc == 0, run.show() + rig.diag()
-        _said_line(run, f"+ {rig.sid} @{NICK} started")
+        _said_line(rig, run, f"+ {rig.sid} @{NICK} started")
         starts = _wait_start_count(rig, 2)
         last = starts[-1]
         assert last["mode"] == "continue", last
@@ -715,7 +717,7 @@ class TestANodeHostsAProjectEndToEnd:
         _needs(rig, "D10")
         started = rig.magent("node", "sync", "-d", tag="sync-d", sync=True)
         assert started.rc == 0, started.show()
-        _said_line(started, "Node sync daemon")
+        _said_line(rig, started, "Node sync daemon")
         wait_for(
             "status reports the node sync daemon ok",
             lambda: _sync_state(rig) == "ok",
@@ -736,7 +738,7 @@ class TestANodeHostsAProjectEndToEnd:
         assert pid is not None
         stopped = rig.magent("node", "sync", "--stop", tag="sync-stop")
         assert stopped.rc == 0, stopped.show()
-        _said_line(stopped, "Stopped the node sync daemon.")
+        _said_line(rig, stopped, "Stopped the node sync daemon.")
         wait_for(f"daemon pid {pid} gone", lambda: not alive(pid), 15)
         assert _sync_state(rig) == "stopped"
 
@@ -764,7 +766,7 @@ class TestANodeHostsAProjectEndToEnd:
             proc.wait(timeout=30)
         stopped = rig.magent("node", "sync", "--stop", tag="sync-stop-serve")
         assert stopped.rc == 0, stopped.show()
-        _said_line(stopped, "Stopped the node sync daemon.")
+        _said_line(rig, stopped, "Stopped the node sync daemon.")
         rig.passed.add("D15")
 
     def test_d13_down_pulls_the_last_turn_then_stops_only_that_session(
@@ -776,7 +778,7 @@ class TestANodeHostsAProjectEndToEnd:
         rig.reset_shim()
         run = rig.magent("down", rig.name, tag="down-one")
         assert run.rc == 0, run.show() + rig.diag()
-        _said_line(run, "Stopped 1 session(s)")
+        _said_line(rig, run, "Stopped 1 session(s)")
         # The final pull brought the last turn home before the kill.
         assert _mirrored(rig, f"poke {tok}"), rig.diag()
         assert rig.session_rc() == 1, rig.diag()
@@ -794,7 +796,7 @@ class TestANodeHostsAProjectEndToEnd:
         _needs(rig, "D13")
         run = rig.magent("up", tag="up-with-sync", sync=True)
         assert run.rc == 0, run.show() + rig.diag()
-        _said_line(run, f"+ {rig.sid} @{NICK} started")
+        _said_line(rig, run, f"+ {rig.sid} @{NICK} started")
         wait_for(
             "the bring-up started a node sync daemon",
             lambda: _sync_state(rig) == "ok",
@@ -807,7 +809,7 @@ class TestANodeHostsAProjectEndToEnd:
 
         down = rig.magent("down", "--all", tag="down-all", sync=True)
         assert down.rc == 0, down.show() + rig.diag()
-        _said_line(down, "Stopped the node sync daemon")
+        _said_line(rig, down, "Stopped the node sync daemon")
         assert rig.session_rc() == 1, rig.diag()
         wait_for(f"daemon pid {pid} gone", lambda: not alive(pid), 15)
         assert _sync_state(rig) == "stopped"
