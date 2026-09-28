@@ -39,9 +39,11 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "none",
         (
             "Run this project's session on a pool machine: a nick from "
-            '`settings.nodes`, `"auto"` to place it by load history, or `"cloud"` '
-            "for a Claude cloud session (needs no pool entry). A node holds a git "
-            "clone at your current branch. Exclusive with `host`."
+            "`settings.nodes`. A node holds a git clone at your current branch. "
+            'Exclusive with `host`. `"auto"` and `"cloud"` are reserved in this '
+            'release: `"auto"` is accepted but not placed yet, so its bring-up '
+            'refuses it ("needs a placement"); `"cloud"` runs as an ordinary '
+            "local session."
         ),
     ),
     (
@@ -217,7 +219,7 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "nodeSync.sampleIntervalS",
         "int",
         "`60`",
-        'Seconds between node load samples; `"node": "auto"` placement reads this history.',
+        'Seconds between node load samples; `"node": "auto"` placement will read this history.',
     ),
     (
         "nodeSync.historyH",
