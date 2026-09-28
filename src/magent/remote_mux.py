@@ -2015,17 +2015,32 @@ def _mirror_members(source: Path, *, who: str) -> list[Path]:
     ]
 
 
+def _owner_only(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    """``_tar_dir``'s filter: every member owner-only (dirs 0700, files
+    0600) and owned by no one in particular, as ``_add_bytes``' members
+    are. The node's tar opens each member with its ARCHIVE mode, and a
+    default ACL there makes the kernel ignore the umask (audit-acl S2),
+    so this is the mode that holds -- and the PC's own would depend on
+    its OS: a Windows stat is 0666/0777. The mtime still travels: the
+    newest transcript is found by it."""
+    info.mode = 0o700 if info.isdir() else 0o600
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    return info
+
+
 def _tar_dir(source: Path) -> bytes:
     """An uncompressed tar of ``source``'s CONTENTS (paths relative to it):
-    its ``_mirror_members``, nothing else. A source that cannot be read, or is
-    a link, raises RemoteError with rc None (nothing ran on a node)."""
+    its ``_mirror_members``, nothing else, every one ``_owner_only``. A
+    source that cannot be read, or is a link, raises RemoteError with rc
+    None (nothing ran on a node)."""
     buf = io.BytesIO()
     try:
         members = _mirror_members(source, who="_tar_dir")
         with tarfile.open(fileobj=buf, mode="w") as tar:
             for path in members:
                 arcname = path.relative_to(source).as_posix()
-                tar.add(path, arcname=arcname, recursive=False)
+                tar.add(path, arcname=arcname, recursive=False, filter=_owner_only)
     except MirrorIsALink as err:
         raise RemoteError(
             None, f"{err}; nothing was sent", ("tar", str(source))

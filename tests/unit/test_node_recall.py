@@ -1204,6 +1204,34 @@ class TestTheTarCarriesOnlyTheConversation:
         with tarfile.open(fileobj=io.BytesIO(remote_mux._tar_dir(source))) as tar:
             assert tar.getnames() == ["a", "a/z.jsonl", "a-b.jsonl"]
 
+    def test_every_member_is_owner_only_whatever_the_pcs_own_modes(self, tmp_path):
+        # audit-acl S2: the node's tar opens each member with ITS archive
+        # mode, and a default ACL there makes the kernel ignore the umask. So
+        # the PC's own modes never travel: 0644/0755 here on POSIX, and a
+        # Windows stat's 0666/0777 (what chmod leaves there).
+        source = _pulled(tmp_path)
+        nested = source / SESSION_ID / "subagents"
+        nested.mkdir(parents=True)
+        (nested / "agent-a1.jsonl").write_bytes(b"{}\n")
+        (source / f"{SESSION_ID}.jsonl").chmod(0o644)
+        (source / "memory").chmod(0o755)
+        assert (source / f"{SESSION_ID}.jsonl").stat().st_mode & 0o777 != 0o600
+        assert (source / "memory").stat().st_mode & 0o777 != 0o700
+
+        with tarfile.open(fileobj=io.BytesIO(remote_mux._tar_dir(source))) as tar:
+            members = tar.getmembers()
+
+        assert {m.name: oct(m.mode) for m in members} == {
+            SESSION_ID: "0o700",
+            f"{SESSION_ID}/subagents": "0o700",
+            f"{SESSION_ID}/subagents/agent-a1.jsonl": "0o600",
+            f"{SESSION_ID}.jsonl": "0o600",
+            "memory": "0o700",
+            "memory/MEMORY.md": "0o600",
+        }
+        # No owner travels either, as with _add_bytes' members.
+        assert {(m.uid, m.gid, m.uname, m.gname) for m in members} == {(0, 0, "", "")}
+
     def test_a_stray_pull_temp_is_not_sent(self, tmp_path):
         # E8's pull writer (544f011) names its temp mkstemp(prefix=".",
         # suffix=".part") beside the target; a SIGKILL mid-write strands one.
