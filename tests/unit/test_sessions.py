@@ -48,12 +48,12 @@ class TestEncodeClaudeProjectPath:
 
     def test_underscores_become_dashes(self):
         assert (
-            encode_claude_project_path(r"C:\Users\amind\AppData\Local\Temp\capture_cc")
-            == "C--Users-amind-AppData-Local-Temp-capture-cc"
+            encode_claude_project_path(r"C:\Users\alice\work\demo_app")
+            == "C--Users-alice-work-demo-app"
         )
 
     def test_a_dot_directory_becomes_a_double_dash(self):
-        assert encode_claude_project_path("/home/amin/.claude") == "-home-amin--claude"
+        assert encode_claude_project_path("/home/demo/.claude") == "-home-demo--claude"
 
     def test_spaces_become_dashes(self):
         result = encode_claude_project_path("my project")
@@ -74,14 +74,14 @@ class TestTheEncoderIsClaudeCodesOwnRule:
         ("path", "expected"),
         [
             (
-                r"C:\p\stealth-chrome-devtools-mcp\.claude\worktrees\agent-a0ed696fa523ab8f6",
-                "C--p-stealth-chrome-devtools-mcp--claude-worktrees-agent-a0ed696fa523ab8f6",
+                r"C:\p\demo-tools-mcp\.claude\worktrees\agent-0123456789abcdef0",
+                "C--p-demo-tools-mcp--claude-worktrees-agent-0123456789abcdef0",
             ),
             (
-                r"c:\Users\amind\OneDrive\Desktop\Projects\INTERNAL\devino-landing-page",
-                "c--Users-amind-OneDrive-Desktop-Projects-INTERNAL-devino-landing-page",
+                r"c:\Users\alice\Desktop\Projects\Acme\demo-landing-page",
+                "c--Users-alice-Desktop-Projects-Acme-demo-landing-page",
             ),
-            ("/home/amin/magent/my_repo.v2", "-home-amin-magent-my-repo-v2"),
+            ("/home/demo/magent/my_repo.v2", "-home-demo-magent-my-repo-v2"),
         ],
     )
     def test_every_ascii_character_outside_letters_and_digits_becomes_a_dash(
@@ -93,14 +93,14 @@ class TestTheEncoderIsClaudeCodesOwnRule:
         # é is one UTF-16 unit (one dash); the emoji is a surrogate pair (two).
         # A code-point regex gives 3 trailing dashes here, a byte regex 6.
         assert (
-            encode_claude_project_path("/home/amin/café \U0001f600")
-            == "-home-amin-caf----"
+            encode_claude_project_path("/home/demo/café \U0001f600")
+            == "-home-demo-caf----"
         )
 
     def test_a_name_over_200_units_is_cut_and_suffixed_with_the_paths_hash(self):
         # A 250-'a' name: cut to 200 units, then the hash suffix of the whole path.
-        encoded = encode_claude_project_path("/home/amin/magent/" + "a" * 250)
-        assert encoded == "-home-amin-magent-" + "a" * 182 + "-d43su2"
+        encoded = encode_claude_project_path("/home/demo/magent/" + "a" * 250)
+        assert encoded == "-home-demo-magent-" + "a" * 182 + "-cn8awk"
         assert len(encoded) == 207
 
     def test_a_name_of_exactly_200_units_is_left_whole(self):
