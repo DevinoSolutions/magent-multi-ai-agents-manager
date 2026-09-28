@@ -398,10 +398,11 @@ _UNUSABLE = [
 
 def _where_the_secret_survives(exc: BaseException | None) -> list[str]:
     """Each place _SECRET can be reached from ``exc``: every link of its
-    chain (__cause__ AND __context__, suppressed or not), each link's args and
-    decode ``object``, and every local of every frame on each link's traceback
-    -- followed into dicts, lists and tuples, since a parsed settings file is
-    a dict."""
+    chain (__cause__ AND __context__, suppressed or not), each link's args,
+    decode ``object`` and JSON ``doc`` (the whole file, even on an error
+    stripped of its traceback), and every local of every frame on each link's
+    traceback -- followed into dicts, lists and tuples, since a parsed
+    settings file is a dict."""
     hits: list[str] = []
     keep: list[object] = []  # holds every visited value, so no id is reused
     seen: set[int] = set()
@@ -422,6 +423,7 @@ def _where_the_secret_survives(exc: BaseException | None) -> list[str]:
             pending += list(value)
         elif isinstance(value, BaseException):
             pending += [*value.args, getattr(value, "object", None)]
+            pending.append(getattr(value, "doc", None))
             pending += [value.__cause__, value.__context__]
             tb = value.__traceback__
             while tb is not None:
