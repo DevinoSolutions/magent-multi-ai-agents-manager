@@ -512,6 +512,10 @@ def _spawn(
             timed_out=True,
         )
     if out.over:
+        # Had stderr ended on its OWN? Asked before the kill: after it every
+        # stream has ended, and one the kill ended was cut off wherever the
+        # writer was -- mid-line, just like one still held open.
+        ended = not err.is_alive()
         _kill(proc)
         if not quiet:
             get_logger("nodes").warning(
@@ -525,12 +529,12 @@ def _spawn(
         # gets the reap bound to end -- time too for words already in the pipe
         # to be read -- and what it delivered is reported either way: a
         # grandchild may hold it open long after the child is gone, and the
-        # words already read are no less the child's. A stream still open may
-        # end mid-line, though, and a fragment is no reason: only whole lines
-        # are kept. Asked BEFORE the handover, so a stream that ends between
-        # the two is trimmed, never a half-line kept.
+        # words already read are no less the child's. Only a stream that ended
+        # before the kill is whole to its last byte; any other may stop
+        # mid-line, and a fragment is no reason: only its whole lines are
+        # kept. One that ends on its own between the question and the kill is
+        # trimmed too -- a last line omitted, never a half-line kept.
         err.join(_REAP_TIMEOUT_S)
-        ended = not err.is_alive()
         held = err.data()
         said = _tail(held if ended else held[: held.rfind(b"\n") + 1])
         # Killed mid-call, so the remote may still be running; but the node
