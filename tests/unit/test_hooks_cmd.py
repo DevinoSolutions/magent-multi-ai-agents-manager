@@ -12,6 +12,7 @@ import pytest
 
 from magent import agent_state, cli
 from magent.cli import hooks_cmd
+from magent.style import style
 
 EVENTS = list(hooks_cmd._EVENTS)
 
@@ -352,22 +353,33 @@ class TestInstall:
         assert json.loads(settings.read_text(encoding="utf-8"))["hooks"] == before
 
 
+# A settings.json can carry API keys in its "env" block. Every unusable file
+# below carries this one, to prove none of it survives in the refusal.
+_SECRET = "sentinel-secret-9d2a"
+_ENV = b'"env": {"ANTHROPIC_API_KEY": "' + _SECRET.encode() + b'"}, '
+
 _UNUSABLE = [
-    pytest.param(b"not json {", "not valid JSON (JSONDecodeError)", id="not-json"),
     pytest.param(
-        b'{"hooks": "\xff"}', "not valid UTF-8 (UnicodeDecodeError)", id="not-utf8"
+        b"{" + _ENV + b"not json", "not valid JSON (JSONDecodeError)", id="not-json"
     ),
     pytest.param(
-        _NESTED.encode(), "nested too deeply to parse (RecursionError)", id="nested"
+        b"{" + _ENV + b'"hooks": "\xff"}',
+        "not valid UTF-8 (UnicodeDecodeError)",
+        id="not-utf8",
     ),
-    pytest.param(b"[]", "not a JSON object", id="not-an-object"),
     pytest.param(
-        b'{"hooks": [], "model": "keep-me"}',
+        b"{" + _ENV + _NESTED[1:].encode(),
+        "nested too deeply to parse (RecursionError)",
+        id="nested",
+    ),
+    pytest.param(b"[{" + _ENV[:-2] + b"}]", "not a JSON object", id="not-an-object"),
+    pytest.param(
+        b"{" + _ENV + b'"hooks": [], "model": "keep-me"}',
         '"hooks" is not a JSON object',
         id="hooks-not-an-object",
     ),
     pytest.param(
-        b'{"hooks": {"Stop": {"type": "command", "command": "mine"}}}',
+        b"{" + _ENV + b'"hooks": {"Stop": {"type": "command", "command": "mine"}}}',
         '"hooks.Stop" is not a JSON array',
         id="event-not-an-array",
     ),
@@ -379,6 +391,40 @@ _UNUSABLE = [
         id="unreadable",
     ),
 ]
+
+
+def _where_the_secret_survives(exc: BaseException | None) -> list[str]:
+    """Each place _SECRET can be reached from ``exc``: every link of its
+    chain (__cause__ AND __context__, suppressed or not), each link's args and
+    decode ``object``, and every local of every frame on each link's traceback
+    -- followed into dicts, lists and tuples, since a parsed settings file is
+    a dict."""
+    hits: list[str] = []
+    keep: list[object] = []  # holds every visited value, so no id is reused
+    seen: set[int] = set()
+    pending: list[object] = [exc]
+    while pending:
+        value = pending.pop()
+        if value is None or id(value) in seen:
+            continue
+        seen.add(id(value))
+        keep.append(value)
+        if isinstance(value, str | bytes):
+            needle = _SECRET.encode() if isinstance(value, bytes) else _SECRET
+            if needle in value:
+                hits.append(ascii(value)[:60])
+        elif isinstance(value, dict):
+            pending += [*value.keys(), *value.values()]
+        elif isinstance(value, list | tuple):
+            pending += list(value)
+        elif isinstance(value, BaseException):
+            pending += [*value.args, getattr(value, "object", None)]
+            pending += [value.__cause__, value.__context__]
+            tb = value.__traceback__
+            while tb is not None:
+                pending += list(tb.tb_frame.f_locals.values())
+                tb = tb.tb_next
+    return hits
 
 
 class TestASettingsFileMagentCannotUnderstand:
@@ -410,10 +456,9 @@ class TestASettingsFileMagentCannotUnderstand:
         assert isinstance(result.exception, SystemExit)
         assert result.stdout == ""
         assert result.stderr == f"  x Cannot edit {settings}: {reason}\n"
-        # Our words alone: a parser error's .doc is the whole file.
-        refusal = result.exception.__cause__
-        assert refusal.__cause__ is None
-        assert refusal.__context__ is None
+        # Our words alone: a parser error's .doc is the whole file, and a
+        # frame that parsed it holds it as a local.
+        assert _where_the_secret_survives(result.exception) == []
         if content is None:
             assert list(settings.iterdir()) == []
         else:
@@ -422,23 +467,37 @@ class TestASettingsFileMagentCannotUnderstand:
         assert [p.name for p in settings.parent.iterdir()] == ["settings.json"]
 
     @pytest.mark.parametrize(("content", "reason"), _UNUSABLE)
-    def test_status_names_the_problem_instead_of_reading_it_as_unwired(
+    def test_status_names_the_problem_and_exits_one(
         self, runner, tmp_path, content, reason
     ):
+        # Unknown is not success: a script reading `magent hooks status`'s
+        # exit code must not take "cannot tell" for "all wired".
         settings = self._plant(tmp_path, content)
 
         result = runner.invoke(
             cli.main, ["hooks", "status", "--settings-file", str(settings)]
         )
 
-        assert result.exit_code == 0, result.exception
-        lines = result.output.splitlines()
-        assert lines[0] == f"  ! Cannot tell what is wired in {settings}: {reason}"
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert result.stderr == (
+            f"  x {settings}: {reason}; cannot tell which hooks are wired\n"
+        )
         for event in EVENTS:
             assert f"x {event}" not in result.output
             assert f"+ {event}" not in result.output
         # The store half of the report still runs.
-        assert "State store is empty" in result.output
+        assert "State store is empty" in result.stdout
+        assert _where_the_secret_survives(result.exception) == []
+
+    def test_the_status_refusal_mark_is_red(self, runner, tmp_path):
+        settings = self._plant(tmp_path, b"not json {")
+
+        result = runner.invoke(
+            cli.main, ["hooks", "status", "--settings-file", str(settings)], color=True
+        )
+
+        assert result.stderr.startswith(f"  {style('x', fg='red')} {settings}: ")
 
 
 class TestStatus:

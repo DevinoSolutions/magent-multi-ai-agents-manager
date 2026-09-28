@@ -73,23 +73,21 @@ def _codex_recipe() -> str:
     return f'notify = [{json.dumps(_hook_exe())}, "--source", "codex"]'
 
 
-class _UnusableSettings(Exception):
-    """settings.json exists, but magent cannot safely understand it."""
+def _load_settings(path: Path) -> dict[str, object] | str:
+    """The parsed settings.json ({} when there is none), or what is wrong with it.
 
+    The string, in our words plus the error's class, is for a file magent
+    cannot safely understand: unreadable, not UTF-8, not JSON, nested past the
+    parser's depth, or not the shape Claude Code writes -- ``hooks`` an
+    object, each of our events' values an array. install refuses such a file
+    untouched (the wt_keys law: a file magent cannot read is never rewritten;
+    before this, a wrong-shaped ``hooks`` was silently replaced), and status
+    says so instead of reporting every event unwired.
 
-def _load_settings(path: Path) -> dict[str, object]:
-    """The parsed settings.json, or {} when there is none.
-
-    Raises _UnusableSettings, in our words plus the error's class, for a file
-    magent cannot safely understand: unreadable, not UTF-8, not JSON, nested
-    past the parser's depth, or not the shape Claude Code writes -- ``hooks``
-    an object, each of our events' values an array. install refuses such a
-    file untouched (the wt_keys law: a file magent cannot read is never
-    rewritten; before this, a wrong-shaped ``hooks`` was silently replaced),
-    and status says so instead of reporting every event unwired.
-
-    Raised after the try statement, so no parser error rides along: a
-    JSONDecodeError's ``.doc`` is the whole file.
+    Returned, never raised: settings.json can hold API keys in its "env"
+    block, and an exception keeps alive both a parser error (a
+    JSONDecodeError's ``.doc`` is the whole file) and the frame that parsed
+    it, whose locals hold the file.
     """
     if not path.exists():
         return {}
@@ -105,15 +103,14 @@ def _load_settings(path: Path) -> dict[str, object]:
         problem = f"could not be read ({type(exc).__name__})"
     else:
         if not isinstance(data, dict):
-            problem = "not a JSON object"
-        elif not isinstance(hooks := data.get("hooks", {}), dict):
-            problem = '"hooks" is not a JSON object'
-        else:
-            wrong = [e for e in _EVENTS if not isinstance(hooks.get(e, []), list)]
-            if not wrong:
-                return data
-            problem = f'"hooks.{wrong[0]}" is not a JSON array'
-    raise _UnusableSettings(problem)
+            return "not a JSON object"
+        if not isinstance(hooks := data.get("hooks", {}), dict):
+            return '"hooks" is not a JSON object'
+        wrong = [e for e in _EVENTS if not isinstance(hooks.get(e, []), list)]
+        if wrong:
+            return f'"hooks.{wrong[0]}" is not a JSON array'
+        return data
+    return problem
 
 
 def _event_wired(entries: object) -> bool:
@@ -174,11 +171,10 @@ def hooks_install_cmd(settings_file: Path | None) -> None:
     -- ~/.codex/config.toml is TOML, edited by hand.
     """
     path = settings_file or _default_settings_file()
-    try:
-        data = _load_settings(path)
-    except _UnusableSettings as exc:
-        click.echo(f"  {style('x', fg='red')} Cannot edit {path}: {exc}", err=True)
-        raise SystemExit(1) from exc
+    data = _load_settings(path)
+    if isinstance(data, str):
+        click.echo(f"  {style('x', fg='red')} Cannot edit {path}: {data}", err=True)
+        raise SystemExit(1)
 
     # _load_settings refused any other shape: these defaults only fill in what
     # is absent.
@@ -243,14 +239,14 @@ def hooks_status_cmd(settings_file: Path | None) -> None:
     from magent import agent_state  # heavy subsystem: in-body per policy
 
     path = settings_file or _default_settings_file()
-    try:
-        data = _load_settings(path)
-    except _UnusableSettings as exc:
+    data = _load_settings(path)
+    if isinstance(data, str):
         # Never per-event rows here: "x" would claim every event is unwired,
         # which a file magent cannot read says nothing about.
         click.echo(
-            f"  {style('!', fg='yellow', bold=True)} Cannot tell what is wired in "
-            f"{path}: {exc}"
+            f"  {style('x', fg='red')} {path}: {data}; cannot tell which hooks "
+            "are wired",
+            err=True,
         )
     else:
         hooks = data.get("hooks")
@@ -260,7 +256,14 @@ def hooks_status_cmd(settings_file: Path | None) -> None:
             mark = style("+", fg="green", bold=True) if wired else style("x", fg="red")
             click.echo(f"  {mark} {event}")
     click.echo()
-    records = agent_state.all_states()
+    _echo_store_freshness(agent_state.all_states())
+    if isinstance(data, str):
+        # Unknown is not success: a script must not read "cannot tell" as
+        # "all wired". The store report above still ran.
+        raise SystemExit(1)
+
+
+def _echo_store_freshness(records: list[dict[str, object]]) -> None:
     if not records:
         click.echo(
             f"  {style('State store is empty', fg='yellow')} "
