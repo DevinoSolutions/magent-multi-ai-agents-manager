@@ -813,7 +813,8 @@ def _source_node(cfg: MagentConfig, held: NodeMapEntry) -> Node | None:
         return None
 
 
-_RERUN = "nothing was stopped or cleared -- run the recall again"
+_UNTOUCHED = "nothing was stopped or cleared"
+_RERUN = f"{_UNTOUCHED} -- run the recall again"
 
 
 def _resume_id(held: NodeMapEntry) -> str | None:
@@ -932,6 +933,7 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         # reason once, and only the way out that applies. remote_mux logs the
         # file it could not store (to node_sync's log); the message can't.
         node_log = log.LOG_DIR / f"{node_sync.LOG_NAME}.log"
+        stop = _RERUN
         if exc.not_stored:
             remedy = (
                 f"\n    A file this PC could not store is named in {node_log}:"
@@ -939,8 +941,10 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
             )
         elif exc.stuck:
             # Asked again from this mark the node answers the same: no run
-            # alone gets further, so none is promised (cq-G14-r3) -- only where
-            # final_pull logged the two marks.
+            # alone gets further, so none is promised (cq-G14-r3), not even
+            # by the stop line (round-2 ruling 2) -- only where final_pull
+            # logged the two marks.
+            stop = _UNTOUCHED
             remedy = (
                 "\n    The mark the node was asked from and the one it answered"
                 f" are in {node_log}."
@@ -948,7 +952,7 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         else:
             remedy = "\n    A reply that ran out of room needs only another run."
         _fail(
-            f"the last pull from @{held.nick} did not finish: {exc.why}; {_RERUN}"
+            f"the last pull from @{held.nick} did not finish: {exc.why}; {stop}"
             f"{remedy}",
             1,
         )

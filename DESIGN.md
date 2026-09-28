@@ -1829,7 +1829,9 @@ is never pulled again, so a pull that a re-run could still complete stops the
 recall before anything is stopped, installed or cleared: a node that answered
 with an error, a pull that left files behind, a placement the pull no longer
 found, or a node map another process holds busy or left torn all exit 1
-with the project still placed and "run the recall again"; a daemon still
+with the project still placed and "run the recall again" -- except a pull
+stuck at its mark, which a re-run would only meet again: that stop names
+nodes.log, where both marks are, instead; a daemon still
 holding the node past the wait exits 3 the same way. Only a node that does not
 answer at all (ssh's own 255, or a timeout), or one this config cannot pull
 from, is reported and not fatal, because no re-run helps: the last `repos.json`

@@ -2295,11 +2295,19 @@ class TestRecallLocal:
 _REAL_FINAL_PULL = node_sync.final_pull
 
 
-def _stopped_before_anything(result, api_repo) -> None:
+def _stopped_before_anything(result, api_repo, *, rerun: bool = True) -> None:
     """The recall ended at the pull: printed, exit 1, placement kept, nothing
-    installed, and the user told to run it again."""
+    installed, and -- unless ``rerun`` is False -- the user told to run it
+    again. A stuck pull never is: asked again from the mark it is stuck on,
+    the node answers the same (round-2 ruling 2)."""
     assert result.exit_code == 1
-    assert "nothing was stopped or cleared -- run the recall again" in result.stderr
+    if rerun:
+        assert "nothing was stopped or cleared -- run the recall again" in (
+            result.stderr
+        )
+    else:
+        assert "nothing was stopped or cleared" in result.stderr
+        assert "run the recall again" not in result.stderr
     assert "Traceback" not in result.output
     assert nodes.read_node_map()["api"].nick == "second"
     assert not _claude_dir(api_repo).exists()
@@ -2387,13 +2395,17 @@ class TestTheLastPullMustFinish:
 
         result = _recall(runner, placed_api, "--local")
 
-        _stopped_before_anything(result, api_repo)
+        _stopped_before_anything(result, api_repo, rerun=False)
         # cq-G14 m-R3-2: the reason is said once, not wrapped in itself.
+        # Round-2 ruling 2: stuck, the stop names no re-run and ends with
+        # where final_pull logged the two marks.
         assert (
             "the last pull from @second did not finish: 1 file(s) did not fit in"
             " the reply and are still on the node (the reply reached the pull cap"
-            f" without moving its mark); {node_cmd._RERUN}"
+            " without moving its mark); nothing was stopped or cleared\n"
+            f"    {_marks_line()}"
         ) in result.stderr
+        assert result.stderr.rstrip().endswith(_marks_line())
         assert "the pull did not finish" not in result.stderr
         # cq-G14-r3: the mark did not move, so a re-run is asked from the
         # same mark and answered the same -- no remedy is promised.
@@ -2442,7 +2454,7 @@ class TestTheLastPullMustFinish:
 
         result = _recall(runner, placed_api, "--local")
 
-        _stopped_before_anything(result, api_repo)
+        _stopped_before_anything(result, api_repo, rerun=not stuck)
         assert why in result.stderr
         assert (
             "A reply that ran out of room needs only another run." in result.stderr
@@ -2494,7 +2506,10 @@ class TestTheLastPullMustFinish:
 
         first = _recall(runner, placed_api, "--local")
 
-        _stopped_before_anything(first, api_repo)
+        # Stuck, so no re-run is promised (round-2 ruling 2); one made
+        # anyway still asks from the owed file, and finishes once the
+        # node's answer moves.
+        _stopped_before_anything(first, api_repo, rerun=False)
 
         second = _recall(runner, placed_api, "--local")
 
