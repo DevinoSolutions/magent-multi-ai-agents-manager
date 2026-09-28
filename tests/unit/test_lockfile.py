@@ -79,3 +79,16 @@ class TestExclusiveLock:
         monkeypatch.setattr(Path, "home", staticmethod(lambda: nested))
         with exclusive_lock("test"):
             assert (nested / ".magent" / "test.lock").exists()
+
+    def test_a_failed_acquire_leaves_the_holders_lock_in_place(self):
+        """A contender that lost must not delete the file. On POSIX the holder's
+        flock lives on that inode: once the path is gone a THIRD contender
+        creates a fresh file, locks it, and runs beside the holder -- two
+        daemons."""
+        lock_file = Path.home() / ".magent" / "test.lock"
+        with exclusive_lock("test"):
+            with pytest.raises(LockHeld), exclusive_lock("test"):
+                pass
+            assert lock_file.exists()
+            with pytest.raises(LockHeld), exclusive_lock("test"):
+                pass
