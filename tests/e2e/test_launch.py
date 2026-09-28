@@ -152,6 +152,8 @@ def _go_dry_run(cfg, *, stdout_encoding):
         capture_output=True,
         env=env,
         stdin=subprocess.DEVNULL,
+        # A hung child fails this test, not the whole job's timeout-minutes.
+        timeout=120,
     )
 
 
