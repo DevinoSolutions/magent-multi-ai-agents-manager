@@ -1581,6 +1581,46 @@ class TestANodeSessionIsDecoratedLikeALocalOne:
         fake_ssh.set_reply("bash -s", rc=255)
         assert remote_mux.decorate(NODE, "api", "second") is False
 
+    # The script names the session, and a project title with no UTF-8 form
+    # cannot be sent. Cosmetic like every decoration failure: False, never
+    # raised, with the class and the codec's words in nodes.log alone.
+    def test_a_session_name_with_no_utf_8_form_is_false_and_sends_nothing(
+        self, fake_ssh, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(psmux, "code_on_path", lambda: False)
+        caplog.set_level("WARNING", logger="magent.nodes")
+        try:
+            answer: bool | UnicodeError = remote_mux.decorate(
+                NODE, "api\ud83d", "second"
+            )
+        except UnicodeError as e:
+            answer = e
+        assert answer is False
+        assert fake_ssh.calls() == []
+        (record,) = [r for r in caplog.records if r.name == "magent.nodes"]
+        assert record.levelno == logging.WARNING
+        message = record.getMessage()
+        assert message.startswith(
+            "decoration of 'api\\ud83d' on second not sent (UnicodeEncodeError): "
+        )
+        assert message.endswith("surrogates not allowed")
+
+    # Already so before the pass above, pinned with it: a decoration's own
+    # failure logs the program it ran, never this PC's path to the client.
+    def test_a_decoration_that_times_out_logs_the_program_never_its_path(
+        self, fake_ssh, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(psmux, "code_on_path", lambda: False)
+        monkeypatch.setattr(remote_mux, "SCRIPT_TIMEOUT_S", 1.0)
+        fake_ssh.set_mode("timeout")
+        caplog.set_level("WARNING", logger="magent.nodes")
+        assert remote_mux.decorate(NODE, "api", "second") is False
+        (message,) = [
+            r.getMessage() for r in caplog.records if r.name == "magent.nodes"
+        ]
+        assert message.startswith("node call timed out after 1.0s: ssh ")
+        assert str(fake_ssh.path) not in caplog.text
+
 
 _SENTINEL = b"\n__MAGENT_PAYLOAD__\n"
 _ROOT = "/home/amin/magent/api"
@@ -1954,6 +1994,38 @@ class TestTheBringUpStaysInsideItsFolders:
     def test_push_mode_validates_the_root_too(self, node_home, tmp_path):
         with pytest.raises(NodeConfigError, match="absolute"):
             remote_mux.push_files(NODE, _recipe(tmp_path, remote_root="-rf"))
+        assert len(node_home.calls()) == 1
+
+
+class TestTextWithNoUtf8FormIsRefusedInOurWords:
+    """The header and the decoration script frame config values (a command,
+    a project title) as UTF-8. One with no UTF-8 form is a ValueError in our
+    words and the class -- the row a user reads -- with the codec's own
+    words chained for nodes.log. Only the HOME probe has run: nothing was
+    sent."""
+
+    def test_a_command_with_no_utf_8_form(self, node_home, tmp_path):
+        _answers(node_home)
+        with pytest.raises(ValueError) as info:
+            remote_mux.bring_up(
+                NODE, _recipe(tmp_path, command="claude --continue \ud83d")
+            )
+        assert str(info.value) == (
+            "the project's repo, node folder or command has text with no "
+            "UTF-8 form (UnicodeEncodeError)"
+        )
+        assert isinstance(info.value.__cause__, UnicodeEncodeError)
+        assert len(node_home.calls()) == 1
+
+    def test_a_session_name_with_no_utf_8_form(self, node_home, tmp_path):
+        _answers(node_home)
+        with pytest.raises(ValueError) as info:
+            remote_mux.bring_up(NODE, _recipe(tmp_path, sid="api\ud83d"))
+        assert str(info.value) == (
+            "the project's session name has text with no UTF-8 form "
+            "(UnicodeEncodeError)"
+        )
+        assert isinstance(info.value.__cause__, UnicodeEncodeError)
         assert len(node_home.calls()) == 1
 
 

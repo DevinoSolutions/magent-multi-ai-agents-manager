@@ -1481,14 +1481,26 @@ def decoration_script(sid: str, nick: str, code_hint: bool) -> str:
 def decorate(node: Node, sid: str, nick: str) -> bool:
     """(Re)apply the decoration to a session already running on ``node``, in
     one connection. ``code_hint`` is THIS machine's answer: F2 is caught by the
-    listener on this PC, not by anything on the node."""
-    script = decoration_script(sid, nick, psmux.code_on_path())
+    listener on this PC, not by anything on the node. A ``sid`` with no UTF-8
+    form cannot be sent: False, like any other decoration failure, with the
+    codec's words in the log alone."""
+    try:
+        script = decoration_script(sid, nick, psmux.code_on_path()).encode("utf-8")
+    except UnicodeEncodeError as e:
+        get_logger("nodes").warning(
+            "decoration of %r on %s not sent (%s): %s",
+            sid,
+            node.nick,
+            type(e).__name__,
+            e,
+        )
+        return False
     try:
         result = run(
             node,
             ["bash", "-s"],
             timeout_s=SCRIPT_TIMEOUT_S,
-            input_bytes=script.encode("utf-8"),
+            input_bytes=script,
             check=False,
         )
     except RemoteError:
@@ -2425,7 +2437,9 @@ def _header(
 ) -> bytes:
     """The payload's ``header`` member: NUL-terminated tokens, read by
     bring_up.sh with ``read -d ''``. A NUL is the one byte a token cannot
-    carry, so one is refused rather than silently splitting a token."""
+    carry, so one is refused rather than silently splitting a token. So is a
+    token with no UTF-8 form (a lone surrogate, from a ``\\udXXX`` escape in
+    the config): our words and the class, the codec's chained for the log."""
     start, fresh = _start_argvs(recipe, resume_id)
     tokens = [_HEADER_MAGIC, "1" if allow_dirty else "0", str(len(recipe.repos))]
     for repo in recipe.repos:
@@ -2438,7 +2452,13 @@ def _header(
     tokens += [str(len(start)), *start, str(len(fresh)), *fresh]
     if any("\0" in token for token in tokens):
         raise ValueError("a bring-up header token contains a NUL byte")
-    return b"".join(token.encode("utf-8") + b"\0" for token in tokens)
+    try:
+        return b"".join(token.encode("utf-8") + b"\0" for token in tokens)
+    except UnicodeEncodeError as e:
+        raise ValueError(
+            "the project's repo, node folder or command has text with no "
+            f"UTF-8 form ({type(e).__name__})"
+        ) from e
 
 
 def _archive_name(rel: str) -> str:
@@ -2576,11 +2596,19 @@ def _add_bytes(tar: tarfile.TarFile, name: str, data: bytes) -> None:
 def _payload(*, header: bytes, decorate: str, files: list[tuple[str, bytes]]) -> bytes:
     """ONE uncompressed PAX tar: ``header``, ``decorate``, then ``files``
     (``_files``' members, in its order). Bytes stay bytes -- a secret file is
-    never re-encoded."""
+    never re-encoded. ``decorate`` names the session, so a title with no
+    UTF-8 form is refused as ``_header`` refuses a token."""
+    try:
+        script = decorate.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise ValueError(
+            "the project's session name has text with no UTF-8 form "
+            f"({type(e).__name__})"
+        ) from e
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
         _add_bytes(tar, "header", header)
-        _add_bytes(tar, "decorate", decorate.encode("utf-8"))
+        _add_bytes(tar, "decorate", script)
         for name, data in files:
             _add_bytes(tar, name, data)
     return buf.getvalue()
