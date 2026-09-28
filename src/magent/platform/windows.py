@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import ctypes.wintypes
+import re
 import shutil
 import subprocess
 import tempfile
@@ -159,9 +160,11 @@ def _ps_quote(value: str) -> str:
     Single-quoted, so nothing inside is expanded: these are paths and a whole
     Windows command line, and a ``$`` or a backtick in either must arrive at
     the child exactly as written. Doubling is the only escape a single-quoted
-    PowerShell string has.
+    PowerShell string has, and PowerShell ends such a string on FIVE code
+    points, not one: U+0027 and the typographic U+2018, U+2019, U+201A and
+    U+201B. Every one of them is doubled, or a value holding one breaks out.
     """
-    return "'" + value.replace("'", "''") + "'"
+    return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", value) + "'"
 
 
 def _handoff_script(

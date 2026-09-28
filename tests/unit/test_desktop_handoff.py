@@ -35,6 +35,12 @@ from magent.launch import (
 )
 from magent.platform import HandoffResult, Platform
 from tests.conftest import FakePlatform
+from tests.unit._ps_parse import argument_of
+from tests.unit._ps_parse import parse as parse_powershell
+
+# Every code point PowerShell's tokenizer ends a single-quoted literal on:
+# U+0027 and the four typographic quotes U+2018, U+2019, U+201A and U+201B.
+_PS_SINGLE_QUOTES = ["'", "\u2018", "\u2019", "\u201a", "\u201b"]
 
 
 def _policy(monkeypatch, value: str) -> None:
@@ -609,6 +615,31 @@ class TestThePowerShellQuoting:
         # whole command line, and a `$` or a backtick must arrive verbatim.
         assert _ps_quote(r"C:\a $b `c") == r"'C:\a $b `c'"
         assert _ps_quote("it's") == "'it''s'"
+
+    @pytest.mark.parametrize("quote", _PS_SINGLE_QUOTES)
+    def test_every_single_quote_powershell_knows_is_doubled(self, quote):
+        from magent.platform.windows import _ps_quote
+
+        # PowerShell ends a single-quoted literal on any of FIVE code points,
+        # not only the ASCII one, and doubling is the escape for each.
+        assert _ps_quote(f"a{quote}b") == f"'a{quote}{quote}b'"
+
+    @pytest.mark.parametrize("quote", _PS_SINGLE_QUOTES)
+    def test_a_cwd_holding_a_single_quote_stays_one_literal(self, tmp_path, quote):
+        # PowerShell's own parser, never a run: the whole cwd must come back as
+        # the ONE single-quoted -WorkingDirectory value, and no fragment of it
+        # may parse as a command of its own.
+        from magent.platform.windows import _handoff_script
+
+        cwd = rf"C:\work{quote}; Get-Date; {quote}x"
+        script = _handoff_script(
+            ["py.exe", "up"], cwd, Path("o"), Path("e"), Path("p"), Path("r")
+        )
+        parsed = parse_powershell(script, tmp_path)
+        assert parsed.errors == []
+        assert parsed.named("Get-Date") == []
+        (start,) = parsed.named("Start-Process")
+        assert argument_of(start, "WorkingDirectory") == ("const", "SingleQuoted", cwd)
 
     def test_the_argv_becomes_one_argument_list_string(self):
         from magent.platform.windows import _handoff_script
