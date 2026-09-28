@@ -155,8 +155,8 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
         # The same door on Linux: config_base() is xdg_config_home(), and an
         # exported XDG_CONFIG_HOME (a login's, a runner's) wins over
         # ~/.config, so moving HOME alone left it pointing at the real one.
-        # <home>/.config is what xdg_config_home() falls back to unset, and
-        # what every tier that builds a child env already sets by hand.
+        # <home>/.config is what xdg_config_home() falls back to when the
+        # variable is unset, so a box that never exported it sees no change.
         monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
         drive, tail = os.path.splitdrive(str(home))
         values = (str(home), str(home), drive, tail or os.sep)
