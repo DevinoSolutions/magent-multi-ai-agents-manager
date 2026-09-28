@@ -19,6 +19,7 @@ import sys
 import tarfile
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ import pytest
 from magent import cli, log, node_scripts, nodes, remote_mux
 from magent.cli import hooks_cmd
 from magent.config import MagentConfig
+from magent.node_scripts import node_apply
 from magent.nodes import Node, UserScope
 from magent.remote_mux import ProvisionReport, RemoteError, ScriptLine
 from tests.unit._fake_ssh import FakeCall, FakeSsh, gh_auth_status, make_fake_ssh
@@ -1062,19 +1064,14 @@ class TestAMalformedPcFileIsANoteNotACrash:
         assert scope.settings == {"model": "opus"}
         assert scope.notes == ()
 
-    # Past the bound, the depth walk refuses it; far past it, json itself
-    # recurses out first, and that keeps its class.
-    @pytest.mark.parametrize(
-        ("depth", "why"),
-        [
-            (65, "nested deeper than 64 levels"),
-            (500, "nested deeper than 64 levels"),
-            (100_000, "RecursionError"),
-        ],
-    )
+    # Past the bound it is refused before json parses it -- far past it too,
+    # where json's own answer (RecursionError, JSONDecodeError or a whole
+    # parse) would depend on the interpreter's C stack.
+    @pytest.mark.parametrize("depth", [65, 500, 100_000])
     def test_a_file_nested_too_deep_is_refused_before_it_is_walked(
-        self, tmp_path, depth, why
+        self, tmp_path, depth
     ):
+        why = "nested deeper than 64 levels"
         home = _pc_home(tmp_path)
         (home / ".claude").mkdir()
         (home / ".claude" / "settings.json").write_text(
@@ -1135,6 +1132,87 @@ def _fail_read(
         return read_text(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", guarded)
+
+
+def _nested(depth: int) -> str:
+    return "[" * depth + "]" * depth
+
+
+# The texts json parses on every stack, and whether each nests past the bound.
+_PARSED_DEPTHS = [
+    pytest.param(_nested(64), False, id="64-arrays"),
+    pytest.param(_nested(65), True, id="65-arrays"),
+    pytest.param('{"a":' * 64 + "1" + "}" * 64, False, id="64-objects"),
+    pytest.param('{"a":' * 64 + "{}" + "}" * 64, True, id="65-objects"),
+    # A bracket inside a string -- a key's too -- is text, not nesting.
+    pytest.param('["' + "[{" * 100 + '"]', False, id="in-a-string"),
+    pytest.param('{"[[[[": ' + _nested(63) + "}", False, id="in-a-key"),
+    # An escaped quote does not end the string...
+    pytest.param('["\\"' + "[" * 100 + '"]', False, id="escaped-quote"),
+    # ... and an escaped backslash does not escape the quote after it.
+    pytest.param('["\\\\", ' + _nested(64) + "]", True, id="escaped-backslash-65"),
+    pytest.param('["\\\\", ' + _nested(63) + "]", False, id="escaped-backslash-64"),
+    # Size is not depth.
+    pytest.param("[" + ",".join(["1"] * 1_000_000) + "]", False, id="1M-flat-entries"),
+]
+
+
+_SCANS = [
+    pytest.param(nodes._text_nests_deeper_than, id="nodes"),
+    pytest.param(node_apply._text_nests_deeper_than, id="node_apply"),
+]
+
+
+class TestTheDepthScanReadsNestingNotText:
+    """The scan every node-JSON read runs before json parses (nodes', and
+    node_apply's pinned copy): only a bracket outside a string nests,
+    exactly MAX_JSON_DEPTH levels still read, and size is never depth."""
+
+    @pytest.mark.parametrize("scan", _SCANS)
+    @pytest.mark.parametrize(
+        ("text", "deeper"),
+        [
+            *_PARSED_DEPTHS,
+            pytest.param("[" * 100_000, True, id="100k-open"),
+            pytest.param(_nested(100_000), True, id="100k-closed"),
+            # An unclosed string runs to the end, as json reads it: its
+            # brackets never make "too deep", and json names the decode error.
+            pytest.param('["' + "[" * 100, False, id="unclosed-string"),
+            pytest.param("", False, id="empty"),
+        ],
+    )
+    def test_it_counts_brackets_outside_strings(self, scan, text, deeper):
+        assert scan(text, nodes.MAX_JSON_DEPTH) is deeper
+
+    # Linear: a flat multi-MB array, and the inputs a backtracking string
+    # pattern chokes on (a long run of escapes, an unclosed string of them).
+    @pytest.mark.parametrize("scan", _SCANS)
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(
+                lambda: "[" + ",".join(["1"] * 2_500_000) + "]", id="5MB-flat-array"
+            ),
+            pytest.param(lambda: '["' + "\\a" * 1_000_000 + '"]', id="2MB-of-escapes"),
+            pytest.param(
+                lambda: '["' + "\\" * 2_000_001, id="2MB-of-backslashes-unclosed"
+            ),
+            pytest.param(lambda: '"x", ' * 400_000, id="400k-strings"),
+        ],
+    )
+    def test_it_is_linear(self, scan, build):
+        text = build()
+        start = time.perf_counter()
+        assert scan(text, nodes.MAX_JSON_DEPTH) is False
+        # Generous, so it never flakes: tens of ms here.
+        assert time.perf_counter() - start < 10.0
+
+    # Where json parses, the scan and the walk behind it agree on the depth.
+    @pytest.mark.parametrize(("text", "deeper"), _PARSED_DEPTHS)
+    def test_it_agrees_with_the_walk_of_what_json_parsed(self, text, deeper):
+        assert (
+            nodes._nests_deeper_than(json.loads(text), nodes.MAX_JSON_DEPTH) is deeper
+        )
 
 
 # Each way a PC file that EXISTS can fail to read as a JSON object, and the
@@ -1235,8 +1313,9 @@ class TestAnUnreadablePcFileIsUnknownNotEmpty:
         assert found == nodes._Unread(why)
 
     def test_a_file_nested_too_deep_to_parse_is_unread_never_raised(self, tmp_path):
-        # json raises RecursionError -- not a ValueError -- on nesting deeper
-        # than it can parse; provisioning must not die on a PC file.
+        # Refused before json parses it: this deep, json answers RecursionError
+        # on one stack and JSONDecodeError on a bigger one. Provisioning must
+        # neither die on a PC file nor name the parser's class.
         path = tmp_path / "settings.json"
         path.write_text("[" * 100_000, encoding="utf-8")
         notes: list[str] = []
@@ -1244,13 +1323,65 @@ class TestAnUnreadablePcFileIsUnknownNotEmpty:
             found: object = nodes._read_object(path, "settings.json", notes)
         except RecursionError as e:  # a raise is this pin's FAILURE
             found = e
-        assert found == nodes._Unread("RecursionError")
+        assert found == nodes._Unread("nested deeper than 64 levels")
         assert notes == [
             (
-                "settings.json: could not be read (RecursionError), so nothing "
-                "from it ships this time"
+                "settings.json: could not be read (nested deeper than 64 levels), "
+                "so nothing from it ships this time"
             )
         ]
+
+    # Brackets inside an unclosed string are never "too deep": json names it.
+    def test_an_unclosed_string_is_a_decode_error_not_too_deep(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text('{"a": "' + "[" * 100, encoding="utf-8")
+        assert nodes._read_object(path, "settings.json", []) == nodes._Unread(
+            "JSONDecodeError"
+        )
+
+    # Size, or a string of brackets, is not depth: both ship.
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"a": "' + "[" * 100_000 + '"}',
+            '{"a": [' + ",".join(["1"] * 1_000_000) + "]}",
+        ],
+        ids=["brackets-in-a-string", "1M-flat"],
+    )
+    def test_what_only_looks_deep_is_read(self, tmp_path, text):
+        path = tmp_path / "settings.json"
+        path.write_text(text, encoding="utf-8")
+        notes: list[str] = []
+        assert nodes._read_object(path, "settings.json", notes) == json.loads(text)
+        assert notes == []
+
+    # The backstops behind the scan, for nesting it does not refuse: the walk
+    # after the parse, and a RecursionError out of the parse keeps its class.
+    def test_the_walk_still_refuses_what_the_scan_let_through(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "_text_nests_deeper_than", lambda text, limit: False)
+        path = tmp_path / "settings.json"
+        path.write_text('{"a":' * 65 + "1" + "}" * 65, encoding="utf-8")
+        assert nodes._read_object(path, "settings.json", []) == nodes._Unread(
+            "nested deeper than 64 levels"
+        )
+
+    def test_a_recursion_error_the_scan_let_through_is_unread_never_raised(
+        self, tmp_path, monkeypatch
+    ):
+        def loads(text: str) -> object:
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(nodes, "_text_nests_deeper_than", lambda text, limit: False)
+        monkeypatch.setattr(nodes, "json", types.SimpleNamespace(loads=loads))
+        path = tmp_path / "settings.json"
+        path.write_text("[]", encoding="utf-8")
+        try:
+            found: object = nodes._read_object(path, "settings.json", [])
+        except RecursionError as e:  # a raise is this pin's FAILURE
+            found = e
+        assert found == nodes._Unread("RecursionError")
 
     @pytest.mark.parametrize("text", ["[1]", '"x"', "null", "3"])
     def test_a_top_level_that_is_not_an_object_is_unread(self, tmp_path, text):

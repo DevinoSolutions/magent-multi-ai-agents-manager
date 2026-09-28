@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import errno
+import inspect
 import io
 import json
 import os
@@ -139,6 +140,21 @@ class TestTheApplierIsShippable:
 
     def test_it_reads_the_manifest_version_the_payload_writes(self):
         assert node_apply.MANIFEST_VERSION == remote_mux.PAYLOAD_VERSION
+
+    # nodes owns the bound and the scan; nothing from magent is installed on
+    # the node, so this module carries copies -- the same bytes, the same
+    # wording nodes' reader gives.
+    def test_it_refuses_nesting_by_the_pcs_bound_and_scan(self):
+        assert node_apply.MAX_JSON_DEPTH == nodes.MAX_JSON_DEPTH
+        assert inspect.getsource(node_apply._text_nests_deeper_than) == (
+            inspect.getsource(nodes._text_nests_deeper_than)
+        )
+        assert node_apply._JSON_NESTING_TOKEN.pattern == (
+            nodes._JSON_NESTING_TOKEN.pattern
+        )
+        assert node_apply._JSON_NESTING_TOKEN.flags == nodes._JSON_NESTING_TOKEN.flags
+        # The literal test_node_provision pins for nodes' reader.
+        assert node_apply._TOO_DEEP == TOO_DEEP
 
     def test_it_installs_the_hook_where_the_settings_entries_run_it(self):
         assert (
@@ -488,6 +504,52 @@ class TestTheStoreAndTheStepLoopNeverAbort:
         assert _status(lines, "state_hook") == "did"
         (store,) = [line for line in lines if line.item == "store"]
         assert store.status == "fail"
+
+    # A store nested past the bound is read as lost, like a torn one, and is
+    # never raised out of the run, whatever json would do with it: every step
+    # looks again, and the store is written anew.
+    @pytest.mark.parametrize(
+        "spoil",
+        [
+            pytest.param(lambda kept: "[" * 100_000, id="100k-open"),
+            pytest.param(
+                lambda kept: json.dumps(
+                    {**kept, "junk": json.loads('{"a":' * 64 + "{}" + "}" * 64)}
+                ),
+                id="65-deep-beside-the-digests",
+            ),
+        ],
+    )
+    def test_a_store_nested_too_deep_is_read_as_lost(
+        self, box, tmp_path, capsys, spoil
+    ):
+        work = _work(tmp_path)
+        box.apply(work)
+        store = box.home / ".magent" / "provision.json"
+        store.write_text(spoil(_json(store)), encoding="utf-8")
+        capsys.readouterr()
+        assert box.apply(work) == 0
+        assert _status(_lines(capsys), "state_hook") == "did"
+        assert "junk" not in _json(store)
+
+    # The same store never escapes provision.sh's entry: main() finishes the
+    # run. (A raise is caught so the pin fails an assertion, not a crash.)
+    def test_a_store_nested_too_deep_never_escapes_main(
+        self, box, tmp_path, monkeypatch
+    ):
+        # main() applies to Path.home(): conftest has already pointed that
+        # at a tmp dir.
+        store = Path.home() / node_apply.STORE
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text("[" * 100_000, encoding="utf-8")
+        monkeypatch.setattr(sys, "stdin", io.StringIO("\n"))
+        work = _work(tmp_path)
+        try:
+            rc = node_apply.main(["--work", str(work), "--path", box.path])
+        except RecursionError:
+            rc = None
+        assert rc == 0
+        assert isinstance(_json(store), dict)
 
     def test_a_step_bug_of_any_type_fails_alone_with_the_token_masked(
         self, box, tmp_path, capsys, monkeypatch
@@ -1229,7 +1291,17 @@ class TestTheMcpOAuthIsTrackedPerEntry:
         for token in ("PC-A", "PC-B"):
             assert token not in text
 
-    @pytest.mark.parametrize("old", ["0" * 64 + ":" + A + "," + B, "{not json", ""])
+    @pytest.mark.parametrize(
+        "old",
+        [
+            "0" * 64 + ":" + A + "," + B,
+            "{not json",
+            "",
+            # Nested past the bound: unreadable too, whatever json would do.
+            pytest.param("[" * 100_000, id="100k-open"),
+            pytest.param('{"a":' * 100_000 + "{}" + "}" * 100_000, id="100k-closed"),
+        ],
+    )
     def test_an_old_or_unreadable_store_value_treats_every_entry_as_new(
         self, box, tmp_path, old
     ):
@@ -1241,6 +1313,22 @@ class TestTheMcpOAuthIsTrackedPerEntry:
         store_path = box.home / ".magent" / "provision.json"
         store = _json(store_path)
         store["digests"]["mcp_oauth"] = old
+        _put(store_path, store)
+        box.apply(work)
+        assert _node_token(box, A) == "PC-A"
+        assert set(json.loads(_stored(box))) == {A, B}
+
+    # Nested past the bound anywhere, the remembered value is unreadable as a
+    # whole -- even beside the shas it would otherwise name.
+    def test_a_remembered_value_nested_too_deep_knows_no_entry(self, box, tmp_path):
+        work = _work(tmp_path, _two())
+        box.apply(work)
+        _refresh_on_node(box, A, "NODE-REFRESHED-A")
+        store_path = box.home / ".magent" / "provision.json"
+        store = _json(store_path)
+        deep = json.loads('{"a":' * 64 + "{}" + "}" * 64)
+        shas = json.loads(store["digests"]["mcp_oauth"])
+        store["digests"]["mcp_oauth"] = json.dumps({**shas, "junk": deep})
         _put(store_path, store)
         box.apply(work)
         assert _node_token(box, A) == "PC-A"
@@ -1949,7 +2037,17 @@ class TestThePlugins:
     @pytest.mark.parametrize("broken", ["plugin list", "plugin marketplace list"])
     @pytest.mark.parametrize(
         ("stdout", "rc"),
-        [("", 1), ("[]", 1), ("[]", 2), ("not json", 0), ('{"id": "p@mkt"}', 0)],
+        [
+            ("", 1),
+            ("[]", 1),
+            ("[]", 2),
+            ("not json", 0),
+            ('{"id": "p@mkt"}', 0),
+            # Nested past the bound: never read as an empty listing, which
+            # would reinstall every plugin, whatever json would do with it.
+            pytest.param("[" * 100 + "]" * 100, 0, id="100-deep"),
+            pytest.param("[" * 100_000, 0, id="100k-open"),
+        ],
     )
     def test_a_listing_claude_cannot_answer_fails_and_installs_nothing(
         self, box, tmp_path, capsys, broken, stdout, rc
@@ -3445,14 +3543,20 @@ UNREAD = [
 ]
 # Each way a payload member can fail to read as a JSON object, and the class
 # the node's row shows. The PC always ships these members, so a missing or
-# empty one is a broken payload -- unknown, never "this PC has none".
+# empty one is a broken payload -- unknown, never "this PC has none". Nesting
+# past the bound is refused before json parses it, whatever json would do
+# with it on this stack: raise, or parse it whole.
+TOO_DEEP = "nested deeper than 64 levels"
 BROKEN_MEMBER = [
     ("missing", "FileNotFoundError"),
     ("not-json", "JSONDecodeError"),
     ("not-an-object", "not a JSON object"),
     ("empty", "JSONDecodeError"),
     ("whitespace", "JSONDecodeError"),
-    ("too-deep", "RecursionError"),
+    ("too-deep", TOO_DEEP),
+    ("too-deep-closed", TOO_DEEP),
+    ("sixty-five", TOO_DEEP),
+    ("unclosed-string", "JSONDecodeError"),
     ("eio", "OSError"),
 ]
 _MEMBER_TEXT = {
@@ -3461,6 +3565,11 @@ _MEMBER_TEXT = {
     "empty": "",
     "whitespace": " \n\t ",
     "too-deep": "[" * 100_000,
+    "too-deep-closed": '{"a":' * 100_000 + "{}" + "}" * 100_000,
+    # One level past the bound: json parses it on every stack.
+    "sixty-five": '{"a":' * 64 + "{}" + "}" * 64,
+    # Brackets inside a string json never closes: a decode error, not depth.
+    "unclosed-string": '{"a": "' + "[" * 100,
 }
 
 
@@ -3719,7 +3828,10 @@ NODE_UNKNOWN = [
         ("empty", "empty", REMEDY),
         ("whitespace", "empty", REMEDY),
         ("not-json", "JSONDecodeError", ""),
-        ("too-deep", "RecursionError", ""),
+        ("too-deep", TOO_DEEP, ""),
+        ("too-deep-closed", TOO_DEEP, ""),
+        ("sixty-five", TOO_DEEP, ""),
+        ("unclosed-string", "JSONDecodeError", ""),
         ("eio", "OSError", ""),
     ]
 ]

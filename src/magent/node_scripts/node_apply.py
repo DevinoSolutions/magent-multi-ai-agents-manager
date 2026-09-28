@@ -55,6 +55,10 @@ if TYPE_CHECKING:
 
 # Pinned equal to remote_mux.PAYLOAD_VERSION by tests/unit/test_node_apply.py.
 MANIFEST_VERSION = 1
+# A node file or payload member nested deeper than this is refused before
+# json parses it (``_text_nests_deeper_than``). Pinned equal to
+# nodes.MAX_JSON_DEPTH -- the PC's own bound -- by tests/unit/test_node_apply.py.
+MAX_JSON_DEPTH = 64
 # The installed state hook, under $HOME. remote_mux.NODE_STATE_HOOK_COMMAND
 # runs it (pinned by test), so a settings hook naming it is magent's own.
 STATE_HOOK_MARKER = ".magent/bin/state-hook.sh"
@@ -209,6 +213,36 @@ _NOT_AN_OBJECT = "not a JSON object"
 # The class ``_node_object`` gives a node file with no bytes, or only
 # whitespace, in place of JSONDecodeError.
 _EMPTY = "empty"
+# The class a node file or payload member nested past ``MAX_JSON_DEPTH``
+# reads as, whatever the parser would have raised -- the nodes.py wording.
+_TOO_DEEP = f"nested deeper than {MAX_JSON_DEPTH} levels"
+# A JSON string (its escapes read; an unterminated one runs to the end, as
+# json reads it) or one bracket: all ``_text_nests_deeper_than`` reads. A
+# copy of nodes._JSON_NESTING_TOKEN, pinned equal by
+# tests/unit/test_node_apply.py -- change the two together.
+_JSON_NESTING_TOKEN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"?|[\[\]{}]', re.DOTALL)
+
+
+# A byte-identical copy of nodes._text_nests_deeper_than (nothing from magent
+# is installed here), pinned by tests/unit/test_node_apply.py -- change the
+# two together.
+def _text_nests_deeper_than(text: str, limit: int) -> bool:
+    """True when the JSON ``text`` opens more than ``limit`` arrays/objects
+    inside one another, read before json.loads sees it. json.loads recurses
+    once per level, and what stops it far past the bound depends on the C
+    stack -- RecursionError on one runner, JSONDecodeError or a whole parse
+    on another -- so the refusal is this scan's, the same on every
+    interpreter and OS. A bracket inside a string is not nesting."""
+    depth = 0
+    for match in _JSON_NESTING_TOKEN.finditer(text):
+        token = match.group()
+        if token in ("[", "{"):
+            depth += 1
+            if depth > limit:
+                return True
+        elif token in ("]", "}"):
+            depth -= 1
+    return False
 
 
 def _member(ctx: Ctx, name: str) -> dict[str, object] | str:
@@ -217,7 +251,11 @@ def _member(ctx: Ctx, name: str) -> dict[str, object] | str:
     so a missing, empty or torn one is a broken payload -- unknown, never
     the {} that reads as "this PC has none"."""
     try:
-        loaded = json.loads((ctx.work / name).read_text(encoding="utf-8"))
+        text = (ctx.work / name).read_text(encoding="utf-8")
+        if _text_nests_deeper_than(text, MAX_JSON_DEPTH):
+            return _TOO_DEEP
+        loaded = json.loads(text)
+    # RecursionError: the backstop for any nesting the scan did not refuse.
     except (OSError, ValueError, RecursionError) as e:
         return type(e).__name__
     return loaded if isinstance(loaded, dict) else _NOT_AN_OBJECT
@@ -234,6 +272,8 @@ def _node_object(path: Path) -> dict[str, object] | str:
         text = path.read_text(encoding="utf-8")
         if not text.strip():
             return _EMPTY
+        if _text_nests_deeper_than(text, MAX_JSON_DEPTH):
+            return _TOO_DEEP
         loaded = json.loads(text)
     except FileNotFoundError:
         return {}
@@ -283,9 +323,12 @@ def _load(path: Path) -> object:
         return None
     if not text.strip():
         return {}
+    if _text_nests_deeper_than(text, MAX_JSON_DEPTH):
+        return None
     try:
         return json.loads(text)
-    except ValueError:
+    # RecursionError: the backstop for any nesting the scan did not refuse.
+    except (ValueError, RecursionError):
         return None
 
 
@@ -964,9 +1007,12 @@ def _entry_shas(stored: object) -> dict[str, str]:
     """The per-entry shas the last clean mcp_oauth run remembered. A value
     that is not that -- the whole-map digest an older apply stored, or
     anything unreadable -- knows no entry, so every entry counts as new once."""
+    if not isinstance(stored, str) or _text_nests_deeper_than(stored, MAX_JSON_DEPTH):
+        return {}
     try:
-        parsed = json.loads(stored) if isinstance(stored, str) else None
-    except ValueError:
+        parsed = json.loads(stored)
+    # RecursionError: the backstop for any nesting the scan did not refuse.
+    except (ValueError, RecursionError):
         parsed = None
     if not isinstance(parsed, dict):
         return {}
@@ -1159,11 +1205,12 @@ def _listing(argv: list[str]) -> list[dict[str, object]] | None:
     """Every object a ``claude ... --json`` listing prints, or None when the
     command failed or printed no JSON list."""
     done = _tool(argv)
-    if done.returncode != 0:
+    if done.returncode != 0 or _text_nests_deeper_than(done.stdout, MAX_JSON_DEPTH):
         return None
     try:
         items = json.loads(done.stdout)
-    except ValueError:
+    # RecursionError: the backstop for any nesting the scan did not refuse.
+    except (ValueError, RecursionError):
         return None
     if not isinstance(items, list):
         return None
