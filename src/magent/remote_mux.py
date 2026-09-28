@@ -2146,8 +2146,9 @@ INSTALL_REFUSALS = {
     3: "the transcript payload arrived missing or broken; nothing was installed",
     4: "the node's project dir is a symlink; nothing was installed through it",
     5: (
-        "the node could not make a folder the conversation goes in, so no file"
-        " was installed; check that the node user has a home it can write to"
+        "the node could not make a folder the conversation goes in, or could"
+        " not restrict one it made to its owner, so no file was installed;"
+        " check that the node user has a home it owns and can write to"
     ),
 }
 # What starts each line of a refusal that carries the OS's reason

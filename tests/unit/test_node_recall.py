@@ -749,6 +749,12 @@ class TestTheInstallScriptsOnANode:
         )
 
         assert done.returncode == 2
+        assert (
+            done.stderr
+            == (
+                f"install_transcripts.sh: not an encoded project dir name: {name}\n"
+            ).encode()
+        )
         assert not (home / ".claude").exists()
 
 
@@ -906,6 +912,13 @@ class TestTheInstallNeverOverwritesTheNodesWork:
         done = _node_run(self._call(monkeypatch, tmp_path), home)
 
         assert done.returncode == 4
+        assert (
+            done.stderr
+            == (
+                f"install_transcripts.sh: {home}/.claude/projects/{_ENCODED} is a"
+                " symlink; not installing through it\n"
+            ).encode()
+        )
         assert list(elsewhere.iterdir()) == []
 
     def test_a_file_where_the_payload_has_a_directory_is_kept_with_its_contents(
@@ -1046,6 +1059,13 @@ class TestTheInstallNeverOverwritesTheNodesWork:
         done = _node_run(self._call(monkeypatch, tmp_path), home)
 
         assert done.returncode == 4
+        assert (
+            done.stderr
+            == (
+                f"install_transcripts.sh: {home}/.claude/projects/{_ENCODED}/memory"
+                " is a symlink; not installing through it\n"
+            ).encode()
+        )
         assert list(elsewhere.iterdir()) == []
         assert not (self._dest(home) / f"{SESSION_ID}.jsonl").exists()
 
@@ -1379,7 +1399,10 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
         self, monkeypatch, tmp_path, rel
     ):
         # mkdir made the folder; the chmod that makes it exactly owner-only
-        # failed. The refusal names that, not a folder it could not make.
+        # failed. The refusal names that, not a folder it could not make, and
+        # chmod's own line never comes through: its reason does, tagged, as
+        # mkdir's does (G-S8). The WHOLE stderr, so chmod's words cannot hide
+        # above a last line that looks right.
         home = tmp_path / "nodehome"
         home.mkdir()
         refused = f"{home}/{rel}"
@@ -1389,13 +1412,13 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
 
         assert done.returncode == 5
         assert (
-            done.stderr.splitlines()[-1]
+            done.stderr
             == (
                 f"install_transcripts.sh: cannot restrict folder {refused} to its"
-                " owner; no file installed"
+                " owner; no file installed\n"
+                f"{remote_mux.INSTALL_REASON_TAG}Operation not permitted\n"
             ).encode()
         )
-        assert b"cannot make folder" not in done.stderr
         assert [p for p in home.rglob("*") if not p.is_dir()] == []
 
     @pytest.mark.skipif(
@@ -1567,6 +1590,15 @@ class TestTheInstallResultAndRefusals:
 
         assert caught.value.stderr_tail == "node said no"
         assert _node_logs(caplog) == []
+
+    def test_the_folder_refusal_names_both_ways_a_folder_fails(self):
+        # G-S8: exit 5 is a folder the node could not make, or one it made
+        # but could not restrict to its owner -- not only "could not make".
+        assert remote_mux.INSTALL_REFUSALS[5] == (
+            "the node could not make a folder the conversation goes in, or could"
+            " not restrict one it made to its owner, so no file was installed;"
+            " check that the node user has a home it owns and can write to"
+        )
 
     # A refusal as install_transcripts.sh says it (G-S1): its own line, then
     # the OS's reason on a line of its own under the tag.
