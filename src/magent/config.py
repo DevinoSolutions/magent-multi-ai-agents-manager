@@ -146,7 +146,7 @@ def _load_json_object(text: str) -> dict[str, object]:
         raise ConfigError(f"Config is not valid JSON: {e}") from e
     if not isinstance(data, dict):
         raise ConfigError("Config must be a JSON object")
-    _refuse_text_with_no_utf8_form(data, "")
+    _refuse_text_with_no_utf8_form(data)
     return data
 
 
@@ -156,9 +156,9 @@ def _escaped(text: str) -> str:
     return text.encode("ascii", "backslashreplace").decode("ascii")
 
 
-def _refuse_text_with_no_utf8_form(node: object, where: str) -> None:
-    """Raise ConfigError at the first string in ``node`` -- a value or a key,
-    at any depth -- that has no UTF-8 form.
+def _refuse_text_with_no_utf8_form(document: dict[str, object]) -> None:
+    """Raise ConfigError at the first string in ``document`` -- a value or a
+    key, at any depth -- that has no UTF-8 form.
 
     Only a lone UTF-16 surrogate qualifies, and JSON can spell one
     (``"api\\ud83d"``) that json.loads hands back as-is. Loaded, it crashed
@@ -168,22 +168,33 @@ def _refuse_text_with_no_utf8_form(node: object, where: str) -> None:
     argv made from it fares no better. Refused here, once, the whole document
     is covered -- fields added later and the unknown keys load only warns
     about included. The refusal shows the value escaped and names the class,
-    never the codec's message, so it cannot crash on the text it reports."""
-    if isinstance(node, str):
-        try:
-            node.encode("utf-8")
-        except UnicodeEncodeError as e:
-            raise ConfigError(
-                f"{_escaped(where)} has text with no UTF-8 form"
-                f" ({type(e).__name__}): '{_escaped(node)}'"
-            ) from e
-    elif isinstance(node, dict):
-        for key, value in node.items():
-            _refuse_text_with_no_utf8_form(key, f"a key in {where or 'the config'}")
-            _refuse_text_with_no_utf8_form(value, f"{where}.{key}" if where else key)
-    elif isinstance(node, list):
-        for i, item in enumerate(node):
-            _refuse_text_with_no_utf8_form(item, f"{where}[{i}]")
+    never the codec's message, so it cannot crash on the text it reports.
+
+    The walk keeps its own stack instead of recursing: json.loads (3.12+)
+    accepts nesting deeper than the recursion limit and such a file has always
+    loaded, so the check must not be what turns it into a traceback. Children
+    go on the stack reversed, so strings are met in document order -- each key
+    just before its value -- and the one refused is the first in the file."""
+    stack: list[tuple[object, str]] = [(document, "")]
+    while stack:
+        node, where = stack.pop()
+        if isinstance(node, str):
+            try:
+                node.encode("utf-8")
+            except UnicodeEncodeError as e:
+                raise ConfigError(
+                    f"{_escaped(where)} has text with no UTF-8 form"
+                    f" ({type(e).__name__}): '{_escaped(node)}'"
+                ) from e
+        elif isinstance(node, dict):
+            children: list[tuple[object, str]] = []
+            for key, value in node.items():
+                children.append((key, f"a key in {where or 'the config'}"))
+                children.append((value, f"{where}.{key}" if where else key))
+            stack.extend(reversed(children))
+        elif isinstance(node, list):
+            items = [(item, f"{where}[{i}]") for i, item in enumerate(node)]
+            stack.extend(reversed(items))
 
 
 def _obj(raw: dict[str, object], key: str) -> dict[str, object]:
