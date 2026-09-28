@@ -1257,17 +1257,19 @@ def final_pull(
             why = "without moving its mark"
         if stuck:
             # What no screen line carries: the mark asked from and the one
-            # answered, to tell a node's clock from a node stuck on one file.
+            # answered, to tell a node's clock from a node stuck on one file,
+            # and the files still owed -- the node's names, so %r: escaped.
             get_logger(LOG_NAME).warning(
                 (
                     "node %s: final pull of %r reached the pull cap %s: asked from"
-                    " mark %r, the node answered %r"
+                    " mark %r, the node answered %r; still owed: %r"
                 ),
                 entry.nick,
                 entry.sid,
                 why,
                 asked.since if asked is not None else None,
                 mark.since,
+                snap.truncated[entry.sid],
             )
         owed = len(snap.truncated[entry.sid])
         raise PullUnfinished(

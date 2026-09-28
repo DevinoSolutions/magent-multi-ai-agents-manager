@@ -2401,7 +2401,10 @@ class TestTheLastPullMustFinish:
         assert "another run" not in result.stderr
         # Round-2 ruling: where to look instead -- final_pull logged both marks.
         assert _marks_line() in result.stderr
-        assert any("asked from mark" in m for m in _node_logs(caplog))
+        assert any(
+            "asked from mark" in m and "api/transcripts/big.jsonl" in m
+            for m in _node_logs(caplog)
+        ), _node_logs(caplog)
         # m-R3-2: only the remedy that applies -- nothing here to close or free.
         assert "could not store" not in result.stderr
         assert "free disk space" not in result.stderr

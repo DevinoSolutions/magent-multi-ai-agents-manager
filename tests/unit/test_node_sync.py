@@ -3158,6 +3158,8 @@ class TestAFinalPullThatDidNotFinish:
         assert any(
             "without moving its mark" in w
             and f"asked from mark {mark!r}, the node answered {mark!r}" in w
+            # ...and what it still owes: files that may share one mtime.
+            and "still owed: ('api/transcripts/owed.jsonl',)" in w
             for w in _warnings(caplog)
         ), _warnings(caplog)
 
@@ -3190,6 +3192,7 @@ class TestAFinalPullThatDidNotFinish:
         assert any(
             "and moved its mark back" in w
             and f"asked from mark {asked_from!r}, the node answered 0.0" in w
+            and "still owed: ('api/transcripts/owed.jsonl',)" in w
             for w in _warnings(caplog)
         ), _warnings(caplog)
 
