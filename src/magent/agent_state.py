@@ -187,8 +187,9 @@ def _warn_bad_record(path: Path, why: str) -> None:
 
 def read_store(root: Path, *, strict: bool = False) -> list[dict[str, object]]:
     """Every readable record in the store at ``root`` -- this PC's, or a node
-    session's mirror under ``~/.magent/nodes``. Corrupt and non-object files
-    are skipped and named once (``_warn_bad_record``). Never sweeps: a mirror
+    session's mirror under ``~/.magent/nodes``. Corrupt, non-object and
+    too deeply nested (``nodes.MAX_JSON_DEPTH``) files are skipped and named
+    once (``_warn_bad_record``). Never sweeps: a mirror
     is the node's to age, and a record deleted here would come back on the
     next pull. A missing or unreadable directory is an empty store (unreadable
     is logged once). Records are unfiltered (no TTL) and ordered by filename,
@@ -223,15 +224,23 @@ def read_store(root: Path, *, strict: bool = False) -> list[dict[str, object]]:
                 "agent-state: %s is unreadable (%s)", root, exc
             )
         return records
+    # lazy: the hook imports this module on every turn (see the docstring).
+    from magent.nodes import TOO_DEEP, nests_too_deep
+
     for p in paths:
         try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-        # RecursionError: a mirror's files are the node's, and json.loads
-        # answers deep nesting ("[" * 200_000) with it rather than ValueError.
+            text = p.read_text(encoding="utf-8")
+            # A mirror's files are the node's: nested past the bound is
+            # refused before json parses it, the same on every stack.
+            too_deep = nests_too_deep(text)
+            d = None if too_deep else json.loads(text)
+        # RecursionError: the backstop for any nesting the scan did not refuse.
         except (OSError, ValueError, RecursionError) as exc:
             _warn_bad_record(p, f"unreadable ({exc})")
             continue
-        if isinstance(d, dict):
+        if too_deep:
+            _warn_bad_record(p, f"unreadable ({TOO_DEEP})")
+        elif isinstance(d, dict):
             records.append(d)
         else:
             _warn_bad_record(p, "not a JSON object")

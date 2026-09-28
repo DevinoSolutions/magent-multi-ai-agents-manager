@@ -1617,20 +1617,33 @@ def sample(node: Node) -> LoadSample:
     is the likely cause). A non-finite, fractional-count, bool or string
     number is not a sample either."""
     result = run_script(node, "sample", [], timeout_s=PROBE_TIMEOUT_S)
+    text = result.stdout.decode("utf-8", "replace")
+    # Refused before json parses it, the same on every stack: deep nesting
+    # fits easily inside the reply cap.
+    if nodes.nests_too_deep(text):
+        raise _not_a_sample(node, result, nodes.TOO_DEEP)
     try:
-        reading = _load_sample(json.loads(result.stdout.decode("utf-8", "replace")))
+        reading = _load_sample(json.loads(text))
     # OverflowError is an ArithmeticError, not a ValueError: float() of a
     # 401-digit integer overflows. (`1e400` parses to inf, a ValueError from
-    # _finite/_integral.) RecursionError is json.loads' answer to deep nesting,
-    # which fits easily inside the reply cap: the node's bad answer too.
+    # _finite/_integral.) RecursionError: the backstop for any nesting the
+    # scan did not refuse -- the node's bad answer too.
     except (ValueError, KeyError, TypeError, OverflowError, RecursionError) as e:
-        shown = _run_shown(node, *_script_call("sample", [], None))
-        raise RemoteError(
-            result.returncode,
-            f"not a load sample: {e}; got {result.stdout[:200]!r}",
-            shown,
-        ) from e
+        raise _not_a_sample(node, result, e) from e
     return reading
+
+
+def _not_a_sample(
+    node: Node, result: subprocess.CompletedProcess[bytes], why: object
+) -> RemoteError:
+    """``sample``'s refusal of ``result``: rc as the node answered, ``why``,
+    and a bounded head of what came back."""
+    shown = _run_shown(node, *_script_call("sample", [], None))
+    return RemoteError(
+        result.returncode,
+        f"not a load sample: {why}; got {result.stdout[:200]!r}",
+        shown,
+    )
 
 
 # --- The pull (node_sync's one ssh per node per tick) -------------------------
@@ -2059,13 +2072,22 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
     framed, count = _split_trailer(rest)
     meta_line, _, archive = framed.partition(b"\n")
     try:
-        meta = json.loads(meta_line.decode("utf-8"))
-    # RecursionError: json.loads' answer to deep nesting (200k '[' fit well
-    # inside the reply cap). The node's bad answer, not a bug on this PC.
+        text = meta_line.decode("utf-8")
+        too_deep = nodes.nests_too_deep(text)
+        meta = None if too_deep else json.loads(text)
+    # RecursionError: the backstop for any nesting the scan did not refuse.
+    # The node's bad answer, not a bug on this PC.
     except (ValueError, RecursionError) as e:
         # By class, as the archive's error is; the parser's words are logged.
         get_logger("nodes").warning("node pull: unreadable pull metadata: %s", e)
         raise _pull_error(f"unreadable pull metadata ({type(e).__name__})") from e
+    if too_deep:
+        # Refused before json parses it (200k '[' fit well inside the reply
+        # cap), in the same words on every stack.
+        get_logger("nodes").warning(
+            "node pull: unreadable pull metadata: %s", nodes.TOO_DEEP
+        )
+        raise _pull_error(f"unreadable pull metadata ({nodes.TOO_DEEP})")
     if not isinstance(meta, dict):
         raise _pull_error("pull metadata is not an object")
     # json.loads accepts NaN and Infinity (a NaN watermark, which

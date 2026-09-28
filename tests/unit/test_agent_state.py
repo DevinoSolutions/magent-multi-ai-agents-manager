@@ -300,15 +300,29 @@ class TestReadStore:
         assert any(str(mirror / "a.json") in m for m in messages)
         assert any(str(mirror / "b.json") in m for m in messages)
 
+    # Past the bound, whatever json.loads would do with it on this stack:
+    # raise (either class), or -- one level past it, in a record otherwise
+    # good -- parse it whole.
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("[" * 200_000, id="200k-open"),
+            pytest.param(
+                '{"state": "done", "ts": 1.0, "cwd": "/w/a", "session_id": "d", '
+                '"junk": ' + "[" * 64 + "]" * 64 + "}",
+                id="65-deep-in-a-good-record",
+            ),
+        ],
+    )
     def test_a_record_nested_too_deep_to_parse_is_skipped_not_raised(
-        self, tmp_path, caplog
+        self, tmp_path, caplog, text
     ):
-        """A mirror's files are the node's (a pull member may be 64 MiB), and
-        json.loads answers deep nesting with RecursionError -- not a
-        ValueError. It must go down the bad-record path like any torn file,
-        in both reads, and never take the valid record beside it along."""
+        """A mirror's files are the node's (a pull member may be 64 MiB). A
+        record nested past the bound goes down the bad-record path like any
+        torn file, in both reads, the same on every stack, and never takes
+        the valid record beside it along."""
         mirror = _mirror(tmp_path)
-        (mirror / "a.json").write_text("[" * 200_000, encoding="utf-8")
+        (mirror / "a.json").write_text(text, encoding="utf-8")
         good = {"state": "done", "ts": 1.0, "cwd": "/w/b", "session_id": "s"}
         _put(mirror, "b.json", good)
         with caplog.at_level(logging.WARNING, logger="magent.attention"):
@@ -320,7 +334,7 @@ class TestReadStore:
             if str(mirror / "a.json") in r.getMessage()
         ]
         assert len(named) == 1
-        assert "unreadable" in named[0]
+        assert named[0].endswith("unreadable (nested deeper than 64 levels)")
 
     def test_reading_a_store_never_sweeps_but_all_states_still_does(self, tmp_path):
         """A node mirror is the node's to age: a record swept here would come

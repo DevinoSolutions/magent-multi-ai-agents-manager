@@ -2163,12 +2163,24 @@ class TestTheLoadSampleEdges:
         ]
         assert len(said(logging.WARNING, "load sample")) == 2
 
-    def test_a_first_line_nested_too_deep_is_trimmed_not_raised(self, placed):
-        """json.loads raises RecursionError, not ValueError, on deep nesting.
-        The row reader must read that as "not a row", or the tick fails."""
+    @pytest.mark.parametrize(
+        "line",
+        [
+            pytest.param("[" * 200_000, id="200k-open"),
+            # In the window, and parsed whole on every stack: only the scan
+            # makes it "not a row".
+            pytest.param(
+                '{"ts": 500.0, "junk": ' + "[" * 64 + "]" * 64 + "}",
+                id="65-deep-in-window",
+            ),
+        ],
+    )
+    def test_a_first_line_nested_too_deep_is_trimmed_not_raised(self, placed, line):
+        """Nesting past the bound is "not a row", whatever json.loads would do
+        with it on this stack -- never a raise out of the tick."""
         path = nodes.load_path("second")
         path.parent.mkdir(parents=True)
-        path.write_text("[" * 200_000 + "\n", encoding="utf-8")
+        path.write_text(line + "\n", encoding="utf-8")
 
         def pull(_node, _sids):
             return _snapshot(sample=LoadSample(**SAMPLE))
@@ -3579,8 +3591,20 @@ class TestARemovedNodeIsForgotten:
         )
 
 
-# 200k nested arrays: json.loads raises RecursionError, not ValueError.
+# Past the bound, whatever json.loads would do with it on this stack: 200k
+# open arrays (RecursionError on one stack, JSONDecodeError on another), or one
+# level past it beside a good file's fields (parsed whole on every stack).
+# Every node-JSON reader refuses both before json parses them.
 _TOO_DEEP = "[" * 200_000
+_DEEP = ["200k-open", "65-deep-beside"]
+_A_MARK = {"api": {"since": 100.0, "realpath": "/home/amin/magent/api"}}
+
+
+def _past(deep: str, good: dict[str, object]) -> str:
+    """``good``'s text nested past the bound the way ``deep`` names."""
+    if deep == "200k-open":
+        return _TOO_DEEP
+    return json.dumps({**good, "junk": json.loads("[" * 64 + "]" * 64)})
 
 
 class TestJsonNestedTooDeeply:
@@ -3604,14 +3628,18 @@ class TestJsonNestedTooDeeply:
             )
 
         results = node_sync.NodeSyncer(_config(), pull=pull).tick()
-        assert results["second"][0] == node_sync.FAILED
-        assert results["second"][1].startswith("unreadable pull metadata")
+        assert results["second"] == (
+            node_sync.FAILED,
+            "unreadable pull metadata (nested deeper than 64 levels)",
+        )
         assert _node_errors(caplog) == []
 
-    def test_a_node_map_nested_too_deeply_does_not_stop_the_tick(self, placed):
+    @pytest.mark.parametrize("deep", _DEEP)
+    def test_a_node_map_nested_too_deeply_does_not_stop_the_tick(self, placed, deep):
         # It does not raise out of the tick, and -- like any map the tick
         # cannot read -- it is no licence to pull every node with nothing.
-        nodes.NODE_MAP_PATH.write_text(_TOO_DEEP, encoding="utf-8")
+        good = json.loads(nodes.NODE_MAP_PATH.read_text(encoding="utf-8"))
+        nodes.NODE_MAP_PATH.write_text(_past(deep, good), encoding="utf-8")
         asked: list[set[str]] = []
 
         def pull(node, sids):
@@ -3626,35 +3654,53 @@ class TestJsonNestedTooDeeply:
         }
         assert asked == []
 
-    def test_the_strict_reader_calls_it_a_bad_file(self, placed):
+    @pytest.mark.parametrize("deep", _DEEP)
+    def test_the_strict_reader_calls_it_a_bad_file(self, placed, deep):
         """ValueError, the one type every strict caller catches for a bad map
-        (state_stores' attention engine holds its last records on it)."""
-        nodes.NODE_MAP_PATH.write_text(_TOO_DEEP, encoding="utf-8")
-        with pytest.raises(ValueError, match="nested too deeply"):
+        (state_stores' attention engine holds its last records on it), in the
+        same words on every stack."""
+        assert nodes.load_node_map_strict()  # the good map reads
+        good = json.loads(nodes.NODE_MAP_PATH.read_text(encoding="utf-8"))
+        nodes.NODE_MAP_PATH.write_text(_past(deep, good), encoding="utf-8")
+        with pytest.raises(ValueError) as exc:
             nodes.load_node_map_strict()
+        assert str(exc.value) == f"{nodes.NODE_MAP_PATH}: nested deeper than 64 levels"
         assert nodes.read_node_map() == {}
 
-    def test_a_watermark_file_nested_too_deeply_is_no_watermark(self, placed):
+    @pytest.mark.parametrize("deep", _DEEP)
+    def test_a_watermark_file_nested_too_deeply_is_no_watermark(self, placed, deep):
         path = nodes.pull_marks_path("second")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_TOO_DEEP, encoding="utf-8")
+        path.write_text(json.dumps(_A_MARK), encoding="utf-8")
+        assert node_sync._read_marks("second")  # the good marks read
+        path.write_text(_past(deep, _A_MARK), encoding="utf-8")
         assert node_sync._read_marks("second") == {}
 
-    def test_a_sessions_file_nested_too_deeply_is_no_snapshot(self, placed):
+    @pytest.mark.parametrize("deep", _DEEP)
+    def test_a_sessions_file_nested_too_deeply_is_no_snapshot(self, placed, deep):
+        good = {"ts": 1.0, "sessions": ["api"]}
         path = nodes.sessions_path("second")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_TOO_DEEP, encoding="utf-8")
+        path.write_text(json.dumps(good), encoding="utf-8")
+        assert nodes.read_sessions("second") is not None  # the good file reads
+        path.write_text(_past(deep, good), encoding="utf-8")
         assert nodes.read_sessions("second") is None
 
+    @pytest.mark.parametrize("deep", _DEEP)
+    def test_a_load_row_nested_too_deeply_is_no_row(self, deep):
+        assert node_sync._row_ts('{"ts": 1.0}') == 1.0  # the good row reads
+        assert node_sync._row_ts(_past(deep, {"ts": 1.0})) is None
+
+    @pytest.mark.parametrize("deep", _DEEP)
     def test_a_node_whose_watermark_file_nests_too_deeply_still_pulls(
-        self, placed, caplog
+        self, placed, caplog, deep
     ):
         """A corrupt local file, not a bug: the node pulls from the beginning,
         and nothing is logged at ERROR (which would be a Sentry event)."""
         _capture_nodes_log(caplog)
         path = nodes.pull_marks_path("second")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_TOO_DEEP, encoding="utf-8")
+        path.write_text(_past(deep, _A_MARK), encoding="utf-8")
         asked: dict[str, dict[str, remote_mux.SidPull]] = {}
 
         def pull(node, sids):

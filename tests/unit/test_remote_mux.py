@@ -1242,14 +1242,32 @@ class TestSample:
         # rc 0: the node answered; the answer was malformed.
         assert exc.value.rc == 0
 
-    def test_a_reply_nested_too_deeply_is_a_remote_error_not_a_crash(self, fake_ssh):
-        # json.loads answers deep nesting with RecursionError, not ValueError;
-        # 200k '[' is far inside the reply cap and still the node's bad answer.
-        fake_ssh.set_reply("bash -s", stdout="[" * 200_000)
+    # Refused before json parses it, whatever json would do with it on this
+    # stack: raise (either class), or -- one level past the bound, beside a
+    # good sample's fields -- parse it whole. Far inside the reply cap, and
+    # still the node's bad answer.
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            pytest.param("[" * 200_000, id="200k-open"),
+            pytest.param(
+                '{"ts": 1727200000, "nproc": 16, "load1": 0.5, "load5": 1.25, '
+                '"load15": 2.0, "mem_total_mb": 64000, "mem_avail_mb": 48000, '
+                '"my_sessions": 3, "junk": ' + "[" * 64 + "]" * 64 + "}",
+                id="65-deep-beside-a-good-sample",
+            ),
+        ],
+    )
+    def test_a_reply_nested_too_deeply_is_a_remote_error_not_a_crash(
+        self, fake_ssh, stdout
+    ):
+        fake_ssh.set_reply("bash -s", stdout=stdout)
         with pytest.raises(RemoteError, match="not a load sample") as exc:
             remote_mux.sample(NODE)
         assert exc.value.rc == 0
-        assert isinstance(exc.value.__cause__, RecursionError)
+        assert exc.value.stderr_tail.startswith(
+            "not a load sample: nested deeper than 64 levels; got b'"
+        )
 
     def test_the_head_of_what_came_back_is_bounded(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="x" * 5000)

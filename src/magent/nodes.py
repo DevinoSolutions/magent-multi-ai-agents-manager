@@ -226,8 +226,11 @@ SECRET_HOME_DIRS = (
 # (deepcopy and the credential scan recurse; a hostile or corrupt file must
 # not crash provisioning). Claude Code's own files are a handful of levels.
 # node_apply.py refuses the node's files by the same bound (pinned equal by
-# tests/unit/test_node_apply.py).
+# tests/unit/test_node_apply.py), and every reader of node JSON here refuses
+# by it too (``nests_too_deep``).
 MAX_JSON_DEPTH = 64
+# What each of them says of a file nested past it.
+TOO_DEEP = f"nested deeper than {MAX_JSON_DEPTH} levels"
 # Secret-bearing FILE names, matched case-insensitively at any depth of the
 # skills walk and on the name a link resolves to: the credential scan cannot
 # see an ssh key, a TLS key or a git token, so these never ship by name.
@@ -342,7 +345,7 @@ def _read_object(
         if too_deep or _nests_deeper_than(raw, MAX_JSON_DEPTH):
             # Refused before json parses it, or -- the backstop -- after:
             # every later walk of it would recurse past the bound.
-            why = f"nested deeper than {MAX_JSON_DEPTH} levels"
+            why = TOO_DEEP
             _log.warning("%s is %s", path, why)
         elif isinstance(raw, dict):
             return raw
@@ -407,6 +410,15 @@ def _text_nests_deeper_than(text: str, limit: int) -> bool:
         elif token in ("]", "}"):
             depth -= 1
     return False
+
+
+def nests_too_deep(text: str) -> bool:
+    """``_text_nests_deeper_than`` at ``MAX_JSON_DEPTH``: what every reader of
+    node JSON -- the pull, the sample, the mirror's records, the node map,
+    the marks, the sessions and load files -- asks before json.loads, so each
+    refuses past the bound (saying ``TOO_DEEP`` where it says anything) the
+    same on every stack."""
+    return _text_nests_deeper_than(text, MAX_JSON_DEPTH)
 
 
 def _is_local_state_hook(hook: object) -> bool:
@@ -1602,6 +1614,10 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
             if attempt == _BUSY_RETRIES:
                 raise
             time.sleep(_BUSY_SLEEP_S)
+    # Refused before json parses it, the same on every stack: the ValueError
+    # every caller already catches for a bad file.
+    if nests_too_deep(text):
+        raise ValueError(f"{NODE_MAP_PATH}: {TOO_DEEP}")
     try:
         raw = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -1609,9 +1625,8 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
         # 1 column 1" alone does not say WHICH file is refusing every write.
         raise ValueError(f"{NODE_MAP_PATH}: {exc}") from exc
     except RecursionError as e:
-        # json.loads' answer to deep nesting. Re-raised as the ValueError every
-        # caller already catches for a bad file, so none of them needs to know.
-        raise ValueError(f"{NODE_MAP_PATH}: nested too deeply to read") from e
+        # The backstop for any nesting the scan did not refuse.
+        raise ValueError(f"{NODE_MAP_PATH}: {TOO_DEEP}") from e
     if not isinstance(raw, dict):
         raise ValueError(f"{NODE_MAP_PATH}: not a JSON object")  # noqa: TRY004  # reason: a non-object file is corrupt DATA, the same family as the JSONDecodeError (a ValueError) a torn file raises; callers catch one type for every bad file
     out: dict[str, NodeMapEntry] = {}
@@ -1627,9 +1642,8 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
 def read_node_map() -> dict[str, NodeMapEntry]:
     """``node-map.json`` keyed by project name, tolerantly: whatever
     ``load_node_map_strict`` raises -- a map still busy after its retries, a
-    torn write, a file that is not a JSON object, one nested too deep for
-    ``json.loads`` (``RecursionError``, which is not a ``ValueError``) -- reads
-    as ``{}``. The map is a record of where things landed, and a bad one must
+    torn write, a file that is not a JSON object, one nested deeper than
+    ``MAX_JSON_DEPTH`` -- reads as ``{}``. The map is a record of where things landed, and a bad one must
     never stop a launch or an F2 press. Never write back what this returns; see
     ``load_node_map_strict``."""
     try:
@@ -2017,10 +2031,10 @@ def read_sessions(nick: str, *, nodes_dir: Path | None = None) -> NodeSessions |
     Neither is a ``sessions`` list holding any non-string: that is corruption,
     and silently dropping the odd entry would report a live session dead."""
     try:
-        raw = json.loads(
-            sessions_path(nick, nodes_dir=nodes_dir).read_text(encoding="utf-8")
-        )
-    # RecursionError: json.loads' answer to deep nesting, a corrupt file too.
+        text = sessions_path(nick, nodes_dir=nodes_dir).read_text(encoding="utf-8")
+        # Nested past the bound is no snapshot, refused before json parses it.
+        raw = None if nests_too_deep(text) else json.loads(text)
+    # RecursionError: the backstop for any nesting the scan did not refuse.
     except (OSError, ValueError, RecursionError):
         return None
     if not isinstance(raw, dict):

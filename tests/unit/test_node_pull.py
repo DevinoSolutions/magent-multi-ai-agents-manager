@@ -104,17 +104,32 @@ class TestParsePull:
             parse_pull(b"hello\n", dest=tmp_path, sids=frozenset())
         assert info.value.rc == 0
 
-    def test_metadata_nested_too_deeply_is_not_a_pull(self, tmp_path):
-        # 200k '[' is far inside the reply cap, and json.loads answers it
-        # with RecursionError, not ValueError: still the node's bad answer.
-        meta = b"[" * 200_000
-        assert len(meta) < remote_mux.PULL_MAX_REPLY_BYTES
-        reply = PULL_HEADER + meta + b"\n" + PULL_TRAILER + b"0\n"
+    # Refused before json parses it, whatever json would do with it on this
+    # stack: raise (either class), or -- one level past the bound, beside a
+    # good pull's fields -- parse it whole.
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            pytest.param(
+                PULL_HEADER + b"[" * 200_000 + b"\n" + PULL_TRAILER + b"0\n",
+                id="200k-open",
+            ),
+            pytest.param(
+                pull_bytes(pull_meta(junk=json.loads("[" * 64 + "]" * 64))),
+                id="65-deep-beside-a-good-pull",
+            ),
+        ],
+    )
+    def test_metadata_nested_too_deeply_is_not_a_pull(self, tmp_path, reply):
+        # Far inside the reply cap: still the node's bad answer.
+        assert len(reply) < remote_mux.PULL_MAX_REPLY_BYTES
         with pytest.raises(RemoteError, match="unreadable pull metadata") as info:
             parse_pull(reply, dest=tmp_path, sids=frozenset())
         assert info.value.rc == 0
-        # Its class only: `node sync --once` prints this line.
-        assert info.value.stderr_tail == "unreadable pull metadata (RecursionError)"
+        # Our words, never the parser's: `node sync --once` prints this line.
+        assert info.value.stderr_tail == (
+            "unreadable pull metadata (nested deeper than 64 levels)"
+        )
         assert str(info.value.__cause__) not in str(info.value)
 
     def test_unreadable_metadata_logs_the_parsers_words(self, tmp_path, caplog):

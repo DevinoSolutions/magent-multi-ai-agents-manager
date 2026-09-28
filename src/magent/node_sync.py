@@ -453,9 +453,12 @@ class Mark:
 
 def _read_marks(nick: str) -> dict[str, Mark]:
     try:
-        raw = json.loads(nodes.pull_marks_path(nick).read_text(encoding="utf-8"))
-    # RecursionError: json.loads' answer to deep nesting -- a corrupt file like
-    # any other, never an internal error (which logs at ERROR, to Sentry).
+        text = nodes.pull_marks_path(nick).read_text(encoding="utf-8")
+        # Nested past the bound is no marks, refused before json parses it.
+        raw = None if nodes.nests_too_deep(text) else json.loads(text)
+    # RecursionError: the backstop for any nesting the scan did not refuse --
+    # a corrupt file like any other, never an internal error (which logs at
+    # ERROR, to Sentry).
     except (OSError, ValueError, RecursionError):
         return {}
     if not isinstance(raw, dict):
@@ -534,7 +537,9 @@ def _prune_state(nick: str, sid: str, keep: Collection[str]) -> None:
 def _row_ts(line: str) -> float | None:
     """A load.jsonl row's ts, or None for a line that is not a row."""
     try:
-        row = json.loads(line)
+        # Nested past the bound is no row, refused before json parses it.
+        row = None if nodes.nests_too_deep(line) else json.loads(line)
+    # RecursionError: the backstop for any nesting the scan did not refuse.
     except (ValueError, RecursionError):
         return None
     ts = row.get("ts") if isinstance(row, dict) else None
