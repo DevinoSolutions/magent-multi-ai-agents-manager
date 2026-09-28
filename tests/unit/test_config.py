@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -253,6 +254,140 @@ class TestDeterministicColors:
         cfg = load_config(path)
         assert cfg.version == SCHEMA_VERSION
         assert capsys.readouterr().err == ""
+
+
+# A lone UTF-16 surrogate. JSON can spell one ("\ud83d") and json.loads hands it
+# back as-is, but no console, pipe, window title or argv can encode it.
+_LONE = "api\ud83d"
+_C = "#22c55e"  # an explicit color, so nothing at load ever hashes the text
+
+
+def _refusal(where: str, shown: str = "'api\\ud83d'") -> str:
+    """The exact refusal: our words, the field, the class, the value ESCAPED."""
+    return f"{where} has text with no UTF-8 form (UnicodeEncodeError): {shown}"
+
+
+def _one(**fields: object) -> dict[str, object]:
+    return {
+        "version": SCHEMA_VERSION,
+        "projects": [{"path": "api", "color": _C, **fields}],
+    }
+
+
+# Every string config.py reads -- each becomes a path, a session name, a window
+# title, an argv or a listing row -- plus the keys and values it only warns about.
+_EVERY_STRING: list[tuple[str, dict[str, object]]] = [
+    ("baseDir", {**_one(), "baseDir": _LONE}),
+    ("settings.defaultTool", {**_one(), "settings": {"defaultTool": _LONE}}),
+    ("settings.ssh.shell", {**_one(), "settings": {"ssh": {"shell": _LONE}}}),
+    ("settings.tools.probe", {**_one(), "settings": {"tools": {"probe": _LONE}}}),
+    ("a key in settings.tools", {**_one(), "settings": {"tools": {_LONE: "x"}}}),
+    ("projects[0].path", _one(path=_LONE, title="t")),
+    ("projects[0].group", _one(group=_LONE)),
+    ("projects[0].color", _one(color=_LONE)),
+    ("projects[0].tool", _one(tool=_LONE)),
+    ("projects[0].title", _one(title=_LONE)),
+    ("projects[0].host", _one(host=_LONE)),
+    ("projects[0].remotePath", _one(remotePath=_LONE)),
+    ("projects[0].windows[0]", _one(windows=[_LONE])),
+    ("projects[0].windows[0].name", _one(windows=[{"name": _LONE}])),
+    ("projects[0].windows[0].tool", _one(windows=[{"tool": _LONE}])),
+    ("projects[0].windows[0].command", _one(windows=[{"command": _LONE}])),
+    # An unknown key's NAME is echoed in a warning, so it counts too.
+    ("a key in the config", {**_one(), _LONE: 1}),
+    ("a key in projects[0]", {"projects": [{"path": "api", _LONE: 1}]}),
+    ("projects[0].note", _one(note=_LONE)),
+]
+
+
+class TestTextWithNoUtf8FormIsRefusedAtLoad:
+    """F-SUR-1: a config string with no UTF-8 form is refused ONCE, at load, in
+    our words. Before, a title like ``"api\\ud83d"`` loaded fine whenever it had
+    a color and then crashed ``--go`` at its first listing row, on every Windows
+    stdout (cp1252 pipe, UTF-8 pipe, a real console); without a color the
+    tab-color hash hit it first and the user read the codec's own message."""
+
+    def test_a_title_is_refused_in_our_words(self, tmp_config):
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "projects": [
+                    {"path": "plain", "title": "plain", "color": "#3b82f6"},
+                    {"path": "api", "title": _LONE, "color": _C},
+                ],
+            }
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value) == _refusal("projects[1].title")
+
+    def test_the_refusal_comes_before_the_tab_color_hash(self, tmp_config):
+        # No color: `_derive_tab_color` encodes the title, and used to be the
+        # place that found it ("'utf-8' codec can't encode character ...").
+        path = tmp_config(
+            {"version": SCHEMA_VERSION, "projects": [{"path": "api", "title": _LONE}]}
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value) == _refusal("projects[0].title")
+
+    @pytest.mark.parametrize(
+        ("where", "config"), _EVERY_STRING, ids=[w for w, _ in _EVERY_STRING]
+    )
+    def test_every_string_in_the_document_is_covered(self, tmp_config, where, config):
+        with pytest.raises(ConfigError) as exc:
+            load_config(tmp_config(config))
+        assert str(exc.value) == _refusal(where)
+
+    def test_the_refusal_is_ascii_and_never_the_codecs_words(self, tmp_config):
+        # The refusal must print on the very streams the raw text crashed, so
+        # the whole value is escape text -- valid accents included -- and the
+        # codec's own message ("... in position 7: surrogates not allowed")
+        # stays off the screen.
+        path = tmp_config(_one(title="café " + _LONE))
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        text = str(exc.value)
+        assert text == _refusal("projects[0].title", "'caf\\xe9 api\\ud83d'")
+        assert text.isascii()
+        for codec_words in ("codec", "surrogates not allowed", "position"):
+            assert codec_words not in text
+
+    @pytest.mark.parametrize(
+        "ensure_ascii", [True, False], ids=["escaped", "raw-utf-8"]
+    )
+    def test_valid_non_ascii_text_still_loads(self, tmp_path, ensure_ascii):
+        # Real emoji (a surrogate PAIR once JSON-escaped, which json.loads
+        # joins), accents and CJK all have a UTF-8 form: they load unchanged,
+        # and a colorless one still gets its hashed color.
+        title = "api \U0001f680"
+        path = "café"
+        command = "claude --continue # 日本"
+        cfg_file = tmp_path / "magent.config.json"
+        cfg_file.write_text(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [
+                        {
+                            "path": path,
+                            "title": title,
+                            "windows": [{"command": command}],
+                        }
+                    ],
+                },
+                ensure_ascii=ensure_ascii,
+            ),
+            encoding="utf-8",
+        )
+        proj = load_config(str(cfg_file)).projects[0]
+        assert proj.windows is not None
+        assert (proj.title, proj.path, proj.windows[0].command) == (
+            title,
+            path,
+            command,
+        )
+        assert proj.color is not None
 
 
 class TestAttentionSettings:

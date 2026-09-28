@@ -136,6 +136,45 @@ class TestJsonInvalidConfig:
         assert payload["error"]
 
 
+# F-SUR-1: the load-time refusal of a title with no UTF-8 form, as each surface
+# shows it. Before, the config loaded (it has a color) and `status` crashed on
+# the title at its first echo; `--json` escaped it into an ok envelope.
+_NO_UTF8_REFUSAL = (
+    "projects[0].title has text with no UTF-8 form (UnicodeEncodeError): 'api\\ud83d'"
+)
+
+
+class TestTextWithNoUtf8FormIsAConfigError:
+    def _config(self, tmp_config):
+        return tmp_config(
+            {
+                "version": 3,
+                "projects": [{"path": "api", "title": "api\ud83d", "color": "#22c55e"}],
+            }
+        )
+
+    def test_json_gets_the_config_error_envelope(self, runner, tmp_config, monkeypatch):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config), "status", "--json"]
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.stdout) == {"ok": False, "error": _NO_UTF8_REFUSAL}
+
+    def test_plain_gets_the_error_line_and_nothing_else(
+        self, runner, tmp_config, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config), "status"]
+        )
+        assert result.exit_code == 1
+        assert result.stderr == f"Error: {_NO_UTF8_REFUSAL}\n"
+        assert result.stdout == ""
+
+
 class TestStatusLines:
     def test_prints_upload_server_and_listener_lines(
         self, runner, tmp_config, monkeypatch
