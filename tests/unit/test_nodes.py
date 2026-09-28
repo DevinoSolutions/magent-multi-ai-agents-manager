@@ -2270,6 +2270,12 @@ class TestRecipeFor:
                 "https://user:ghp_SECRET@[2001:db8::1]:8443/org/repo.git",
                 "https://[2001:db8::1]:8443/org/repo.git",
             ),
+            # The userinfo runs to the LAST '@': a login holding an '@' (an
+            # email) still loses its password with it.
+            (
+                "https://bob@corp.example:ghp_SECRET@git.example/org/repo.git",
+                "https://git.example/org/repo.git",
+            ),
             # ssh-family keeps the login and drops only the password.
             (
                 "ssh://user:ghp_SECRET@github.com/org/repo.git",
