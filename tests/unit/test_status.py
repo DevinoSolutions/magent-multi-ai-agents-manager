@@ -2109,7 +2109,8 @@ def _supervisor_refusals(monkeypatch) -> threading.Event:
 def _tick_holding_serves_lock(monkeypatch, spawns: _FakeDaemon | None) -> None:
     """A stand-in serve supervisor tick, on the REAL supervisor lock: it
     holds the lock until ``down``'s ask for it is refused, starts ``spawns``
-    (a daemon that locks only after its own delay), then lets go."""
+    and lets go once that daemon is parked at its gate. Whatever the fake
+    holds by then, it holds before down's first look."""
     from magent import node_sync
 
     ticking = threading.Event()
@@ -2122,27 +2123,54 @@ def _tick_holding_serves_lock(monkeypatch, spawns: _FakeDaemon | None) -> None:
         refused.wait(10)
         if spawns is not None:
             spawns.start()
+            spawns.parked.wait(5)
         _let_go(fd)
 
     threading.Thread(target=tick, daemon=True).start()
     assert ticking.wait(5)
 
 
-class _FakeDaemon:
-    """A node sync daemon on the REAL daemon lock, in a thread: after
-    ``delay`` it takes ``node_sync.LOCK_NAME``, then writes its pid file -- the
-    real daemon's order (``run_sync_loop``), ``pid_gap`` apart -- and holds
-    both until killed. Both paths are bound at construction: a thread that
-    outlived its test must never lock in the next test's HOME."""
+def _once_down_looks_for_a_late_daemon(monkeypatch) -> threading.Event:
+    """Set when ``down``'s look for a late daemon
+    (``node_sync.await_late_daemon``) has looked once and found none it can
+    stop -- its first wait between looks. A ``_FakeDaemon`` let in by it
+    locks after every read of the lock before that look, and after that
+    look's own first read: late by construction, not by a delay a slow
+    runner outruns."""
+    from magent import node_sync
 
-    def __init__(self, pid: int, delay: float = 0.0, pid_gap: float = 0.0) -> None:
+    looked = threading.Event()
+    real = node_sync.await_late_daemon
+
+    def sleep(s: float) -> None:
+        looked.set()
+        time.sleep(s)
+
+    monkeypatch.setattr(
+        node_sync, "await_late_daemon", lambda **k: real(sleep=sleep, **k)
+    )
+    return looked
+
+
+class _FakeDaemon:
+    """A node sync daemon on the REAL daemon lock, in a thread: once
+    ``after`` is set (at once without one) it takes ``node_sync.LOCK_NAME``,
+    then writes its pid file -- the real daemon's order (``run_sync_loop``),
+    ``pid_gap`` apart -- and holds both until killed. ``parked`` is set as it
+    starts waiting for ``after``. Both paths are bound at construction: a
+    thread that outlived its test must never lock in the next test's HOME."""
+
+    def __init__(
+        self, pid: int, pid_gap: float = 0.0, after: threading.Event | None = None
+    ) -> None:
         from magent import lockfile, node_sync
 
         self.pid = pid
-        self.delay = delay
         self.pid_gap = pid_gap
+        self.after = after
         self.lock = lockfile.lock_path(node_sync.LOCK_NAME)
         self.pid_path = node_sync._PID_PATH
+        self.parked = threading.Event()
         self.locked = threading.Event()
         self.killed = threading.Event()
         self.gone = threading.Event()
@@ -2155,10 +2183,19 @@ class _FakeDaemon:
         thread.start()
         self.thread = thread
 
+    def _let_in(self) -> bool:
+        """Wait for ``after``; False when killed first."""
+        self.parked.set()
+        after = self.after
+        while after is not None and not after.wait(0.05):
+            if self.killed.is_set():
+                return False
+        return not self.killed.is_set()
+
     def _live(self) -> None:
         try:
-            if self.killed.wait(self.delay):
-                return  # torn down before it ever started
+            if not self._let_in():
+                return  # torn down before it was let in
             fd = _hold_lock_file(self.lock)
             try:
                 if self.killed.wait(self.pid_gap):
@@ -3144,10 +3181,14 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         # a daemon (whatever spawned it may spawn another), or a supervisor
         # tick held serve's lock when down asked for it (that tick may have
         # spawned one). It waits for its pid too: the kill needs one, and the
-        # daemon writes it just after taking the lock.
+        # daemon writes it just after taking the lock. The late one locks only
+        # once that end look has looked: every read of the first stop is
+        # before its lock, however slow the runner.
         from magent import node_sync
 
-        late = _FakeDaemon(4302, delay=0.4, pid_gap=pid_gap)
+        late = _FakeDaemon(
+            4302, pid_gap=pid_gap, after=_once_down_looks_for_a_late_daemon(monkeypatch)
+        )
         daemons[late.pid] = late
         if why == "seen":
             first = _FakeDaemon(4301)
@@ -3193,10 +3234,11 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         # No node project left in the config, so no stop runs ahead of the
         # pulls: the end stop is the only one and down's hold starts there. A
         # tick holding serve's lock then may have spawned a daemon that has not
-        # locked yet, and it is waited for all the same.
+        # locked yet, and it is waited for all the same. It locks only once
+        # that look has looked and found none.
         from magent import node_sync
 
-        late = _FakeDaemon(4302, delay=0.4)
+        late = _FakeDaemon(4302, after=_once_down_looks_for_a_late_daemon(monkeypatch))
         daemons[late.pid] = late
         _tick_holding_serves_lock(monkeypatch, spawns=late)
         out, *_ = self._run(
