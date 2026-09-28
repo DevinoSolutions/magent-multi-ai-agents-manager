@@ -5550,7 +5550,8 @@ def _fails_on_the_node_key(
 ) -> None:
     """``tool`` fails for an argument matching the shell ``pattern`` (the node
     key, or ``*/.ssh`` for its directory) and is the real one for any other:
-    the shims come first on the fake box's PATH."""
+    the shims come first on the fake box's PATH. The other shims see it too:
+    the fake ssh-keygen's ``-y`` stats the key."""
     real = shutil.which(tool)
     assert real is not None, f"{tool} is not on this runner"
     shim = tmp_path / "shims" / tool
@@ -6187,6 +6188,8 @@ class TestSetupShUnderRealBash:
     ):
         # The key IS 0600 here, but setup cannot tell: it chmods anyway and
         # reports a repair, because an unknown mode never reads as a skip.
+        # The .pub stays: the stat shim also fails the fake ssh-keygen's own
+        # stat, so a derive (-y) here would fail for a shim reason.
         state, env = _setup_box(tmp_path)
         _run_setup(env)
         _fails_on_the_node_key(tmp_path, "stat")
