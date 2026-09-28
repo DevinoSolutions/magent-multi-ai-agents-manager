@@ -106,9 +106,9 @@ def _take_exclusive(name: str, lock_path: Path) -> IO[str]:
 
 
 def _still_named(lock_path: Path, fh: IO[str]) -> bool:
-    """True when ``lock_path`` still names the file ``fh`` has open. A path
-    that is gone (ENOENT) names nothing: False."""
+    """True when ``lock_path`` still names the file ``fh`` has open (same
+    device and inode). A path that is gone (ENOENT) names nothing: False."""
     try:
-        return os.stat(lock_path).st_ino == os.fstat(fh.fileno()).st_ino
+        return os.path.samestat(os.stat(lock_path), os.fstat(fh.fileno()))
     except FileNotFoundError:
         return False
