@@ -132,11 +132,19 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
         # powershell.exe child, its ModuleAnalysisCache path turns
         # CWD-relative, and a long-lived hand-off launcher wrote
         # Microsoft\Windows\PowerShell\ModuleAnalysisCache into the repo
-        # checkout. LOCALAPPDATA/APPDATA stay inherited: the lookup does not
-        # read them, and find_psmux's %LOCALAPPDATA%\psmux fallback must still
-        # find the real install. Empty dirs; harmless off Windows.
+        # checkout. The lookup does not read LOCALAPPDATA/APPDATA; creating
+        # the folders is the fix. Empty dirs; harmless off Windows.
         (home / "AppData" / "Local").mkdir(parents=True, exist_ok=True)
         (home / "AppData" / "Roaming").mkdir(parents=True, exist_ok=True)
+        # APPDATA is a door of its own: on Windows it IS env.config_base(),
+        # so a test that forgot --config resolved the developer's real
+        # %APPDATA%\magent\config.json (and discover scanned the real VS Code
+        # storage). Point it at this home's Roaming folder -- the path
+        # appdata_dir() falls back to where APPDATA is unset, so every OS
+        # gets the same answer. LOCALAPPDATA stays inherited: find_psmux's
+        # %LOCALAPPDATA%\psmux fallback must still find the real install, and
+        # wt_keys resolves through its own seam.
+        monkeypatch.setenv("APPDATA", str(home / "AppData" / "Roaming"))
         drive, tail = os.path.splitdrive(str(home))
         values = (str(home), str(home), drive, tail or os.sep)
         for var, value in zip(_HOME_VARS, values, strict=True):
