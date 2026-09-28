@@ -60,6 +60,7 @@ from tests.e2e._nodes_rig import (
     child_env,
     clamp,
     install_stand_in,
+    no_monitors,
     node_wire_or_skip,
     only_stops,
     run_files,
@@ -70,12 +71,7 @@ from tests.e2e._nodes_rig import (
     write_config,
 )
 from tests.e2e._pty import Budget
-from tests.e2e._ssh_helpers import (
-    UNROUTABLE,
-    emit_ci_warning,
-    free_port,
-    kill_ssh_carrying,
-)
+from tests.e2e._ssh_helpers import UNROUTABLE, free_port, kill_ssh_carrying
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -518,20 +514,11 @@ class TestANodeHostsAProjectEndToEnd:
         _assert_nothing_created(rig)
 
     def test_d06_the_launch_preview_names_the_node_and_creates_nothing(
-        self, rig: NodeRig, capsys: pytest.CaptureFixture[str]
+        self, rig: NodeRig
     ) -> None:
         run = rig.magent("--go", "--dry-run", tag="go-dry-run")
         if run.rc == 2 and "No monitors detected" in run.said:
-            # run_magent plans the monitor grid before it reads a project, so
-            # with no X screen the preview stops before the node rows. The
-            # nodes-e2e job provisions one (setup-virtual-displays); this is
-            # the fallback for a runner where that did not take.
-            emit_ci_warning(
-                capsys,
-                "nodes-e2e: --go --dry-run not exercised",
-                "no monitors, so the preview stops before node rows",
-            )
-            pytest.skip("no monitor: --go --dry-run stops at 'No monitors'")
+            no_monitors(run)
         assert run.rc == 0, run.show()
         _said_line(rig, run, f"@{NICK}")
         # The preview's own rows: where the project would land, and the

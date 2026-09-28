@@ -30,7 +30,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 import pytest
 
@@ -268,6 +268,23 @@ def node_wire_or_skip() -> Wire:
             "the node, so it runs against the loopback sshd only"
         )
     return wire
+
+
+def no_monitors(run: Run) -> NoReturn:
+    """D6's ``--go --dry-run`` stopped at "No monitors detected": run_magent
+    plans the monitor grid before it reads a project, so with no screen the
+    preview never reaches the node rows. The nodes-e2e job provisions one
+    (setup-virtual-displays), so on CI a missing screen is a provisioning bug
+    and FAILS -- a regression there must not bring back the green skip that
+    left D6 unexercised. Anywhere else (a container with the gate on) it
+    skips."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        pytest.fail(
+            "--go --dry-run found no monitors on the nodes-e2e runner: "
+            "setup-virtual-displays did not take, so the launch preview went "
+            f"unchecked\n{run.show()}"
+        )
+    pytest.skip("no monitor: --go --dry-run stops at 'No monitors detected'")
 
 
 def resolved_hostname(ssh_g: str) -> str | None:

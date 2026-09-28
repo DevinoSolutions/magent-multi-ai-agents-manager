@@ -121,6 +121,24 @@ class TestTheGateSkipsOnlyOffCi:
         assert got.startswith("failed:") and rig.GATE_VAR in got, got
 
 
+class TestAPreviewWithNoScreenSkipsOnlyOffCi:
+    """D6's fallback when ``--go --dry-run`` finds no monitors."""
+
+    def test_on_ci_it_fails_naming_the_screen_step(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The job provisions a screen: without one D6 must not read green.
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        got = _outcome(lambda: rig.no_monitors(_run(2, "No monitors detected")))
+        assert got.startswith("failed:") and "setup-virtual-displays" in got, got
+        assert "No monitors detected" in got, got
+
+    def test_off_ci_it_skips(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        got = _outcome(lambda: rig.no_monitors(_run(2)))
+        assert got.startswith("skipped:"), got
+
+
 @pytest.fixture
 def gated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A node runner as node_wire_or_skip wants it, every piece present: the
