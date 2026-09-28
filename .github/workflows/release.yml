@@ -36,8 +36,8 @@ jobs:
     timeout-minutes: 10
     outputs:
       # "true" for a PEP 440 pre-release tag (v3.20.0rc1, v3.20.0a1, v3.20.0b2,
-      # v3.20.0.dev1), "false" for a final one. Empty on workflow_dispatch,
-      # which never reaches github-release.
+      # v3.20.0.dev1), "false" for a final one. Empty unless the run's ref is
+      # a v* tag; a run without a tag ref never reaches github-release.
       prerelease: ${{ steps.classify.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -74,9 +74,13 @@ jobs:
         run: twine check --strict dist/*
       # PyPI gets the version in the BUILT artifacts (pyproject's), never the
       # tag's, and an upload cannot be taken back. So v3.20.0rc1 over a 3.20.0
-      # build fails here, before publish. PEP 440 comparison: v3.20.0-rc1
-      # matches 3.20.0rc1. Tag pushes only: a workflow_dispatch dry run has no
-      # tag to compare against, so the step is skipped there.
+      # build fails here, before publish. The tag must be exactly "v" + the
+      # canonical PEP 440 form of the built version: v3.20.0rc1, never
+      # v3.20.0-rc1, so the GitHub tag, the Release and the CHANGELOG links
+      # all spell the version the way PyPI does. The built side is normalized
+      # because hatchling writes pyproject's spelling into METADATA verbatim.
+      # Skipped unless the run's ref is a v* tag; a workflow_dispatch on a tag
+      # ref runs it too, which is harmless (publish needs a push event).
       - name: Check the tag matches the built version
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -94,8 +98,12 @@ jobs:
           def version_of(raw):
               return BytesHeaderParser().parsebytes(raw)["Version"]
 
-          (wheel,) = glob.glob("dist/*.whl")
-          (sdist,) = glob.glob("dist/*.tar.gz")
+          wheels = sorted(glob.glob("dist/*.whl"))
+          sdists = sorted(glob.glob("dist/*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              print(f"::error::expected exactly one wheel and one sdist in dist/, found {wheels + sdists}")
+              sys.exit(1)
+          (wheel,), (sdist,) = wheels, sdists
           with zipfile.ZipFile(wheel) as zf:
               (meta,) = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
               wheel_version = version_of(zf.read(meta))
@@ -105,13 +113,14 @@ jobs:
               sdist_version = version_of(tf.extractfile(info).read())
 
           tag = os.environ["TAG"]
-          if Version(wheel_version) != Version(sdist_version):
+          built = Version(wheel_version)
+          if built != Version(sdist_version):
               print(f"::error::wheel is {wheel_version} but sdist is {sdist_version}; they must match")
               sys.exit(1)
-          if Version(tag.removeprefix("v")) != Version(wheel_version):
-              print(f"::error::tag {tag} does not match the built version {wheel_version}; bump pyproject.toml or retag")
+          if tag != f"v{built}":
+              print(f"::error::tag {tag} does not match the built version {built} (expected tag v{built}); bump pyproject.toml or retag")
               sys.exit(1)
-          print(f"tag {tag} matches the built version {wheel_version} (wheel and sdist)")
+          print(f"tag {tag} matches the built version {built} (wheel and sdist)")
           PY
       - uses: DevinoSolutions/artifact/upload@v1
         with:
