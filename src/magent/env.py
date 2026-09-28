@@ -49,7 +49,14 @@ class MagentEnv(BaseSettings):
     correct there, because that file belongs to magent alone.
     """
 
-    model_config = {"env_prefix": "MAGENT_", "extra": "forbid"}
+    # utf-8-sig: Notepad and PowerShell's utf8BOM write a byte-order mark, and
+    # read as plain utf-8 it became part of the first key -- a valid setting
+    # refused as an unknown variable. A file without the mark reads the same.
+    model_config = {
+        "env_prefix": "MAGENT_",
+        "extra": "forbid",
+        "env_file_encoding": "utf-8-sig",
+    }
 
     sentry_dsn: HttpUrl | None = None
     ntfy_topic: HttpUrl | None = None

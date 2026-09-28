@@ -6,6 +6,7 @@ A new env var without an .env.example update = red gate.
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import logging
 import os
@@ -777,6 +778,54 @@ class TestAnUnusableEnvFile:
             (logging.INFO, True),
             ["psmux boost: environment did not validate; boosting anyway"],
         )
+
+
+class TestTheEnvFileEncoding:
+    """Notepad and PowerShell 7's ``-Encoding utf8BOM`` save UTF-8 with a
+    byte-order mark. Read as plain UTF-8, the mark became part of the first
+    key, so a valid ``MAGENT_LOG_LEVEL`` was refused as an unknown variable
+    named ``\\ufeffMAGENT_LOG_LEVEL``."""
+
+    _LINE = "MAGENT_LOG_LEVEL=DEBUG\n"
+
+    def test_a_byte_order_mark_is_not_part_of_the_first_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _clear_magent_env(monkeypatch)
+        env_module.ENV_FILE.write_bytes(codecs.BOM_UTF8 + self._LINE.encode())
+
+        assert env_module.get_env().log_level == "DEBUG"
+
+    def test_utf16_is_refused_as_not_utf8(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Windows PowerShell 5.1's `Out-File` (and `>`) default: UTF-16 LE with
+        # its own mark, which is no UTF-8 mark and must not be read as one.
+        _clear_magent_env(monkeypatch)
+        env_module.ENV_FILE.write_bytes(
+            codecs.BOM_UTF16_LE + self._LINE.encode("utf-16-le")
+        )
+
+        with pytest.raises(ValidationError) as caught:
+            env_module.get_env()
+
+        assert env_module.validation_error_items(caught.value) == [
+            (
+                "",
+                (
+                    f"{env_module.ENV_FILE} is not valid UTF-8 "
+                    "(UnicodeDecodeError); re-save it as UTF-8"
+                ),
+            )
+        ]
+
+    def test_a_file_without_the_mark_reads_as_before(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _clear_magent_env(monkeypatch)
+        env_module.ENV_FILE.write_bytes(self._LINE.encode())
+
+        assert env_module.get_env().log_level == "DEBUG"
 
 
 class TestSession0Policy:
