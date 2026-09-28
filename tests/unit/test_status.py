@@ -11,6 +11,7 @@ config *discovery* entirely, so no test ever searches the real filesystem.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import logging
 import math
@@ -2088,6 +2089,37 @@ class TestANodeMapTheSyncCannotReadIsShownAsSyncPaused:
         assert "node sync paused" not in result.stdout
         assert "(node unknown)" in result.stdout
         assert json.loads(as_json.stdout)["node_sync_paused"] is None
+
+    def test_a_map_unreadable_for_any_other_os_reason_is_a_pause_and_exits_3(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # Only a PermissionError is busy. Any other OSError (EIO here; EROFS,
+        # a folder at the map path on POSIX) is a pause the sync sits in, so
+        # unknown must not read as clean in the exit code either. The OS's
+        # words are nodes.log's.
+        from magent import nodes
+
+        def broken() -> dict[str, nodes.NodeMapEntry]:
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", broken)
+        cfgpath = self._config(tmp_config, tmp_path)
+
+        result = self._status(runner, cfgpath)
+        as_json = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 3, result.output
+        assert (
+            "node sync paused  (the node map could not be read (OSError);"
+            " nothing is pulled from any node)"
+        ) in result.stdout
+        assert "Input/output error" not in result.output
+        assert "(node unknown)" in result.stdout
+        assert as_json.exit_code == 3, as_json.output
+        assert json.loads(as_json.stdout)["node_sync_paused"] == {
+            "error": "OSError",
+            "entry": None,
+        }
 
     def test_with_the_sync_switched_off_nothing_is_paused(
         self, runner, tmp_config, tmp_path, monkeypatch
