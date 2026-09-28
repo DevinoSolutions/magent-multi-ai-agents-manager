@@ -347,6 +347,9 @@ class TestTextWithNoUtf8FormIsRefusedAtLoad:
         with pytest.raises(ConfigError) as exc:
             load_config(path)
         assert str(exc.value) == _refusal("projects[1].title")
+        # The codec's own message stays off the screen but not out of reach:
+        # it is the refusal's cause, for a traceback or a log.
+        assert isinstance(exc.value.__cause__, UnicodeEncodeError)
 
     def test_the_refusal_comes_before_the_tab_color_hash(self, tmp_config):
         # No color: `_derive_tab_color` encodes the title, and used to be the
