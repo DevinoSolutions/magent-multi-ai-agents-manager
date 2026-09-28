@@ -3422,6 +3422,13 @@ class TestTextWithNoUtf8FormReachesTheRowInOurWords:
         assert [r for r in records if r.levelno >= logging.ERROR] == []
         return [r.getMessage() for r in records]
 
+    @staticmethod
+    def _nothing_sent(fake_ssh) -> None:
+        # The HOME probe, if it ran, is the only call: a refusal hoisted
+        # before it passes too.
+        calls = [" ".join(c.argv) for c in fake_ssh.calls()]
+        assert [c for c in calls if "printenv HOME" not in c] == []
+
     def test_a_command_with_no_utf_8_form(self, real_node, api, caplog):
         base = _config(api)
         config = dataclasses.replace(
@@ -3441,8 +3448,7 @@ class TestTextWithNoUtf8FormReachesTheRowInOurWords:
         (failed,) = self._logged(caplog)
         assert "bring-up of api failed: " in failed
         assert failed.endswith("surrogates not allowed")
-        # The HOME probe alone: nothing was sent.
-        assert len(real_node.calls()) == 1
+        self._nothing_sent(real_node)
 
     def test_a_title_with_no_utf_8_form(self, real_node, api, caplog):
         titled = dataclasses.replace(api, title="api\ud83d")
@@ -3456,7 +3462,7 @@ class TestTextWithNoUtf8FormReachesTheRowInOurWords:
         )
         (failed,) = self._logged(caplog)
         assert failed.endswith("surrogates not allowed")
-        assert len(real_node.calls()) == 1
+        self._nothing_sent(real_node)
 
     def test_the_failed_line_lands_escaped_in_nodes_log(
         self, real_node, api, tmp_path, capsys

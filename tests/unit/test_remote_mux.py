@@ -2001,8 +2001,13 @@ class TestTextWithNoUtf8FormIsRefusedInOurWords:
     """The header and the decoration script frame config values (a command,
     a project title) as UTF-8. One with no UTF-8 form is a ValueError in our
     words and the class -- the row a user reads -- with the codec's own
-    words chained for nodes.log. Only the HOME probe has run: nothing was
-    sent."""
+    words chained for nodes.log. Nothing was sent: the HOME probe, if it
+    ran, is the only call (a refusal hoisted before it passes too)."""
+
+    @staticmethod
+    def _nothing_sent(node_home) -> None:
+        home = _wrapped(["printenv", "HOME"])
+        assert [c.argv[-1] for c in node_home.calls() if c.argv[-1] != home] == []
 
     def test_a_command_with_no_utf_8_form(self, node_home, tmp_path):
         _answers(node_home)
@@ -2015,7 +2020,7 @@ class TestTextWithNoUtf8FormIsRefusedInOurWords:
             "UTF-8 form (UnicodeEncodeError)"
         )
         assert isinstance(info.value.__cause__, UnicodeEncodeError)
-        assert len(node_home.calls()) == 1
+        self._nothing_sent(node_home)
 
     def test_a_session_name_with_no_utf_8_form(self, node_home, tmp_path):
         _answers(node_home)
@@ -2026,7 +2031,7 @@ class TestTextWithNoUtf8FormIsRefusedInOurWords:
             "(UnicodeEncodeError)"
         )
         assert isinstance(info.value.__cause__, UnicodeEncodeError)
-        assert len(node_home.calls()) == 1
+        self._nothing_sent(node_home)
 
 
 def _in_thread(fn, *, timeout_s: float = 20.0) -> BaseException | None:

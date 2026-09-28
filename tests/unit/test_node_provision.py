@@ -4596,6 +4596,36 @@ class TestTextWithNoUtf8FormLeavesOnlyItsItemUnread:
         assert "SECRET-DECOY" not in repr(report)
         assert all(b"SECRET-DECOY" not in blob for blob in data.values())
 
+    def test_a_name_holding_a_credential_is_logged_as_one(self, fake_ssh, caplog):
+        # user_scope never ships such a name, but a relay scope (plan K)
+        # re-adds a server by its name. The key path goes through _named.
+        caplog.set_level("DEBUG", logger="magent.nodes")
+        report = self._provision(
+            _scope(
+                mcp_servers={
+                    API_DECOY: {"type": "http", "url": "https://example.com/\udc80"}
+                }
+            )
+        )
+        manifest, data = _applied(fake_ssh, report)
+        assert manifest["unread"] == {"mcp": "UnicodeEncodeError"}
+        assert (
+            "mcp: '(a name holding one).url' holds text with no UTF-8 form; not sent"
+            in _nodes_log(caplog).splitlines()
+        )
+        assert "DECOY" not in caplog.text
+        assert "DECOY" not in repr(report)
+        assert all(b"DECOY" not in blob for blob in data.values())
+
+    def test_the_first_such_string_in_the_items_own_order_is_named(self, caplog):
+        caplog.set_level("DEBUG", logger="magent.nodes")
+        nodes.without_unsendable_items(
+            _scope(settings={"a": "\ud83d", "b": {"c": "\udc80"}})
+        )
+        assert _nodes_log(caplog).splitlines() == [
+            "settings: 'a' holds text with no UTF-8 form; not sent"
+        ]
+
     def test_a_server_name_leaves_mcp_unread_and_oauth_is_judged_alone(self, fake_ssh):
         report = self._provision(_surrogate_named_server())
         manifest, data = _applied(fake_ssh, report)
@@ -4658,6 +4688,8 @@ class TestTextWithNoUtf8FormLeavesOnlyItsItemUnread:
     def test_a_plugin_id_or_source_leaves_the_plugin_list_unread(
         self, fake_ssh, plugins, marketplaces
     ):
+        # A built scope. Through the real walk a plugin id also sits in
+        # settings.enabledPlugins, so settings goes unread with it (below).
         report = self._provision(
             _scope(
                 settings={"model": "opus"}, plugins=plugins, marketplaces=marketplaces
@@ -4670,6 +4702,37 @@ class TestTextWithNoUtf8FormLeavesOnlyItsItemUnread:
         assert (manifest["plugins"], manifest["marketplaces"]) == ([], {})
         assert json.loads(data["settings.json"]) == {"model": "opus"}
         assert _unread_row("the plugin list") in report.lines
+
+    def test_a_walked_plugin_id_leaves_settings_unread_with_it(
+        self, fake_ssh, tmp_path
+    ):
+        # By design: settings is judged whole, since a settings.json short of
+        # one key would read as "absent" on the node and take it back.
+        home = tmp_path / "pc"
+        (home / ".claude" / "plugins").mkdir(parents=True)
+        (home / ".claude" / "settings.json").write_text(
+            '{"enabledPlugins": {"p\\ud83d@mkt": true, "ok@mkt": true}, '
+            '"model": "opus"}',
+            encoding="ascii",
+        )
+        _write_json(
+            home / ".claude" / "plugins" / "known_marketplaces.json",
+            {"mkt": {"source": {"source": "git", "url": "https://h/x.git"}}},
+        )
+        _write_json(home / ".claude.json", {"mcpServers": {"ok": _HTTP}})
+        scope = _walked(home)
+        assert "p\ud83d@mkt" in scope.plugins
+        report = self._provision(scope)
+        manifest, data = _applied(fake_ssh, report)
+        assert manifest["unread"] == {
+            "settings": "UnicodeEncodeError",
+            "plugins": "UnicodeEncodeError",
+        }
+        assert "settings.json" not in data
+        assert (manifest["plugins"], manifest["marketplaces"]) == ([], {})
+        assert _unread_row("settings.json") in report.lines
+        assert _unread_row("the plugin list") in report.lines
+        assert json.loads(data["mcp_servers.json"]) == {"ok": _HTTP}
 
     def test_a_step_already_unread_keeps_its_own_class_and_its_one_note(self, fake_ssh):
         # A scope a wrapper built (plan K) can arrive with a step unread for
@@ -4787,6 +4850,28 @@ class TestTextWithNoUtf8FormLeavesOnlyItsItemUnread:
             "mcp: 'srv\\udc80' holds text with no UTF-8 form; not sent"
         )
         assert "Logging error" not in capsys.readouterr().err
+
+    def test_every_item_digests_hashes_is_one_the_filter_judges(self):
+        # digests, the filter's items, _ITEM_SOURCES and its emptying are kept
+        # in step by hand. A digest item the filter does not know fails here,
+        # not as a whole payload refused on a PC. Skills are judged per file
+        # (without_unframable_skills).
+        bad = {
+            "settings": {"settings": {"k": "\udc80"}},
+            "mcp": {"mcp_servers": {"s": {"type": "http", "url": "https://h/\udc80"}}},
+            "mcp_oauth": {"mcp_oauth": {"s|1": {"accessToken": "\udc80"}}},
+            "plugins": {"plugins": ("p\udc80@m",)},
+        }
+        assert (
+            set(bad) == set(nodes._ITEM_SOURCES) == set(_scope().digests()) - {"skills"}
+        )
+        for step, fields in bad.items():
+            with pytest.raises(UnicodeEncodeError):
+                _scope(**fields).digests()
+            judged = nodes.without_unsendable_items(_scope(**fields))
+            assert judged.unread == {step: "UnicodeEncodeError"}, step
+            assert judged.notes == (_unread_row(nodes._ITEM_SOURCES[step]).detail,)
+            assert judged.digests() == _scope().digests(), step
 
 
 def _sysbin(
