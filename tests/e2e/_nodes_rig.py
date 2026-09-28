@@ -43,9 +43,9 @@ if TYPE_CHECKING:
 
 NICK = "loop"
 # One wall clock for a module's node stages (see _pty.Budget). The healthy D
-# path measured 38-47 s in a 4-CPU ubuntu container; the job's timeout-minutes
-# sits well above this, so a slow stage lands as a FAILURE with its output,
-# never a cancel.
+# path, rig build through D16, measured 92 s on the hosted ubuntu-latest
+# runner (PR #239 at 2a55f47); the job's timeout-minutes sits well above
+# this, so a slow stage lands as a FAILURE with its output, never a cancel.
 NODES_BUDGET_S = 300.0
 # How long a stage waits for the node sync daemon to come up (`node sync
 # -d`, serve's supervisor, a bring-up): two cold interpreters in a row, the
