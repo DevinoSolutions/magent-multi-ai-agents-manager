@@ -5,6 +5,7 @@ bash on POSIX; the pool is Linux)."""
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import hashlib
 import inspect
@@ -1139,6 +1140,26 @@ def _nested(depth: int) -> str:
     return "[" * depth + "]" * depth
 
 
+def _node_map(projects: int) -> str:
+    """A node-map.json with ``projects`` entries, in the shape the PC writes
+    it: ``{project: entry}``, two levels however many projects."""
+    entries = {
+        f"proj{i}": dataclasses.asdict(
+            nodes.NodeMapEntry(
+                nick="second",
+                sid=f"proj{i}",
+                placed_ts=1727200000.0,
+                attached_existing=False,
+                remote_root=f"~/magent/proj{i}",
+                target="amin@devino-second",
+                cwd=f"/home/amin/magent/proj{i}",
+            )
+        )
+        for i in range(projects)
+    }
+    return json.dumps(entries, indent=2, allow_nan=False)
+
+
 # The texts json parses on every stack, and whether each nests past the bound.
 _PARSED_DEPTHS = [
     pytest.param(_nested(64), False, id="64-arrays"),
@@ -1155,6 +1176,16 @@ _PARSED_DEPTHS = [
     pytest.param('["\\\\", ' + _nested(63) + "]", False, id="escaped-backslash-64"),
     # Size is not depth.
     pytest.param("[" + ",".join(["1"] * 1_000_000) + "]", False, id="1M-flat-entries"),
+    # Nor is width: each container closes before the next opens, so far more
+    # than 64 of them in all is still two levels. A scan that counted
+    # containers instead of depth would refuse a 64-project node map.
+    pytest.param(
+        "[" + ",".join(["[]"] * 1000) + "]", False, id="1000-shallow-siblings"
+    ),
+    pytest.param(
+        "[" + ",".join(['{"a": 1}'] * 64) + "]", False, id="64-objects-at-depth-2"
+    ),
+    pytest.param(_node_map(64), False, id="64-project-node-map"),
 ]
 
 

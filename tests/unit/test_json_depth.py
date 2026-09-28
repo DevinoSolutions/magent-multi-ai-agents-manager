@@ -25,6 +25,8 @@ class TestTheBoundEveryReaderShares:
             pytest.param("[" * 64 + "]" * 64, False, id="64"),
             pytest.param("[" * 65 + "]" * 65, True, id="65"),
             pytest.param('["' + "[" * 100, False, id="unclosed-string"),
+            # Width is not depth: 101 containers, two levels.
+            pytest.param("[" + ",".join(["[]"] * 100) + "]", False, id="100-wide"),
         ],
     )
     def test_nests_too_deep_is_the_scan_at_the_bound(self, text, deeper):
