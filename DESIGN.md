@@ -1851,7 +1851,13 @@ ships a mirror to a node: no link is followed, a mirror that is itself a link
 is refused, and a pull's `.part` temp is never copied. A local file the node's
 copy changed is named, because it may be work this PC had.
 
-<!-- R-A/R-B pending: Task 16 -->
+**Not yet measured (plan G Task 16, a user-run probe):** whether
+`claude --resume <id>` resumes a conversation installed under another
+folder's name. Until it is measured, `recall --local` prints the exact
+command, `claude --resume <id>`, and under it a `resume by hand` line: run
+`claude --resume` in the project's folder and pick the conversation from
+the list. `recall --to` starts the moved session on the new node with
+`claude --resume <id>`.
 
 ## 3. Known debt
 
