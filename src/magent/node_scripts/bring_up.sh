@@ -307,6 +307,7 @@ main() {
   seed_memory "$unpacked/memory" "$HOME/.claude/projects/$enc/memory"
   # Read after the ship: the trees the session starts on. --allow-dirty
   # checked nothing, so it reports nothing either way.
+  # So a shipped file git does not ignore (.env) reads dirty: the fail-safe side.
   if [ "$allow" != 1 ]; then
     for ((i = 0; i < nrepos; i++)); do note_dirty "${dirs[i]}"; done
   fi
