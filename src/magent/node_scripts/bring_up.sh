@@ -164,6 +164,24 @@ capture() {
   printf -v "$1" '%s' "${out%?x}"
 }
 
+# Create the folder $1 and every missing folder above it, each 0700, stated
+# outright: a default ACL on a parent makes the kernel ignore the umask for a
+# new folder (GitHub's runner homes carry one), and `mkdir -p -m` gives the
+# mode to the last folder only. A folder already there is the node's own and
+# keeps its mode.
+mkdir_private() {
+  local dir=$1
+  local -a made=()
+  while [ ! -e "$dir" ] && [ ! -h "$dir" ]; do
+    made=("$dir" "${made[@]}")
+    capture dir dirname -- "$dir" || return 1
+  done
+  for dir in "${made[@]}"; do
+    mkdir -m 700 -- "$dir" || return 1
+  done
+  [ -d "$1" ]
+}
+
 # Copy every file under $1 into the EXISTING folder $2, mode 600, and set
 # `copied` to their relative names. Every name is checked before anything is
 # written. Each destination is resolved first, so a link already on the node
@@ -171,9 +189,9 @@ capture() {
 # one that stays inside $2 is followed. A file is written to a fresh 0600 temp
 # beside its target and renamed over it: an old 0644 file is replaced, never
 # rewritten in place under a reader that holds it open. Folders created on the
-# way are 0700 (umask 077) -- intended containment, not an accident.
+# way are 0700 (mkdir_private) -- intended containment, not an accident.
 copy_tree() {
-  local src=$1 dest=$2 base rel target dir tmp mask
+  local src=$1 dest=$2 base rel target dir tmp
   local -a rels=()
   copied=()
   [ -d "$src" ] || return 0
@@ -183,21 +201,18 @@ copy_tree() {
     rels+=("$rel")
   done < <(cd -- "$src" && find . -type f -print0 | sort -z)
   capture base realpath -e -- "$dest" || die 5 "cannot resolve $dest"
-  mask=$(umask)
-  umask 077
   for rel in "${rels[@]}"; do
     capture target realpath -m -- "$dest/$rel" || die 5 "cannot resolve $dest/$rel"
     [[ $target == "$base"/* ]] || die 5 "$dest/$rel resolves outside $dest ($target); not writing through a link"
     [ ! -d "$target" ] || die 5 "$dest/$rel is a folder on the node"
     capture dir dirname -- "$target" || die 5 "cannot resolve $dest/$rel"
-    mkdir -p -- "$dir" || die 5 "cannot create a folder for $rel"
+    mkdir_private "$dir" || die 5 "cannot create a folder for $rel"
     capture tmp mktemp -- "$dir/.magent-ship.XXXXXX" || die 5 "cannot write $dest/$rel"
     # mktemp creates it 0600 whatever the umask; cp into it keeps that mode.
     cp -- "$src/$rel" "$tmp" || { rm -f -- "$tmp"; die 5 "cannot write $dest/$rel"; }
     mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; die 5 "cannot write $dest/$rel"; }
     copied+=("$rel")
   done
-  umask "$mask"
 }
 
 ship_files() {
@@ -211,7 +226,7 @@ seed_memory() {
   local src=$1 dest=$2
   [ -d "$src" ] || return 0
   if [ -e "$dest" ] || [ -h "$dest" ]; then return 0; fi
-  (umask 077 && mkdir -p -- "$dest") || die 5 "cannot create $dest"
+  mkdir_private "$dest" || die 5 "cannot create $dest"
   copy_tree "$src" "$dest"
 }
 

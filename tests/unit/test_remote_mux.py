@@ -17,6 +17,7 @@ import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -2771,6 +2772,21 @@ class TestTheScriptLiterals:
         main = node_scripts._read("bring_up").split("\nmain() {", 1)[1]
         assert 0 <= main.index("umask 077") < main.index("tar -x")
 
+    def test_a_folder_the_payload_lands_in_is_made_0700_outright(self):
+        # A default ACL on a parent makes the kernel IGNORE the umask for a
+        # new folder (GitHub's runner homes carry one), so the mode is stated
+        # on each folder the script creates, never left to `umask 077`. And
+        # never `mkdir -p -m 700`: -p gives -m to the last folder only.
+        text = node_scripts._read("bring_up")
+        helper = _shell_function(text, "mkdir_private")
+        assert "mkdir -m 700 -- " in helper
+        assert "mkdir -p" not in helper
+        for name in ("copy_tree", "seed_memory"):
+            body = _shell_function(text, name)
+            assert "mkdir_private " in body
+            assert "umask" not in body
+            assert "mkdir " not in body
+
     def test_the_archive_is_never_extracted_with_absolute_names(self):
         text = node_scripts._read("bring_up")
         assert not re.search(r"\btar\b[^\n]*(\s-P\b|--absolute-names)", text)
@@ -2818,6 +2834,41 @@ def _link(name: str, target: str, kind: bytes = tarfile.SYMTYPE) -> tarfile.TarI
 
 def _tree(path: Path) -> list[str]:
     return sorted(str(p.relative_to(path)) for p in path.rglob("*"))
+
+
+def _shell_function(text: str, name: str) -> str:
+    """The code of the shell function ``name`` in a node script, without its
+    comment lines."""
+    found = re.search(rf"\n{name}\(\) \{{\n(.*?)\n\}}\n", text, re.DOTALL)
+    assert found, f"no {name}() in the script"
+    lines = found.group(1).splitlines()
+    return "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+
+
+def _grant_by_default_acl(path: Path) -> None:
+    """Give ``path`` a default ACL of u::rwx g::r-x o::r-x -- the shape a
+    GitHub runner home carries -- written as the kernel's own xattr, so no
+    setfacl is needed. Skips where the filesystem keeps no POSIX ACLs, or
+    keeps one that does not override the umask: nothing to prove there."""
+    user_obj, group_obj, other, no_id = 0x01, 0x04, 0x20, 0xFFFFFFFF
+    blob = struct.pack("<I", 2) + b"".join(
+        struct.pack("<HHI", tag, perm, no_id)
+        for tag, perm in ((user_obj, 7), (group_obj, 5), (other, 5))
+    )
+    try:
+        os.setxattr(path, "system.posix_acl_default", blob)
+    except OSError as exc:
+        pytest.skip(f"no POSIX default ACL on this filesystem: {exc}")
+    probe = path / ".acl-probe"
+    mask = os.umask(0o077)
+    try:
+        probe.mkdir()
+    finally:
+        os.umask(mask)
+    mode = stat.S_IMODE(probe.stat().st_mode)
+    probe.rmdir()
+    if mode == 0o700:
+        pytest.skip("a default ACL here does not override the umask")
 
 
 @pytest.mark.skipif(
@@ -3409,12 +3460,62 @@ class TestBringUpShOnARealShell:
         ] == []
 
     def test_a_folder_created_on_the_way_is_owner_only(self, rig):
-        # umask 077 covers the folders copy_tree makes, not only the files.
+        # The folders copy_tree makes are 0700, not only the files 0600.
         root = rig["root"]
         root.mkdir(parents=True)
         self._push_raw(rig, _raw_payload(("project/sub/.env", b"K=V\n")))
         assert stat.S_IMODE((root / "sub").stat().st_mode) == 0o700
         assert (root / "sub" / ".env").read_bytes() == b"K=V\n"
+
+    def test_a_default_acl_cannot_widen_a_folder_created_on_the_way(self, rig):
+        # A default ACL on the parent makes the kernel ignore the umask: under
+        # `umask 077` alone, sub/ and sub/deeper/ came out 0755, listable by
+        # anyone. The file itself stays 0600 either way (mktemp).
+        root = rig["root"]
+        root.mkdir(parents=True)
+        _grant_by_default_acl(root)
+        self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
+        modes = [
+            stat.S_IMODE(p.stat().st_mode)
+            for p in (
+                root / "sub",
+                root / "sub" / "deeper",
+                root / "sub" / "deeper" / ".env",
+            )
+        ]
+        assert modes == [0o700, 0o700, 0o600]
+
+    def test_a_folder_already_on_the_node_keeps_its_own_mode(self, rig):
+        # Only a folder the script made is 0700: one that was already there is
+        # the node's own, and a push is no reason to chmod it.
+        root = rig["root"]
+        (root / "sub").mkdir(parents=True)
+        root.chmod(0o751)
+        (root / "sub").chmod(0o755)
+        self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
+        modes = [
+            stat.S_IMODE(p.stat().st_mode)
+            for p in (root, root / "sub", root / "sub" / "deeper")
+        ]
+        assert modes == [0o751, 0o755, 0o700]
+
+    def test_a_default_acl_cannot_widen_the_seeded_memory_folders(self, rig):
+        # The seed lands under ~/.claude, on a home that may carry a default
+        # ACL: every folder the seed creates is 0700, and ~/.claude, already
+        # there, keeps its own mode.
+        home = Path.home()
+        _grant_by_default_acl(home)
+        claude = home / ".claude"
+        claude.mkdir()
+        claude.chmod(0o755)
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        store = claude / "projects" / rig["enc"]
+        modes = [
+            stat.S_IMODE(p.stat().st_mode)
+            for p in (claude, claude / "projects", store, store / "memory")
+        ]
+        assert modes == [0o755, 0o700, 0o700, 0o700]
+        assert stat.S_IMODE((store / "memory" / "MEMORY.md").stat().st_mode) == 0o600
 
     def test_a_failed_decoration_still_starts_the_session(self, rig):
         # The one step allowed to fail: a bare status line is not a failed
