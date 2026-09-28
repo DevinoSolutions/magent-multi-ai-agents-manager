@@ -431,6 +431,42 @@ class TestAFailureIsAnOutcomeNeverACrash:
         assert escaped.encode("ascii") in line
         assert all(0x20 <= byte < 0x7F for byte in line)
 
+    def test_an_over_cap_reply_shows_its_cap_and_logs_the_childs_words(
+        self, rig, api, caplog, capsys
+    ):
+        # Over the cap the child's words are remote text -- tool noise, or a
+        # complaint at the pipe the cap closed: the row is magent's cap line,
+        # and nodes.log has the words, escaped, on one line.
+        from magent.log import LOG_DIR, get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        rig.error = RemoteError(
+            None,
+            "reply exceeded 8 bytes\nboom: \x1b]0;x\x07disk full",
+            ("ssh",),
+            over_cap=True,
+            after_cap="BrokenPipeError: [Errno 32] Broken pipe",
+        )
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.error == "reply exceeded 8 bytes"
+        launch._echo_node_outcomes([outcome])
+        assert capsys.readouterr().out == "  x api: reply exceeded 8 bytes\n"
+        (logged,) = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes" and r.levelno == logging.WARNING
+        ]
+        assert r"reply exceeded 8 bytes\nboom: \x1b]0;x\x07disk full" in logged
+        assert r"\nafter the cap: BrokenPipeError: [Errno 32] Broken pipe" in logged
+        (line,) = [
+            line
+            for line in (LOG_DIR / "nodes.log").read_bytes().splitlines()
+            if b"bring-up of" in line
+        ]
+        assert b"disk full" in line
+        assert all(0x20 <= byte < 0x7F for byte in line)
+
     def test_an_unreachable_node_is_an_outcome(self, rig, api):
         rig.error = RemoteError(
             None, "ssh: connect to host devino-second: timed out", ("ssh",)
@@ -2732,6 +2768,42 @@ class TestDownPullsTheLastTurnHomeFirst:
         assert "tar: noise" not in out
         assert "bash -s" not in out
         assert "; kept in the node map for `magent node sync --once`" in out
+
+    def test_an_over_cap_pull_shows_its_cap_and_logs_the_childs_words(
+        self, rig, api, monkeypatch, capsys, caplog, killed
+    ):
+        # The not-pulled line is magent's cap; the child's words -- here with
+        # a terminal-title sequence -- are nodes.log's, escaped, on one line.
+        from magent.log import LOG_DIR, get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        _hold("api")
+        self._pulls(
+            monkeypatch,
+            RemoteError(
+                None,
+                "reply exceeded 8 bytes\nboom: \x1b]0;x\x07disk full",
+                ("ssh",),
+                over_cap=True,
+            ),
+        )
+        launch.stop_node_sessions(_config(api), ["api"])
+        out = capsys.readouterr().out
+        assert "api: last turn not pulled (reply exceeded 8 bytes)" in out
+        assert "disk full" not in out
+        (logged,) = [
+            r.getMessage()
+            for r in caplog.records
+            if "final pull of api failed" in r.getMessage()
+        ]
+        assert r"reply exceeded 8 bytes\nboom: \x1b]0;x\x07disk full" in logged
+        (line,) = [
+            line
+            for line in (LOG_DIR / "nodes.log").read_bytes().splitlines()
+            if b"final pull of api failed" in line
+        ]
+        assert all(0x20 <= byte < 0x7F for byte in line)
 
     def test_the_nodes_words_reach_the_screen_as_ascii(
         self, rig, api, monkeypatch, capsys, killed

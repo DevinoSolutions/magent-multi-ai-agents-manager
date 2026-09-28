@@ -155,6 +155,16 @@ class TestRemoteError:
         assert RemoteError(None, "", ()).timed_out is False
         assert RemoteError(None, "", (), timed_out=True).timed_out is True
 
+    def test_a_row_reads_the_whole_tail_but_over_the_cap_only_the_cap(self):
+        # Over the cap the child's words are the log's; the flag decides it,
+        # never the wording, and nothing is dropped from the error itself.
+        tail = "reply exceeded 8 bytes\nboom: disk full"
+        over = RemoteError(None, tail, ("ssh",), over_cap=True)
+        assert over.row_text == "reply exceeded 8 bytes"
+        assert over.stderr_tail == tail
+        assert "boom: disk full" in str(over)
+        assert RemoteError(1, tail, ("ssh",)).row_text == tail
+
 
 class TestTheSshResolver:
     def test_it_reads_path(self, tmp_path, monkeypatch):
@@ -754,7 +764,7 @@ class TestTheReplyIsBoundedInMemory:
     @pytest.mark.usefixtures("kill_order")
     def test_a_stderr_held_open_mid_line_never_hands_over_the_fragment(self, tmp_path):
         # The stream is still open, so its last line may be half-written: only
-        # whole lines are the child's words, and the row shows the last one.
+        # whole lines are the child's words -- the log's; the row is the cap.
         error, _ = self._flood_past_a_held_stderr(
             tmp_path, said="boom: disk full\nwriting blo"
         )
@@ -762,7 +772,7 @@ class TestTheReplyIsBoundedInMemory:
         assert lines[0] == f"reply exceeded {CAP} bytes"
         assert "boom: disk full" in lines[1:]
         assert "writing blo" not in error.stderr_tail
-        assert launch._node_error_text(error) == "boom: disk full"
+        assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
 
     @pytest.mark.usefixtures("kill_order")
     def test_a_stderr_held_open_before_a_whole_line_gives_no_reason(self, tmp_path):
@@ -809,7 +819,7 @@ class TestTheReplyIsBoundedInMemory:
         assert "boom: disk full" in lines[1:]
         assert "writing blo" not in error.stderr_tail
         assert "Broken pipe" not in error.stderr_tail
-        assert launch._node_error_text(error) == "boom: disk full"
+        assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
         if ending == "complains-at-the-pipe" and kill_order in _KILL_WAITS:
             assert _COMPLAINT in str(error)  # what launch logs
 
@@ -882,7 +892,8 @@ class TestTheReplyIsBoundedInMemory:
                 max_stdout_bytes=CAP,
             )
         assert exc.value.over_cap
-        assert launch._node_error_text(exc.value) == "boom: disk full"
+        assert exc.value.stderr_tail.splitlines()[1:] == ["boom: disk full"]
+        assert launch._node_error_text(exc.value) == f"reply exceeded {CAP} bytes"
 
     def test_the_drain_hands_over_what_arrived_before_the_stream_ends(self):
         # A data() taken mid-read is what has arrived, and the read goes on

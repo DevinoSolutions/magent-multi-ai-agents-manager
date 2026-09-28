@@ -169,8 +169,9 @@ class RemoteError(RuntimeError):
       FIRST line is magent's own ``reply exceeded N bytes`` and the child's
       words from before the cap follow it. What stderr said after the cap,
       and a half line the cap cut, is ``after_cap`` instead: never a reason,
-      so never in the tail a row reads, but in the message (``str``) for the
-      log.
+      so never in the tail, but in the message (``str``) for the log.
+    - ``row_text``: what may a screen row say? The text its one line is taken
+      from -- see the property.
 
     A spawn failure sets none of them."""
 
@@ -201,6 +202,15 @@ class RemoteError(RuntimeError):
         and neither stops a non-tty remote command. False does not cover an
         rc 255 transport drop, which may also have run (see the class)."""
         return self.timed_out or self.over_cap
+
+    @property
+    def row_text(self) -> str:
+        """The text a screen row takes its one line from: ``stderr_tail``,
+        where a node script writes its reason last -- but over the cap only
+        magent's own ``reply exceeded N bytes``. The cap is why the call
+        failed, and what the child said around it is the log's: remote tool
+        noise, or a complaint at the pipe the cap closed."""
+        return self.stderr_tail.split("\n", 1)[0] if self.over_cap else self.stderr_tail
 
 
 @functools.lru_cache(maxsize=1)
