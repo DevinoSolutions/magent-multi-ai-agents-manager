@@ -449,9 +449,9 @@ def _sync_state(rig: NodeRig) -> object:
 
 
 def _session_option(rig: NodeRig, option: str) -> str:
-    """The session's own value of ``option``. A failed read FAILS (not an
-    AssertionError), so D7b's xfail excuses only a real value mismatch and
-    never a broken wire."""
+    """The session's own value of ``option``. A failed read fails the test
+    outright (``pytest.fail``), so a broken wire never reads as a wrong
+    value."""
     run = rig.tmux("show-options", "-v", "-t", f"={rig.sid}:", option, tag=option)
     if run.rc != 0:
         pytest.fail(f"reading {option} off the node failed\n{run.show()}")
