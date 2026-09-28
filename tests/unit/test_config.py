@@ -1,5 +1,6 @@
 import json
 import sys
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -275,13 +276,17 @@ def _one(**fields: object) -> dict[str, object]:
     }
 
 
-def _deep_config(tmp_path: Path, leaf: str) -> tuple[str, str]:
+def _deep_config(
+    tmp_path: Path, leaf: str, *, siblings: bool = False
+) -> tuple[str, str]:
     """A config whose unknown ``projects[0].note`` holds ``leaf`` (JSON text)
     under more containers than the recursion limit, alternating list and
-    object; and the where-label that reaches the leaf. Built as text because
-    json.dumps recurses and cannot write it."""
+    object; and the where-label that reaches the leaf. With ``siblings``, each
+    of those containers also holds something AFTER the way down. Built as text
+    because json.dumps recurses and cannot write it."""
     pairs = sys.getrecursionlimit() // 2 + 100
-    note = '[{"n": ' * pairs + leaf + "}]" * pairs
+    close = ', "m": 1}, 1]' if siblings else "}]"
+    note = '[{"n": ' * pairs + leaf + close * pairs
     text = (
         f'{{"version": {SCHEMA_VERSION}, "projects":'
         f' [{{"path": "api", "color": "{_C}", "note": {note}}}]}}'
@@ -438,11 +443,42 @@ class TestTextWithNoUtf8FormIsRefusedAtLoad:
             "Warning: unknown config key: projects[0].note\n"
         )
 
-    def test_a_lone_surrogate_at_that_depth_is_refused_with_its_path(self, tmp_path):
-        path, where = _deep_config(tmp_path, '"api\\ud83d"')
+    @pytest.mark.parametrize(
+        "siblings",
+        [False, True],
+        ids=["a-bare-chain", "a-later-sibling-at-every-level"],
+    )
+    def test_a_lone_surrogate_at_that_depth_is_refused_with_its_path(
+        self, tmp_path, siblings
+    ):
+        path, where = _deep_config(tmp_path, '"api\\ud83d"', siblings=siblings)
         with pytest.raises(ConfigError) as exc:
             load_config(path)
         assert str(exc.value) == _refusal(where)
+
+    def test_a_later_sibling_at_every_level_costs_memory_linear_in_the_depth(self):
+        from magent.config import _refuse_text_with_no_utf8_form
+
+        # Each level's later sibling waits on the walk's stack while it goes
+        # down. With a spelled-out label apiece those waiting labels summed to
+        # the depth squared: 31 MB here, 450 MB for a 155 KB file. Built in
+        # Python and walked directly, so no json ceiling caps the depth on any
+        # version and the parse is not what gets measured.
+        note: object = "ok"
+        for _ in range(2000):
+            note = [{"n": note, "m": 1}, 1]
+        document: dict[str, object] = {"projects": [{"path": "api", "note": note}]}
+        tracemalloc.start()
+        try:
+            base = tracemalloc.get_traced_memory()[0]
+            tracemalloc.reset_peak()
+            _refuse_text_with_no_utf8_form(document)
+            peak = tracemalloc.get_traced_memory()[1] - base
+        finally:
+            tracemalloc.stop()
+        # A bound, not a measurement: ~1 MB on 3.10-3.14 when only the refused
+        # string's label is ever spelled out.
+        assert peak < 4_000_000
 
     @pytest.mark.parametrize(
         ("where", "config"),
