@@ -309,6 +309,10 @@ def load_settings(path: Path) -> dict[str, object]:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except ValueError as exc:
         raise SettingsParseError(str(exc)) from exc
+    except RecursionError as exc:
+        # JSON nested past the parser's depth. Not a ValueError, but a file we
+        # cannot parse all the same, and every caller refuses those by name.
+        raise SettingsParseError("settings.json is nested too deeply to parse") from exc
     if not isinstance(data, dict):
         raise SettingsParseError("settings.json is not a JSON object")
     return data

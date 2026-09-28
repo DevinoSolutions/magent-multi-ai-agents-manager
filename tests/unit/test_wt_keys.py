@@ -20,6 +20,10 @@ from tests.conftest import FakePlatform
 CTRL_W_ESCAPE = "\\u0017"
 ESC_CR_ESCAPE = "\\u001b\\r"
 
+# A settings file nested past the JSON parser's depth: json.loads raises
+# RecursionError on it, which is not a ValueError.
+_NESTED = '{"actions": ' + "[" * 200_000 + "]" * 200_000 + "}"
+
 
 @pytest.fixture(autouse=True)
 def _on_windows(monkeypatch):
@@ -222,6 +226,50 @@ class TestJsoncRefusal:
         result = _status(runner, path)
         assert result.exit_code == 0
         assert "unreadable" in result.output
+
+
+class TestNestedPastTheParsersDepth:
+    """json.loads raises RecursionError, not ValueError, on a document nested
+    past its depth. It is a file we cannot parse like any other, so it takes
+    the same refusal: named, never a traceback, never rewritten."""
+
+    def _nested(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_bytes(_NESTED.encode("utf-8"))
+        return path
+
+    def test_load_settings_raises_the_parse_error(self, tmp_path):
+        with pytest.raises(wt_keys.SettingsParseError, match="nested too deeply"):
+            wt_keys.load_settings(self._nested(tmp_path))
+
+    def test_install_refuses_by_name_and_leaves_the_file_byte_identical(
+        self, runner, tmp_path
+    ):
+        path = self._nested(tmp_path)
+
+        result = _install(runner, path)
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert f"Cannot edit {path}: " in result.stderr
+        assert "nested too deeply" in result.stderr
+        assert path.read_bytes() == _NESTED.encode("utf-8")
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["settings.json"]
+
+    def test_status_reports_unparseable_never_absent(self, runner, tmp_path):
+        # Unknown must never read as absent: no per-key "not bound" rows, and
+        # never "Windows Terminal not found".
+        path = self._nested(tmp_path)
+
+        result = _status(runner, path)
+
+        assert result.exit_code == 0, result.exception
+        assert "unreadable: " in result.output
+        assert "nested too deeply" in result.output
+        assert "ctrl+backspace" not in result.output
+        assert "shift+enter" not in result.output
+        assert "not found" not in result.output
+        assert path.read_bytes() == _NESTED.encode("utf-8")
 
 
 class TestBackup:

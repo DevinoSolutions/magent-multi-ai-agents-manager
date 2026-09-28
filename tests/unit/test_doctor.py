@@ -33,6 +33,10 @@ from magent.config import SCHEMA_VERSION, load_config
 from magent.grid import MonitorRect
 from tests.conftest import FakePlatform
 
+# A settings file nested past the JSON parser's depth: json.loads raises
+# RecursionError on it, which is not a ValueError.
+_NESTED = '{"actions": ' + "[" * 200_000 + "]" * 200_000 + "}"
+
 
 class TestCheckConfig:
     def test_missing_config_fails_with_init_hint(self, tmp_path):
@@ -383,6 +387,39 @@ class TestCheckWtKeys:
         status, detail = doctor._check_wt_keys()
         assert status == WARN
         assert "magent terminal install" in detail
+
+    def test_settings_nested_past_the_parsers_depth_warn_naming_it(
+        self, monkeypatch, tmp_path
+    ):
+        # json.loads raises RecursionError there, not ValueError.
+        self._platform(monkeypatch, supported=True)
+        self._settings(monkeypatch, tmp_path, _NESTED)
+        status, detail = doctor._check_wt_keys()
+        assert status == WARN
+        assert "nested too deeply" in detail
+        assert "magent terminal install" in detail
+
+    def test_settings_nested_past_the_parsers_depth_leave_the_rest_running(
+        self, runner, monkeypatch, tmp_path, tmp_config
+    ):
+        # _run_checks has no per-check guard: an exception out of this one
+        # check would take every other check down with it.
+        self._platform(monkeypatch, supported=True)
+        self._settings(monkeypatch, tmp_path, _NESTED)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        config_path = tmp_config(
+            {"version": SCHEMA_VERSION, "projects": [{"path": "api"}]}
+        )
+
+        result = runner.invoke(cli.main, ["--config", config_path, "doctor", "--json"])
+
+        checks = {c["name"]: c for c in json.loads(result.stdout)["checks"]}
+        assert checks["wt-keys"]["status"] == WARN
+        assert "nested too deeply" in checks["wt-keys"]["detail"]
+        assert {"logs dir", "state dir", "sentry", "tailscale", "upload port"} <= set(
+            checks
+        )
 
 
 class TestCheckPsmuxSessionZero:
