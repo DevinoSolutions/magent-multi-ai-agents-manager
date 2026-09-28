@@ -52,10 +52,15 @@ Because the project does not exist on PyPI yet, add it as a **pending** publishe
    `pypi` (must match the `environment: name` in `release.yml`).
 2. (Recommended) Under **Deployment protection rules**, add yourself / the
    release team as **Required reviewers**. Every publish then pauses for a manual
-   approval click before the package is pushed to PyPI.
+   approval click before the package is pushed to PyPI. The repo's `pypi`
+   environment currently has **no** required reviewer (its only rule allows
+   `v*` tags), so a tag push publishes without a pause.
 3. No secrets are needed in this environment — Trusted Publishing uses the
-   job's short-lived OIDC token (`permissions: id-token: write`), which is
-   already scoped to the publish job only.
+   job's short-lived OIDC token (`permissions: id-token: write`). That
+   permission is currently granted at the **workflow** level, so every job in
+   `release.yml` can mint a token; PyPI accepts it only from a job running in
+   the `pypi` environment, which is the publish job. Scoping it to the publish
+   job alone is a follow-up.
 
 ---
 
@@ -143,9 +148,17 @@ To validate build + smoke without publishing, trigger the workflow manually:
 - **GitHub UI:** *Actions → Release → Run workflow* (leave **dry_run** checked).
 - **CLI:** `gh workflow run release.yml -f dry_run=true`
 
-The `build` and `smoke` jobs run; `publish` and `github-release` are skipped.
-`workflow_dispatch` can **never** publish — publishing is gated to `push` events
-on `v*` tags — so a dispatch is always safe, whatever the `dry_run` value.
+The `build`, `smoke` and `sdist-smoke` jobs run; `publish` and `github-release`
+are skipped. `workflow_dispatch` can **never** publish — publishing is gated to
+`push` events on `v*` tags — so a dispatch is always safe, whatever the
+`dry_run` value.
+
+A dry run from a branch does **not** exercise the tag checks (the pre-release
+classification and the tag-vs-built-version guard) or `github-release`: they
+need a tag, so their first real run is the tag push itself. With no required
+reviewer on `pypi`, that push publishes without a pause. The checks fail
+closed: they run in the `build` job before the artifacts are uploaded, so a bad
+tag stops the run with nothing published.
 
 > A `workflow_dispatch` run only appears once `release.yml` exists on the
 > repository's **default branch** (a GitHub requirement for the manual trigger).
@@ -160,9 +173,33 @@ on `v*` tags — so a dispatch is always safe, whatever the `dry_run` value.
   environment (`pypi`). All four must match exactly.
 - **Publish waits and never runs** — a Required reviewer must approve the `pypi`
   environment deployment (Actions run page → **Review deployments**).
-- **`tag vX does not match the built version Y`** — the tag and `pyproject.toml`
-  disagree; nothing was published. Fix the version (and `uv lock`), commit, then
-  delete and re-push the tag.
+- **`tag vX does not match the built version Y (expected tag vY)`** — nothing
+  was published; the `build` job stopped before the upload. Two cases:
+  - *`pyproject.toml` is wrong* (the tag is the version you meant): delete the
+    tag, fix the version, then re-create the tag **on the fixed commit** and
+    push it. Re-pushing the old local tag would point at the old commit again.
+
+    ```bash
+    git push origin :refs/tags/vX   # delete the tag on GitHub
+    git tag -d vX                   # and locally
+    # fix pyproject.toml, run `uv lock`, commit, push the commit
+    git tag vX                      # re-create it on the fixed commit
+    git push origin vX
+    ```
+
+  - *The tag is the typo* (`pyproject.toml` is right): delete it and tag the
+    same commit with the right name. Nothing in `pyproject.toml` changes.
+
+    ```bash
+    commit=$(git rev-list -n 1 vX)  # the commit the wrong tag points at
+    git push origin :refs/tags/vX
+    git tag -d vX
+    git tag vY "$commit"
+    git push origin vY
+    ```
+
+  An `InvalidVersion: Invalid version: '...'` from the classify step means the
+  tag is not PEP 440 at all; recover the same way as a tag typo.
 - **`File already exists` from PyPI** — that version was already uploaded. PyPI
   is immutable; bump to a new version and tag again.
 - **`uv lock --check` fails in CI** — you bumped the version without running

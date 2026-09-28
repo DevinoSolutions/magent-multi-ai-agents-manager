@@ -16,8 +16,11 @@ on:
         type: boolean
         default: true
 
-# Least privilege at the top; only the publish and release jobs elevate, each
-# narrowly and only on a real tag push.
+# `id-token: write` is granted here, at the WORKFLOW level, so every job can
+# mint an OIDC token. PyPI accepts one only from a job in the `pypi`
+# environment (the Trusted Publisher's environment constraint), i.e. publish.
+# `contents: write` is elevated in github-release alone. Scoping id-token to
+# the publish job is a follow-up.
 permissions:
   id-token: write
   contents: read
