@@ -11,7 +11,6 @@ import os
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,7 +20,7 @@ from magent.cli.app import main
 from magent.cli.config_io import _load_config_or_exit
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.paths import find_config
-from magent.procs import pid_alive
+from magent.procs import await_registration, pid_alive
 from magent.style import style
 from magent.titles import get_leaf_name
 
@@ -386,16 +385,13 @@ def attention_cmd(
                     spawn_detached,
                 )
 
-                spawn_detached(args)
-                for _ in range(20):
-                    time.sleep(0.1)
-                    pid = daemon_pid()
-                    if pid:
-                        click.echo(
-                            f"  {style('+', fg='green')} Attention daemon running "
-                            f"{style(f'(pid {pid})', dim=True)}"
-                        )
-                        return
+                pid = await_registration(spawn_detached(args), daemon_pid)
+                if pid:
+                    click.echo(
+                        f"  {style('+', fg='green')} Attention daemon running "
+                        f"{style(f'(pid {pid})', dim=True)}"
+                    )
+                    return
                 click.echo(f"  {style('x', fg='red')} attention daemon failed to start")
                 sys.exit(1)
         except LockHeld:

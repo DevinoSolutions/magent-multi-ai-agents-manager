@@ -532,6 +532,54 @@ class TestGoPathCreationVerify:
         assert "2 session(s) failed to come up" in out
         assert "refusing to start psmux sessions" in out
 
+    def test_a_refused_session_is_named_with_its_reason_and_not_respawned(
+        self, monkeypatch, capsys
+    ):
+        # The platform left `b` alone (its has-session never answered). The
+        # verify finds it missing, but a respawn would only repeat the wait
+        # that failed -- so it is reported, with the platform's reason, and
+        # the Session-0 note line still follows the casualty list.
+        why = "could not tell whether b is running (has-session gave no answer)"
+        plat = FakePlatform(supports_psmux=True, psmux_launch_failures={"b"})
+        original = plat.launch_psmux_session
+
+        def _refusing(windows):
+            original(windows)
+            return {"b": why} if any(w.window_name == "b" for w in windows) else {}
+
+        plat.launch_psmux_session = _refusing
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+
+        fp = self._run(monkeypatch, missing=[], plat=plat)
+
+        assert fp.psmux_launches == [["a", "b"]]
+        out = capsys.readouterr().out
+        assert "1 session(s) failed to come up: b" in out
+        assert why in out
+        assert "S0-NOTE" in out
+
+    def test_the_casualty_block_is_byte_for_byte(self, monkeypatch, capsys):
+        # Characterization: the whole block, in order -- a blank line, the
+        # count and names with the local log hint, one dimmed line per KNOWN
+        # reason (none for an empty one), then the Session-0 note.
+        why = "could not tell whether b is running (has-session gave no answer)"
+        plat = FakePlatform(supports_psmux=True)
+        monkeypatch.setattr(
+            "magent.psmux.launch_verified", lambda _p, _w: {"a": "", "b": why}
+        )
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+
+        self._run(monkeypatch, missing=[], plat=plat)
+
+        out = capsys.readouterr().out
+        assert out.startswith(
+            "\n"
+            "  x 2 session(s) failed to come up: a, b"
+            " (see ~/.magent/logs/launch.log)\n"
+            f"    {why}\n"
+            "  S0-NOTE\n"
+        ), out
+
 
 class TestHotkeyRestartReason:
     """The keep-or-restart decision for an already-running Alt+V/F2 listener.
@@ -1885,6 +1933,131 @@ class TestUploadServerSupervisor:
         clock.t += 60.0
         assert sup.tick() is True
         assert len(spawned) == 2
+
+    class _Child:
+        """What `spawn_detached` hands back: a poll-able child that records
+        every attempt to end it (the supervisor must never make one)."""
+
+        def __init__(self, returncode: int | None) -> None:
+            self.returncode = returncode
+            self.ended: list[str] = []
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.ended.append("kill")
+
+        def terminate(self) -> None:
+            self.ended.append("terminate")
+
+        def send_signal(self, _sig: int) -> None:
+            self.ended.append("send_signal")
+
+    def _wire_children(self, monkeypatch, *, alive, returncodes):
+        """Like `_wire`, but each spawn returns the next `_Child`."""
+        children = [self._Child(rc) for rc in returncodes]
+        pending = iter(children)
+        spawned: list[list[str]] = []
+
+        def spawn(args):
+            spawned.append(args)
+            return next(pending)
+
+        answers = iter(alive)
+        monkeypatch.setattr(launch, "_probe_upload_port", lambda _p: next(answers))
+        monkeypatch.setattr(launch, "spawn_detached", spawn)
+        return spawned, children
+
+    def test_a_serve_still_starting_is_not_doubled_after_the_cooldown(
+        self, monkeypatch
+    ):
+        # Measured on a loaded desktop: a serve took ~4.7s to bind, the 3s
+        # cooldown expired first, and the second serve bound the SAME port
+        # (SO_REUSEADDR on Windows) -- two live servers, one pid file. A child
+        # that is alive inside the registration window is slow, not failed.
+        # A spare child for the spawn that must NOT happen, so a regression
+        # fails the assertion instead of exhausting the fake's iterator.
+        spawned, children = self._wire_children(
+            monkeypatch, alive=[False, False, False], returncodes=[None, None]
+        )
+        clock = _FakeClock()
+        sup = launch.UploadServerSupervisor(8099, cooldown_s=3.0, now=clock)
+
+        assert sup.tick() is True
+        clock.t += 3.5
+        assert sup.tick() is False
+        clock.t += launch.REGISTRATION_TIMEOUT_S - 3.5 - 0.1
+        assert sup.tick() is False
+        assert len(spawned) == 1
+        assert all(c.ended == [] for c in children)
+
+    def test_past_the_registration_window_a_live_child_no_longer_blocks(
+        self, monkeypatch
+    ):
+        # A child alive but still not answering after the whole window is a
+        # wedge; the cooldown alone decides again, and the wedge is not ended.
+        spawned, children = self._wire_children(
+            monkeypatch, alive=[False, False], returncodes=[None, None]
+        )
+        clock = _FakeClock()
+        sup = launch.UploadServerSupervisor(8099, cooldown_s=3.0, now=clock)
+
+        assert sup.tick() is True
+        clock.t += launch.REGISTRATION_TIMEOUT_S
+        assert sup.tick() is True
+        assert len(spawned) == 2
+        assert children[0].ended == []
+
+    def test_a_child_that_exited_is_respawned_once_the_cooldown_expires(
+        self, monkeypatch
+    ):
+        # Any exit -- 0 included -- means nothing of ours is still starting, so
+        # a crash-on-startup is retried at the cooldown rate, as before.
+        spawned, children = self._wire_children(
+            monkeypatch, alive=[False, False, False], returncodes=[0, 1]
+        )
+        clock = _FakeClock()
+        sup = launch.UploadServerSupervisor(8099, cooldown_s=3.0, now=clock)
+
+        assert sup.tick() is True
+        clock.t += 1.0
+        assert sup.tick() is False  # the cooldown still holds
+        clock.t += 2.5
+        assert sup.tick() is True
+        assert len(spawned) == 2
+        assert all(c.ended == [] for c in children)
+
+    def test_a_spawn_that_raises_is_not_timed_against_the_previous_child(
+        self, monkeypatch
+    ):
+        # _last_spawn is stamped before the spawn so a raising spawn still
+        # paces; the previous child must not then stand in for the attempt
+        # that failed and hold the next one for the whole window.
+        alive_but_unbound = self._Child(None)
+        calls: list[list[str]] = []
+
+        def spawn(args):
+            calls.append(args)
+            if len(calls) == 1:
+                return alive_but_unbound
+            if len(calls) == 2:
+                raise OSError("spawn failed")
+            return self._Child(None)
+
+        monkeypatch.setattr(launch, "_probe_upload_port", lambda _p: False)
+        monkeypatch.setattr(launch, "spawn_detached", spawn)
+        clock = _FakeClock()
+        sup = launch.UploadServerSupervisor(8099, cooldown_s=3.0, now=clock)
+
+        assert sup.tick() is True
+        clock.t += launch.REGISTRATION_TIMEOUT_S  # the first child's window ends
+        with pytest.raises(OSError):
+            sup.tick()
+        clock.t += 3.5  # past the cooldown of the attempt that raised
+        assert sup.tick() is True
+        assert len(calls) == 3
+        assert alive_but_unbound.ended == []
 
     def test_a_healthy_tick_inside_the_cooldown_costs_nothing(self, monkeypatch):
         # The cooldown gate is reached only when the port is dead: a server that

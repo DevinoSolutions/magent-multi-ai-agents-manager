@@ -13,6 +13,7 @@ import pytest
 from click.testing import CliRunner
 
 from magent import cli, wt_keys
+from magent import env as env_module
 from magent import psmux as psmux_mod
 from magent.cli import doctor
 from magent.cli.doctor import (
@@ -36,6 +37,10 @@ from magent.grid import MonitorRect
 from magent.remote_mux import ScriptLine
 from tests.conftest import FakePlatform
 
+# A settings file nested past the JSON parser's depth: json.loads raises
+# RecursionError on it, which is not a ValueError.
+_NESTED = '{"actions": ' + "[" * 200_000 + "]" * 200_000 + "}"
+
 
 class TestCheckConfig:
     def test_missing_config_fails_with_init_hint(self, tmp_path):
@@ -57,6 +62,26 @@ class TestCheckConfig:
         assert result[0] == OK
         assert cfg is not None
 
+    def test_text_with_no_utf8_form_fails_in_our_words(self, tmp_config):
+        # F-SUR-1: a colorless title with a lone surrogate used to escape this
+        # check as the tab-color hash's UnicodeEncodeError (not a ConfigError),
+        # taking doctor down with a traceback instead of reporting the config.
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "projects": [{"path": "api", "title": "api\ud83d"}],
+            }
+        )
+        (result, cfg) = _check_config(Path(path))
+        assert result == (
+            FAIL,
+            (
+                "config invalid: projects[0].title has text with no UTF-8 form"
+                " (UnicodeEncodeError): 'api\\ud83d'"
+            ),
+        )
+        assert cfg is None
+
 
 class TestCheckEnv:
     def test_invalid_field_fails_naming_the_full_var(self, monkeypatch):
@@ -70,6 +95,39 @@ class TestCheckEnv:
             if key.upper().startswith("MAGENT_"):
                 monkeypatch.delenv(key, raising=False)
         assert doctor._check_env()[0] == OK
+
+    def test_an_env_file_that_is_not_utf8_fails_naming_it(self):
+        # Exact: the item has no field name, so nothing may precede the path.
+        env_module.ENV_FILE.write_bytes(b"MAGENT_LOG_LEVEL=\xff\xfe\n")
+        status, detail = doctor._check_env()
+        assert status == FAIL
+        assert detail == (
+            f"invalid environment variable(s): {env_module.ENV_FILE} is not "
+            "valid UTF-8 (UnicodeDecodeError); re-save it as UTF-8 (see .env.example)"
+        )
+
+    def test_an_env_file_that_is_not_utf8_leaves_every_other_check_running(
+        self, monkeypatch, tmp_config
+    ):
+        # Driven below the CLI: the group callback refuses a bad env before
+        # any subcommand runs. The sentry check reads get_env() again, and
+        # _run_checks has no per-check guard, so it has to survive the file
+        # too or the checklist dies at the first check after env.
+        fp = FakePlatform()
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        env_module.ENV_FILE.write_bytes(b"MAGENT_LOG_LEVEL=\xff\xfe\n")
+        config_file = Path(
+            tmp_config({"version": SCHEMA_VERSION, "projects": [{"path": "api"}]})
+        )
+
+        checks = {c["name"]: c for c in doctor._run_checks(config_file)}
+
+        assert checks["env"]["status"] == FAIL
+        assert "is not valid UTF-8" in checks["env"]["detail"]
+        assert checks["sentry"]["detail"].startswith("skipped")
+        assert "upload port" in checks
 
 
 class TestCheckAgentTools:
@@ -386,6 +444,39 @@ class TestCheckWtKeys:
         status, detail = doctor._check_wt_keys()
         assert status == WARN
         assert "magent terminal install" in detail
+
+    def test_settings_nested_past_the_parsers_depth_warn_naming_it(
+        self, monkeypatch, tmp_path
+    ):
+        # json.loads raises RecursionError there, not ValueError.
+        self._platform(monkeypatch, supported=True)
+        self._settings(monkeypatch, tmp_path, _NESTED)
+        status, detail = doctor._check_wt_keys()
+        assert status == WARN
+        assert "nested too deeply" in detail
+        assert "magent terminal install" in detail
+
+    def test_settings_nested_past_the_parsers_depth_leave_the_rest_running(
+        self, runner, monkeypatch, tmp_path, tmp_config
+    ):
+        # _run_checks has no per-check guard: an exception out of this one
+        # check would take every other check down with it.
+        self._platform(monkeypatch, supported=True)
+        self._settings(monkeypatch, tmp_path, _NESTED)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        config_path = tmp_config(
+            {"version": SCHEMA_VERSION, "projects": [{"path": "api"}]}
+        )
+
+        result = runner.invoke(cli.main, ["--config", config_path, "doctor", "--json"])
+
+        checks = {c["name"]: c for c in json.loads(result.stdout)["checks"]}
+        assert checks["wt-keys"]["status"] == WARN
+        assert "nested too deeply" in checks["wt-keys"]["detail"]
+        assert {"logs dir", "state dir", "sentry", "tailscale", "upload port"} <= set(
+            checks
+        )
 
 
 class TestCheckPsmuxSessionZero:

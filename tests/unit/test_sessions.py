@@ -663,9 +663,15 @@ def _real_project_dirs(limit: int = 400) -> list[tuple[Path, str]]:
     return out
 
 
+@pytest.mark.skipif(
+    os.environ.get("MDTEST_REAL_CLAUDE_STORE") != "1",
+    reason="reads the real ~/.claude/projects; opt in with MDTEST_REAL_CLAUDE_STORE=1",
+)
 class TestTheEncoderMatchesClaudeCodesOwnStore:
     """The encoder is only right if it names the directory the CLI actually
-    wrote. These read the REAL store, read-only, and skip where there is none.
+    wrote. These read the REAL store, read-only, so they are opt-in
+    (MDTEST_REAL_CLAUDE_STORE=1): a default unit run never reads the real
+    home. Opted in, they still skip where there is no store.
 
     The evidence behind the rule (2026-09-24, one developer machine): of 297
     ~/.claude/projects dirs with a recorded cwd, 295 are named exactly

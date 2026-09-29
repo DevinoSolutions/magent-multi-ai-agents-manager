@@ -13,8 +13,9 @@ import json
 import time
 
 import pytest
+from click.testing import CliRunner
 
-from magent import cli
+from magent import cli, psmux
 from tests.unit._fake_psmux import make_fake_psmux
 
 MID = "·"
@@ -26,6 +27,21 @@ CARET = chr(0x276F)
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda *_: None)
+
+
+@pytest.fixture(autouse=True)
+def _patient_capture(monkeypatch):
+    # The capture budget in these tests only. The fake psmux is a Python shim;
+    # on a loaded Windows box its start alone has overrun the product's 3s, and
+    # green tests failed as "nopane" / exit 0. The tests that pin what a
+    # capture TIMEOUT does set their own tiny budget and a slow fake.
+    monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 60.0)
+
+
+def _slow_capture(fake, monkeypatch):
+    """Make the fake's capture-pane answer well after a tiny budget."""
+    fake.set_capture_delay(1.5)
+    monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 0.3)
 
 
 def _cfg(tmp_config, tmp_path, titles):
@@ -125,6 +141,30 @@ class TestSend:
         )
 
         assert result.exit_code == 4
+
+    def test_a_pane_that_cannot_be_read_back_is_unconfirmed_exit_4(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The prompt is still sitting on the input line, but the capture that
+        # would show it ran out the clock. An unread pane confirms nothing:
+        # this used to exit 0 ("OK sent") on exactly the pane exit 4 is for.
+        fake = make_fake_psmux(
+            tmp_path,
+            pane="scrollback\nPlease do the big refactor now",
+            live=["caramel"],
+        )
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        _slow_capture(fake, monkeypatch)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel"])
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", cfg, "send", "caramel", "Please do the big refactor now"],
+        )
+
+        assert result.exit_code == 4
+        assert "could not read" in result.stderr
+        assert "OK" not in result.stdout
 
     def test_file_source(self, runner, tmp_config, tmp_path, monkeypatch):
         fake = make_fake_psmux(
@@ -309,6 +349,20 @@ class TestPeek:
 
         assert result.exit_code == 2
 
+    def test_a_pane_that_does_not_answer_is_an_error_not_an_empty_tail(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, pane="line1\nline2", live=["caramel"])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        _slow_capture(fake, monkeypatch)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel"])
+
+        result = runner.invoke(cli.main, ["--config", cfg, "peek", "caramel"])
+
+        assert result.exit_code == 3
+        assert "could not read" in result.stderr
+        assert result.stdout == ""
+
     def test_a_legacy_code_page_stdout_loses_glyphs_not_the_command(self, monkeypatch):
         # The pane is the AGENT's UI and carries its glyphs; a redirected
         # Windows stdout is cp1252. This used to raise UnicodeEncodeError out of
@@ -324,6 +378,25 @@ class TestPeek:
         assert f"Fable 5.1 {MID} high" in out
         assert "? prompt" in out
         assert out.encode("cp1252")  # the whole point: it can now be written
+
+    def test_peek_keeps_its_question_marks_under_the_entry_escape(
+        self, tmp_config, tmp_path, monkeypatch
+    ):
+        # The entry point escapes what stdout cannot encode, but a pane is the
+        # AGENT's screen and peek is a lossy glance: _stdout_safe still turns
+        # the caret into "?" before the stream ever sees it, rather than into
+        # an escape nobody asked to read.
+        fake = make_fake_psmux(tmp_path, pane=f"{CARET} prompt", live=["caramel"])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel"])
+
+        result = CliRunner(charset="cp1252").invoke(
+            cli.main, ["--config", cfg, "peek", "caramel"]
+        )
+
+        assert result.exit_code == 0, result.exception
+        assert "? prompt" in result.stdout
+        assert "\\u276f" not in result.stdout
 
     def test_a_utf8_stdout_keeps_every_glyph(self, monkeypatch):
         from magent.cli import fleet_cmd
@@ -355,6 +428,23 @@ class TestSessionsJson:
         assert by_name["caramel"]["effort"] == "high"
         assert by_name["upup"]["live"] is False
         assert by_name["upup"]["state"] == "dead"
+
+    def test_a_live_pane_that_does_not_answer_reads_timeout_not_nopane(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(
+            tmp_path, pane=f"PS> claude\nFable 5.1 {MID} high", live=["caramel"]
+        )
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        _slow_capture(fake, monkeypatch)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel"])
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        assert result.exit_code == 0
+        (row,) = json.loads(result.stdout)
+        assert row["live"] is True
+        assert row["state"] == "timeout"
 
     def test_empty_config_is_empty_array(
         self, runner, tmp_config, tmp_path, monkeypatch

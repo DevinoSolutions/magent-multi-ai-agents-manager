@@ -58,16 +58,23 @@ def _echo_outcome(outcome: wt_keys.KeyState) -> None:
     )
 
 
-def _echo_manual_snippet(path: Path, reason: str) -> None:
+def _echo_manual_snippet(path: Path, exc: wt_keys.SettingsParseError) -> None:
     """Refusal, with everything needed to finish the job by hand."""
-    click.echo(f"  {style('x', fg='red')} Cannot edit {path}: {reason}", err=True)
-    click.echo(
-        f"  {style('Windows Terminal accepts comments and trailing commas; the', dim=True)}"
-    )
-    click.echo(
-        f"  {style('stdlib JSON parser does not, and magent never rewrites a file', dim=True)}"
-    )
-    click.echo(f"  {style('it could not read. Add this by hand instead:', dim=True)}")
+    click.echo(f"  {style('x', fg='red')} Cannot edit {path}: {exc}", err=True)
+    if exc.maybe_jsonc:
+        click.echo(
+            f"  {style('Windows Terminal accepts comments and trailing commas; the', dim=True)}"
+        )
+        click.echo(
+            f"  {style('stdlib JSON parser does not, and magent never rewrites a file', dim=True)}"
+        )
+        click.echo(
+            f"  {style('it could not read. Add this by hand instead:', dim=True)}"
+        )
+    else:
+        click.echo(
+            f"  {style('magent never rewrites a file it could not read. Add this by hand instead:', dim=True)}"
+        )
     click.echo()
     for line in wt_keys.manual_snippet().splitlines():
         click.echo(f"    {style(line, fg='cyan')}")
@@ -108,7 +115,7 @@ def terminal_install_cmd(settings_file: Path | None) -> None:
     try:
         report = wt_keys.install(path)
     except wt_keys.SettingsParseError as exc:
-        _echo_manual_snippet(path, str(exc))
+        _echo_manual_snippet(path, exc)
         raise SystemExit(1) from exc
     except OSError as exc:
         click.echo(f"  {style('x', fg='red')} Cannot edit {path}: {exc}", err=True)
@@ -152,13 +159,21 @@ def terminal_status_cmd(settings_file: Path | None) -> None:
         doc = wt_keys.load_settings(path)
     except wt_keys.SettingsParseError as exc:
         click.echo(f"  {style('!', fg='yellow', bold=True)} unreadable: {exc}")
-        click.echo(
-            f"  {style('Windows Terminal allows JSONC; magent will not rewrite a', dim=True)}"
-        )
-        click.echo(
-            f"  {style('file it cannot parse. Run `magent terminal install` for the', dim=True)}"
-        )
-        click.echo(f"  {style('snippet to paste by hand.', dim=True)}")
+        if exc.maybe_jsonc:
+            click.echo(
+                f"  {style('Windows Terminal allows JSONC; magent will not rewrite a', dim=True)}"
+            )
+            click.echo(
+                f"  {style('file it cannot parse. Run `magent terminal install` for the', dim=True)}"
+            )
+            click.echo(f"  {style('snippet to paste by hand.', dim=True)}")
+        else:
+            click.echo(
+                f"  {style('magent will not rewrite a file it cannot parse. Run', dim=True)}"
+            )
+            click.echo(
+                f"  {style('`magent terminal install` for the snippet to paste by hand.', dim=True)}"
+            )
         return
     except OSError as exc:
         click.echo(f"  {style('!', fg='yellow', bold=True)} unreadable: {exc}")

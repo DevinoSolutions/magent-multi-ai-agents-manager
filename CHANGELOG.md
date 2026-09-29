@@ -173,6 +173,196 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history.
 - `"node": "cloud"` is reserved, and in this release it runs as an ordinary
   local session.
+## [3.19.4] - 2026-09-29
+
+### Fixed
+
+- **A desktop hand-off from a folder whose path has non-ASCII characters
+  works again (Windows).** Since 3.18.0, magent wrote the hand-off script as
+  UTF-8 without a byte-order mark, so Windows PowerShell 5.1 read it in the
+  legacy code page. A hand-off from such a folder therefore failed, and some
+  letters, such as `Ñ` or `т`, even ended the quoted path early. The script
+  is now written with a byte-order mark, so PowerShell reads it as UTF-8.
+  magent also now escapes all five characters PowerShell ends a quoted
+  string on: the curly quotes `‘` `’` `‚` `‛` as well as `'`.
+
+- **A settings file magent cannot read is refused by name, never with a
+  traceback and never by rewriting it.** This covers the Windows Terminal
+  `settings.json` (`magent terminal`, `doctor`), Claude Code's
+  `settings.json` (`magent hooks`) and `~/.magent/.env`.
+  - A file nested deeper than the JSON parser allows used to crash
+    `terminal`, `hooks` and `doctor`, and `doctor --json` printed nothing at
+    all.
+  - A `.env` that is not UTF-8, or that another program holds locked, used to
+    crash every command. It now fails like any invalid environment, with one
+    line naming the file and the repair. A `.env` saved with a byte-order
+    mark now loads.
+  - `magent hooks install` could rewrite a Claude `settings.json` whose shape
+    it did not understand, replacing your values. It now refuses. `magent
+    hooks status` says it cannot tell what is wired and exits 1, instead of
+    crashing or listing every hook as missing.
+  - When `hooks install` rewrites `settings.json`, the file keeps its
+    permissions. A file that can hold API keys no longer comes back readable
+    by everyone on Linux and macOS, and a read-only file is refused rather
+    than silently replaced.
+  - `magent terminal` gives its "comments and trailing commas" advice only
+    when the file really has a JSON syntax error.
+  - A Claude `settings.json` saved with a byte-order mark, as Windows
+    PowerShell 5.1's `-Encoding utf8` writes it, is now read by `magent hooks
+    install` and `magent hooks status` instead of being refused as invalid
+    JSON. `hooks install` writes the file back without the mark.
+
+- **A name your console cannot print no longer crashes a command (Windows).**
+  When output was piped or redirected, one character outside the Windows
+  code page, such as a CJK letter in a project path, ended `magent config
+  show`, `magent up --json` and every other printing command with a
+  `UnicodeEncodeError` traceback. For a desktop hand-off, whose output is
+  always redirected, that could happen after the sessions were already up.
+  Such a character now prints as a Python escape (`\u4e2d`), and everything
+  else prints as before. A desktop hand-off from a folder such as `café` now
+  relays its accents instead of garbling them.
+
+- **Bringing up the fleet can no longer hang forever on one stuck psmux
+  session (Windows).** `magent --go`, `magent up` (also the host side of
+  `magent attach`) and the menu's `u` waited, with no limit, on every psmux
+  command they ran. One session that stopped answering held the whole
+  bring-up, so the command never returned. Every wait now has a deadline. A
+  session magent cannot get an answer from is left alone, never killed and
+  re-created, because an unresponsive session can still be a live agent in
+  the middle of a turn. The rest of the fleet comes up, and each session that
+  could not is listed under "failed to come up" with the reason.
+
+- **A desktop hand-off no longer loses a fast command's exit code
+  (Windows).** Since 3.18.0, a `magent up` that arrives over ssh re-runs
+  itself on the host's desktop and reports that copy's exit code. Windows
+  PowerShell started that copy and let go of it, so a command that finished
+  quickly lost its exit code, and a bring-up that had worked came back with
+  none. A small Python launcher now starts the command and keeps hold of it,
+  so the exit code always comes back. A command that cannot start at all is
+  now reported at once, with the reason, instead of after a wait.
+
+## [3.19.3] - 2026-09-28
+
+### Fixed
+
+- **Claude sessions resume again in projects whose path contains a dot or an
+  underscore.** magent finds a project's Claude Code conversations in a folder
+  named after the project's path, but it spelled that name differently from
+  Claude Code. It kept `.` and `_`, where Claude Code turns every character
+  other than a letter or digit into `-`. For a project such as `my_repo` or
+  `site.v2`, magent concluded there was nothing to resume. So since 3.11.1,
+  `--go` and `up` dropped `--continue` and started the agent fresh, and
+  `magent discover` and the session picker did not list those sessions.
+  magent now uses Claude Code's own rule, including the shortened, hashed form
+  it gives a very long path.
+
+- **`magent send` no longer reports a prompt as sent when it could not read
+  the pane back.** The fleet commands read a pane with a 3-second budget.
+  When a busy multiplexer took longer, the read came back empty and was taken
+  at face value:
+  - `magent sessions --json` and `magent model` showed a live session as
+    `nopane`;
+  - `magent peek` printed nothing and exited 0;
+  - `magent send` printed `OK sent` and exited 0 without having confirmed
+    anything.
+
+  A read that runs out of time is now reported as a timeout:
+  - the session's state is `timeout`;
+  - `send` exits 4 with `could not read X's pane within 3s; delivery
+    unconfirmed`;
+  - `peek` exits 3 with the reason on stderr.
+
+  The budget is unchanged, so a multiplexer that has stopped answering still
+  cannot hang these commands.
+
+- **`magent attention -d` no longer reports a daemon that is still starting
+  as failed.** The launcher gave the new daemon about 2 seconds to register.
+  On a busy machine that took up to 11 seconds, so the launcher printed
+  `attention daemon failed to start` and exited 1 while the daemon went on
+  to run anyway. It now waits up to 20 seconds. It still returns as soon as
+  the daemon registers, and it reports at once if the daemon exits. The
+  Alt+V listener start had the same 2-second window and now shares this one.
+  A daemon that really does not register in time is still reported as
+  failed, and it is left running rather than killed.
+
+- The upload watchdog no longer starts a second `magent serve` beside one it
+  started that is still coming up. This only mattered with
+  `MAGENT_UPLOAD_RESPAWN_COOLDOWN_S` set below a server's startup time; the
+  default 60 seconds was not affected.
+
+- **A second `magent serve` on a port that is already served now exits instead
+  of sharing it (Windows).** The server allowed address reuse, and on Windows
+  that let a second server bind a port that was already listening. Two servers
+  then shared the port in silence while the pid file named only one of them, so
+  the watchdog could stop or restart the wrong one. On Windows the server now
+  claims its port exclusively. A second serve, whether started by hand, by
+  `--ensure` or by the watchdog, exits with "port N is already in use" and
+  leaves the running server and its pid file alone. Restarting serve right away
+  still works on every OS. A port Windows has reserved (an excluded port range)
+  is reported as reserved, with the `netsh` command that lists the ranges, not
+  as in use.
+
+- **On Linux and macOS, two `magent attention -d` daemons can no longer run at
+  once.** The lock that stops a second daemon from starting could be held by
+  two processes at the same time when several starts raced, in two ways:
+  - a start that lost the race deleted the lock file on its way out;
+  - a start could lock a file that another process had already deleted.
+
+  The lock now has exactly one holder. Windows was not affected.
+
+- **A Windows host brought up through `magent attach` no longer reports a
+  successful desktop hand-off as failed.** Since 3.18.0, a `magent up` that
+  arrives over ssh re-runs itself on the host's desktop and reports that
+  copy's exit code. magent read the exit code as soon as its file appeared.
+  But PowerShell creates that file before it writes to it, and refuses
+  readers until it has finished. So the read often found the file empty or
+  locked, and the hand-off was reported as never having run. An exit code now
+  counts only once it reads as a whole number. A file that stays unreadable
+  is reported as a command that finished with an unreadable exit code, with
+  the reason, rather than as a command that never ran.
+
+- **A config holding text with no UTF-8 form is refused when it loads, naming
+  the field.** A JSON escape such as `"\ud83d"` (half of an emoji) used to
+  load without complaint. Then:
+  - `magent --go` crashed partway through its listing with a raw traceback;
+  - `magent status` reported the config healthy;
+  - `magent up` went on to start sessions.
+
+  magent now refuses the config at load, once and in its own words, with
+  exit code 1:
+
+  ```
+  Error: projects[1].title has text with no UTF-8 form (UnicodeEncodeError): 'api\ud83d'
+  ```
+
+  The `--json` commands put the same message in their error envelope,
+  `magent doctor` reports it as an invalid config, and `magent config
+  migrate` refuses before it writes. Ordinary non-ASCII text, emoji
+  included, is unaffected.
+
+- **Log records are no longer written twice, or lost.** Two separate faults:
+  - Duplicates: when several threads first used a log at the same moment,
+    each could attach its own file writer. That happens, for example, with
+    the status-line updates that run in parallel when many sessions time out
+    together. Every later record in that log was then written several times.
+  - Losses: a record that could not be encoded, typically one naming a file
+    whose name is not valid Unicode, was dropped, with `--- Logging error ---`
+    printed to stderr.
+
+  Each log now gets exactly one writer, and such a record is written with
+  the unencodable characters escaped.
+
+### Changed
+
+- The release pipeline now checks that a release tag names exactly the
+  version in the built package, and stops before anything is published if
+  it does not. A pre-release tag such as `v3.20.0rc1` is published as a
+  GitHub pre-release rather than as the latest release. Nothing in the
+  installed package changes.
+- The test suite's temporary home now also covers the Windows AppData folders
+  and `XDG_CONFIG_HOME`. As a result, tests can no longer leave PowerShell
+  cache files in a checkout, or find a developer's real config. Nothing in the
+  installed package changes.
 
 ## [3.19.2] - 2026-09-27
 
@@ -1566,6 +1756,8 @@ tool, every screen.
 
 [3.20.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.2...v3.20.0
 [3.20.0rc1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.2...v3.20.0rc1
+[3.19.4]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.3...v3.19.4
+[3.19.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.2...v3.19.3
 [3.19.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.1...v3.19.2
 [3.19.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.0...v3.19.1
 [3.19.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.18.1...v3.19.0

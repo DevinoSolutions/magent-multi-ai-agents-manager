@@ -1076,6 +1076,7 @@ def _menu_up(config_file: Path) -> None:
     from magent.launch import (  # heavy subsystem: in-body per policy
         bring_up_psmux,
         psmux_status,
+        report_bring_up_casualties,
     )
 
     cfg = _load_config_or_exit(config_file)
@@ -1130,21 +1131,10 @@ def _menu_up(config_file: Path) -> None:
         )
         # The casualties `launch_verified` already logged, said out loud. This
         # menu used to report every attempted session as brought up, so a wave
-        # that half-failed looked identical to one that worked.
-        if failed:
-            click.echo(
-                f"  {style('x', fg='red')} {style(str(len(failed)), fg='red', bold=True)}"
-                f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
-                f" {style('(see ~/.magent/logs/launch.log)', dim=True)}"
-            )
-            # The menu is a local, interactive surface and never hands off, so
-            # a Session-0 refusal from the choke point is the one cause it can
-            # name here (see launch.session0_note).
-            from magent.launch import session0_note
-
-            note = session0_note()
-            if note:
-                click.echo(f"  {style(note, dim=True)}")
+        # that half-failed looked identical to one that worked. The menu is a
+        # local, interactive surface and never hands off, so a Session-0
+        # refusal from the choke point is the one cause its note can name.
+        report_bring_up_casualties(failed)
         if cfg.settings.upload_server:
             _maybe_start_upload_server(cfg.settings.upload_port, str(config_file))
     click.echo()

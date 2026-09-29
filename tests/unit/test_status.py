@@ -150,6 +150,94 @@ class TestJsonInvalidConfig:
         assert payload["error"]
 
 
+# F-SUR-1: the load-time refusal of a title with no UTF-8 form, as each surface
+# shows it. Before, the config loaded (it has a color) and `status` crashed on
+# the title at its first echo; `--json` escaped it into an ok envelope.
+_NO_UTF8_REFUSAL = (
+    "projects[0].title has text with no UTF-8 form (UnicodeEncodeError): 'api\\ud83d'"
+)
+# A live OSC 0 (set the window title) and SGR 31 (red), as a config can spell.
+_ESC_SEQUENCES = "\x1b]0;x\x07\x1b[31m"
+
+
+class TestTextWithNoUtf8FormIsAConfigError:
+    def _config(self, tmp_config):
+        return tmp_config(
+            {
+                "version": 3,
+                "projects": [{"path": "api", "title": "api\ud83d", "color": "#22c55e"}],
+            }
+        )
+
+    def test_json_gets_the_config_error_envelope(self, runner, tmp_config, monkeypatch):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config), "status", "--json"]
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.stdout) == {"ok": False, "error": _NO_UTF8_REFUSAL}
+
+    def test_plain_gets_the_error_line_and_nothing_else(
+        self, runner, tmp_config, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config), "status"]
+        )
+        assert result.exit_code == 1
+        assert result.stderr == f"Error: {_NO_UTF8_REFUSAL}\n"
+        assert result.stdout == ""
+
+    @pytest.mark.parametrize(
+        ("config", "refusal"),
+        [
+            (
+                {"projects": [{"path": "api", "title": _ESC_SEQUENCES + "api\ud83d"}]},
+                (
+                    "projects[0].title has text with no UTF-8 form (UnicodeEncodeError):"
+                    " '\\x1b]0;x\\x07\\x1b[31mapi\\ud83d'"
+                ),
+            ),
+            (
+                {
+                    "settings": {"tools": {_ESC_SEQUENCES + "red": "api\ud83d"}},
+                    "projects": [{"path": "api"}],
+                },
+                (
+                    "settings.tools.\\x1b]0;x\\x07\\x1b[31mred has text with no UTF-8"
+                    " form (UnicodeEncodeError): 'api\\ud83d'"
+                ),
+            ),
+            (
+                {"projects": [{"path": "api", "title": "C:\\Users\\api\ud83d"}]},
+                (
+                    "projects[0].title has text with no UTF-8 form (UnicodeEncodeError):"
+                    " 'C:\\\\Users\\\\api\\ud83d'"
+                ),
+            ),
+        ],
+        ids=["in-the-value", "in-the-field-path", "a-backslash-is-doubled"],
+    )
+    def test_control_characters_reach_stderr_as_escape_text(
+        self, runner, tmp_config, monkeypatch, config, refusal
+    ):
+        # The refusal quotes text already known to be broken. An ESC or BEL in
+        # it reached a real terminal live (an OSC 0 title change, SGR red), so
+        # controls are escaped like the surrogate is; a backslash doubles, as
+        # the JSON file itself spells it, so a literal "\ud83d" folder name
+        # cannot read like the lone surrogate.
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"version": 3, **config}), "status"]
+        )
+        assert result.exit_code == 1
+        assert result.stderr == f"Error: {refusal}\n"
+        assert all(" " <= c <= "~" for c in result.stderr.rstrip("\n"))
+
+
 class TestStatusLines:
     def test_prints_upload_server_and_listener_lines(
         self, runner, tmp_config, monkeypatch
@@ -585,7 +673,7 @@ class TestMenuUpReportsCasualties:
         )
         monkeypatch.setattr(
             "magent.launch.bring_up_psmux",
-            lambda cfg, only=None, group=None: (list(created), list(failed)),
+            lambda cfg, only=None, group=None: (list(created), dict(failed)),
         )
         monkeypatch.setattr(status_mod.click, "prompt", lambda *a, **k: "a")
         monkeypatch.setattr(status_mod.click, "pause", lambda *a, **k: None)
@@ -593,16 +681,42 @@ class TestMenuUpReportsCasualties:
         status_mod._menu_up(Path(cfgpath))
 
     def test_failed_sessions_are_named_in_red(self, monkeypatch, tmp_config, capsys):
-        self._drive(monkeypatch, tmp_config, created=["web"], failed=["api"])
+        self._drive(monkeypatch, tmp_config, created=["web"], failed={"api": ""})
         out = capsys.readouterr().out
         assert "Brought up 1 session(s)" in out
         assert "1 session(s) failed to come up" in out
         assert "api" in out
 
+    def test_a_refused_session_says_why(self, monkeypatch, tmp_config, capsys):
+        # "Could not tell whether it is running" is not "dead", and the menu
+        # has to say which one it is. The Session-0 note still follows.
+        why = "could not tell whether api is running (has-session gave no answer)"
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+        self._drive(monkeypatch, tmp_config, created=[], failed={"api": why})
+        out = capsys.readouterr().out
+        assert "1 session(s) failed to come up" in out
+        assert why in out
+        assert "S0-NOTE" in out
+
+    def test_the_casualty_block_is_byte_for_byte(self, monkeypatch, tmp_config, capsys):
+        # Characterization: the whole block, in order -- the count and names
+        # with the local log hint, one dimmed line per KNOWN reason (none for
+        # an empty one), then the Session-0 note.
+        why = "could not tell whether web is running (has-session gave no answer)"
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+        self._drive(monkeypatch, tmp_config, created=[], failed={"api": "", "web": why})
+        out = capsys.readouterr().out
+        assert (
+            "  x 2 session(s) failed to come up: api, web"
+            " (see ~/.magent/logs/launch.log)\n"
+            f"    {why}\n"
+            "  S0-NOTE\n"
+        ) in out
+
     def test_a_clean_wave_says_nothing_about_failures(
         self, monkeypatch, tmp_config, capsys
     ):
-        self._drive(monkeypatch, tmp_config, created=["api", "web"], failed=[])
+        self._drive(monkeypatch, tmp_config, created=["api", "web"], failed={})
         out = capsys.readouterr().out
         assert "Brought up 2 session(s)" in out
         assert "failed to come up" not in out

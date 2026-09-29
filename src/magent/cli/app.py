@@ -6,6 +6,7 @@ can `from magent.cli.app import main` without a cycle -- see E6.md S2.1.
 
 from __future__ import annotations
 
+import codecs
 import sys
 from pathlib import Path
 
@@ -16,6 +17,76 @@ from magent.cli.config_io import _load_config_or_exit
 from magent.cli.ui import _open_in_editor
 from magent.init_config import write_config
 from magent.paths import find_config
+
+# The error handler the entry point gives stdout (see _escape_unencodable_output).
+OUTPUT_ERRORS = "magent.escape"
+# What surrogateescape decodes an undecodable byte into: a lone U+DC80..U+DCFF
+# IS the byte 0x80..0xFF it was read from, and writing it back means that byte.
+_ESCAPED_BYTES = range(0xDC80, 0xDD00)
+# The handlers a stdout is born with. Any other one was chosen on purpose -- a
+# PYTHONIOENCODING=cp1252:replace, a harness's own wrapper -- and is kept.
+_DEFAULT_ERRORS = frozenset({"strict", "surrogateescape"})
+
+
+def _escape_or_restore(exc: UnicodeError) -> tuple[str | bytes, int]:
+    """The ``magent.escape`` error handler: an undecodable byte is written back
+    as itself, anything else unencodable as its escape.
+
+    Both answers come from the stdlib handlers, never a copy of either: a lone
+    U+DC80..U+DCFF gets surrogateescape's (the original byte, exactly what a
+    stream that already used surrogateescape wrote -- so a POSIX path holding
+    a non-UTF-8 byte still prints as that path), every other character
+    backslashreplace's (``\\u4e2d``), other lone surrogates included. One call
+    can be handed a run holding both kinds, so it answers only the run's
+    leading same-kind prefix and returns where that prefix ends; the encoder
+    resumes there and calls again for the rest.
+    """
+    if not isinstance(exc, UnicodeEncodeError):
+        raise exc
+    text = exc.object
+    as_byte = ord(text[exc.start]) in _ESCAPED_BYTES
+    stop = exc.start + 1
+    while stop < exc.end and (ord(text[stop]) in _ESCAPED_BYTES) == as_byte:
+        stop += 1
+    prefix = UnicodeEncodeError(exc.encoding, text, exc.start, stop, exc.reason)
+    stdlib = "surrogateescape" if as_byte else "backslashreplace"
+    return codecs.lookup_error(stdlib)(prefix)
+
+
+def _escape_unencodable_output() -> None:
+    """Print a character stdout cannot encode as an escape, never a crash.
+
+    On Windows a redirected stdout -- a pipe, a file, the Session-0 hand-off's
+    out.txt, the ssh channel `magent attach` reads -- is the ANSI code page,
+    whose surrogateescape (or, under PYTHONIOENCODING, strict) handler raises
+    on anything that is not an escaped byte. So one project name or path it
+    could not hold raised UnicodeEncodeError out of click.echo and exited 1;
+    `up` got that far only after its sessions existed. Only the error handler
+    changes: everything the stream could already encode is written
+    byte-for-byte as before, an escaped byte is written back as that byte, and
+    the rest becomes ``\\u4e2d`` (see ``_escape_or_restore``). This process
+    only -- nothing is inherited and no environment is touched.
+
+    Only a stream still on a default handler is changed, and its encoding
+    never is: a Python parent that reads magent with text=True in its locale
+    encoding must keep getting that encoding. Never raises on a byte-oriented
+    encoding (a code page, UTF-8); a UTF-16/32 stdout, which only an explicit
+    PYTHONIOENCODING gives, still raises on a lone U+DC80..U+DCFF, as it
+    always did -- surrogateescape refuses those codecs.
+
+    The ``--json`` emitters keep json.dumps's ensure_ascii default, so their
+    output is ASCII and never reaches this handler; ensure_ascii=False would
+    print ``\\U0001f600``, which is not a JSON escape.
+
+    ``sys.stdout`` is None under pythonw, and a substitute stream may have no
+    ``reconfigure``; both are left alone.
+    """
+    stream = sys.stdout
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None or getattr(stream, "errors", None) not in _DEFAULT_ERRORS:
+        return
+    codecs.register_error(OUTPUT_ERRORS, _escape_or_restore)
+    reconfigure(errors=OUTPUT_ERRORS)
 
 
 @click.group(invoke_without_command=True)
@@ -90,6 +161,7 @@ def main(
     allow_dirty: bool,
 ) -> None:
     """Open every project in its own terminal and auto-tile across all monitors."""
+    _escape_unencodable_output()
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
 

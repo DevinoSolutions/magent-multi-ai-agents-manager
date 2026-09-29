@@ -327,6 +327,7 @@ def get_logger(name: str) -> logging.Logger:
 
         logger.addHandler(handler)
         logger.setLevel(_configured_level())
+        # Last, and inside the lock: the unlocked fast path above trusts it.
         setattr(logger, _CONFIGURED_ATTR, True)
     return logger
 

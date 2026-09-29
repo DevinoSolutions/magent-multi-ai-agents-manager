@@ -158,6 +158,42 @@ class TestMigrateConfigFile:
         with pytest.raises(ConfigError, match="valid JSON"):
             migrate_config_file(str(p))
 
+    @pytest.mark.parametrize("color", [None, "#22c55e"], ids=["colorless", "colored"])
+    def test_migrate_refuses_text_with_no_utf8_form_and_writes_nothing(
+        self, tmp_config, color
+    ):
+        # F-SUR-1: the same refusal load_config gives, before migrate's own
+        # color hash (colorless: it used to raise the codec's words) and before
+        # its write (colored: it used to stamp the version onto the file).
+        project: dict[str, object] = {"path": "api", "title": "api\ud83d"}
+        if color:
+            project["color"] = color
+        path = tmp_config({"projects": [project]})
+        before = Path(path).read_bytes()
+        with pytest.raises(ConfigError) as exc:
+            migrate_config_file(path)
+        assert str(exc.value) == (
+            "projects[0].title has text with no UTF-8 form (UnicodeEncodeError):"
+            " 'api\\ud83d'"
+        )
+        assert Path(path).read_bytes() == before
+
+    def test_migrate_refuses_before_it_reshapes_anything(self, tmp_config):
+        # The refusal names the field the FILE holds. A v2 legacy window is a
+        # bare string; checked after migrate_raw, it would be named by its v3
+        # shape, projects[0].windows[0].name, which the file does not contain.
+        path = tmp_config(
+            {"version": 2, "projects": [{"path": "api", "windows": ["x\ud83d"]}]}
+        )
+        before = Path(path).read_bytes()
+        with pytest.raises(ConfigError) as exc:
+            migrate_config_file(path)
+        assert str(exc.value) == (
+            "projects[0].windows[0] has text with no UTF-8 form (UnicodeEncodeError):"
+            " 'x\\ud83d'"
+        )
+        assert Path(path).read_bytes() == before
+
 
 class TestMigrate2To3Windows:
     """Characterization pins for _migrate_2_to_3, which normalizes the v2

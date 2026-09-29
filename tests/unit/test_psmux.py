@@ -18,13 +18,14 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from typing import ClassVar
 
 import pytest
 
-from magent import psmux
+from magent import log, psmux
 from magent.config import DEFAULT_TOOLS, MagentConfig, ProjectConfig, Settings
 from magent.sessions import AGENT_TOOLS
 from tests.unit._fake_panes import fake_panes, pane_tree
@@ -61,6 +62,52 @@ class TestCapturePane:
             lambda cmd, **kw: (_ for _ in ()).throw(OSError("no psmux")),
         )
         assert psmux.capture_pane("sess", psmux="psmux") == ""
+
+    def test_a_timeout_is_a_timeout_not_an_empty_pane(self, monkeypatch):
+        # A capture that ran out the clock says nothing about the pane: the
+        # session may be perfectly live on a loaded box. Reporting it as ""
+        # made fleet call a live agent "nopane" and `send` call an unverified
+        # prompt delivered.
+        def _slow(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+
+        monkeypatch.setattr(subprocess, "run", _slow)
+        assert psmux.read_pane("sess", psmux="psmux") == psmux.PaneCapture(
+            text="", timed_out=True
+        )
+        # The plain-text accessor keeps its "" for callers that only poll.
+        assert psmux.capture_pane("sess", psmux="psmux") == ""
+
+    def test_an_unlaunchable_psmux_is_not_a_timeout(self, monkeypatch):
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kw: (_ for _ in ()).throw(OSError("no psmux")),
+        )
+        assert psmux.read_pane("sess", psmux="psmux") == psmux.PaneCapture(
+            text="", timed_out=False
+        )
+
+    def test_no_psmux_binary_is_not_a_timeout(self, monkeypatch):
+        # No binary resolved is an answer (there is no pane to read), not an
+        # unread pane -- and nothing is spawned to find that out.
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: pytest.fail("spawned"))
+        assert psmux.read_pane("sess") == psmux.PaneCapture(text="", timed_out=False)
+
+    def test_the_budget_is_read_at_call_time(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        def _run(cmd, **kw):
+            seen["timeout"] = kw["timeout"]
+            return _FakeCompleted(returncode=0, stdout="x\n")
+
+        monkeypatch.setattr(subprocess, "run", _run)
+        monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 7.5)
+        assert psmux.read_pane("sess", psmux="psmux") == psmux.PaneCapture(
+            text="x\n", timed_out=False
+        )
+        assert seen["timeout"] == 7.5
 
 
 class TestPaneCwd:
@@ -1288,7 +1335,7 @@ class TestBringUpCreationVerify:
             monkeypatch, tmp_path, names=["api", "web"], failures=["api"]
         )
         assert created == ["api", "web"]
-        assert failed == []
+        assert failed == {}
 
     def test_session_zero_never_reaches_the_spawn(self, monkeypatch, tmp_path, slept):
         # THE choke point's safety net. Every session magent creates goes
@@ -1309,7 +1356,7 @@ class TestBringUpCreationVerify:
         )
 
         assert created == []
-        assert failed == ["api", "web"]
+        assert failed == {"api": "", "web": ""}
         assert fp.psmux_launches == []
 
     def test_a_handoff_disposition_also_never_spawns_here(
@@ -1331,7 +1378,7 @@ class TestBringUpCreationVerify:
             monkeypatch, tmp_path, names=["api"], plat=fp
         )
 
-        assert failed == ["api"]
+        assert failed == {"api": ""}
         assert fp.psmux_launches == []
         assert fp.handoffs == []
 
@@ -1349,7 +1396,7 @@ class TestBringUpCreationVerify:
         )
 
         assert created == ["api"]
-        assert failed == []
+        assert failed == {}
 
     def test_the_probe_gets_a_settle_before_it_runs(self, monkeypatch, tmp_path, slept):
         # Probing at t=0 would misclassify a slow-but-fine server on a loaded
@@ -1441,7 +1488,7 @@ class TestBringUpCreationVerify:
         # used to discard the verify's answer and return every attempted name,
         # so the caller printed "Brought up 1 session(s)" for a session the log
         # in the very same run called "never came up".
-        assert created == ([], ["api"])
+        assert created == ([], {"api": ""})
 
     def test_a_respawn_that_cannot_be_launched_never_raises(
         self, monkeypatch, tmp_path, slept, caplog
@@ -1456,14 +1503,14 @@ class TestBringUpCreationVerify:
             calls.append(1)
             if len(calls) > 1:
                 raise OSError("psmux vanished mid-wave")
-            original(windows)
+            return original(windows)
 
         fp.launch_psmux_session = _flaky
         with caplog.at_level(logging.WARNING, logger="magent.launch"):
             created, _fp = self._bring_up(
                 monkeypatch, tmp_path, names=["api"], failures=["api"], plat=fp
             )
-        assert created == ([], ["api"])
+        assert created == ([], {"api": ""})
         assert len(calls) == 2
 
     def test_no_psmux_binary_skips_the_verify_entirely(
@@ -1487,7 +1534,7 @@ class TestBringUpCreationVerify:
         assert slept == []
         # Unprovable is not "fine": with no binary to probe with, nothing may be
         # claimed as created either.
-        assert created == ([], ["api"])
+        assert created == ([], {"api": ""})
 
 
 class TestBringUpContainsCreationFailures:
@@ -1519,6 +1566,7 @@ class TestBringUpContainsCreationFailures:
                 raise boom
             for w in windows:
                 fp.psmux_sessions.add(w.window_name)
+            return {}
 
         fp.launch_psmux_session = _launch
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
@@ -1544,7 +1592,7 @@ class TestBringUpContainsCreationFailures:
         # No pytest.raises: the point is that nothing escapes.
         failed = psmux.launch_verified(fp, self._windows(["api", "web"]))
         assert calls[0] == ["api", "web"]
-        assert failed == []
+        assert failed == {}
 
     def test_the_verify_still_runs_and_respawns_the_missing(self, monkeypatch, slept):
         boom = subprocess.CalledProcessError(1, ["psmux", "new-session"])
@@ -1575,13 +1623,14 @@ class TestBringUpContainsCreationFailures:
             calls.append(1)
             if len(calls) == 1:
                 raise subprocess.CalledProcessError(1, ["psmux", "new-session"])
+            return {}
 
         fp.launch_psmux_session = _launch
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
         monkeypatch.setattr(
             psmux, "has_session", lambda name, psmux=None, timeout=None: False
         )
-        assert psmux.launch_verified(fp, self._windows(["api"])) == ["api"]
+        assert psmux.launch_verified(fp, self._windows(["api"])) == {"api": ""}
         assert len(calls) == 2
 
 
@@ -2070,6 +2119,42 @@ class TestDecorateSession:
     def test_fan_out_without_binary_is_a_noop(self, monkeypatch):
         monkeypatch.setattr(psmux, "find_psmux", lambda: None)
         assert psmux.decorate_sessions(["api"]) == []
+
+    def test_a_failing_fan_out_writes_each_warning_once(self, monkeypatch):
+        # Every decoration command fails, so each worker's failure path is where
+        # get_logger("launch") is FIRST asked for -- by all of them at once
+        # (conftest's log.reset_logging() hands every test an unconfigured
+        # logger). A handler stacked per worker writes every warning that many
+        # times into launch.log.
+        names = [f"s{i}" for i in range(8)]
+        together = threading.Barrier(len(names), timeout=10)
+        started: set[str] = set()
+        guard = threading.Lock()
+
+        def _fail(cmd, **kwargs):
+            with guard:
+                first = cmd[2] not in started
+                started.add(cmd[2])
+            if first:
+                together.wait()  # every worker reaches its first warning at once
+            raise OSError("no psmux")
+
+        real = log._SharedRotatingFileHandler
+
+        def slow(*a, **kw):
+            time.sleep(0.05)  # hold get_logger's first-use window open
+            return real(*a, **kw)
+
+        monkeypatch.setattr(subprocess, "run", _fail)
+        monkeypatch.setattr(log, "_SharedRotatingFileHandler", slow)
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        assert logging.getLogger("magent.launch").handlers == []
+        assert psmux.decorate_sessions(names, code_hint=True) == names
+        assert len(logging.getLogger("magent.launch").handlers) == 1
+        text = (log.LOG_DIR / "launch.log").read_text(encoding="utf-8")
+        per_session = len(psmux.decoration_argv("s0", "psmux", True))
+        for name in names:
+            assert text.count(f"session={name}: ") == per_session
 
 
 class _SpawnRecorder:

@@ -18,7 +18,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import click
 
@@ -36,7 +36,8 @@ DEFAULT_TOOLS: dict[str, str] = {
 
 
 class ConfigError(ValueError):
-    """Structurally invalid magent config: bad JSON, wrong-typed field, or missing required key."""
+    """Structurally invalid magent config: bad JSON, wrong-typed field, missing
+    required key, or text with no UTF-8 form."""
 
 
 @dataclass
@@ -178,15 +179,104 @@ class MagentConfig:
 
 
 def _load_json_object(text: str) -> dict[str, object]:
-    """Parse ``text`` as a JSON object, or raise ConfigError. The single JSON
-    entry point shared by load_config and migrate_config_file."""
+    """Parse ``text`` as a JSON object whose every string has a UTF-8 form, or
+    raise ConfigError. The single JSON entry point shared by load_config and
+    migrate_config_file, so both refuse the same text in the same words."""
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
         raise ConfigError(f"Config is not valid JSON: {e}") from e
+    except RecursionError as e:
+        # json.loads' own nesting ceiling; its message is the interpreter's.
+        raise ConfigError("Config is nested too deeply to read") from e
     if not isinstance(data, dict):
         raise ConfigError("Config must be a JSON object")
+    _refuse_text_with_no_utf8_form(data)
     return data
+
+
+def _escaped(text: str) -> str:
+    """``text`` as printable-ASCII escape text, so a message quoting it prints
+    on any stream in any code page and does nothing to the terminal. A lone
+    surrogate reads ``\\ud83d``, a control character ``\\x1b`` (an ESC in a
+    config could otherwise retitle the window or recolor the line), and a
+    backslash doubles, as the JSON file spells it, so a literal ``\\ud83d``
+    in a Windows path cannot read like the surrogate."""
+    return text.encode("unicode_escape").decode("ascii")
+
+
+class _Step(NamedTuple):
+    """One step of a field's JSON path -- an object key or a list index --
+    linked to the step before it; ``None`` above the first is the document."""
+
+    up: _Step | None
+    to: str | int
+
+
+def _where(at: _Step | None) -> str:
+    """``at`` spelled the way _warn_unknown_keys names a field
+    (``projects[0].title``); the document itself is ``""``."""
+    steps: list[str | int] = []
+    while at is not None:
+        steps.append(at.to)
+        at = at.up
+    where = ""
+    for to in reversed(steps):
+        if isinstance(to, int):
+            where = f"{where}[{to}]"
+        else:
+            where = f"{where}.{to}" if where else to
+    return where
+
+
+def _refuse_text_with_no_utf8_form(document: dict[str, object]) -> None:
+    """Raise ConfigError at the first string in ``document`` -- a value or a
+    key, at any depth -- that has no UTF-8 form.
+
+    Only a lone UTF-16 surrogate qualifies, and JSON can spell one
+    (``"api\\ud83d"``) that json.loads hands back as-is. Loaded, it crashed
+    ``--go`` at its first listing row on every Windows stdout (a pipe in
+    either encoding, and a real console), and a colorless one crashed the
+    tab-color hash in the codec's own words; a session name, window title or
+    argv made from it fares no better. Refused here, once, the whole document
+    is covered -- fields added later and the unknown keys load only warns
+    about included. The refusal shows the value escaped and names the class,
+    never the codec's message, so it cannot crash on the text it reports.
+
+    The walk keeps its own stack instead of recursing: json.loads (3.12+)
+    accepts nesting deeper than the recursion limit and such a file has always
+    loaded, so the check must not be what turns it into a traceback. Children
+    go on the stack reversed, so strings are met in document order -- each key
+    just before its value -- and the one refused is the first in the file.
+
+    An entry carries its path as a _Step, not as a spelled-out label: a deep
+    document's later siblings wait on the stack while the walk descends, and a
+    full label apiece made that quadratic in the depth (450 MB for a 155 KB
+    file). Only the refused string's label is ever spelled out."""
+    # (node, its path -- for a key, its object's path --, whether it is a key)
+    stack: list[tuple[object, _Step | None, bool]] = [(document, None, False)]
+    while stack:
+        node, at, is_key = stack.pop()
+        if isinstance(node, str):
+            try:
+                node.encode("utf-8")
+            except UnicodeEncodeError as e:
+                where = _where(at)
+                if is_key:
+                    where = f"a key in {where or 'the config'}"
+                raise ConfigError(
+                    f"{_escaped(where)} has text with no UTF-8 form"
+                    f" ({type(e).__name__}): '{_escaped(node)}'"
+                ) from e
+        elif isinstance(node, dict):
+            children: list[tuple[object, _Step | None, bool]] = []
+            for key, value in node.items():
+                children.append((key, at, True))
+                children.append((value, _Step(at, key), False))
+            stack.extend(reversed(children))
+        elif isinstance(node, list):
+            items = [(item, _Step(at, i), False) for i, item in enumerate(node)]
+            stack.extend(reversed(items))
 
 
 def _obj(raw: dict[str, object], key: str) -> dict[str, object]:

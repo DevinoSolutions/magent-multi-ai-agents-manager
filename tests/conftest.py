@@ -32,6 +32,10 @@ REAL_MAGENT_DIR = REAL_HOME / ".magent"
 # on Windows the pytest tmp root lives at %LOCALAPPDATA%\Temp, i.e. inside it.
 # These are the trees a leaking test actually damages.
 _REAL_STATE_ROOTS = (REAL_MAGENT_DIR, REAL_HOME / ".claude")
+# The inherited APPDATA, captured here for the same reason. On Windows it IS
+# env.config_base(), so the developer's real config sits at
+# REAL_APPDATA\magent\config.json. None where it is unset (off Windows).
+REAL_APPDATA = Path(os.environ["APPDATA"]) if os.environ.get("APPDATA") else None
 
 # Tests under this directory keep the machine's own home. tests/platform is the
 # CI-only tier that drives REAL windows, monitors and psmux against the session
@@ -106,7 +110,14 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     1. the module-level path constants magent binds at import (LOG_DIR &c),
     2. the HOME family in the process environment, which covers every
        call-time ``Path.home()`` (``lockfile.exclusive_lock`` is one) AND
-       every child process, since they inherit ``os.environ``,
+       every child process, since they inherit ``os.environ``. With it go
+       ``APPDATA`` (to ``<home>/AppData/Roaming``) and ``XDG_CONFIG_HOME``
+       (to ``<home>/.config``), the variables ``env.config_base()`` reads
+       instead of ~, so a test that forgets ``--config`` cannot find the
+       real config. The empty ``<home>/AppData/Local`` and
+       ``<home>/AppData/Roaming`` folders are created for the Windows
+       known-folder lookups, which need them to exist. ``LOCALAPPDATA``
+       stays inherited on purpose (``find_psmux``'s fallback),
     3. the import-bound ``~/.magent`` constants layer 2 is too late for.
 
     Layer 2 is the one that was missing, and its absence is not theoretical: a
@@ -126,6 +137,32 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
         # answers. Same lifetime, no collisions with the fixture's own tree.
         home = tmp_path.parent / f"{tmp_path.name}-home"
         home.mkdir(exist_ok=True)
+        # The profile folders the Windows known-folder lookups name. The
+        # USERPROFILE redirect below moves those folders into this home, but
+        # the lookup also checks that the folder EXISTS: against an empty home
+        # .NET's GetFolderPath('LocalApplicationData') answers '' in a
+        # powershell.exe child, its ModuleAnalysisCache path turns
+        # CWD-relative, and a long-lived hand-off launcher wrote
+        # Microsoft\Windows\PowerShell\ModuleAnalysisCache into the repo
+        # checkout. The lookup does not read LOCALAPPDATA/APPDATA; creating
+        # the folders is the fix. Empty dirs; harmless off Windows.
+        (home / "AppData" / "Local").mkdir(parents=True, exist_ok=True)
+        (home / "AppData" / "Roaming").mkdir(parents=True, exist_ok=True)
+        # APPDATA is a door of its own: on Windows it IS env.config_base(),
+        # so a test that forgot --config resolved the developer's real
+        # %APPDATA%\magent\config.json (and discover scanned the real VS Code
+        # storage). Point it at this home's Roaming folder -- the path
+        # appdata_dir() falls back to where APPDATA is unset, so every OS
+        # gets the same answer. LOCALAPPDATA stays inherited: find_psmux's
+        # %LOCALAPPDATA%\psmux fallback must still find the real install, and
+        # wt_keys resolves through its own seam.
+        monkeypatch.setenv("APPDATA", str(home / "AppData" / "Roaming"))
+        # The same door on Linux: config_base() is xdg_config_home(), and an
+        # exported XDG_CONFIG_HOME (a login's, a runner's) wins over
+        # ~/.config, so moving HOME alone left it pointing at the real one.
+        # <home>/.config is what xdg_config_home() falls back to when the
+        # variable is unset, so a box that never exported it sees no change.
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
         drive, tail = os.path.splitdrive(str(home))
         values = (str(home), str(home), drive, tail or os.sep)
         for var, value in zip(_HOME_VARS, values, strict=True):
@@ -653,7 +690,7 @@ class FakePlatform(Platform):
     def snapshot_windows(self):
         return self._windows
 
-    def launch_psmux_session(self, windows) -> None:
+    def launch_psmux_session(self, windows) -> dict[str, str]:
         self.launched_psmux.extend(windows)
         self.psmux_launches.append([w.window_name for w in windows])
         for w in windows:
@@ -661,6 +698,7 @@ class FakePlatform(Platform):
                 self._psmux_launch_failures.discard(w.window_name)
                 continue
             self.psmux_sessions.add(w.window_name)
+        return {}
 
     def attach_psmux(self, session_name, title, color=None, config_path=None) -> None:
         self.attached_psmux.append((session_name, title, color, config_path))

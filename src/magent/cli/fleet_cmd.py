@@ -107,6 +107,13 @@ def _stdout_safe(text: str) -> str:
         return text
 
 
+def _unread_pane(name: str) -> str:
+    """The one wording for a capture that ran out its budget (send + peek)."""
+    from magent import psmux  # heavy subsystem: in-body per policy
+
+    return f"could not read {name}'s pane within {psmux.CAPTURE_PANE_TIMEOUT_S:g}s"
+
+
 def _footer(state: dict[str, object]) -> str:
     """Render a parsed ``{model, effort}`` as ASCII ``model / effort``."""
     model = state.get("model") or "?"
@@ -157,7 +164,8 @@ def send_cmd(
     then confirms the prompt left the input line.
 
     Exit codes: 0 sent, 2 session not found, 3 psmux error, 4 send not
-    confirmed (or the session never went idle).
+    confirmed (the pane could not be read back, or the session never went
+    idle).
     """
     from pathlib import Path
 
@@ -207,8 +215,17 @@ def send_cmd(
         sys.exit(_EXIT_PSMUX_ERROR)
 
     time.sleep(1.5)
-    pane = psmux.capture_pane(name, psmux=psmux_bin)
-    if fleet.looks_unsent(pane, body):
+    capture = psmux.read_pane(name, psmux=psmux_bin)
+    if capture.timed_out:
+        # An unread pane confirms nothing. Read as "", it passed the check
+        # below -- a prompt still sitting unsent reported "OK sent".
+        click.echo(
+            f"  {style('!', fg='yellow')} {_unread_pane(name)}; delivery "
+            f"unconfirmed. check: magent peek {name}",
+            err=True,
+        )
+        sys.exit(_EXIT_NOT_CONFIRMED)
+    if fleet.looks_unsent(capture.text, body):
         click.echo(
             f"  {style('!', fg='yellow')} prompt may still be unsent in {name}; "
             f"check: magent peek {name}",
@@ -358,6 +375,12 @@ def peek_cmd(ctx: click.Context, session: str, lines: int) -> None:
 
     psmux_bin = _require_psmux()
     name = _resolve_or_exit(session, _live_names(ctx.obj.get("config_path"), psmux_bin))
-    pane = psmux.capture_pane(name, psmux=psmux_bin)
-    tail = "\n".join(pane.rstrip().splitlines()[-max(1, lines) :])
+    capture = psmux.read_pane(name, psmux=psmux_bin)
+    if capture.timed_out:
+        click.echo(
+            f"  {style('x', fg='red')} {_unread_pane(name)} (psmux did not answer).",
+            err=True,
+        )
+        sys.exit(_EXIT_PSMUX_ERROR)
+    tail = "\n".join(capture.text.rstrip().splitlines()[-max(1, lines) :])
     click.echo(_stdout_safe(tail))

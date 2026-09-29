@@ -1420,9 +1420,9 @@ def up_cmd(
         node_session_ids,
         psmux_status,
         relay_handoff,
+        report_bring_up_casualties,
         revive_psmux,
         session0_disposition,
-        session0_note,
         session0_refusal,
     )
 
@@ -1561,26 +1561,19 @@ def up_cmd(
         # `created` now means "the verify proved it is up", so the sessions it
         # does NOT contain have to be named -- this line is what `magent attach`
         # relays from the host, and a silent casualty there reads as success.
-        if failed:
-            # A node casualty's reason is logged by the "nodes" logger, not
-            # "launch" -- point at whichever log(s) actually hold this set.
-            node_failed = [s for s in failed if s in node_sids]
-            logs: list[str] = []
-            if len(node_failed) < len(failed):
-                logs.append("~/.magent/logs/launch.log")
-            if node_failed:
-                logs.append("~/.magent/logs/nodes.log")
-            click.echo(
-                f"  {style('x', fg='red')} {style(str(len(failed)), fg='red', bold=True)}"
-                f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
-                f" {style('(see ' + ' and '.join(logs) + ' on the host)', dim=True)}"
-            )
-            # Only ever set when the choke point refused -- the hand-off and
-            # refusal above have already returned on every other Session-0
-            # path -- so this is the "policy said no" case wearing its reason.
-            note = session0_note()
-            if note:
-                click.echo(f"  {style(note, dim=True)}")
+        # Its Session-0 note is only ever set when the choke point refused: the
+        # hand-off and refusal above have already returned on every other
+        # Session-0 path. A node casualty's reason is logged by the "nodes"
+        # logger, not "launch" -- point at whichever log(s) actually hold this set.
+        node_failed = [s for s in failed if s in node_sids]
+        logs: list[str] = []
+        if len(node_failed) < len(failed):
+            logs.append("~/.magent/logs/launch.log")
+        if node_failed:
+            logs.append("~/.magent/logs/nodes.log")
+        report_bring_up_casualties(
+            failed, log_hint="(see " + " and ".join(logs) + " on the host)"
+        )
 
     # Unconditional on the interactive path: a session that is up but parked at
     # a bare shell is exactly what this command is asked to fix, and there is
