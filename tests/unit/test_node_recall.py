@@ -60,16 +60,16 @@ class TestTheEncodedDirIsClaudeCodesOwnRule:
         ("path", "expected"),
         [
             (
-                r"C:\Users\alice\Documents\Projects\CUSTOM MCPs & PRODUCTIVITY\magent-multi-ai-agents-manager",
-                "C--Users-alice-Documents-Projects-CUSTOM-MCPs---PRODUCTIVITY-magent-multi-ai-agents-manager",
+                r"C:\Users\alice\Documents\Projects\Tools & Notes\magent-multi-ai-agents-manager",
+                "C--Users-alice-Documents-Projects-Tools---Notes-magent-multi-ai-agents-manager",
             ),
             (
-                r"C:\p\stealth-chrome-devtools-mcp\.claude\worktrees\agent-a0ed696fa523ab8f6",
-                "C--p-stealth-chrome-devtools-mcp--claude-worktrees-agent-a0ed696fa523ab8f6",
+                r"C:\p\demo-tools-mcp\.claude\worktrees\agent-0123456789abcdef0",
+                "C--p-demo-tools-mcp--claude-worktrees-agent-0123456789abcdef0",
             ),
             (
-                r"c:\Users\alice\Documents\Projects\INTERNAL\devino-landing-page",
-                "c--Users-alice-Documents-Projects-INTERNAL-devino-landing-page",
+                r"c:\Users\alice\Desktop\Projects\Acme\demo-landing-page",
+                "c--Users-alice-Desktop-Projects-Acme-demo-landing-page",
             ),
             ("/home/demo/magent/my_repo.v2", "-home-demo-magent-my-repo-v2"),
         ],
