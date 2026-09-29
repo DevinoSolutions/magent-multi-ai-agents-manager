@@ -59,9 +59,11 @@ _BUDGET_S = 45.0
 # e2e job has no minutes to spare). A healthy fake client shares the hung one's
 # deadline and must still answer inside it: one `python -I -S` start behind a
 # .cmd, measured at ~80ms a fan-out, on a fake the fixture has already run once
-# so a first-exec scan cannot land on the timed part. The production values
-# are pinned separately (TestTheProductionBudgets).
-_SHRUNK_S = 0.5
+# so a first-exec scan cannot land on the timed part. 0.5s was not enough: a
+# healthy kill-server overran it once on a loaded desktop, and a hosted
+# Windows runner is slower than that desktop. The production values are
+# pinned separately (TestTheProductionBudgets).
+_SHRUNK_S = 1.0
 
 # How long a killed client gets to be gone before the pin calls it left behind.
 _GONE_GRACE_S = 10.0
