@@ -778,6 +778,11 @@ def _menu_up(config_file: Path) -> None:
                 f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
                 f" {style('(see ~/.magent/logs/launch.log)', dim=True)}"
             )
+            # A session the bring-up deliberately left alone says why (e.g. it
+            # could not tell whether the session was running).
+            for why in failed.values():
+                if why:
+                    click.echo(f"    {style(why, dim=True)}")
             # The menu is a local, interactive surface and never hands off, so
             # a Session-0 refusal from the choke point is the one cause it can
             # name here (see launch.session0_note).

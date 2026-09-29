@@ -1563,6 +1563,11 @@ def up_cmd(
                 f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
                 f" {style('(see ~/.magent/logs/launch.log on the host)', dim=True)}"
             )
+            # A session the bring-up deliberately left alone says why (e.g. it
+            # could not tell whether the session was running).
+            for why in failed.values():
+                if why:
+                    click.echo(f"    {style(why, dim=True)}")
             # Only ever set when the choke point refused -- the hand-off and
             # refusal above have already returned on every other Session-0
             # path -- so this is the "policy said no" case wearing its reason.

@@ -1333,7 +1333,7 @@ class TestBringUpCreationVerify:
             monkeypatch, tmp_path, names=["api", "web"], failures=["api"]
         )
         assert created == ["api", "web"]
-        assert failed == []
+        assert failed == {}
 
     def test_session_zero_never_reaches_the_spawn(self, monkeypatch, tmp_path, slept):
         # THE choke point's safety net. Every session magent creates goes
@@ -1354,7 +1354,7 @@ class TestBringUpCreationVerify:
         )
 
         assert created == []
-        assert failed == ["api", "web"]
+        assert failed == {"api": "", "web": ""}
         assert fp.psmux_launches == []
 
     def test_a_handoff_disposition_also_never_spawns_here(
@@ -1376,7 +1376,7 @@ class TestBringUpCreationVerify:
             monkeypatch, tmp_path, names=["api"], plat=fp
         )
 
-        assert failed == ["api"]
+        assert failed == {"api": ""}
         assert fp.psmux_launches == []
         assert fp.handoffs == []
 
@@ -1394,7 +1394,7 @@ class TestBringUpCreationVerify:
         )
 
         assert created == ["api"]
-        assert failed == []
+        assert failed == {}
 
     def test_the_probe_gets_a_settle_before_it_runs(self, monkeypatch, tmp_path, slept):
         # Probing at t=0 would misclassify a slow-but-fine server on a loaded
@@ -1486,7 +1486,7 @@ class TestBringUpCreationVerify:
         # used to discard the verify's answer and return every attempted name,
         # so the caller printed "Brought up 1 session(s)" for a session the log
         # in the very same run called "never came up".
-        assert created == ([], ["api"])
+        assert created == ([], {"api": ""})
 
     def test_a_respawn_that_cannot_be_launched_never_raises(
         self, monkeypatch, tmp_path, slept, caplog
@@ -1501,14 +1501,14 @@ class TestBringUpCreationVerify:
             calls.append(1)
             if len(calls) > 1:
                 raise OSError("psmux vanished mid-wave")
-            original(windows)
+            return original(windows)
 
         fp.launch_psmux_session = _flaky
         with caplog.at_level(logging.WARNING, logger="magent.launch"):
             created, _fp = self._bring_up(
                 monkeypatch, tmp_path, names=["api"], failures=["api"], plat=fp
             )
-        assert created == ([], ["api"])
+        assert created == ([], {"api": ""})
         assert len(calls) == 2
 
     def test_no_psmux_binary_skips_the_verify_entirely(
@@ -1532,7 +1532,7 @@ class TestBringUpCreationVerify:
         assert slept == []
         # Unprovable is not "fine": with no binary to probe with, nothing may be
         # claimed as created either.
-        assert created == ([], ["api"])
+        assert created == ([], {"api": ""})
 
 
 class TestBringUpContainsCreationFailures:
@@ -1564,6 +1564,7 @@ class TestBringUpContainsCreationFailures:
                 raise boom
             for w in windows:
                 fp.psmux_sessions.add(w.window_name)
+            return {}
 
         fp.launch_psmux_session = _launch
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
@@ -1589,7 +1590,7 @@ class TestBringUpContainsCreationFailures:
         # No pytest.raises: the point is that nothing escapes.
         failed = psmux.launch_verified(fp, self._windows(["api", "web"]))
         assert calls[0] == ["api", "web"]
-        assert failed == []
+        assert failed == {}
 
     def test_the_verify_still_runs_and_respawns_the_missing(self, monkeypatch, slept):
         boom = subprocess.CalledProcessError(1, ["psmux", "new-session"])
@@ -1620,13 +1621,14 @@ class TestBringUpContainsCreationFailures:
             calls.append(1)
             if len(calls) == 1:
                 raise subprocess.CalledProcessError(1, ["psmux", "new-session"])
+            return {}
 
         fp.launch_psmux_session = _launch
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
         monkeypatch.setattr(
             psmux, "has_session", lambda name, psmux=None, timeout=None: False
         )
-        assert psmux.launch_verified(fp, self._windows(["api"])) == ["api"]
+        assert psmux.launch_verified(fp, self._windows(["api"])) == {"api": ""}
         assert len(calls) == 2
 
 

@@ -1015,7 +1015,7 @@ class TestUpDecorates:
         )
         monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
         monkeypatch.setattr(
-            "magent.launch.bring_up_psmux", lambda *a, **k: (list(created), [])
+            "magent.launch.bring_up_psmux", lambda *a, **k: (list(created), {})
         )
         monkeypatch.setattr("magent.launch.decorate_psmux_sessions", seen.append)
         return seen
@@ -1071,21 +1071,35 @@ class TestUpReportsCasualties:
         monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
         monkeypatch.setattr(
             "magent.launch.bring_up_psmux",
-            lambda cfg, only=None, group=None: (list(created), list(failed)),
+            lambda cfg, only=None, group=None: (list(created), dict(failed)),
         )
 
     def test_failed_sessions_are_named(self, runner, tmp_path, monkeypatch):
-        self._patch(monkeypatch, created=["web"], failed=["api"])
+        self._patch(monkeypatch, created=["web"], failed={"api": ""})
         result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
         assert result.exit_code == 0
         assert "Brought up 1" in result.output
         assert "1 session(s) failed to come up" in result.output
         assert "api" in result.output
 
+    def test_a_refused_session_says_why(self, runner, tmp_path, monkeypatch):
+        # A session the bring-up deliberately left alone (its has-session never
+        # answered) is named WITH its reason: this is the line `magent attach`
+        # relays from the host, and "failed" alone reads as "dead" when the
+        # truth is "could not tell". The Session-0 note still follows it.
+        why = "could not tell whether api is running (has-session gave no answer)"
+        self._patch(monkeypatch, created=[], failed={"api": why})
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+        assert result.exit_code == 0
+        assert "1 session(s) failed to come up" in result.output
+        assert why in result.output
+        assert "S0-NOTE" in result.output
+
     def test_a_clean_wave_says_nothing_about_failures(
         self, runner, tmp_path, monkeypatch
     ):
-        self._patch(monkeypatch, created=["api"], failed=[])
+        self._patch(monkeypatch, created=["api"], failed={})
         result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
         assert result.exit_code == 0
         assert "failed to come up" not in result.output
@@ -1106,7 +1120,7 @@ class TestUpReportsCasualties:
         brought_up: list[object] = []
         monkeypatch.setattr(
             "magent.launch.bring_up_psmux",
-            lambda *a, **k: (brought_up.append(a), ([], []))[1],
+            lambda *a, **k: (brought_up.append(a), ([], {}))[1],
         )
         result = runner.invoke(
             cli.main, ["--config", self._config(tmp_path), "up", "--json"]

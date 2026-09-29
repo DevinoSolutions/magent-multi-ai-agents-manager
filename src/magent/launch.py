@@ -1088,6 +1088,11 @@ def _start_psmux_and_upload(
                 f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
                 f" {style('(see ~/.magent/logs/launch.log)', dim=True)}"
             )
+            # A session the bring-up deliberately left alone says why (e.g. it
+            # could not tell whether the session was running).
+            for why in failed.values():
+                if why:
+                    click.echo(f"    {style(why, dim=True)}")
             # `--go` never hands off (it is a local, interactive command by
             # definition), so reaching here in Session 0 means the choke point
             # refused -- and a casualty list with no cause is what sent a user
@@ -1272,8 +1277,9 @@ def psmux_status(
 
 def bring_up_psmux(
     config: MagentConfig, only: list[str] | None = None, group: str | None = None
-) -> tuple[list[str], list[str]]:
-    """Delegate to ``psmux.bring_up``. Returns ``(created, failed)``."""
+) -> tuple[list[str], dict[str, str]]:
+    """Delegate to ``psmux.bring_up``. Returns ``(created, failed)``, where
+    ``failed`` maps each session that stayed down to why ("" = see the log)."""
     from magent import psmux
 
     return psmux.bring_up(config, only, group)

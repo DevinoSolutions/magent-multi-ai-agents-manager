@@ -581,7 +581,7 @@ class FakePlatform(Platform):
     def snapshot_windows(self):
         return self._windows
 
-    def launch_psmux_session(self, windows) -> None:
+    def launch_psmux_session(self, windows) -> dict[str, str]:
         self.launched_psmux.extend(windows)
         self.psmux_launches.append([w.window_name for w in windows])
         for w in windows:
@@ -589,6 +589,7 @@ class FakePlatform(Platform):
                 self._psmux_launch_failures.discard(w.window_name)
                 continue
             self.psmux_sessions.add(w.window_name)
+        return {}
 
     def attach_psmux(self, session_name, title, color=None, config_path=None) -> None:
         self.attached_psmux.append((session_name, title, color, config_path))
