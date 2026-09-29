@@ -129,6 +129,28 @@ class TestUpJson:
         assert data["down"][0]["name"] == "my.api"
         assert data["down"][0]["session"] == "my-api"
 
+    def test_an_emoji_name_is_still_json_on_a_legacy_code_page_pipe(
+        self, tmp_path, home
+    ):
+        # stdout escapes what it cannot encode, and Python's escape for a
+        # character past U+FFFF is \U0001f600 -- not a JSON escape. Today's
+        # --json emitters keep json.dumps's ensure_ascii default, so the
+        # output is ASCII and never reaches the escape; one that passed
+        # ensure_ascii=False would fail this parse (or, unescaped, crash).
+        # PYTHONIOENCODING forces the Windows pipe's code page on every OS.
+        # The folder does not exist, so no multiplexer is ever asked.
+        cfg = _write_cfg(
+            tmp_path, [{"path": str(tmp_path / "\U0001f600"), "tool": "claude"}]
+        )
+        r = subprocess.run(
+            [sys.executable, "-m", "magent", "--config", str(cfg), "up", "--json"],
+            capture_output=True,
+            env={**_child_env(home), "PYTHONIOENCODING": "cp1252"},
+        )
+        assert r.returncode == 0, r.stderr
+        data = json.loads(r.stdout)
+        assert [p["name"] for p in data["projects"]] == ["\U0001f600"]
+
     def test_bad_config_errors_as_json(self, tmp_path, home):
         cfg = tmp_path / "bad.json"
         cfg.write_text("not json{")
