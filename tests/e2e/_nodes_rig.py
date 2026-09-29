@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
@@ -419,8 +420,21 @@ def run_files(
         err=err_p.read_bytes().decode("utf-8", "replace"),
     )
     if timed_out:
-        pytest.fail(f"{tag}: timed out after {timeout:.0f}s\n{run.show()}")
+        pytest.fail(f"{_timeout_head(tag)}{timeout:.0f}s\n{run.show()}")
     return run
+
+
+def _timeout_head(tag: str) -> str:
+    """How the failure ``run_files`` raises at its deadline begins."""
+    return f"{tag}: timed out after "
+
+
+def _stalled(exc: BaseException, tag: str) -> bool:
+    """Whether ``exc`` is ``run_files`` killing ``tag`` at its deadline: a
+    hop that never answered, as against a spent budget or no ssh at all."""
+    return isinstance(exc, pytest.fail.Exception) and str(exc).startswith(
+        _timeout_head(tag)
+    )
 
 
 def wait_for(
@@ -463,6 +477,11 @@ SSH_OPTS = (
     "-o",
     "ServerAliveCountMax=3",
 )
+# The root hop's own: VERBOSE adds "Authenticated to ..." at the end of
+# userauth (and a byte count at exit) to its stderr, which nothing parses,
+# so a stalled hop shows whether it got past authentication. The node
+# user's hop is the product's wire and keeps its stderr as it is.
+ROOT_SSH_OPTS = ("-o", "LogLevel=VERBOSE")
 
 
 @dataclass
@@ -473,13 +492,15 @@ class Remote:
     target: str
     out_dir: Path
     budget: Budget
+    # ssh options after SSH_OPTS, for this login alone.
+    opts: tuple[str, ...] = ()
 
     def run(self, argv: Sequence[str], *, tag: str, want: float = 60.0) -> Run:
         """``argv`` as ONE ``bash -c`` string (the product's DECISION-9 rule):
         only bash ever parses it, whatever the login shell is."""
         remote = "bash -c " + shlex.quote(shlex.join(argv))
         return run_files(
-            ["ssh", *SSH_OPTS, self.target, remote],
+            ["ssh", *SSH_OPTS, *self.opts, self.target, remote],
             self.out_dir,
             f"ssh-{tag}",
             clamp(self.budget, want, f"ssh-{tag}"),
@@ -492,7 +513,7 @@ class Remote:
         the budget clamp (teardown's reserved allowance)."""
         remote = shlex.join(["bash", "-s", "--", *args])
         return run_files(
-            ["ssh", *SSH_OPTS, self.target, remote],
+            ["ssh", *SSH_OPTS, *self.opts, self.target, remote],
             self.out_dir,
             f"ssh-{tag}",
             timeout or clamp(self.budget, want, f"ssh-{tag}"),
@@ -524,23 +545,37 @@ _BAD_NAME, _EXISTS = 2, 3
 # _DELETE_USER's exit for a user whose stamp is not this run's.
 _NOT_OURS = 5
 
+# Each step names itself on stderr before it runs, so a hop killed at its
+# deadline shows the step it hung in as its last marker; `done` after the
+# answer means it hung after the script (the session's teardown). printf is
+# a builtin: a marker waits on no command. $SECONDS, not $EPOCHREALTIME,
+# which `set -u` makes fatal on a bash older than 5.
 _CREATE_USER = f"""set -eu
 u=$1
 key=$2
 owner=$3
+mark() {{ printf 'phase %s +%ss\\n' "$1" "$SECONDS" >&2; }}
+mark start
 case $u in {_USER_CASE}) ;; *) echo "refusing to create $u" >&2; exit {_BAD_NAME} ;; esac
+mark getent
 if getent passwd "$u" >/dev/null; then echo "$u already exists" >&2; exit {_EXISTS}; fi
+mark useradd
 useradd --create-home --shell /bin/bash --comment "$owner" "$u"
+mark usermod
 # '*' is no password, not a LOCKED one ('!'): sshd refuses pubkey logins to a
 # locked account when PAM is off.
 usermod -p '*' "$u"
+mark lookup
 home=$(getent passwd "$u" | cut -d: -f6)
 group=$(id -gn "$u")
+mark key
 install -d -m 700 -o "$u" -g "$group" "$home/.ssh"
 printf '%s\\n' "$key" > "$home/.ssh/authorized_keys"
 chown "$u:$group" "$home/.ssh/authorized_keys"
 chmod 600 "$home/.ssh/authorized_keys"
+mark answer
 printf '%s %s\\n' "$(id -u "$u")" "$home"
+mark done
 """
 
 # As the node user: its own key (a real node fetches origin with its own
@@ -609,10 +644,14 @@ class NodeUser:
     home: str
     root: Remote
     login: Remote
+    # (name, stamp) of each create attempt a stall abandoned: gone when it
+    # was abandoned, but a useradd killed only on OUR side of the wire may
+    # still finish on the node's, so teardown deletes each one again.
+    abandoned: tuple[tuple[str, str], ...] = ()
 
     @classmethod
     def create(cls, wire: Wire, out_dir: Path, budget: Budget) -> NodeUser:
-        root = Remote(f"root@{wire.host}", out_dir, budget)
+        root = Remote(f"root@{wire.host}", out_dir, budget, opts=ROOT_SSH_OPTS)
         probe = root.run(["true"], tag="root-probe", want=30)
         if probe.rc != 0:
             pytest.fail(
@@ -620,15 +659,10 @@ class NodeUser:
                 "the test key for root@mdssh before this tier runs\n" + probe.show()
             )
         pub = Path(f"{wire.key}.pub").read_text(encoding="utf-8").strip()
-        name = f"mgn{secrets.token_hex(3)[:5]}"
-        owner = f"{OWNER_PREFIX} {secrets.token_hex(8)}"
-        try:
-            made = root.script(_CREATE_USER, name, pub, owner, tag="useradd", want=60)
-        except BaseException:
-            # A timeout: the useradd may have finished on the far side of it.
-            _discard(root, name, owner)
-            raise
+        created = _useradd(root, pub)
+        name, owner, made = created.name, created.owner, created.run
         if made.rc in (_BAD_NAME, _EXISTS):
+            _discard_all(root, created.abandoned)
             pytest.fail(
                 f"the root hop refused to create {name}; nothing was created, "
                 f"so nothing is deleted\n{made.show()}"
@@ -650,12 +684,14 @@ class NodeUser:
                 home=home,
                 root=root,
                 login=Remote(f"{name}@{wire.host}", out_dir, budget),
+                abandoned=created.abandoned,
             )
             boot = user.login.script(_BOOTSTRAP_USER, wire.port, tag="bootstrap")
             if boot.rc != 0:
                 pytest.fail(f"could not bootstrap the node user {name}\n{boot.show()}")
         except BaseException:
             _discard(root, name, owner)
+            _discard_all(root, created.abandoned)
             raise
         return user
 
@@ -669,20 +705,155 @@ class NodeUser:
         )
 
 
-def _discard(root: Remote, name: str, owner: str) -> None:
-    """Delete the user a failed ``create`` may have left, by its stamp. Its
-    own failure -- a timeout (``Failed``), no ssh at all (``OSError``), or a
-    refusal -- goes to stderr, never up: the create's failure is the one the
-    report is about, and it is re-raised as it was."""
+def _delete_by_stamp(root: Remote, name: str, owner: str) -> str | None:
+    """Delete ``name`` if it carries ``owner``: None once it is verifiably
+    gone (or never came to exist), else what went wrong, to follow a colon
+    -- a timeout (``Failed``), no ssh at all (``OSError``), or a refusal."""
     try:
         gone = root.script(
             _DELETE_USER, name, owner, tag="userdel", timeout=CLEANUP_TIMEOUT_S
         )
     except (pytest.fail.Exception, OSError) as exc:
-        sys.stderr.write(f"cleanup of node user {name} failed: {exc}\n")
-        return
+        return f" {exc}"
     if gone.rc != 0:
-        sys.stderr.write(f"cleanup of node user {name} failed:\n{gone.show()}\n")
+        return f"\n{gone.show()}"
+    return None
+
+
+def _discard(root: Remote, name: str, owner: str) -> None:
+    """Delete the user a failed ``create`` may have left, by its stamp. Its
+    own failure goes to stderr, never up: the create's failure is the one
+    the report is about, and it is re-raised as it was."""
+    problem = _delete_by_stamp(root, name, owner)
+    if problem is not None:
+        sys.stderr.write(f"cleanup of node user {name} failed:{problem}\n")
+
+
+# A create hop that TIMES OUT is retried at most this many times, each under
+# a fresh name and stamp, and only once the stalled attempt's user is
+# verifiably gone. CI run 36443883198: the hop sat silent for its whole bound
+# while the same root hop answered a second either side of it. A refusal, an
+# rc or an answer that does not parse is an answer, and is never retried.
+USERADD_RETRIES = 1
+# Each attempt keeps the bound the create always had: green runs show up to
+# ~40 s of wait here, and a shorter one would turn slow greens into retries.
+USERADD_WANT_S = 60.0
+
+
+class StallRescued(UserWarning):
+    """A create hop stalled and was retried. The run may still pass, so the
+    stall must stay in a GREEN log: pytest prints a warnings summary on every
+    run, while a test's stderr and logged WARNINGs show only when it fails."""
+
+
+# What a stalled create hop leaves on the node, read at once over the same
+# root hop: the processes a stuck useradd or sshd session is (and the kernel
+# wait channel each sleeps in), systemd's queued jobs (a login's session
+# scope waits there), and sshd's and logind's own journal lines. The job log
+# is public: no read here prints an environment, and each is bounded in time
+# and in lines.
+_STALL_SNAPSHOT = """set -u
+echo '--- processes: sshd, useradd, getent, logind ---'
+timeout 3 ps -eo pid,ppid,etimes,stat,wchan:32,args 2>&1 | awk 'NR == 1 || /[s]shd|[u]ser(add|mod)|[g]etent|[l]ogind/' | head -n 60
+echo '--- systemd jobs ---'
+timeout 3 systemctl list-jobs --no-pager 2>&1 | head -n 30
+echo '--- journal: sshd, systemd-logind (last 120 s) ---'
+timeout 3 journalctl -t sshd -t sshd-session -t systemd-logind --since=-120s --no-pager -o short-precise 2>&1 | tail -n 60
+"""
+
+
+def _stall_snapshot(root: Remote) -> str:
+    """``_STALL_SNAPSHOT`` over the root hop within DIAG_READ_S, whatever the
+    module budget has left; a read that failed is the snapshot's text."""
+    try:
+        got = root.script(_STALL_SNAPSHOT, tag="stall-snapshot", timeout=DIAG_READ_S)
+    except (pytest.fail.Exception, OSError) as exc:
+        return f"(stall snapshot unavailable: {exc})"
+    return got.show()
+
+
+def _fresh_name(taken: Iterable[tuple[str, str]]) -> str:
+    """A node user name of the root hop's shape, and none of ``taken``'s."""
+    used = {name for name, _ in taken}
+    while True:
+        name = f"mgn{secrets.token_hex(3)[:5]}"
+        if name not in used:
+            return name
+
+
+@dataclass(frozen=True)
+class _Created:
+    """The create hop's answer for ``name``, and the (name, stamp) of each
+    attempt before it that a stall abandoned."""
+
+    name: str
+    owner: str
+    run: Run
+    abandoned: tuple[tuple[str, str], ...]
+
+
+def _useradd(root: Remote, pub: str) -> _Created:
+    """``_CREATE_USER`` under a fresh name and stamp. A hop that TIMED OUT is
+    snapshotted and its user deleted by its stamp; only once that delete
+    verified is it retried, under a fresh name and stamp, at most
+    USERADD_RETRIES times. Anything else returns at once (an answer, for
+    ``create`` to read) or raises (a spent budget, no ssh) -- and a raise
+    deletes each abandoned attempt once more, since no rig will."""
+    stalls: list[str] = []
+    abandoned: list[tuple[str, str]] = []
+    try:
+        while True:
+            name = _fresh_name(abandoned)
+            owner = f"{OWNER_PREFIX} {secrets.token_hex(8)}"
+            try:
+                made = root.script(
+                    _CREATE_USER, name, pub, owner, tag="useradd", want=USERADD_WANT_S
+                )
+            except BaseException as exc:
+                if not _stalled(exc, "ssh-useradd"):
+                    # The useradd may have finished on the far side of it.
+                    _discard(root, name, owner)
+                    raise
+                stalls.append(
+                    f"--- attempt {len(stalls) + 1}: {name} ({owner}) ---\n{exc}\n"
+                    f"--- the node right after it ---\n{_stall_snapshot(root)}"
+                )
+                said = "\n".join(stalls)
+                problem = _delete_by_stamp(root, name, owner)
+                if problem is not None:
+                    # A second user on top of an unconfirmed first: never.
+                    # The stall is the report, re-raised as it was; why it
+                    # was not retried, and the node's state, go to stderr.
+                    sys.stderr.write(
+                        f"the create hop for {name} stalled and its user is not "
+                        f"verifiably gone, so it is not retried (delete:{problem})\n"
+                        f"{said}\n"
+                    )
+                    raise
+                if len(stalls) > USERADD_RETRIES:
+                    pytest.fail(
+                        f"the create hop stalled on all {len(stalls)} attempts\n{said}"
+                    )
+                abandoned.append((name, owner))
+                warnings.warn(
+                    StallRescued(
+                        f"the create hop for {name} stalled; its user is gone, "
+                        f"retrying under a fresh name\n{said}"
+                    ),
+                    stacklevel=2,
+                )
+                continue
+            return _Created(name, owner, made, tuple(abandoned))
+    except BaseException:
+        _discard_all(root, abandoned)
+        raise
+
+
+def _discard_all(root: Remote, attempts: Iterable[tuple[str, str]]) -> None:
+    """``_discard`` each (name, stamp) a stall abandoned: a useradd killed
+    only on OUR side of the wire may have finished on the node's since."""
+    for name, owner in attempts:
+        _discard(root, name, owner)
 
 
 # ---------------------------------------------------------------------------
@@ -1276,7 +1447,8 @@ class NodeRig:
     def close(self) -> list[str]:
         """Kill every PC-side child this rig started (by its Popen), stop any
         sync daemon a PC home holds, then delete the node user -- which takes
-        its tmux server, its stand-ins and its sessions with it. Returns what
+        its tmux server, its stand-ins and its sessions with it -- and any
+        create attempt a stall abandoned, each by its own stamp. Returns what
         could not be cleaned, a timed-out delete included, for the fixture to
         fail on; never raises past a step, so every step runs."""
         problems: list[str] = []
@@ -1331,6 +1503,10 @@ class NodeRig:
                 problems.append(
                     f"node user {self.user.name} not deleted:\n{deleted.show()}"
                 )
+        for name, owner in self.user.abandoned:
+            problem = _delete_by_stamp(self.user.root, name, owner)
+            if problem is not None:
+                problems.append(f"stalled node user {name} not deleted:{problem}")
         return problems
 
 

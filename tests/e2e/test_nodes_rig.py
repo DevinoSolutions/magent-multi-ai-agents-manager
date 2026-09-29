@@ -14,9 +14,11 @@ import fnmatch
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,8 +78,12 @@ class TestEveryStageIsUnderTheBudget:
 
     def test_the_journey_budget_leaves_the_job_clock_its_margin(self) -> None:
         # Setup, the bash pins, teardown and the post-deadline floors ride on
-        # top of the budget (worst case 999 s of 1500 s at 300 s): a budget
-        # past a third of timeout-minutes is a cancel waiting to happen.
+        # top of the budget: worst case about 1069 s of 1500 s at 300 s -- the
+        # 999 s it was, plus a stalled create's snapshot (10 s) and discard
+        # (60 s); its retry runs inside the budget. The abandoned attempt's
+        # second delete at teardown (60 s) and the create-hop pins (25 s)
+        # bound it at 1154 s. A budget past a third of timeout-minutes is a
+        # cancel waiting to happen.
         found = re.search(r"timeout-minutes: (\d+)", _WORKFLOW.read_text("utf-8"))
         assert found, _WORKFLOW
         timeout_s, budget_s = int(found.group(1)) * 60, rig.NODES_BUDGET_S
@@ -354,25 +360,52 @@ class TestDownOnlyProbesAndKillsTheLocalHalf:
 @dataclass(frozen=True)
 class _Call:
     target: str
-    script: str  # "run", "create", "bootstrap" or "delete"
+    script: str  # "run", "create", "bootstrap", "delete" or "snapshot"
     args: tuple[str, ...]
+
+
+_MADE = _run(0, "4242 /home/mgnabcde\n")
+_SNAPSHOT = "--- processes ---\n  812     1  61 Ss  do_epoll_wait  sshd: root@notty\n"
+
+
+def _stall() -> BaseException:
+    """A create hop killed at its deadline, as ``run_files`` reports it: the
+    stall is an exception, and each call makes a new one (identity pins)."""
+    return pytest.fail.Exception(
+        "ssh-useradd: timed out after 60s\n"
+        "$ ssh -o BatchMode=yes root@mdssh 'bash -s -- mgnabcde'\nrc=-1\n"
+        "--- stdout ---\n\n--- stderr ---\n"
+        'Authenticated to mdssh ([127.0.0.1]:2222) using "publickey".\n'
+        "phase start +0s\nphase getent +0s\nphase useradd +0s\n"
+    )
 
 
 class _FakeHop:
     """``Remote.run``/``Remote.script`` as ``NodeUser.create`` drives them.
     Every call is recorded; each script answers from ``answers`` -- a Run, or
-    an exception to raise (what ``run_files`` raises on a timeout)."""
+    an exception to raise (what ``run_files`` raises on a timeout), for every
+    call; or a LIST of those, one per call in order, then the default."""
 
     def __init__(
-        self, monkeypatch: pytest.MonkeyPatch, **answers: rig.Run | BaseException
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        **answers: rig.Run | BaseException | list[rig.Run | BaseException],
     ) -> None:
         self.calls: list[_Call] = []
         names = {
             rig._CREATE_USER: "create",
             rig._BOOTSTRAP_USER: "bootstrap",
             rig._DELETE_USER: "delete",
+            rig._STALL_SNAPSHOT: "snapshot",
         }
-        made = _run(0, "4242 /home/mgnabcde\n")
+        defaults = {"create": _MADE, "snapshot": _run(0, _SNAPSHOT)}
+        plan = {k: list(v) if isinstance(v, list) else v for k, v in answers.items()}
+
+        def answer(name: str) -> rig.Run | BaseException:
+            got = plan.get(name, defaults.get(name, _run(0)))
+            if isinstance(got, list):
+                return got.pop(0) if got else defaults.get(name, _run(0))
+            return got
 
         def run(
             remote: rig.Remote, argv: list[str], *, tag: str, want: float = 60.0
@@ -392,10 +425,10 @@ class _FakeHop:
             del tag, want, timeout
             name = names[text]
             self.calls.append(_Call(remote.target, name, args))
-            answer = answers.get(name, made if name == "create" else _run(0))
-            if isinstance(answer, BaseException):
-                raise answer
-            return answer
+            got = answer(name)
+            if isinstance(got, BaseException):
+                raise got
+            return got
 
         monkeypatch.setattr(rig.Remote, "run", run)
         monkeypatch.setattr(rig.Remote, "script", script)
@@ -427,27 +460,17 @@ class TestTheRootHopDeletesOnlyTheUserThisRunMade:
             _create(tmp_path)
         assert hop.scripts() == ["create"]
 
-    @pytest.mark.parametrize(
-        ("stage", "scripts"),
-        [
-            ("create", ["create", "delete"]),
-            ("bootstrap", ["create", "bootstrap", "delete"]),
-        ],
-    )
-    def test_a_timeout_still_deletes_the_user_by_this_runs_stamp(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        stage: str,
-        scripts: list[str],
+    def test_a_bootstrap_timeout_still_deletes_the_user_by_this_runs_stamp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        timed_out = pytest.fail.Exception(f"ssh-{stage}: timed out after 60s")
-        hop = _FakeHop(monkeypatch, **{stage: timed_out})
+        # Only the CREATE hop's stall is retried (TestAStalledCreate...).
+        timed_out = pytest.fail.Exception("ssh-bootstrap: timed out after 60s")
+        hop = _FakeHop(monkeypatch, bootstrap=timed_out)
         with pytest.raises(pytest.fail.Exception) as raised:
             _create(tmp_path)
         # The timeout is the report, re-raised as it was.
         assert raised.value is timed_out
-        assert hop.scripts() == scripts
+        assert hop.scripts() == ["create", "bootstrap", "delete"]
         name, pub, owner = hop.only("create").args
         assert pub == _PUB
         assert owner.startswith(f"{rig.OWNER_PREFIX} ")
@@ -539,6 +562,303 @@ class TestTheRootHopDeletesOnlyTheUserThisRunMade:
             _create(tmp_path)
         err = capsys.readouterr().err
         assert "cleanup of node user" in err and "rc=5" in err, err
+
+
+class TestAStalledCreateIsRetriedOnceAndOnlyThen:
+    """The create hop that TIMES OUT is retried once, under a fresh name and
+    stamp, after a snapshot and only once the discard verified; an answer is
+    never retried. CI run 36443883198: a 60 s silent stall on the create hop,
+    the root hop healthy a second either side of it."""
+
+    def test_a_stall_is_retried_once_under_a_fresh_name_and_stamp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        hop = _FakeHop(monkeypatch, create=[_stall(), _MADE])
+        with pytest.warns(rig.StallRescued) as seen:
+            user = _create(tmp_path)
+        assert hop.scripts() == ["create", "snapshot", "delete", "create", "bootstrap"]
+        snapshot = hop.only("snapshot")
+        assert (snapshot.target, snapshot.args) == ("root@mdssh", ())
+        first, second = [c.args for c in hop.calls if c.script == "create"]
+        # The stalled attempt is discarded by ITS name and stamp...
+        assert hop.only("delete").args == (first[0], first[2])
+        # ...and the retry shares neither with it.
+        assert second[0] != first[0], (first, second)
+        assert second[2] != first[2], (first, second)
+        assert (user.name, user.owner) == (second[0], second[2])
+        # A useradd killed only on our side may still finish on the node's.
+        assert user.abandoned == ((first[0], first[2]),)
+        # The rescue stays visible in a GREEN log, the snapshot with it.
+        (warned,) = [w for w in seen if issubclass(w.category, rig.StallRescued)]
+        said = str(warned.message)
+        assert first[0] in said and _SNAPSHOT in said, said
+        assert "ssh-useradd: timed out after 60s" in said, said
+        assert "phase useradd" in said, said
+
+    def test_the_snapshot_is_bounded_whatever_the_budget_has_left(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Its own DIAG_READ_S, never the module budget's clamp: a spent
+        # budget neither skips the snapshot nor stretches it.
+        bounds: list[float] = []
+
+        def run_files(
+            argv: list[str], out_dir: Path, tag: str, timeout: float, **_: object
+        ) -> rig.Run:
+            del argv, out_dir, tag
+            bounds.append(timeout)
+            return _run(0, _SNAPSHOT)
+
+        monkeypatch.setattr(rig, "run_files", run_files)
+        root = rig.Remote("root@mdssh", tmp_path, Budget(0), opts=rig.ROOT_SSH_OPTS)
+        assert _SNAPSHOT in rig._stall_snapshot(root)
+        assert bounds == [rig.DIAG_READ_S]
+
+    def test_a_second_stall_fails_carrying_both_attempts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        hop = _FakeHop(
+            monkeypatch,
+            create=[_stall(), _stall(), _MADE],
+            snapshot=[_run(0, "snap-one\n"), _run(0, "snap-two\n")],
+        )
+        with (
+            pytest.warns(rig.StallRescued),
+            pytest.raises(pytest.fail.Exception) as raised,
+        ):
+            _create(tmp_path)
+        assert hop.scripts() == [
+            *("create", "snapshot", "delete"),
+            *("create", "snapshot", "delete"),
+            "delete",
+        ]
+        creates = [c.args for c in hop.calls if c.script == "create"]
+        deletes = [c.args for c in hop.calls if c.script == "delete"]
+        # Each attempt by its own stamp, then the abandoned first once more:
+        # no rig is built, so no teardown will.
+        first, second = [(args[0], args[2]) for args in creates]
+        assert deletes == [first, second, first]
+        said = str(raised.value)
+        assert "snap-one" in said and "snap-two" in said, said
+        assert said.count("ssh-useradd: timed out after 60s") == 2, said
+        assert all(args[0] in said for args in creates), said
+
+    @pytest.mark.parametrize(
+        "delete",
+        [
+            _run(1),
+            _run(rig._NOT_OURS),
+            pytest.fail.Exception("ssh-userdel: timed out after 60s"),
+            FileNotFoundError("ssh"),
+        ],
+        ids=["still-there", "not-ours", "timed-out", "no-ssh"],
+    )
+    def test_a_stall_whose_discard_did_not_verify_is_never_retried(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        delete: rig.Run | BaseException,
+    ) -> None:
+        # A second user on top of an unconfirmed first: never.
+        stall = _stall()
+        hop = _FakeHop(monkeypatch, create=[stall, _MADE], delete=delete)
+        with pytest.raises(pytest.fail.Exception) as raised:
+            _create(tmp_path)
+        assert hop.scripts() == ["create", "snapshot", "delete"]
+        # The stall is the report, re-raised as it was...
+        assert raised.value is stall
+        # ...and stderr says what the node looked like, and why no retry.
+        err = capsys.readouterr().err
+        assert str(stall) in err and _SNAPSHOT in err, err
+        assert "not retried" in err, err
+
+    @pytest.mark.parametrize(
+        ("then", "scripts"),
+        [
+            (
+                {"create": [_stall(), _run(1)]},
+                ["create", "snapshot", "delete", "create", "delete", "delete"],
+            ),
+            (
+                {"create": [_stall(), _run(rig._EXISTS)]},
+                ["create", "snapshot", "delete", "create", "delete"],
+            ),
+            (
+                {"create": [_stall(), _run(0, "useradd said something else\n")]},
+                ["create", "snapshot", "delete", "create", "delete", "delete"],
+            ),
+            (
+                {
+                    "create": [
+                        _stall(),
+                        pytest.fail.Exception("budget exhausted before ssh-useradd"),
+                    ]
+                },
+                ["create", "snapshot", "delete", "create", "delete", "delete"],
+            ),
+            (
+                {"create": [_stall(), _MADE], "bootstrap": _run(1)},
+                [
+                    *("create", "snapshot", "delete", "create", "bootstrap"),
+                    *("delete", "delete"),
+                ],
+            ),
+        ],
+        ids=["useradd-failed", "exists", "answer-unparsed", "budget-spent", "boot"],
+    )
+    def test_a_create_that_fails_after_a_rescue_deletes_the_stalled_one_again(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        then: dict[str, rig.Run | BaseException | list[rig.Run | BaseException]],
+        scripts: list[str],
+    ) -> None:
+        # No rig is built, so its teardown never sweeps: the create does.
+        hop = _FakeHop(monkeypatch, **then)
+        with (
+            pytest.warns(rig.StallRescued),
+            pytest.raises(pytest.fail.Exception),
+        ):
+            _create(tmp_path)
+        assert hop.scripts() == scripts
+        first = next(c.args for c in hop.calls if c.script == "create")
+        deletes = [c.args for c in hop.calls if c.script == "delete"]
+        assert deletes[0] == deletes[-1] == (first[0], first[2]), deletes
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            _run(1),
+            _run(rig._EXISTS),
+            _run(rig._BAD_NAME),
+            _run(0, "useradd said something else\n"),
+        ],
+        ids=["useradd-failed", "exists", "bad-name", "answer-unparsed"],
+    )
+    def test_an_answer_is_never_retried(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        answer: rig.Run,
+    ) -> None:
+        hop = _FakeHop(monkeypatch, create=[answer, _MADE])
+        with pytest.raises(pytest.fail.Exception):
+            _create(tmp_path)
+        assert hop.scripts().count("create") == 1, hop.scripts()
+        assert "snapshot" not in hop.scripts()
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            pytest.fail.Exception("budget exhausted before ssh-useradd"),
+            FileNotFoundError("ssh"),
+        ],
+        ids=["budget-spent", "no-ssh"],
+    )
+    def test_a_create_hop_that_did_not_time_out_is_never_retried(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure: BaseException,
+    ) -> None:
+        hop = _FakeHop(monkeypatch, create=[failure, _MADE])
+        with pytest.raises(type(failure)) as raised:
+            _create(tmp_path)
+        # Re-raised as it was, after the discard by this attempt's stamp.
+        assert raised.value is failure
+        assert hop.scripts() == ["create", "delete"]
+        name, _, owner = hop.only("create").args
+        assert hop.only("delete").args == (name, owner)
+
+    def test_the_rig_reads_its_own_timeout_as_a_stall(self, tmp_path: Path) -> None:
+        # The recognizer and run_files' report must not drift apart: a real
+        # child, killed at a real deadline.
+        with pytest.raises(pytest.fail.Exception) as raised:
+            rig.run_files(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                tmp_path,
+                "ssh-useradd",
+                1.0,
+            )
+        assert rig._stalled(raised.value, "ssh-useradd")
+        assert not rig._stalled(raised.value, "ssh-bootstrap")
+        spent = pytest.fail.Exception("budget exhausted before ssh-useradd")
+        assert not rig._stalled(spent, "ssh-useradd")
+        assert not rig._stalled(FileNotFoundError("ssh"), "ssh-useradd")
+
+    def test_this_runs_warning_filters_show_a_rescue_and_never_raise_it(
+        self,
+    ) -> None:
+        # The channel of a rescued stall: pytest's warnings summary prints on
+        # a green run too. `error` would fail the rescue; `ignore` would hide
+        # it. The filters in force here are this run's own (pyproject, -W).
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.warn(rig.StallRescued("probe"), stacklevel=1)
+        assert [w.category for w in seen] == [rig.StallRescued]
+
+
+class TestOnlyTheRootHopLogsVerbose:
+    def test_the_root_hop_says_when_it_authenticated_and_the_node_user_not(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # VERBOSE's "Authenticated to" line splits a stall into before auth,
+        # session setup, or the script. Nothing parses the root hop's stderr.
+        argvs: list[list[str]] = []
+        answers = {
+            "ssh-root-probe": _run(0),
+            "ssh-useradd": _MADE,
+            "ssh-bootstrap": _run(0),
+            "ssh-userdel": _run(0),
+        }
+
+        def run_files(
+            argv: list[str], out_dir: Path, tag: str, timeout: float, **_: object
+        ) -> rig.Run:
+            del out_dir, timeout
+            argvs.append(list(argv))
+            return answers[tag]
+
+        monkeypatch.setattr(rig, "run_files", run_files)
+        _create(tmp_path).delete()
+
+        def opts(argv: list[str]) -> list[str]:
+            return [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-o"]
+
+        root = [argv for argv in argvs if argv[-2] == "root@mdssh"]
+        login = [argv for argv in argvs if argv[-2] != "root@mdssh"]
+        assert len(root) == 3 and len(login) == 1, argvs
+        for argv in root:
+            assert "LogLevel=VERBOSE" in opts(argv), argv
+            assert "BatchMode=yes" in opts(argv), argv
+        (boot,) = login
+        assert not any(o.startswith("LogLevel=") for o in opts(boot)), boot
+        assert "BatchMode=yes" in opts(boot), boot
+
+
+class TestTheStallSnapshotIsSafeToPrint:
+    """The job log is public: the snapshot reads processes, systemd's jobs
+    and sshd's/logind's journal lines, and nothing that holds a secret."""
+
+    def test_it_reads_the_three_things_and_no_environment(self) -> None:
+        text = rig._STALL_SNAPSHOT
+        assert "ps -eo pid,ppid,etimes,stat,wchan:32,args" in text
+        assert "systemctl list-jobs --no-pager" in text
+        words = set(re.findall(r"[\w/.-]+", text))
+        assert not words & {"env", "printenv", "environ", "export", "declare"}
+        assert "/proc" not in text
+
+    def test_the_journal_is_sshd_and_logind_only_and_bounded(self) -> None:
+        (line,) = [s for s in rig._STALL_SNAPSHOT.splitlines() if "journalctl" in s]
+        assert set(re.findall(r" -t (\S+)", line)) == {
+            "sshd",
+            "sshd-session",
+            "systemd-logind",
+        }, line
+        assert re.search(r"\| tail -n \d+$", line), line
+        # Every read is bounded on its own, inside the hop's DIAG_READ_S.
+        reads = [s for s in rig._STALL_SNAPSHOT.splitlines() if s.startswith("timeout")]
+        assert len(reads) == 3, rig._STALL_SNAPSHOT
 
 
 # ---------------------------------------------------------------------------
@@ -708,6 +1028,29 @@ class TestCloseKillsOnlyWhatItOwns:
             tmp_path, monkeypatch, cmdline=lambda cfg: b"", delete=delete
         )
         assert problems[-1] == f"node user mgnabcde not deleted: {said}"
+
+    def test_a_stalled_attempt_is_deleted_again_by_its_own_stamp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A useradd killed only on our side may finish on the node's after
+        # the discard found nothing there: teardown deletes it once more.
+        built = _offline_rig(tmp_path)
+        stalled = ("mgnfffff", f"{rig.OWNER_PREFIX} fedcba9876543210")
+        built.user.abandoned = (stalled,)
+        hop = _FakeHop(monkeypatch, delete=[_run(0), _run(1)])
+        monkeypatch.setattr(
+            rig,
+            "subprocess",
+            _subprocess_with(
+                lambda argv, **_: subprocess.CompletedProcess(argv, 0, b"", b"")
+            ),
+        )
+        problems = built.close()
+        deletes = [c for c in hop.calls if c.script == "delete"]
+        user = built.user
+        assert [c.args for c in deletes] == [(user.name, user.owner), stalled]
+        (problem,) = problems
+        assert "mgnfffff" in problem and "rc=1" in problem, problems
 
 
 class TestDiagNamesEveryRead:
@@ -908,3 +1251,144 @@ class TestTheRootScriptsCheckOwnershipBeforeTouchingAnything:
             tmp_path, rig._CREATE_USER, _NAME, _PUB, _OWNER, passwd=_passwd("")
         )
         assert (ran.rc, ran.calls) == (rig._EXISTS, [f"getent passwd {_NAME}"]), ran
+
+
+# ---------------------------------------------------------------------------
+# The create hop names the step it stalled in
+# ---------------------------------------------------------------------------
+
+# The create hop's commands, answering as a node's would -- except the one
+# named in FAKE_STALL, which records its pid and hangs until killed.
+_CREATE_FAKE = """#!/bin/sh
+me=${0##*/}
+if [ "$me" = "$FAKE_STALL" ]; then
+  echo $$ > "$FAKE_STATE/stalled.pid"
+  exec "$FAKE_SLEEP" 30
+fi
+case $me in
+  getent)
+    [ -e "$FAKE_STATE/created" ] || exit 2
+    printf '%s\\n' "$FAKE_PASSWD"
+    ;;
+  useradd) : > "$FAKE_STATE/created" ;;
+  cut) IFS=: read -r _ _ _ _ _ home _; printf '%s\\n' "$home" ;;
+  id) if [ "$1" = -u ]; then echo 4242; else echo mgnabcde; fi ;;
+esac
+exit 0
+"""
+_CREATE_COMMANDS = (
+    "chmod",
+    "chown",
+    "cut",
+    "getent",
+    "id",
+    "install",
+    "useradd",
+    "usermod",
+)
+# The deadline a stalled pin's hop is killed at. Reaching any step is a few
+# forks of a /bin/sh shim; five stalls cost the nodes-e2e job 15 s.
+_STALL_S = 3.0
+
+
+def _markers(said: str) -> list[str]:
+    """The create hop's phase markers in a transcript, in order."""
+    return re.findall(r"^phase (\S+) \+\d+s$", said, re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class _CreateHop:
+    argv: list[str]
+    env: dict[str, str]
+    state: Path
+    home: Path
+
+
+def _create_hop(tmp_path: Path, stall: str = "") -> _CreateHop:
+    """``_CREATE_USER``'s ``bash -s`` with ONLY the create fakes on PATH."""
+    bash, sleep = shutil.which("bash"), shutil.which("sleep")
+    if bash is None or sleep is None:
+        pytest.skip("no bash or sleep to run the create hop under")
+    fakes, state, home = tmp_path / "fakes", tmp_path / "state", tmp_path / "home"
+    for made in (fakes, state, home / ".ssh"):
+        made.mkdir(parents=True)
+    for name in _CREATE_COMMANDS:
+        (fakes / name).write_text(_CREATE_FAKE, encoding="utf-8")
+        (fakes / name).chmod(0o755)
+    env = {
+        "PATH": str(fakes),
+        "FAKE_STATE": str(state),
+        "FAKE_STALL": stall,
+        "FAKE_SLEEP": sleep,
+        "FAKE_PASSWD": f"{_NAME}:x:4242:4242:{_OWNER}:{home}:/bin/bash",
+    }
+    argv = [bash, "-s", "--", _NAME, _PUB, _OWNER]
+    return _CreateHop(argv=argv, env=env, state=state, home=home)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the root hop's scripts are the Linux node's bash; POSIX legs run this",
+)
+class TestTheCreateHopNamesTheStepItStalledIn:
+    """A create hop killed at its deadline said nothing, whatever it hung in
+    (CI run 36443883198). Its last marker is now the step it was in."""
+
+    @pytest.mark.parametrize(
+        ("command", "phase"),
+        [
+            ("getent", "getent"),
+            ("useradd", "useradd"),
+            ("usermod", "usermod"),
+            ("id", "lookup"),
+            ("install", "key"),
+        ],
+    )
+    def test_the_last_marker_is_the_stalled_step(
+        self, tmp_path: Path, command: str, phase: str
+    ) -> None:
+        hop = _create_hop(tmp_path, stall=command)
+        stalled = hop.state / "stalled.pid"
+        try:
+            with pytest.raises(pytest.fail.Exception) as raised:
+                rig.run_files(
+                    hop.argv,
+                    tmp_path,
+                    "ssh-useradd",
+                    _STALL_S,
+                    env=hop.env,
+                    stdin=rig._CREATE_USER.encode("utf-8"),
+                )
+        finally:
+            # run_files killed bash; the hung command is its orphan.
+            if stalled.exists():
+                os.kill(int(stalled.read_text("utf-8")), signal.SIGKILL)
+        said = str(raised.value)
+        assert stalled.exists(), f"never reached {command}:\n{said}"
+        marks = _markers(said)
+        assert marks[:1] == ["start"], said
+        assert marks[-1:] == [phase], said
+        # ...in the very failure the retry reads as a stall.
+        assert rig._stalled(raised.value, "ssh-useradd")
+
+    def test_a_create_that_finishes_marks_every_step_and_answers(
+        self, tmp_path: Path
+    ) -> None:
+        hop = _create_hop(tmp_path)
+        done = subprocess.run(
+            hop.argv,
+            input=rig._CREATE_USER.encode("utf-8"),
+            env=hop.env,
+            capture_output=True,
+            timeout=_SCRIPT_RUN_S,
+            check=False,
+        )
+        err = done.stderr.decode("utf-8", "replace")
+        assert done.returncode == 0, err
+        assert done.stdout.decode("utf-8") == f"4242 {hop.home}\n"
+        assert _markers(err) == [
+            *("start", "getent", "useradd", "usermod"),
+            *("lookup", "key", "answer", "done"),
+        ], err
+        keys = hop.home / ".ssh" / "authorized_keys"
+        assert keys.read_text(encoding="utf-8") == _PUB + "\n"
