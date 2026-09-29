@@ -500,6 +500,30 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "and snapshot age."
         ),
     ),
+    (
+        "magent node plan <project|--all>",
+        (
+            "Show where a project would be placed (the load-history score per "
+            "node for `auto`) and which non-git files would be shipped. Writes "
+            "nothing."
+        ),
+    ),
+    (
+        "magent node push <project>",
+        (
+            "Re-ship a project's non-git files (`.env*` etc.) to its running node "
+            "session."
+        ),
+    ),
+    (
+        "magent node recall <project> (--to <nick> | --local)",
+        (
+            "Bring a node session home (`--local` prints the `claude --resume` "
+            "to run after a `git pull`) or move it to another node and resume it "
+            "there. Pulls once more first; a node that does not answer is "
+            "reported, not fatal."
+        ),
+    ),
     ("magent config show", "Display current config."),
     ("magent config layout <cols> <rows>", "Set window grid."),
     ("magent config base-dir <path>", "Set projects folder."),

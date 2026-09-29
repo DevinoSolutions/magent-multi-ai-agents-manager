@@ -10,10 +10,12 @@
 #   memory/   the project's Claude memory (seeded only if absent)
 # Exit codes: 2 bad input, 3 dirty node tree, 4 tmux, 5 git or a write.
 # The last stdout line is ONE JSON object; remote_mux._parse_result reads it.
+# Its "dirty" holds a tree only where this run read it (never on an attach
+# or under --allow-dirty); remote_mux.BringUpResult says the rest.
 set -euo pipefail
 # @include lib.sh
 
-declare -A commits=()
+declare -A commits=() dirty=()
 shipped=()
 copied=()
 
@@ -65,6 +67,13 @@ emit() {
     ((first)) || printf ','
     first=0
     printf '%s:%s' "$(json_str "$key")" "$(json_str "${commits[$key]}")"
+  done
+  printf '},"dirty":{'
+  first=1
+  for key in "${!dirty[@]}"; do
+    ((first)) || printf ','
+    first=0
+    printf '%s:%s' "$(json_str "$key")" "${dirty[$key]}"
   done
   printf '},"shipped":['
   first=1
@@ -153,6 +162,16 @@ update_repo() {
     git clone -q --branch "$branch" -- "$url" "$dir" || die 5 "git clone of $(redact_url "$url") failed"
   fi
   commits[$dir]=$(git -C "$dir" rev-parse HEAD) || die 5 "no HEAD in $dir"
+}
+
+# The report's clean-or-dirty for one tree, by repo_status.sh's rule:
+# untracked files count, where the refusal in update_repo ignores them. A
+# status that fails leaves the tree out -- unknown on the PC, never clean.
+note_dirty() {
+  local st
+  if st=$(git --no-optional-locks -C "$1" status --porcelain 2>/dev/null); then
+    if [ -n "$st" ]; then dirty[$1]=true; else dirty[$1]=false; fi
+  fi
 }
 
 # `capture VAR cmd...`: VAR = cmd's stdout minus the ONE newline realpath,
@@ -305,6 +324,12 @@ main() {
   mkdir -p -- "$root" || die 5 "cannot create $root"
   ship_files "$unpacked/project" "$root"
   seed_memory "$unpacked/memory" "$HOME/.claude/projects/$enc/memory"
+  # Read after the ship: the trees the session starts on. --allow-dirty
+  # checked nothing, so it reports nothing either way.
+  # So a shipped file git does not ignore (.env) reads dirty: the fail-safe side.
+  if [ "$allow" != 1 ]; then
+    for ((i = 0; i < nrepos; i++)); do note_dirty "${dirs[i]}"; done
+  fi
 
   local -a cmd=("${argv[@]}") transcripts=()
   shopt -s nullglob

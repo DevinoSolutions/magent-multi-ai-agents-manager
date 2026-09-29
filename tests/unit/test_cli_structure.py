@@ -158,7 +158,7 @@ HELP_SNAPSHOTS = {
     ): "Usage: main config path [OPTIONS]\n\n  Print the config file path.\n\nOptions:\n  --help  Show this message and exit.\n",
     (
         "node",
-    ): "Usage: main node [OPTIONS] COMMAND [ARGS]...\n\n  Run projects on a pool of Linux machines over ssh.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  doctor  Check a node, or every node: tools, the Claude login, the node's...\n  setup   Prepare a machine once: packages, a per-person user, your key,...\n  sync    Mirror every node's sessions, load and agent state onto this PC.\n",
+    ): "Usage: main node [OPTIONS] COMMAND [ARGS]...\n\n  Run projects on a pool of Linux machines over ssh.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  doctor  Check a node, or every node: tools, the Claude login, the node's...\n  plan    Show where a node project would run and what it would ship.\n  push    Re-ship a project's non-git files (.env* etc.) to its node.\n  recall  Bring a node session home, or move it to another node.\n  setup   Prepare a machine once: packages, a per-person user, your key,...\n  sync    Mirror every node's sessions, load and agent state onto this PC.\n",
     (
         "node",
         "doctor",
@@ -167,6 +167,18 @@ HELP_SNAPSHOTS = {
         "node",
         "setup",
     ): "Usage: main node setup [OPTIONS] NICK\n\n  Prepare a machine once: packages, a per-person user, your key, Claude Code and\n  the node's own GitHub key, then the user scope and a check.\n\n  Logs in as root@<host> for this one hop. Idempotent: every step prints\n  ok/did/skip. The Claude login is NOT copied: run `ssh <user>@<host> claude`\n  once. Exit 0 when nothing failed but that login, 1 when a step failed, 2 when\n  nothing was sent (unknown nick, bad user name, no public key).\n\nOptions:\n  --user TEXT  A Unix user to create on the node (repeatable; default: the\n               node's user).\n  --key FILE   This PC's ssh PUBLIC key to authorize (default:\n               ~/.ssh/id_ed25519.pub, then id_ecdsa, id_rsa).\n  --help       Show this message and exit.\n",
+    (
+        "node",
+        "plan",
+    ): "Usage: main node plan [OPTIONS] [PROJECT]\n\n  Show where a node project would run and what it would ship. Writes nothing.\n\n  The same placement a launch makes -- the node-map, the load history and, for a\n  node with too few recent samples, one live reading -- but nothing is recorded\n  and nothing is started.\n\nOptions:\n  --all   Every enabled node project.\n  --help  Show this message and exit.\n",
+    (
+        "node",
+        "push",
+    ): "Usage: main node push [OPTIONS] PROJECT\n\n  Re-ship a project's non-git files (.env* etc.) to its node.\n\nOptions:\n  --help  Show this message and exit.\n",
+    (
+        "node",
+        "recall",
+    ): "Usage: main node recall [OPTIONS] PROJECT\n\n  Bring a node session home, or move it to another node.\n\n  Pulls once more, reports the node's last commit per repo, stops the session,\n  installs its conversation and memory where the destination's Claude looks, and\n  clears the placement. A node that does not answer is reported, never fatal:\n  what was already pulled is used.\n\nOptions:\n  --to NICK      Move the session to this node and resume it there.\n  --local        Bring the session home and print the command that resumes it.\n  --allow-dirty  Bring node projects up despite a dirty or unpushed tree\n  --help         Show this message and exit.\n",
     (
         "node",
         "sync",
@@ -196,7 +208,7 @@ TOP_LEVEL_COMMANDS = [
     "watch",
 ]
 TERMINAL_SUBCOMMANDS = ["install", "status"]
-NODE_SUBCOMMANDS = ["doctor", "setup", "sync"]
+NODE_SUBCOMMANDS = ["doctor", "plan", "push", "recall", "setup", "sync"]
 CONFIG_SUBCOMMANDS = [
     "add",
     "base-dir",

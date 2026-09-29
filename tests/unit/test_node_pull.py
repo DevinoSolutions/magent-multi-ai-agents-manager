@@ -24,6 +24,8 @@ from magent.remote_mux import (
     PULL_HEADER,
     PULL_TRAILER,
     WATERMARK_OVERLAP_S,
+    NotAPull,
+    PullRefused,
     RemoteError,
     SidPull,
     next_since,
@@ -99,8 +101,45 @@ class TestParsePull:
         )
         assert snap.failed_sids == frozenset()
 
+    @pytest.mark.parametrize(
+        ("meta", "message"),
+        [
+            (b"not json", "unreadable pull metadata"),
+            (b"[1]", "pull metadata is not an object"),
+        ],
+        ids=["unreadable", "not-an-object"],
+    )
+    def test_metadata_that_is_not_an_object_is_not_a_pull(
+        self, tmp_path, meta, message
+    ):
+        # cq-G14 C-R3-1: every _pull_error site is a NotAPull -- the recall
+        # stops on that type, so one site left a plain RemoteError would slip
+        # a reply this PC cannot read past it. The other sites' tests below
+        # (header, clock, sessions, trailer, count, cap, archive) pin the rest.
+        reply = PULL_HEADER + meta + b"\n" + PULL_TRAILER + b"0\n"
+        with pytest.raises(NotAPull, match=message) as info:
+            parse_pull(reply, dest=tmp_path, sids=frozenset({"api"}))
+        assert info.value.rc == 0
+
+    def test_the_two_rc_0_kinds_are_remote_errors_and_never_each_other(self):
+        # The daemon and every RemoteError caller see rc 0 exactly as before;
+        # only a caller that asks by type tells an answer from a refusal.
+        answer = NotAPull("no MAGENT-PULL header in the reply")
+        refusal = remote_mux.refused_pull(
+            NODE,
+            {"api": SidPull(roots=("~/magent/api",), project_dir=None, since=0.0)},
+            "not a pullable session name: 'CON'",
+        )
+        assert isinstance(answer, RemoteError)
+        assert isinstance(refusal, RemoteError)
+        assert (answer.rc, refusal.rc) == (0, 0)
+        assert answer.command_redacted == ("pull.sh",)
+        assert isinstance(refusal, PullRefused)
+        assert not isinstance(refusal, NotAPull)
+        assert not isinstance(answer, PullRefused)
+
     def test_a_reply_without_the_header_is_not_a_pull(self, tmp_path):
-        with pytest.raises(RemoteError, match="no MAGENT-PULL header") as info:
+        with pytest.raises(NotAPull, match="no MAGENT-PULL header") as info:
             parse_pull(b"hello\n", dest=tmp_path, sids=frozenset())
         assert info.value.rc == 0
 
@@ -253,7 +292,7 @@ class TestParsePull:
         meta = pull_meta(now=now)
         if now == "missing":
             del meta["now"]
-        with pytest.raises(RemoteError, match="no clock"):
+        with pytest.raises(NotAPull, match="no clock"):
             _parse(pull_reply(meta), tmp_path)
 
     @pytest.mark.parametrize(
@@ -265,7 +304,7 @@ class TestParsePull:
         meta = pull_meta(sessions=sessions)
         if sessions == "missing":
             del meta["sessions"]
-        with pytest.raises(RemoteError, match="sessions is not a list of names"):
+        with pytest.raises(NotAPull, match="sessions is not a list of names"):
             _parse(pull_reply(meta), tmp_path)
 
     def test_a_corrupt_archive_is_a_pull_error(self, tmp_path, caplog):
@@ -277,7 +316,7 @@ class TestParsePull:
             + PULL_TRAILER
             + b"1\n"
         )
-        with pytest.raises(RemoteError, match="unreadable pull archive") as info:
+        with pytest.raises(NotAPull, match="unreadable pull archive") as info:
             parse_pull(reply, dest=tmp_path, sids=frozenset({"api"}))
         # Its class on screen (an OSError here can name a path on this PC);
         # its words in nodes.log.
@@ -512,7 +551,7 @@ class TestATruncatedReplyIsNeverSuccess:
     def test_a_reply_cut_after_the_first_member_is_an_error(self, tmp_path):
         reply, second = _two_member_reply()
         dest = tmp_path / "second"
-        with pytest.raises(RemoteError, match="reply truncated") as info:
+        with pytest.raises(NotAPull, match="reply truncated") as info:
             parse_pull(reply[:second], dest=dest, sids=frozenset({"api"}))
         assert info.value.rc == 0
         assert _stored(dest) == []
@@ -521,7 +560,7 @@ class TestATruncatedReplyIsNeverSuccess:
         reply, second = _two_member_reply()
         broken = reply[:second] + b"\xff" * 512 + reply[second + 512 :]
         dest = tmp_path / "second"
-        with pytest.raises(RemoteError, match=r"expected 2 .*saw 1"):
+        with pytest.raises(NotAPull, match=r"expected 2 .*saw 1"):
             parse_pull(broken, dest=dest, sids=frozenset({"api"}))
         assert _stored(dest) == []
 
@@ -532,14 +571,14 @@ class TestATruncatedReplyIsNeverSuccess:
             [member("api/transcripts/a.jsonl"), member("api/transcripts/b.jsonl")],
             count=claimed,
         )
-        with pytest.raises(RemoteError, match=f"expected {claimed} .*saw 2"):
+        with pytest.raises(NotAPull, match=f"expected {claimed} .*saw 2"):
             parse_pull(reply, dest=tmp_path / "second", sids=frozenset({"api"}))
 
     def test_a_meta_only_reply_whose_trailer_claims_members_is_an_error(self, tmp_path):
         # No archive at all: the trailer's count is the only word on it.
         reply = pull_bytes(pull_meta(), [], count=2)
         dest = tmp_path / "second"
-        with pytest.raises(RemoteError, match=r"expected 2 .*saw 0") as info:
+        with pytest.raises(NotAPull, match=r"expected 2 .*saw 0") as info:
             parse_pull(reply, dest=dest, sids=frozenset({"api"}))
         assert info.value.rc == 0
         assert _stored(dest) == []
@@ -553,12 +592,12 @@ class TestATruncatedReplyIsNeverSuccess:
 
     def test_a_reply_with_no_trailer_at_all_is_truncated(self, tmp_path):
         reply = PULL_HEADER + b'{"now": 1.0, "sessions": []}\n'
-        with pytest.raises(RemoteError, match="reply truncated"):
+        with pytest.raises(NotAPull, match="reply truncated"):
             parse_pull(reply, dest=tmp_path, sids=frozenset({"api"}))
 
     def test_anything_after_the_trailer_line_means_it_was_not_the_last(self, tmp_path):
         reply = pull_reply(pull_meta()).encode("ascii") + b"logout\n"
-        with pytest.raises(RemoteError, match="reply truncated"):
+        with pytest.raises(NotAPull, match="reply truncated"):
             parse_pull(reply, dest=tmp_path, sids=frozenset({"api"}))
 
     def test_the_trailer_text_inside_a_file_is_not_the_trailer(self, tmp_path):
@@ -613,7 +652,7 @@ class TestTheArchiveIsBounded:
             pull_meta(), [member("api/transcripts/a.jsonl")], compression="gz"
         )
         assert gzip.decompress(reply[archive_start(reply) :].split(PULL_TRAILER)[0])
-        with pytest.raises(RemoteError, match="unreadable pull archive"):
+        with pytest.raises(NotAPull, match="unreadable pull archive"):
             parse_pull(reply, dest=tmp_path / "second", sids=frozenset({"api"}))
         assert _stored(tmp_path / "second") == []
 
@@ -654,7 +693,7 @@ class TestTheArchiveIsBounded:
             ],
         )
         dest = tmp_path / "second"
-        with pytest.raises(RemoteError, match="over the 5-byte cap"):
+        with pytest.raises(NotAPull, match="over the 5-byte cap"):
             parse_pull(reply, dest=dest, sids=frozenset({"api"}))
         assert _stored(dest) == []
 
@@ -830,6 +869,14 @@ class TestWhichSessionsCanBeMirrored:
             ("..", False),
             ("", False),
             ("a/b", False),
+            # A sid is printed too: DEL and every C1 control are refused
+            # as C0 is (0x9b is a CSI); 0x7e is the last character kept.
+            ("a\x1bb", False),
+            ("a\x7fb", False),
+            ("a\x80b", False),
+            ("a\x9b2Jb", False),
+            ("a\x9fb", False),
+            ("a~b", True),
         ],
     )
     def test_a_session_name_must_be_a_directory_name_on_this_pc(self, sid, ok):
@@ -929,6 +976,16 @@ class TestPullNode:
         assert info.value.command_redacted[-1].startswith("<stdin: ")
         assert _node_logs(caplog) == []
 
+    def test_a_node_that_does_not_answer_in_time_raises_with_no_returncode(
+        self, fake_ssh, tmp_path
+    ):
+        # The docstring's "a timeout (None)", pinned at this level and not
+        # only one down at run(quiet=True).
+        fake_ssh.set_mode("timeout")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.pull_node(NODE, {}, dest=tmp_path, timeout_s=0.5)
+        assert info.value.rc is None
+
     def test_the_reply_held_in_ram_is_capped_at_the_pull_bound(
         self, fake_ssh, tmp_path, monkeypatch
     ):
@@ -983,7 +1040,7 @@ class TestPull:
         assert result == remote_mux.PullResult(files=(), since=42.0)
 
     def test_a_session_name_that_cannot_be_a_directory_here_is_refused(self, fake_ssh):
-        with pytest.raises(RemoteError, match="not a pullable session name") as info:
+        with pytest.raises(PullRefused, match="not a pullable session name") as info:
             remote_mux.pull(NODE, "CON", ["~/x"], 0.0)
         assert info.value.rc == 0
         # Exactly the pull it would have sent -- same spec, same shown form.

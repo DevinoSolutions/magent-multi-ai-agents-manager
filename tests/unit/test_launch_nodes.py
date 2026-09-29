@@ -504,7 +504,8 @@ class TestAFailureIsAnOutcomeNeverACrash:
     def test_an_auto_project_with_no_placement_fails_with_the_resolve_text(
         self, rig, tmp_path
     ):
-        # G-C12: `up` does not place; until PR-G's placer lands this is the answer.
+        # G-C12: `up` and --go place before they bring up; a project that
+        # reaches bring_up_node_project still unplaced gets resolve's words.
         folder = tmp_path / "web"
         folder.mkdir()
         proj = ProjectConfig(path=str(folder), node="auto")
@@ -870,8 +871,11 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         ids=["missing-folder", "unplaced-auto"],
     )
     def test_a_project_the_scan_skips_does_not_hide_a_later_pair(
-        self, rig, tmp_path, make
+        self, rig, tmp_path, make, monkeypatch
     ):
+        # G-C12: the unplaced auto one is the placer's refusal now, after a
+        # live reading that none answers.
+        monkeypatch.setattr(remote_mux, "sample", lambda node: None)
         (tmp_path / "web2").mkdir()
         x_api, y_api, _web = _twin_apis(tmp_path, rig)
         outcomes = _batch(_config(make(tmp_path), x_api, y_api))
@@ -1046,6 +1050,28 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         assert "'api-y'" in (outcomes[0].error or "")
         assert rig.recipes == []
 
+    def test_the_batchs_placed_copy_of_an_auto_project_is_the_one_checked(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The placement phase hands the batch an auto project already turned
+        # into a nick, and writes nothing to the map until it is up. Config's
+        # copy still says "auto" with no record, which places nowhere: checked
+        # instead of the batch's, api-y would be cloned into the folder api-x
+        # holds on second.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        placed = dataclasses.replace(y_api, node="second")
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
+        outcomes = launch._run_node_bring_ups(
+            _config(x_api, y_api), [x_api, placed], allow_dirty=False, window=False
+        )
+        assert [(o.sid, o.ok, o.node) for o in outcomes] == [
+            ("api-x", False, "second"),
+            ("api-y", False, "second"),
+        ]
+        assert "'api-x' and 'api-y' would share" in (outcomes[1].error or "")
+        assert rig.recipes == []
+
     def test_the_rule_is_asked_once_over_the_whole_fleet(
         self, rig, tmp_path, monkeypatch
     ):
@@ -1083,8 +1109,9 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
                 "not found on this PC",
             ),
             (
+                # G-C12: `up` places first, so the placer's words name it.
                 lambda tmp: ProjectConfig(path=str(tmp / "web2"), node="auto"),
-                "needs a placement",
+                'pin a node with "node": "<nick>"',
             ),
             (
                 lambda tmp: ProjectConfig(path=tmp.anchor, node="second", title="rt"),
@@ -1094,10 +1121,13 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         ids=["missing-folder", "unplaced-auto", "drive-root"],
     )
     def test_a_project_the_check_cannot_place_fails_on_its_own(
-        self, rig, tmp_path, make, reason
+        self, rig, tmp_path, make, reason, monkeypatch
     ):
         # No folder name to compare is not a collision: that project's own
         # bring-up names its reason, and the rest of the batch goes ahead.
+        # The auto one has no load history, so the placer asks for a live
+        # reading: none answers.
+        monkeypatch.setattr(remote_mux, "sample", lambda node: None)
         (tmp_path / "web2").mkdir()
         (good,) = _projects(tmp_path, rig, [("a1", "second")])
         odd = make(tmp_path)
@@ -1809,7 +1839,13 @@ class TestGoBringsNodeProjectsUp:
         monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
         proj = ProjectConfig(path=str(tmp_path), node="auto")
         launch.run_magent(_config(proj), launch.RunOpts(dry_run=True))
-        assert "needs a placement" in capsys.readouterr().out
+        # G's placement phase resolves auto before anything launches, and
+        # names why it found no node: a dry run takes no live reading, so
+        # the empty windows say what the real run would do (launch.
+        # _unplaced_reason).
+        out = capsys.readouterr().out
+        assert "no live reading taken:" in out
+        assert "would take a live reading at launch" in out
 
     def test_dry_run_names_a_folder_this_user_may_not_read(
         self, desk, no_sleep, tmp_path, monkeypatch, capsys, caplog
@@ -2762,7 +2798,10 @@ class TestDownPullsTheLastTurnHomeFirst:
             node_sync.NodeLockHeld("node-pull-second lock is held by another process"),
             RemoteError(255, "ssh: connect to host devino-second: timed out", ("ssh",)),
             RemoteError(None, "reply exceeded 8 bytes", ("ssh",), over_cap=True),
-            RemoteError(0, "could not store every pulled file of 'api'", ("pull.sh",)),
+            node_sync.PullUnfinished(
+                "a file of session 'api' could not be stored on this PC",
+                not_stored=True,
+            ),
             nodes.NodeConfigError("node 'second' is not in settings.nodes"),
             OSError(28, "No space left on device"),
         ],
@@ -2777,6 +2816,25 @@ class TestDownPullsTheLastTurnHomeFirst:
         assert killed == ["api"]
         assert "api" in nodes.read_node_map()
         assert "api: last turn not pulled" in capsys.readouterr().out
+
+    def test_a_file_this_pc_could_not_store_is_named_in_the_row(
+        self, rig, api, monkeypatch, capsys, killed
+    ):
+        # node_sync's own error, said once: the row reads its words.
+        _hold("api")
+        self._pulls(
+            monkeypatch,
+            node_sync.PullUnfinished(
+                "a file of session 'api' could not be stored on this PC",
+                not_stored=True,
+            ),
+        )
+        launch.stop_node_sessions(_config(api), ["api"])
+        assert (
+            "api: last turn not pulled (the pull did not finish: a file of"
+            " session 'api' could not be stored on this PC); kept in the node"
+            " map for `magent node sync --once`"
+        ) in capsys.readouterr().out
 
     def test_the_line_is_the_nodes_last_word_and_names_the_repair(
         self, rig, api, monkeypatch, capsys, killed
@@ -2917,7 +2975,11 @@ class TestDownPullsTheLastTurnHomeFirst:
         for name in ("a1", "a2", "a3"):
             _hold(name)
         self._pulls(
-            monkeypatch, RemoteError(0, "could not store every pulled file", ("x",))
+            monkeypatch,
+            node_sync.PullUnfinished(
+                "a file of session 'a1' could not be stored on this PC",
+                not_stored=True,
+            ),
         )
         launch.stop_node_sessions(_config(a1, a2, a3), ["a1", "a2"])
         out = capsys.readouterr().out
@@ -3135,7 +3197,10 @@ class TestDownPullsTheLastTurnHomeFirst:
         "error",
         [
             RemoteError(None, "reply exceeded 8 bytes", ("ssh",), over_cap=True),
-            RemoteError(0, "could not store every pulled file", ("pull.sh",)),
+            node_sync.PullUnfinished(
+                "a file of session 'a1' could not be stored on this PC",
+                not_stored=True,
+            ),
             OSError(28, "No space left on device"),
             lockfile.LockHeld("node-marks lock is held by another process"),
             nodes.NodeConfigError("node 'second' is not in settings.nodes"),

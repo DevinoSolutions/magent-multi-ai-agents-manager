@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.20.0] - UNRELEASED
 
+### Added
+
+- **magent places `auto` node projects by their load history, and `magent node
+  plan`/`push`/`recall` manage them.** `"node": "auto"` picks the node with the
+  lowest 30-minute load score (spikes and low memory count against a node, and
+  a node under 10% free memory is skipped while another is above it) and keeps
+  it there. `magent node` shows the pool; `node plan` shows where a project
+  would go and what it would ship, changing nothing; `node push` re-ships a
+  project's `.env*` files; `node recall
+  --local` brings a session and its conversation home and prints the `cd` and
+  the `claude --resume` to run; `node recall --to <nick>` moves it to
+  another node and resumes it there. A node that does not answer
+  is only a note, but a recall whose last pull did not finish stops before it
+  changes anything (exit 1, or 3 while the sync daemon holds the node), so
+  running it again loses no work.
+
 ## [3.20.0rc1] - 2026-09-28
 
 ### Added

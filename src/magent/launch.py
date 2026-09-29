@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import socket
 import sys
@@ -43,7 +44,14 @@ if TYPE_CHECKING:
 
     from magent.config import MagentConfig, ProjectConfig
     from magent.env import MagentEnv
-    from magent.nodes import LocalGitState, Node, NodeMapEntry, Recipe
+    from magent.nodes import (
+        LoadSample,
+        LocalGitState,
+        Node,
+        NodeMapEntry,
+        Recipe,
+    )
+    from magent.nodes import Placement as NodePlacement
 
 
 def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[bytes]:
@@ -744,6 +752,18 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
     if projects is None:
         return 0
 
+    # "node": "auto" becomes a nick here, before any dispatcher runs -- the
+    # same slot account routing takes on its branch. A dry run or a tile-only
+    # pass never opens a connection to sample a node.
+    placements = place_node_projects(
+        config, projects, live=not (opts.dry_run or opts.tile_only)
+    )
+    for note in placements.notes:
+        click.echo(f"  {style('!', fg='yellow')} {style(note, dim=True)}")
+    for line in placements.refused:
+        click.echo(f"  {style('x', fg='red')} {line}")
+    projects = placements.projects
+
     base_dir = config.base_dir
     if base_dir:
         base_dir = _expand_base_dir(base_dir)
@@ -827,6 +847,183 @@ def _select_projects(config: MagentConfig, opts: RunOpts) -> list[ProjectConfig]
         if not projects:
             return None
     return projects
+
+
+@dataclass(frozen=True)
+class NodePlacements:
+    """What the placement phase hands the launch phase (spec §11): the
+    projects with every ``"auto"`` replaced by a concrete nick (an unplaceable
+    one is dropped), the lines to print, and each auto project's Placement --
+    `magent node plan` renders these same objects. ``notes`` are advisories;
+    ``refused`` are failures -- an auto project not brought up because where
+    it runs is unknown -- printed as a red ``x`` like ``up``'s.
+
+    The same facts per project, for a caller that reports each project
+    on its own row (``bring_up_node_projects``' outcomes): ``unplaced``
+    maps each dropped auto project's name to why it was not launched --
+    the words ``refused``/``notes`` print after the name -- and
+    ``history_notes`` are the notes about a node's unreadable load
+    history, which every project scored in this pass rests on."""
+
+    projects: list[ProjectConfig]
+    notes: list[str]
+    placements: dict[str, NodePlacement]
+    refused: list[str] = dataclasses.field(default_factory=list)
+    unplaced: dict[str, str] = dataclasses.field(default_factory=dict)
+    history_notes: tuple[str, ...] = ()
+
+
+def _kept(
+    config: MagentConfig, entries: dict[str, NodeMapEntry], proj: ProjectConfig
+) -> bool:
+    from magent import nodes
+
+    held = entries.get(nodes.project_name(proj))
+    return held is not None and held.nick in config.settings.nodes
+
+
+def _live_sampler(config: MagentConfig) -> Callable[[str], LoadSample | None]:
+    """The sparse rule's one live reading per node, through remote_mux. A node
+    that cannot be resolved or does not answer is left unscored, never fatal."""
+    from magent import env, nodes, remote_mux
+
+    user = env.local_username()
+    log = get_logger("launch")
+    # Warm remote_mux's own logger here, on the calling thread: get_logger is
+    # check-then-set, so two first calls racing on sampler worker threads
+    # could each attach a handler and double every "nodes" line.
+    get_logger("nodes")
+
+    def sample(nick: str) -> LoadSample | None:
+        try:
+            node = nodes.node_for_nick(config, nick, local_user=user)
+            reading = remote_mux.sample(node)
+        except (nodes.NodeConfigError, remote_mux.RemoteError) as exc:
+            log.warning("live load sample for node %s failed: %s", nick, exc)
+            return None
+        return reading
+
+    return sample
+
+
+def _unplaced_reason(samples: dict[str, list[LoadSample]], *, live: bool) -> str:
+    """Why no node could be scored, named per cause. ``samples`` is
+    ``placement_samples``' output, where a node ends up with no sample only
+    when its window was empty and either no live reading was allowed (a dry
+    run or a tile-only pass -- the wording fits both) or the live reading
+    failed -- a thin node always gets one."""
+    from magent import nodes
+
+    blank = ", ".join(nick for nick, window in samples.items() if not window)
+    if not blank:
+        return nodes.PLACE_REASONS["no-data"]
+    if not live:
+        return f"no live reading taken: {blank} would take a live reading at launch"
+    return f"live reading failed for {blank} (see ~/.magent/logs/launch.log)"
+
+
+def place_node_projects(
+    config: MagentConfig,
+    projects: list[ProjectConfig],
+    *,
+    live: bool = True,
+    now: float | None = None,
+) -> NodePlacements:
+    """Resolve every ``"node": "auto"`` project to a nick (spec §11).
+
+    Its own phase between selection and launch, so a dispatcher only ever sees
+    a concrete nick. It NEVER writes node-map.json: the bring-up records a
+    placement once it has actually happened, so a failed launch leaves nothing
+    sticky behind. Nothing is sampled when every auto project is already
+    placed on a configured node. ``live=False`` (``--dry-run``, tile-only)
+    never opens a connection: a thin node is then scored on what it has.
+    Only ``auto`` is ever placed: local, pinned and ``cloud`` projects
+    (DECISION-15; ``cloud`` is pin-only) pass through untouched.
+
+    The map is read strictly (``_node_map_for_placement``). Unreadable, NO
+    ``auto`` project is placed: each is dropped with the map's refusal (in
+    ``refused``, a failure) and an ``"unknown"`` Placement (D17: its node is
+    None), nothing is sampled, and the rest of the fleet goes on. A node
+    whose load history cannot be read is placed on as if it had none (one
+    live reading, or unscored in a dry run) and named in ``notes``.
+    """
+    from magent import nodes
+    from magent.config import NODE_AUTO
+
+    auto = [p for p in projects if p.node == NODE_AUTO]
+    if not auto:
+        return NodePlacements(list(projects), [], {})
+    entries, unreadable = _node_map_for_placement()
+    if unreadable is not None:
+        # Read as {}, an auto project already running on a node would be
+        # scored onto a fresh one: a second session while the first runs.
+        get_logger("nodes").warning(
+            "auto placement skipped, node map unreadable: %s", unreadable
+        )
+        unknown = {
+            nodes.project_name(p): _map_unreadable_text(unreadable) for p in auto
+        }
+        return NodePlacements(
+            [p for p in projects if p.node != NODE_AUTO],
+            [],
+            {name: nodes.Placement(None, "unknown") for name in unknown},
+            refused=[f"{name}: {text}" for name, text in unknown.items()],
+            unplaced=unknown,
+        )
+    when = time.time() if now is None else now
+    samples: dict[str, list[LoadSample]] = {}
+    sampled: frozenset[str] = frozenset()
+    unreadable_history: dict[str, OSError | ValueError] = {}
+    if not all(_kept(config, entries, p) for p in auto):
+        samples, sampled = nodes.placement_samples(
+            config,
+            now=when,
+            live_sample=_live_sampler(config) if live else None,
+            on_unreadable=unreadable_history.__setitem__,
+        )
+    spread: dict[str, int] = {}
+    out: list[ProjectConfig] = []
+    # An unreadable history is unknown, not "never sampled": said, class only.
+    history_notes = tuple(
+        f"@{nick}: its load history is unreadable ({type(exc).__name__});"
+        + (" scored on one live reading" if nick in sampled else " not scored")
+        for nick, exc in unreadable_history.items()
+    )
+    notes: list[str] = list(history_notes)
+    unplaced: dict[str, str] = {}
+    chosen: dict[str, NodePlacement] = {}
+    for proj in projects:
+        if proj.node != NODE_AUTO:
+            out.append(proj)
+            continue
+        name = nodes.project_name(proj)
+        held = entries.get(name)
+        placement = nodes.place(
+            config,
+            samples,
+            now=when,
+            map_entry=held.nick if held else None,
+            placed=spread,
+            live=sampled,
+        )
+        chosen[name] = placement
+        if placement.note:
+            notes.append(f"{name}: {placement.note}")
+        if placement.nick is None:
+            unplaced[name] = (
+                f"not launched -- {_unplaced_reason(samples, live=live)};"
+                ' pin a node with "node": "<nick>"'
+            )
+            notes.append(f"{name}: {unplaced[name]}")
+            continue
+        # A kept project's session is already running there and already counts
+        # in that node's my_sessions; adding it to the spread would count it twice.
+        if placement.reason != "kept":
+            spread[placement.nick] = spread.get(placement.nick, 0) + 1
+        out.append(dataclasses.replace(proj, node=placement.nick))
+    return NodePlacements(
+        out, notes, chosen, unplaced=unplaced, history_notes=history_notes
+    )
 
 
 @dataclass(frozen=True)
@@ -1222,7 +1419,7 @@ def _node_map_snapshot(
 def _node_map_for_placement() -> tuple[
     dict[str, NodeMapEntry], OSError | ValueError | None
 ]:
-    """The node map for a decision that places something: ``(entries,
+    """The node map for a decision that places or stops something: ``(entries,
     None)``, or ``({}, the error)`` when it cannot be read -- torn, or still
     busy after its retries. Never ``read_node_map``'s ``{}``: an unreadable
     map is UNKNOWN, not "nothing is placed", and read as empty an ``auto``
@@ -2052,6 +2249,36 @@ def bring_up_node_project(
                 result = remote_mux.bring_up(
                     node, recipe, allow_dirty=allow_dirty, resume_id=resume_id
                 )
+                # What the node's repos were at this bring-up, for a later
+                # recall from a node that no longer answers. Clean or dirty
+                # only where bring_up.sh read the tree (repo_status.sh's rule,
+                # untracked files included); an attach and --allow-dirty read
+                # nothing, and a tree it could not read is missing from
+                # result.dirty -- all unknown, never clean. A record that
+                # cannot be written is logged and keeps the old one
+                # (write_repo_record).
+                nodes.write_repo_record(
+                    nick,
+                    result.sid,
+                    nodes.RepoRecord(
+                        ts=time.time(),
+                        source="bring-up",
+                        repos=tuple(
+                            nodes.RepoStatus(
+                                remote_dir=repo,
+                                head=sha,
+                                branch="",
+                                dirty=(
+                                    None
+                                    if result.attached_existing or allow_dirty
+                                    else result.dirty.get(repo)
+                                ),
+                                unpushed=None,
+                            )
+                            for repo, sha in sorted(result.commits.items())
+                        ),
+                    ),
+                )
             warnings = recipe.warnings
             try:
                 nodes.update_node_map(
@@ -2233,6 +2460,44 @@ def _folder_clashes(
     return clash
 
 
+def _fleet_folder_clashes(
+    config: MagentConfig, projects: list[ProjectConfig]
+) -> tuple[dict[str, tuple[str, Recipe, bool]], dict[str, str]]:
+    """X3 over the WHOLE fleet with ``projects`` in it: ``(placed, clash)``,
+    ``_placement_recipes``' ``{sid: (nick, recipe, holder)}`` and
+    ``_folder_clashes``' ``{sid: why}``, read from config and the map alone."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    # A copy in ``projects`` wins over config's: the placement phase hands
+    # over an auto project already turned into a nick, and writes nothing to
+    # the map until it is up -- config's "auto" copy would place nowhere, and
+    # the folder it is about to be cloned into would go unchecked.
+    batch = {nodes.node_sid(proj): proj for proj in projects}
+    listed = nodes.node_projects(config)
+    known = {nodes.node_sid(proj) for proj in listed}
+    fleet = [batch.get(nodes.node_sid(proj), proj) for proj in listed]
+    fleet += [proj for proj in projects if nodes.node_sid(proj) not in known]
+    held, unreadable = _node_map_for_placement()
+    placed = _placement_recipes(config, fleet, held, map_known=unreadable is None)
+    return placed, _folder_clashes(placed, unreadable)
+
+
+def node_folder_refusal(config: MagentConfig, proj: ProjectConfig) -> str | None:
+    """X3 for ONE project about to be placed (``recall --to``'s moved copy):
+    the refusal ``up`` would give it -- a newcomer to a node folder name
+    another project would share -- or None. Config and the map only: no ssh,
+    no git, so a caller can ask before it touches anything."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    placed, clash = _fleet_folder_clashes(config, [proj])
+    sid = nodes.node_sid(proj)
+    if sid in clash and not placed[sid][2]:
+        return clash[sid]
+    return None
+
+
 def _run_node_bring_ups(
     config: MagentConfig,
     projects: list[ProjectConfig],
@@ -2257,31 +2522,21 @@ def _run_node_bring_ups(
     is brought up as usual -- attached if its session runs, restarted in its
     own folder if not, neither overwriting anyone -- with the collision as a
     warning, so a healthy session is never reported failed because a newcomer
-    arrived."""
+    arrived.
+
+    Every project arrives placed: ``place_node_projects`` turns each ``auto``
+    one into a nick or leaves it out (an unreadable map included), so none
+    reaches here still ``auto``."""
     # heavy subsystem: in-body per policy
     from magent import nodes
 
     if not projects:
         return []
-    fleet = nodes.node_projects(config)
-    known = {nodes.node_sid(proj) for proj in fleet}
-    fleet += [proj for proj in projects if nodes.node_sid(proj) not in known]
-    held, unreadable = _node_map_for_placement()
-    placed = _placement_recipes(config, fleet, held, map_known=unreadable is None)
-    clash = _folder_clashes(placed, unreadable)
+    placed, clash = _fleet_folder_clashes(config, projects)
     outcomes: dict[str, NodeBringUpOutcome] = {}
     for proj in projects:
         sid = nodes.node_sid(proj)
-        if unreadable is not None and proj.node == NODE_AUTO:
-            # Refused HERE, not left to its own bring-up: a map readable
-            # again by then would place it past the check this one failed.
-            get_logger("nodes").warning(
-                "node project %s refused, node map unreadable: %s", sid, unreadable
-            )
-            outcomes[sid] = NodeBringUpOutcome(
-                ok=False, sid=sid, node="", error=_map_unreadable_text(unreadable)
-            )
-        elif sid in clash and not placed[sid][2]:
+        if sid in clash and not placed[sid][2]:
             get_logger("nodes").warning("node project %s refused: %s", sid, clash[sid])
             outcomes[sid] = NodeBringUpOutcome(
                 ok=False, sid=sid, node=placed[sid][0], error=clash[sid]
@@ -2317,7 +2572,14 @@ def bring_up_node_projects(
     window: bool = False,
 ) -> list[NodeBringUpOutcome]:
     """Bring up every node project in scope. ``only`` holds session ids, the
-    same currency as ``psmux.bring_up``'s -- a local id in it is ignored."""
+    same currency as ``psmux.bring_up``'s -- a local id in it is ignored.
+
+    Every ``"auto"`` project becomes a nick first, as ONE batch, so a
+    single ``up`` spreads across equal nodes exactly as ``--go`` does
+    (G-C12). An auto project that cannot be placed is a failed outcome
+    saying why (``place_node_projects``' own words), never a silent
+    drop; what the placement said about a project rides on its outcome
+    as warnings, which the callers print."""
     # heavy subsystem: in-body per policy
     from magent import nodes
 
@@ -2326,7 +2588,39 @@ def bring_up_node_projects(
         for proj in nodes.node_projects(config, group)
         if only is None or nodes.node_sid(proj) in only
     ]
-    return _run_node_bring_ups(config, projects, allow_dirty=allow_dirty, window=window)
+    placed = place_node_projects(config, projects)
+    # node_projects keeps one project per session id, and the placer keeps
+    # their order: the fan-out's outcomes line up with `chosen`'s.
+    chosen = {nodes.node_sid(proj): proj for proj in placed.projects}
+    ready = iter(
+        _run_node_bring_ups(
+            config, list(chosen.values()), allow_dirty=allow_dirty, window=window
+        )
+    )
+    outcomes: list[NodeBringUpOutcome] = []
+    for proj in projects:
+        name, sid = nodes.project_name(proj), nodes.node_sid(proj)
+        placement = placed.placements.get(name)
+        said: tuple[str, ...] = ()
+        if placement is not None:
+            # A kept project was not scored: the load history is not why
+            # it runs where it does.
+            if placement.reason != "kept":
+                said = placed.history_notes
+            if placement.note:
+                said = (*said, placement.note)
+        if sid not in chosen:
+            outcomes.append(
+                NodeBringUpOutcome(
+                    ok=False, sid=sid, error=placed.unplaced[name], warnings=said
+                )
+            )
+            continue
+        outcome = next(ready)
+        if said:
+            outcome = replace(outcome, warnings=(*said, *outcome.warnings))
+        outcomes.append(outcome)
+    return outcomes
 
 
 def node_session_ids(config: MagentConfig, group: str | None = None) -> list[str]:
@@ -2479,12 +2773,12 @@ def stop_node_sessions(
     from magent.env import local_username
 
     log = get_logger("nodes")
-    try:
-        entries = nodes.load_node_map_strict()
-        map_known = True
-    except (OSError, ValueError) as exc:
-        log.warning("down: node map unreadable, no placement is trusted: %s", exc)
-        entries, map_known = {}, False
+    entries, unreadable = _node_map_for_placement()
+    map_known = unreadable is None
+    if unreadable is not None:
+        log.warning(
+            "down: node map unreadable, no placement is trusted: %s", unreadable
+        )
     # A pull can wait out a held lock and then a slow node, one session after
     # another: minutes. Say so before the first (the fan-out rule).
     due = sum(

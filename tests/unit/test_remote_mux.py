@@ -1413,34 +1413,42 @@ class TestHasSession:
 
 
 class TestTheNumberReaders:
+    # The readers are nodes' (the leaf owns the one load-sample parse);
+    # remote_mux reaches them only through nodes._load_sample.
     def test_finite_takes_bare_numbers(self):
-        assert remote_mux._finite(3) == 3.0
-        assert remote_mux._finite(0.5) == 0.5
+        assert nodes._finite(3) == 3.0
+        assert nodes._finite(0.5) == 0.5
 
     @pytest.mark.parametrize("value", ["1.5", True, None, [1]])
     def test_finite_refuses_a_non_number_with_a_type_error(self, value):
         with pytest.raises(TypeError):
-            remote_mux._finite(value)
+            nodes._finite(value)
 
     @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
     def test_finite_refuses_a_non_finite_reading_with_a_value_error(self, value):
         with pytest.raises(ValueError, match="non-finite"):
-            remote_mux._finite(value)
+            nodes._finite(value)
 
     def test_integral_takes_an_int_or_a_whole_float(self):
-        assert remote_mux._integral(16) == 16
-        assert remote_mux._integral(16.0) == 16
-        assert type(remote_mux._integral(16.0)) is int
+        assert nodes._integral(16) == 16
+        assert nodes._integral(16.0) == 16
+        assert type(nodes._integral(16.0)) is int
 
     @pytest.mark.parametrize("value", ["16", True, False, None])
     def test_integral_refuses_a_non_number_with_a_type_error(self, value):
         with pytest.raises(TypeError):
-            remote_mux._integral(value)
+            nodes._integral(value)
 
     @pytest.mark.parametrize("value", [16.9, math.nan, math.inf])
     def test_integral_refuses_a_fraction_or_a_non_finite_float(self, value):
         with pytest.raises(ValueError, match="not a whole reading"):
-            remote_mux._integral(value)
+            nodes._integral(value)
+
+    def test_integral_refuses_an_int_too_large_for_a_float(self):
+        # A count is scored as a float: bounding it here keeps the overflow
+        # in the reader's refusal set instead of crashing score_node.
+        with pytest.raises(OverflowError):
+            nodes._integral(10**400)
 
 
 class TestSample:
@@ -1498,6 +1506,8 @@ class TestSample:
         fake_ssh.set_reply("bash -s", stdout=stdout)
         with pytest.raises(RemoteError, match="not a load sample") as exc:
             remote_mux.sample(NODE)
+        assert isinstance(exc.value, RemoteError), repr(exc.value)
+        assert "not a load sample" in exc.value.stderr_tail
         assert exc.value.rc == 0
         assert exc.value.stderr_tail.startswith(
             "not a load sample: nested deeper than 64 levels; got b'"
@@ -1516,10 +1526,12 @@ class TestSample:
             # 1e400 parses to inf; _integral refuses it before any int()
             # conversion ("ValueError: not a whole reading: inf").
             '"nproc": 1e400',
-            # A 401-digit integer: _finite's float() of it is an OverflowError,
-            # an ArithmeticError and not a ValueError -- the only case that
-            # reaches sample()'s OverflowError catch.
+            # A 401-digit integer: float() of it is an OverflowError, an
+            # ArithmeticError and not a ValueError. It reaches sample()'s
+            # OverflowError catch from a float field (_finite) and from a
+            # count field (_integral bounds a count by the same float()).
             '"ts": 1' + "0" * 400,
+            '"mem_avail_mb": 1' + "0" * 400,
             # The int fields are as strict as the float ones: no fraction, no
             # bool (json `true` is a Python bool, and bool is an int).
             '"nproc": 16.9',
@@ -1533,6 +1545,7 @@ class TestSample:
         ids=[
             "infinite-count",
             "float-overflow",
+            "count-overflow",
             "fractional-count",
             "bool-count",
             "string-count",
@@ -2048,6 +2061,7 @@ _RESULT = {
     "attached_existing": False,
     "cwd": _ROOT,
     "commits": {_ROOT: "0123abcd"},
+    "dirty": {_ROOT: True},
     "shipped": [".env"],
 }
 
@@ -2225,7 +2239,20 @@ class TestOneConnectionBringsAProjectUp:
             commits={_ROOT: "0123abcd"},
             cwd=_ROOT,
             shipped=(".env",),
+            dirty={_ROOT: True},
         )
+
+    def test_a_tree_flag_that_is_not_a_bool_is_left_unknown(self, node_home, tmp_path):
+        # A folder missing from ``dirty`` is unknown on the PC, never
+        # clean: only a real true/false says the tree was read.
+        _answers(node_home, {**_RESULT, "dirty": {_ROOT: "false", "/x": None}})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).dirty == {}
+
+    def test_a_result_without_tree_flags_leaves_every_tree_unknown(
+        self, node_home, tmp_path
+    ):
+        _answers(node_home, {k: v for k, v in _RESULT.items() if k != "dirty"})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).dirty == {}
 
     def test_an_attach_to_a_live_session_is_reported(self, node_home, tmp_path):
         _answers(node_home, {**_RESULT, "attached_existing": True})
@@ -3668,6 +3695,43 @@ class TestBringUpShOnARealShell:
         # ...and --allow-dirty starts it anyway, leaving the edit alone.
         remote_mux.bring_up(rig["node"], rig["recipe"], allow_dirty=True)
         assert (rig["root"] / "README.md").read_bytes() == b"edited on the node\n"
+
+    def _unshipped(self, rig) -> Recipe:
+        # No push file lands in the clone: its tree is exactly origin's.
+        return dataclasses.replace(rig["recipe"], push_files=())
+
+    def test_a_clean_tree_is_reported_clean(self, rig):
+        result = remote_mux.bring_up(rig["node"], self._unshipped(rig))
+        assert result.dirty == {str(rig["root"]): False}
+
+    def test_an_untracked_file_is_reported_dirty_and_not_refused(self, rig):
+        # The refusal ignores untracked files; the report counts them, as
+        # repo_status.sh does -- "clean" would say they are not there.
+        remote_mux.bring_up(rig["node"], self._unshipped(rig))
+        (rig["state"] / "sessions" / "api").unlink()
+        (rig["root"] / "notes.txt").write_bytes(b"node only\n")
+        result = remote_mux.bring_up(rig["node"], self._unshipped(rig))
+        assert result.attached_existing is False
+        assert result.dirty == {str(rig["root"]): True}
+
+    def test_a_shipped_file_git_does_not_ignore_reads_as_dirty(self, rig):
+        # Read after the ship: the tree the session starts on, which is
+        # what repo_status.sh would report at that moment.
+        result = remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert git(rig["root"], "status", "--porcelain") == "?? .env"
+        assert result.dirty == {str(rig["root"]): True}
+
+    def test_allow_dirty_reports_no_tree_state(self, rig):
+        # --allow-dirty looks at nothing, so it claims nothing either way.
+        result = remote_mux.bring_up(
+            rig["node"], self._unshipped(rig), allow_dirty=True
+        )
+        assert result.commits != {}
+        assert result.dirty == {}
+
+    def test_an_attach_reports_no_tree_state(self, rig):
+        (rig["state"] / "sessions" / "api").write_bytes(b"cwd=/x\ncmd=old\n")
+        assert remote_mux.bring_up(rig["node"], rig["recipe"]).dirty == {}
 
     def _up_then_stop(self, rig) -> Path:
         # A first bring-up, then the session gone: the next one reaches git.

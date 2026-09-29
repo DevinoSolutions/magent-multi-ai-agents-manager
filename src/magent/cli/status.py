@@ -176,10 +176,14 @@ def _node_sync_state(cfg: MagentConfig) -> str:
     daemon is not a daemon anyone expects, and the repair hint's "serve starts
     a fresh one" is only ever shown when serve will.
 
-    Only "stale" degrades (``_is_degraded``): every node row is then frozen at
-    a pull nobody refreshes. "stopped" does not -- `serve` starts a daemon
-    within its supervise interval, with serve off the upload-server line
-    already says so, and the spec promises exit 3 for a stale daemon only.
+    Two node conditions degrade (``_is_degraded``), each because every node
+    row is then frozen until a human repairs something: "stale" -- a pull
+    nobody refreshes -- and a sync paused on a node map it cannot read
+    (``_node_sync_pause``, which this state does not carry: it comes from
+    the map read, not the heartbeat; the Q1 ruling on the round-2
+    report-back). "stopped" does not -- `serve` starts a daemon within its
+    supervise interval, and with serve off the upload-server line already
+    says so.
     """
     from magent import launch  # heavy subsystem: in-body per policy
     from magent.cli.node_cmd import _daemon_state  # DECISION-17's one reader
@@ -187,6 +191,78 @@ def _node_sync_state(cfg: MagentConfig) -> str:
     if not launch.node_sync_enabled(cfg):
         return "off"
     return _daemon_state()
+
+
+# G-MERGE: "node sync paused" is status's own strict read of the map every sync tick reads first (round-2 ruling 3); keep it at the K/F merges -- F's `node doctor` can report it through _node_sync_pause and _node_sync_pause_lines
+NODE_SYNC_PAUSED = "node sync paused"
+
+
+def _node_sync_pause(
+    sync_state: str, errors: Sequence[OSError | ValueError]
+) -> OSError | ValueError | None:
+    """Why the node sync pulls nothing, or None. Every sync tick reads the
+    node map strictly first, and a map it cannot read -- torn, or one
+    malformed entry in it -- makes the tick dial no node and write nothing
+    (node_sync's ``_map_unreadable``) until the map reads again. That
+    daemon's memory is not status's to read, so status reports its OWN
+    strict read of the same file (``errors``, handed over by
+    ``nodes.session_rows``): the same reader, so the same verdict.
+
+    None when no daemon is expected (``"off"``), when the map read, and when
+    it was only busy: a ``PermissionError`` past the reader's retries is
+    another process's write in flight, which the next tick retries -- a
+    moment, not a pause -- and its rows already read stale."""
+    if sync_state == "off" or not errors:
+        return None
+    exc = errors[-1]
+    return None if isinstance(exc, PermissionError) else exc
+
+
+def _node_sync_pause_lines(exc: OSError | ValueError) -> tuple[str, str]:
+    """The pause and its repair, in our words and the error's CLASS: the
+    parser's or the OS's words are nodes.log's, where ``session_rows``
+    logged them. A malformed entry is named by its key, through
+    ``node_sync.printable``: the key is whatever the file holds. No magent
+    command rewrites the map, so the repair is the user's -- fix it or move
+    it aside, never delete it: it is the only record of where each project
+    runs."""
+    from magent import node_sync, nodes  # heavy subsystem: in-body per policy
+
+    what = nodes.map_unread_text(exc)
+    key = nodes.malformed_entry(exc)
+    if key is None:
+        return (
+            f"({what}; nothing is pulled from any node)",
+            (
+                f"fix {nodes.NODE_MAP_PATH}, or move it aside"
+                "  (nodes.log says what is wrong)"
+            ),
+        )
+    entry = f"entry '{node_sync.printable(key)}'"
+    return (
+        f"({what}: {entry} is malformed; nothing is pulled from any node)",
+        (
+            f"fix {entry} in {nodes.NODE_MAP_PATH}, or move the file aside"
+            "  (nodes.log says what is wrong)"
+        ),
+    )
+
+
+def _node_sync_pause_json(
+    exc: OSError | ValueError | None,
+) -> dict[str, object] | None:
+    """``status --json``'s additive ``node_sync_paused``: None, or the
+    error's class and the malformed entry's printable key (None for a
+    whole-file refusal)."""
+    if exc is None:
+        return None
+    from magent import node_sync, nodes  # heavy subsystem: in-body per policy
+
+    key = nodes.malformed_entry(exc)
+    return {
+        "error": type(exc).__name__,
+        "entry": None if key is None else node_sync.printable(key),
+    }
 
 
 def _agents_snapshot(cfg: MagentConfig) -> list[dict[str, object]]:
@@ -304,12 +380,18 @@ def _gather_status(cfg: MagentConfig) -> dict[str, str]:
     }
 
 
-def _is_degraded(status: dict[str, str]) -> bool:
+# G-MERGE: a paused node sync degrades too (Q1 ruling on the round-2 report-back); keep it at the K/F merges
+def _is_degraded(status: dict[str, str], *, sync_paused: bool = False) -> bool:
+    """Exit 3's verdict. ``sync_paused`` is the node sync pulling nothing
+    because the node map cannot be read (``_node_sync_pause``): not a
+    ``status`` field, since it comes from the map read, not a daemon's
+    liveness."""
     return (
         status["upload_server"] == "dead"
         or status["listener"] in ("stale", "dead")
         or status["attention"] in ("stale", "crashed")
         or status["node_sync"] == "stale"
+        or sync_paused
     )
 
 
@@ -375,17 +457,22 @@ def _render_status(config_file: Path) -> StatusReport:
     # Node sessions (PR-D): read from the sync daemon's last pull, never over
     # ssh -- a stale row is a node this PC has not heard from, not a dead one.
     # heavy subsystem: in-body per policy
-    from magent import nodes
+    from magent import node_sync, nodes
 
-    node_rows = nodes.session_rows(cfg, now=time.time())
+    # G-MERGE: the map's error comes back for the pause line (round-2 ruling 3)
+    map_errors: list[OSError | ValueError] = []
+    node_rows = nodes.session_rows(
+        cfg, now=time.time(), on_unreadable=map_errors.append
+    )
     # The daemon behind those rows: stale freezes every one of them, which is
-    # what makes it the one node state that degrades (_node_sync_state). Named
+    # why it degrades, as a paused sync does (_node_sync_state). Named
     # even with no rows -- a node-pinned IDE project has none, yet serve still
     # runs the daemon for it. A stopped one is named too (dim, not degraded):
     # the JSON says so, and every row will drift to stale until serve starts it.
     sync_stale = status["node_sync"] == "stale"
     sync_stopped = status["node_sync"] == "stopped"
-    if node_rows or sync_stale or sync_stopped:
+    paused = _node_sync_pause(status["node_sync"], map_errors)
+    if node_rows or sync_stale or sync_stopped or paused is not None:
         click.echo(f"\n  {style('Nodes', bold=True)}")
     tint = {"live": "green", "stale": "yellow", "dead": "red"}
     for node_row in node_rows:
@@ -394,9 +481,20 @@ def _render_status(config_file: Path) -> StatusReport:
         # without one is an auto project behind an unreadable node map.
         unplaced = "(not placed)" if state == "dead" else "(node unknown)"
         node = f"@{node_row['node']}" if node_row["node"] else unplaced
+        # The sid is the node map's, whatever the file holds: printable
+        # ASCII only on this screen, as recall shows it.
+        sid = node_sync.printable(str(node_row["session"]))
         click.echo(
-            f"    {node_row['session']}  {style(node, fg='blue')}  {style(state, fg=tint[state])}"
+            f"    {sid}  {style(node, fg='blue')}  {style(state, fg=tint[state])}"
         )
+    if paused is not None:
+        # Degraded (exit 3), like a stale daemon: every row above is frozen
+        # until a human repairs the map.
+        what, repair = _node_sync_pause_lines(paused)
+        click.echo(
+            f"  {style(NODE_SYNC_PAUSED, fg='yellow', bold=True)}  {style(what, dim=True)}"
+        )
+        click.echo(f"  {style('Repair:', dim=True)} {style(repair, bold=True)}")
     if sync_stale:
         click.echo(
             f"  {style('node sync daemon stale  (heartbeat expired)', fg='red', bold=True)}"
@@ -488,7 +586,7 @@ def _render_status(config_file: Path) -> StatusReport:
             err=True,
         )
 
-    return StatusReport(_is_degraded(status), listed)
+    return StatusReport(_is_degraded(status, sync_paused=paused is not None), listed)
 
 
 @main.command("status")
@@ -530,13 +628,21 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         # it changes neither the envelope's shape nor the exit contract.
         payload["psmux_session0"] = len(session0_server_pids())
         # Additive, like psmux_sessions: a dead or stale node session is a row
-        # state, never a degraded daemon; only the sync daemon's own
-        # `node_sync` field can degrade (exit 3).
+        # state, never a degraded daemon; only the sync daemon can degrade
+        # (exit 3): its own `node_sync` field, or `node_sync_paused` below.
         from magent import nodes  # heavy subsystem: in-body per policy
 
-        payload["node_sessions"] = nodes.session_rows(cfg, now=time.time())
+        map_errors: list[OSError | ValueError] = []
+        payload["node_sessions"] = nodes.session_rows(
+            cfg, now=time.time(), on_unreadable=map_errors.append
+        )
+        # Additive too: a paused sync says why (round-2 ruling 3), and is
+        # degraded like a stale daemon (Q1): every row is frozen until the
+        # map is repaired.
+        paused = _node_sync_pause(status["node_sync"], map_errors)
+        payload["node_sync_paused"] = _node_sync_pause_json(paused)
         click.echo(json.dumps(payload))
-        sys.exit(3 if _is_degraded(status) else 0)
+        sys.exit(3 if _is_degraded(status, sync_paused=paused is not None) else 0)
 
     if _render_status(config_file).degraded:
         sys.exit(3)

@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import reprlib
 import socket
 import stat
 import stringprep
@@ -29,11 +30,18 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
-from magent.config import NODE_AUTO, NODE_CLOUD, is_cloud, runs_on_node
+from magent.config import (
+    _NODE_NICK_RE,
+    NODE_AUTO,
+    NODE_CLOUD,
+    is_cloud,
+    runs_on_node,
+)
 from magent.json_depth import MAX_JSON_DEPTH, TOO_DEEP, nests_too_deep
 from magent.lockfile import LockHeld, persistent_lock
 from magent.log import get_logger
@@ -43,7 +51,7 @@ from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
 
@@ -1502,26 +1510,50 @@ def encoded_project_dir(path: str) -> str:
     return encode_claude_project_path(path)
 
 
-def _map_entry(raw: object) -> NodeMapEntry | None:
-    if not isinstance(raw, dict):
+def _epoch(value: object) -> float | None:
+    """A timestamp read back from JSON, as a finite float, or None. bool is an
+    int subclass (`"ts": true` is corruption, not 1.0); json.loads accepts
+    NaN/Infinity and arbitrarily long integers, and neither is a time --
+    float() of a 309+-digit int raises instead of saturating."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    nick, sid, root = raw.get("nick"), raw.get("sid"), raw.get("remote_root")
-    ts, attached = raw.get("placed_ts"), raw.get("attached_existing")
-    if not (isinstance(nick, str) and isinstance(sid, str) and isinstance(root, str)):
-        return None
-    # bool is an int subclass: `"placed_ts": true` is corruption, not 1.0.
-    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
-        return None
-    if not isinstance(attached, bool):
-        return None
-    # json.loads accepts NaN/Infinity and arbitrarily long integers; neither is
-    # a time. float() of a 309+-digit int raises instead of saturating.
     try:
-        placed_ts = float(ts)
+        out = float(value)
     except OverflowError:
         return None
-    if not math.isfinite(placed_ts):
-        return None
+    return out if math.isfinite(out) else None
+
+
+def _shown(value: object) -> str:
+    """A bad field's value as nodes.log shows it: a bounded repr, so a torn or
+    hostile value can neither flood the log nor put a raw escape in it."""
+    return reprlib.repr(value)
+
+
+def _map_text(raw: Mapping[str, object], field: str) -> str:
+    value = raw.get(field)
+    if not isinstance(value, str):
+        raise ValueError(f"{field} is {_shown(value)}, not a string")  # noqa: TRY004  # reason: a malformed entry is corrupt DATA, the same family as a torn file's JSONDecodeError; callers catch one type for every bad map
+    return value
+
+
+def _map_entry(raw: object) -> NodeMapEntry:
+    """One node-map value as an entry, or ValueError saying why it is not one
+    -- the reason ``_load_node_map`` names with the entry's key."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"not a JSON object but {_shown(raw)}")  # noqa: TRY004  # reason: corrupt DATA, as in _map_text
+    nick, sid = _map_text(raw, "nick"), _map_text(raw, "sid")
+    root = _map_text(raw, "remote_root")
+    # The nick becomes a path under NODES_DIR and a word on the screen: one
+    # config's own rule refuses ("../x", an escape sequence) is corruption.
+    if not _NODE_NICK_RE.fullmatch(nick):
+        raise ValueError(f"nick {_shown(nick)} is not a node nick")
+    ts, attached = raw.get("placed_ts"), raw.get("attached_existing")
+    placed_ts = _epoch(ts)
+    if placed_ts is None:
+        raise ValueError(f"placed_ts {_shown(ts)} is not a finite number")
+    if not isinstance(attached, bool):
+        raise ValueError(f"attached_existing {_shown(attached)} is not true or false")  # noqa: TRY004  # reason: corrupt DATA, as in _map_text
     target, cwd = raw.get("target", ""), raw.get("cwd", "")
     return NodeMapEntry(
         nick=nick,
@@ -1551,13 +1583,42 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
     is momentarily locked (``PermissionError``: the Windows reader racing an
     ``os.replace``) is retried ``_BUSY_RETRIES`` times ``_BUSY_SLEEP_S`` apart,
     then re-raised; any other ``OSError``, and a torn, non-object or too
-    deeply nested file (``ValueError``), propagate. A malformed ENTRY is still
-    dropped alone.
+    deeply nested file (``ValueError``), propagate. So does ONE malformed
+    entry: a ``ValueError`` naming the file, the entry's key and why
+    (``malformed_entry`` reads the key back off it). An
+    entry that cannot be read is a hand edit or corruption, the same class as
+    a torn file -- dropped, it read as "not placed" to every caller of this
+    read, and the next ``update_node_map`` wrote the map back without it.
 
     PR-D's ``update_node_map`` MUST read through this for its
     read-modify-write: an unreadable map read as ``{}`` and written back would
     erase every placement. Code that only needs a best-effort answer calls
     ``read_node_map``."""
+    return _load_node_map(strict=True)
+
+
+# G-MERGE: MalformedMapEntry carries a refused entry's key for status's "node sync paused" (round-2 ruling 3); keep it at the K/F merges
+class MalformedMapEntry(ValueError):
+    """Why ONE node-map entry could not be read, carrying its key. It is the
+    ``__cause__`` of the ``ValueError`` ``load_node_map_strict`` raises for
+    that entry, never the error itself: every surface names that refusal
+    ``ValueError``, the torn file's family, and a surface that shows the entry
+    asks ``malformed_entry`` for the key. The key is the file's, anything at
+    all: a screen shows it only through ``node_sync.printable``."""
+
+    def __init__(self, project: str, why: str) -> None:
+        super().__init__(why)
+        self.project = project
+
+
+def _load_node_map(*, strict: bool) -> dict[str, NodeMapEntry]:
+    """The one parse behind both readers. A whole-file failure raises either
+    way -- a file nested deeper than ``MAX_JSON_DEPTH`` among them, refused by
+    ``nests_too_deep`` before ``json.loads`` walks it, with a
+    ``RecursionError`` out of the parse as the backstop; a malformed entry
+    raises when ``strict`` -- a ``ValueError`` whose cause, a
+    ``MalformedMapEntry``, carries the key -- and otherwise is dropped alone
+    with one nodes.log WARNING naming its key and why."""
     for attempt in range(_BUSY_RETRIES + 1):
         try:
             text = NODE_MAP_PATH.read_text(encoding="utf-8")
@@ -1585,32 +1646,41 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
         raise ValueError(f"{NODE_MAP_PATH}: not a JSON object")  # noqa: TRY004  # reason: a non-object file is corrupt DATA, the same family as the JSONDecodeError (a ValueError) a torn file raises; callers catch one type for every bad file
     out: dict[str, NodeMapEntry] = {}
     for project, value in raw.items():
-        entry = _map_entry(value)
+        try:
+            entry = _map_entry(value)
+        except ValueError as exc:
+            why = f"{NODE_MAP_PATH}: entry {project!r} is malformed: {exc}"
+            if strict:
+                cause = MalformedMapEntry(str(project), str(exc))
+                cause.__cause__ = exc
+                raise ValueError(why) from cause
+            get_logger("nodes").warning(
+                "node map: %s; skipped by a best-effort read", why
+            )
+            continue
         # A key out of json.loads is always str: this isinstance narrows the
         # type for ty, it does not tolerate anything.
-        if isinstance(project, str) and entry is not None:
+        if isinstance(project, str):
             out[project] = entry
     return out
 
 
 def read_node_map() -> dict[str, NodeMapEntry]:
-    """``node-map.json`` keyed by project name, tolerantly: whatever
-    ``load_node_map_strict`` raises -- a map still busy after its retries, a
-    torn write, a file that is not a JSON object, one nested deeper than
-    ``MAX_JSON_DEPTH`` -- reads as ``{}``. The map is a record of where things landed, and a bad one must
-    never stop a launch or an F2 press. Never write back what this returns; see
-    ``load_node_map_strict``."""
+    """``node-map.json`` keyed by project name, tolerantly: whatever makes
+    the whole file unreadable -- a map still busy after its retries, a torn
+    write, a file that is not a JSON object, one nested deeper than
+    ``MAX_JSON_DEPTH`` (refused by a scan before ``json.loads`` walks it) --
+    reads as ``{}``. A malformed entry is dropped alone, and nodes.log gets
+    one WARNING per dropped key. The map is a record of where things landed,
+    and a bad one must never stop a launch or an F2 press. Never write back
+    what this returns; see ``load_node_map_strict``."""
     try:
-        return load_node_map_strict()
+        return _load_node_map(strict=False)
     except (OSError, ValueError, RecursionError):
         return {}
 
 
 # What every surface says for a map ``load_node_map_strict`` refused.
-# D-MERGE: (G step) Gmap carries its own copy of launch._map_unreadable_text
-# saying "the node map is unreadable (<Class>)"; at the Gmap merge keep
-# launch's one copy, which builds on map_unread_text, and move Gmap's pins to
-# this sentence, so `up` and `down` name it in one phrasing.
 MAP_UNREAD = "the node map could not be read"
 
 
@@ -1619,6 +1689,15 @@ def map_unread_text(exc: BaseException) -> str:
     error's own text names the map's path and the parser's words, which go
     to nodes.log, never the screen."""
     return f"{MAP_UNREAD} ({type(exc).__name__})"
+
+
+# G-MERGE: malformed_entry names the entry status's "node sync paused" line shows (round-2 ruling 3); keep it at the K/F merges
+def malformed_entry(exc: BaseException) -> str | None:
+    """The key of the one entry that made a strict read refuse the map (the
+    error's cause is a ``MalformedMapEntry``), or None for any other refusal:
+    a torn, busy or non-object file names no entry."""
+    cause = exc.__cause__
+    return cause.project if isinstance(cause, MalformedMapEntry) else None
 
 
 def write_node_map(entries: Mapping[str, NodeMapEntry]) -> None:
@@ -1740,10 +1819,11 @@ def update_node_map(
     `down` clearing the placement it just killed passes the entry it read, so
     a placement a concurrent `up` recorded meanwhile survives.
 
-    Reads through ``load_node_map_strict``: a torn or unreadable map raises
-    (ValueError / OSError) and is left as it is, never read as ``{}`` and
-    written back over every placement. Raises LockHeld when another writer
-    holds the map for longer than ``wait_s``."""
+    Reads through ``load_node_map_strict``: a torn or unreadable map, or one
+    holding a malformed entry, raises (ValueError / OSError) and is left as it
+    is, never read as ``{}`` -- or without that entry -- and written back over
+    every placement. Raises LockHeld when another writer holds the map for
+    longer than ``wait_s``."""
     with map_lock(wait_s):
         _sweep_stale_temps()
         current = load_node_map_strict()
@@ -1899,6 +1979,53 @@ def resolve(
 # Every path reads NODES_DIR at CALL time (never a second import-bound Path),
 # so the test-isolation redirect of NODES_DIR covers all of them.
 
+# A session directory sits beside these per-node files; no sid may take a name.
+_RESERVED_NAMES = frozenset(
+    {"sessions.json", "load.jsonl", "pull.json", "node-map.json"}
+)
+# Every path part must be a legal file name on THIS PC, which may be Windows.
+_UNSAFE_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
+# ntpath's reserved set on 3.13 (ntpath.isreserved is 3.13+, so it is copied):
+# the superscript digits count as COM/LPT numbers too.
+_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{c}" for c in "123456789¹²³"),
+        *(f"LPT{c}" for c in "123456789¹²³"),
+    }
+)
+
+
+def _safe_part(part: str) -> bool:
+    # A part ending in "." or " " is refused outright (Windows drops them), so
+    # the device check needs only ntpath's: the stem before the FIRST dot,
+    # trailing spaces dropped -- "CON .jsonl" opens the console.
+    return (
+        part not in ("", ".", "..")
+        and _UNSAFE_CHARS.search(part) is None
+        and not part.endswith((".", " "))
+        and part.split(".", 1)[0].rstrip(" ").upper() not in _DEVICE_NAMES
+    )
+
+
+# A sid is printed as well as joined: DEL and the C1 controls are refused
+# with C0 (node_sync._CONTROL's range) -- 0x9b is a CSI to a terminal.
+_DEL_OR_C1 = re.compile(r"[\x7f-\x9f]")
+
+
+def pullable_sid(sid: str) -> bool:
+    """Can ``sid`` name a directory under ``~/.magent/nodes/<nick>/`` here?"""
+    return (
+        _safe_part(sid)
+        and sid not in _RESERVED_NAMES
+        and _DEL_OR_C1.search(sid) is None
+    )
+
 
 def node_dir(nick: str, *, nodes_dir: Path | None = None) -> Path:
     return (nodes_dir if nodes_dir is not None else NODES_DIR) / nick
@@ -1910,14 +2037,14 @@ def transcripts_dir(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Pa
     ``sid`` is joined VERBATIM: ``psmux.session_name`` keeps ``/`` and ``\\``,
     so a node-map sid like ``/etc`` would resolve outside the node dir --
     callers (the attention reader, recall) pass it through
-    ``remote_mux.pullable_sid`` first."""
+    ``pullable_sid`` first."""
     return node_dir(nick, nodes_dir=nodes_dir) / sid / "transcripts"
 
 
 def state_dir(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
     """Where the daemon mirrors a node session's agent-state records.
     ``sid`` is joined VERBATIM, exactly as in ``transcripts_dir``: callers
-    pass a node-map sid through ``remote_mux.pullable_sid`` first."""
+    pass a node-map sid through ``pullable_sid`` first."""
     return node_dir(nick, nodes_dir=nodes_dir) / sid / "state"
 
 
@@ -2875,7 +3002,13 @@ def node_session_state(
     return "live" if sid in snap.sessions else "dead"
 
 
-def session_rows(config: MagentConfig, *, now: float) -> list[dict[str, object]]:
+# G-MERGE: on_unreadable hands status the map's error for "node sync paused" (round-2 ruling 3); keep it at the K/F merges
+def session_rows(
+    config: MagentConfig,
+    *,
+    now: float,
+    on_unreadable: Callable[[OSError | ValueError], None] | None = None,
+) -> list[dict[str, object]]:
     """One row per node project, config order: ``name``, ``session``,
     ``node`` (the nick; None for an ``auto`` project not yet placed, or whose
     placement cannot be read) and ``state`` (``NODE_SESSION_STATES``). An
@@ -2887,13 +3020,17 @@ def session_rows(config: MagentConfig, *, now: float) -> list[dict[str, object]]
     non-object map would read as "nothing was ever placed" and turn a live
     session dead. A map this PC cannot read says nothing about any row -- the
     node AND the sid come from it -- so every row reads ``stale``, the same
-    law as an unreachable node, and the reason goes to nodes.log."""
+    law as an unreachable node, and the reason goes to nodes.log.
+    ``on_unreadable``, when given, is handed that error too: ``status``
+    names a paused node sync with it."""
     try:
         entries: dict[str, NodeMapEntry] | None = load_node_map_strict()
     except (OSError, ValueError) as exc:
         get_logger("nodes").warning(
             "node map unreadable; every node session reads stale: %s", exc
         )
+        if on_unreadable is not None:
+            on_unreadable(exc)
         entries = None
     interval = config.settings.node_sync.pull_interval_s
     rows: list[dict[str, object]] = []
@@ -2915,3 +3052,541 @@ def session_rows(config: MagentConfig, *, now: float) -> list[dict[str, object]]
             )
         rows.append({"name": name, "session": sid, "node": nick, "state": state})
     return rows
+
+
+# --- placement for "node": "auto" (spec §11) -----------------------------------
+
+# The auto sentinel is config.NODE_AUTO (B, DECISION-10/22); nodes has no copy.
+# "cloud" is never a candidate: config refuses a pool entry named "cloud", so
+# `place`, which only walks settings.nodes, cannot reach it.
+PLACEMENT_WINDOW_S = 30 * 60
+MIN_WINDOW_SAMPLES = 5
+SPIKE_WEIGHT = 0.5
+SPIKE_RATIO = 1.5
+MEM_WEIGHT = 0.5
+MEM_FLOOR = 0.15
+# DECISION-11: under 10 % free (newest sample) a node is not eligible at all
+# while any other node is above it -- the soft MEM term alone is at most 0.075.
+MEM_HARD_FLOOR = 0.10
+SESSION_WEIGHT = 0.05
+
+
+@dataclass(frozen=True)
+class NodeScore:
+    """One node's §11 score and the terms it is made of (``node plan`` prints
+    every one of them). ``live`` marks a score taken from a live sample;
+    ``below_floor`` a node under ``MEM_HARD_FLOOR`` free memory."""
+
+    nick: str
+    samples: int
+    p75: float
+    spike: float
+    mem: float
+    my_sessions: int
+    score: float
+    live: bool = False
+    below_floor: bool = False
+
+
+def _finite(value: object) -> float:
+    """``value`` as a float. Three refusals:
+
+    - TypeError for a non-number. A bool and a numeric string both count:
+      json's ``true`` is a Python bool (an int subclass), and ``sample.sh``
+      prints bare numbers, so ``"1.5"`` is not a reading. The isinstance
+      guard is also what narrows ``object`` for ty.
+    - ValueError for NaN or an infinity: json accepts them, the snapshot
+      writer does not.
+    - OverflowError for an int too large for a float (json has no bound on
+      an integer's digits)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"not a number: {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite reading: {number}")
+    return number
+
+
+def _integral(value: object) -> int:
+    """``value`` as an int, as strict as ``_finite``: TypeError for a
+    non-number (a bool and a str included), ValueError for a float that is
+    not finite or not whole (``16.9``), OverflowError for an int too large
+    for a float. A whole float (``16.0``) is taken.
+
+    The overflow bound is the scorer's: every count ends up in float
+    arithmetic (load per core, the free-memory fraction), so a count json
+    parsed as a 401-digit int is refused HERE, where every caller already
+    catches OverflowError, rather than crashing ``score_node`` later."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"not a number: {value!r}")
+    if isinstance(value, int):
+        float(value)  # OverflowError past a float's range; the value stays exact
+        return value
+    if not math.isfinite(value) or not value.is_integer():
+        raise ValueError(f"not a whole reading: {value}")
+    return int(value)
+
+
+def _load_sample(raw: object) -> LoadSample:
+    """``magent_sample``'s JSON object as a LoadSample -- the ONE parse, shared
+    by ``remote_mux.sample()``, ``remote_mux.parse_pull`` and
+    ``read_load_history``. KeyError, TypeError, ValueError or OverflowError
+    when it is not one: a JSON list or string is a TypeError, and every field
+    goes through ``_finite``/``_integral``, whose refusals (non-number, bool,
+    string, NaN, infinity, fractional count, an integer too large for a
+    float) are those exceptions."""
+    if not isinstance(raw, dict):
+        raise TypeError(f"expected an object, got {type(raw).__name__}")
+    return LoadSample(
+        ts=_finite(raw["ts"]),
+        nproc=_integral(raw["nproc"]),
+        load1=_finite(raw["load1"]),
+        load5=_finite(raw["load5"]),
+        load15=_finite(raw["load15"]),
+        mem_total_mb=_integral(raw["mem_total_mb"]),
+        mem_avail_mb=_integral(raw["mem_avail_mb"]),
+        my_sessions=_integral(raw["my_sessions"]),
+    )
+
+
+def parse_load_lines(lines: Iterable[str]) -> list[LoadSample]:
+    """LoadSamples out of ``load.jsonl`` lines, through the one strict parse.
+    A line it refuses is skipped, never fatal: the daemon appends while a
+    reader reads, so a torn last line is normal, and one bad reading must not
+    take the whole placement pass down with it."""
+    samples: list[LoadSample] = []
+    for line in lines:
+        try:
+            samples.append(_load_sample(json.loads(line)))
+        # RecursionError: json.loads' answer to deep nesting, which is not a
+        # ValueError -- a corrupt line like any other.
+        except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+            continue
+    return samples
+
+
+def read_load_history(nick: str, *, nodes_dir: Path | None = None) -> list[LoadSample]:
+    """Every sample the daemon kept for ``nick`` (``<nick>/load.jsonl``), or
+    [] when it never sampled that node -- the file does not exist. A file
+    that is there and cannot be read (any other OSError, or bytes that are
+    not UTF-8: UnicodeDecodeError, a ValueError) raises: that is unknown,
+    not "never sampled"."""
+    path = load_path(nick, nodes_dir=nodes_dir)  # E's (DECISION-19): one layout owner
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    return parse_load_lines(text.splitlines())
+
+
+def in_window(samples: Iterable[LoadSample], *, now: float) -> list[LoadSample]:
+    """The samples placement may use: the last ``PLACEMENT_WINDOW_S``. No
+    upper bound: every ts is stamped on THIS PC's clock (node_sync), so a
+    sample past ``now`` is only ever a few seconds ahead of the caller's own
+    reading of the clock (tests seed at ``time.time() + 30`` for that
+    reason), never a node's clock drifting."""
+    start = now - PLACEMENT_WINDOW_S
+    return [s for s in samples if s.ts >= start]
+
+
+def _p75(values: Sequence[float]) -> float:
+    """75th percentile, linear between the closest ranks (what
+    ``statistics.quantiles(method="inclusive")`` returns -- written out because
+    that needs two points and one live sample is a legitimate window)."""
+    ordered = sorted(values)
+    pos = 0.75 * (len(ordered) - 1)
+    low = int(pos)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (pos - low)
+
+
+def score_node(
+    nick: str,
+    window: Sequence[LoadSample],
+    *,
+    extra_sessions: int = 0,
+    live: bool = False,
+) -> NodeScore | None:
+    """Spec §11 over one node's window; None when there is nothing to score.
+
+    Load is per core (``load1``, spec §11's ``u``), so a 32-core box at load 8
+    reads as quiet. Memory and my session count come from the NEWEST sample:
+    they are levels, not rates. Two samples sharing the newest ts resolve to
+    the worse one (less free memory, then more of my sessions), so the score
+    never depends on the order they were read in. ``extra_sessions`` counts
+    projects this same pass already put here.
+
+    A negative reading is clamped to zero -- load per core, the free-memory
+    fraction and my session count alike -- so a broken sampler can make a
+    node look idle at best, never better than idle, and never win placement
+    on an impossible number.
+    """
+    if not window:
+        return None
+    usage = [max(0.0, s.load1 / max(s.nproc, 1)) for s in window]
+    p75 = _p75(usage)
+    spike = SPIKE_WEIGHT * max(0.0, max(usage) - SPIKE_RATIO * p75)
+    latest = max(window, key=lambda s: (s.ts, -s.mem_avail_mb, s.my_sessions))
+    mem = 0.0
+    below_floor = False
+    if latest.mem_total_mb > 0:
+        free = max(0.0, latest.mem_avail_mb / latest.mem_total_mb)
+        mem = MEM_WEIGHT * max(0.0, MEM_FLOOR - free)
+        below_floor = free < MEM_HARD_FLOOR
+    mine = max(0, latest.my_sessions) + extra_sessions
+    return NodeScore(
+        nick=nick,
+        samples=len(window),
+        p75=p75,
+        spike=spike,
+        mem=mem,
+        my_sessions=mine,
+        score=p75 + spike + mem + SESSION_WEIGHT * mine,
+        live=live,
+        below_floor=below_floor,
+    )
+
+
+# Why a placement came out the way it did -- a closed vocabulary, printed by
+# `magent node plan` and the launch notes.
+PLACE_REASONS: dict[str, str] = {
+    "kept": "already placed there (node-map.json)",
+    "re-placed": "its node left settings.nodes; placed again by load",
+    "placed": "lowest load score over the last 30 minutes",
+    "no-data": "no node has load samples to score",
+    "unknown": f"{MAP_UNREAD}, so where it runs is unknown",
+}
+
+
+@dataclass(frozen=True)
+class Placement:
+    """Where an ``auto`` project goes, why, and every score behind it.
+    ``nick`` is None only for ``no-data`` and ``unknown`` (the map could not
+    be read). ``note`` is a line to print."""
+
+    nick: str | None
+    reason: str
+    scores: tuple[NodeScore, ...] = ()
+    note: str | None = None
+
+
+def place(
+    config: MagentConfig,
+    samples: Mapping[str, Sequence[LoadSample]],
+    *,
+    now: float,
+    map_entry: str | None,
+    placed: Mapping[str, int] | None = None,
+    live: frozenset[str] = frozenset(),
+) -> Placement:
+    """Spec §11: the lowest score over the last 30 minutes wins; ties go to
+    the node listed first in ``settings.nodes``. A node under
+    ``MEM_HARD_FLOOR`` free memory is not a candidate while any other scored
+    node is above it; when all are below, the score alone decides.
+
+    Pure: it never talks to a node (``placement_samples`` owns the one live
+    reading a sparse node gets). ``map_entry`` is the nick node-map.json already
+    holds for the project -- it wins while that nick is still configured.
+    ``placed`` counts projects this same pass already put on a node, so a batch
+    spreads instead of piling onto one box before its next sample. ``live``
+    names the nodes whose only sample is a live one.
+    """
+    nicks = list(config.settings.nodes)
+    extra = placed or {}
+    scored = tuple(
+        score
+        for nick in nicks
+        if (
+            score := score_node(
+                nick,
+                in_window(samples.get(nick, ()), now=now),
+                extra_sessions=extra.get(nick, 0),
+                live=nick in live,
+            )
+        )
+        is not None
+    )
+    if map_entry is not None and map_entry in config.settings.nodes:
+        return Placement(map_entry, "kept", scored)
+    vanished = (
+        f"{map_entry!r} is no longer in settings.nodes"
+        if map_entry is not None
+        else None
+    )
+    if not scored:
+        return Placement(None, "no-data", scored, vanished)
+    order = {nick: index for index, nick in enumerate(nicks)}
+    candidates = [s for s in scored if not s.below_floor] or list(scored)
+    # round(..., 9): scores equal up to float noise from summing the terms tie
+    # exactly, so config order decides, not the last bit.
+    best = min(candidates, key=lambda s: (round(s.score, 9), order[s.nick]))
+    if vanished is None:
+        return Placement(best.nick, "placed", scored)
+    return Placement(
+        best.nick, "re-placed", scored, f"{vanished}; re-placed on {best.nick!r}"
+    )
+
+
+def placement_samples(
+    config: MagentConfig,
+    *,
+    now: float,
+    live_sample: Callable[[str], LoadSample | None] | None,
+    nodes_dir: Path | None = None,
+    on_unreadable: Callable[[str, OSError | ValueError], None] | None = None,
+) -> tuple[dict[str, list[LoadSample]], frozenset[str]]:
+    """Each configured node's window, ready for ``place``, plus which nodes
+    were read live.
+
+    Spec §11's sparse rule: a node with fewer than ``MIN_WINDOW_SAMPLES`` in
+    the window gets exactly ONE live reading, and that reading is its only
+    sample -- three quiet samples from before someone started a build must not
+    win. ``live_sample`` is the caller's seam to ``remote_mux.sample`` (this
+    module never talks to a node); None -- a dry run -- scores a thin node on
+    what it has. A failed live reading leaves the node unscored.
+
+    The sparse nodes are probed at once, one thread each, so a pool where
+    every node is thin (a fresh install, the sync daemon off) costs one probe
+    timeout before launch, not one per node. ``live_sample`` signals an
+    unreachable node by returning None, which leaves that node unscored; it
+    must not raise for that. Anything it does raise propagates (the caller's
+    wrapper is where a transport error becomes None). The live reading is
+    deliberately NOT appended to ``load.jsonl``: the sync daemon owns sampling
+    and that file has one writer, so a second placement pass inside the
+    window probes the node again.
+
+    A history that cannot be read is an empty window, so the sparse rule
+    applies to it; it is logged in full to nodes.log and handed to
+    ``on_unreadable`` so the caller can SAY so -- unknown, never read as
+    "the daemon never sampled this node".
+    """
+    windows: dict[str, list[LoadSample]] = {}
+    for nick in config.settings.nodes:
+        try:
+            history = read_load_history(nick, nodes_dir=nodes_dir)
+        except (OSError, ValueError) as exc:
+            get_logger("nodes").warning(
+                "load history for node %s is unreadable: %s", nick, exc
+            )
+            if on_unreadable is not None:
+                on_unreadable(nick, exc)
+            history = []
+        windows[nick] = in_window(history, now=now)
+    sparse = [nick for nick, w in windows.items() if len(w) < MIN_WINDOW_SAMPLES]
+    readings: dict[str, LoadSample | None] = {}
+    if live_sample is not None and sparse:
+        with ThreadPoolExecutor(max_workers=len(sparse)) as executor:
+            readings = dict(zip(sparse, executor.map(live_sample, sparse), strict=True))
+    samples: dict[str, list[LoadSample]] = {}
+    sampled: set[str] = set()
+    for nick, window in windows.items():
+        if nick not in readings:
+            samples[nick] = window
+            continue
+        reading = readings[nick]
+        if reading is None:
+            samples[nick] = []
+            continue
+        samples[nick] = [replace(reading, ts=now)]
+        sampled.add(nick)
+    return samples, frozenset(sampled)
+
+
+# --- resume (spec §12) ----------------------------------------------------------
+
+# A top-level conversation's file is named by its session id (a UUID); the
+# subagent logs beside it are ``agent-<hex>.jsonl`` and are not resumable.
+# Always ``fullmatch``: the id lands on a ``claude --resume`` line, and ``$``
+# (or ``match``) would let a trailing newline -- an Enter -- ride along.
+_SESSION_STEM = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+
+
+def latest_transcript_id(
+    nick: str, sid: str, *, nodes_dir: Path | None = None
+) -> str | None:
+    """The newest pulled conversation's id, or None when nothing was pulled:
+    no folder, or none of its files is a conversation.
+
+    A folder that is there but cannot be listed (no access, a file where the
+    folder should be) RAISES its ``OSError``: that is unknown, never "nothing
+    was pulled" (inv-unknown) -- recall would start the session fresh on it
+    and leave the conversation behind.
+
+    The file stem IS the session id (verified: every record's ``sessionId``
+    equals it). "Newest" means most recently active ON THE NODE: tar keeps the
+    node's mtimes, so the pulled file carries them. A member stored without a
+    usable mtime gets the local pull time instead and can win -- rare, and
+    still a valid id. A tie breaks by name, so the answer never depends on
+    directory order.
+
+    Only a regular file whose stem is a whole UUID counts. Each candidate is
+    stat'ed on its own: one file vanishing mid-pull is skipped, it does not
+    blank the answer for the whole folder.
+    """
+    folder = transcripts_dir(nick, sid, nodes_dir=nodes_dir)
+    try:
+        # iterdir, not glob: glob answers an unreadable folder with nothing.
+        paths = [path for path in folder.iterdir() if path.suffix == ".jsonl"]
+    except FileNotFoundError:
+        return None
+    candidates: list[tuple[float, str, str]] = []
+    for path in paths:
+        if _SESSION_STEM.fullmatch(path.stem) is None:
+            continue
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode):
+            candidates.append((info.st_mtime, path.name, path.stem))
+    newest = max(candidates, default=None)
+    return None if newest is None else newest[2]
+
+
+# --- what a node's repos looked like (spec §12 step 2) --------------------------
+
+
+@dataclass(frozen=True)
+class RepoStatus:
+    """One repo on a node at last contact. ``head == ""`` means no repo was
+    found there; ``dirty``/``unpushed`` None means unknown."""
+
+    remote_dir: str
+    head: str
+    branch: str
+    dirty: bool | None
+    unpushed: int | None
+
+
+@dataclass(frozen=True)
+class RepoRecord:
+    """The last known state of a node session's repos, and where it came from
+    (``bring-up`` or ``recall``) -- so a recall from a node that no longer
+    answers can still say which commit the work was at."""
+
+    ts: float
+    source: str
+    repos: tuple[RepoStatus, ...]
+
+
+# repo_status.sh's stdout is the node's words, so it is bounded here: a session
+# root is one repo or a workspace of a handful, and no field needs more than a
+# path's length. A line past either bound is dropped, never truncated.
+REPO_STATUS_MAX_LINES = 256
+REPO_STATUS_MAX_FIELD = 4096
+# An unpushed count wider than this is not a count git produced for a repo.
+_COUNT_MAX_DIGITS = 9
+# C0, DEL and C1: nothing a node reports may drive the terminal it is shown on.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _count(text: str) -> int | None:
+    # str.isdigit() is true for U+00B2 SUPERSCRIPT TWO (which int() refuses)
+    # and for full-width digits, and int() of thousands of digits is slow and
+    # raises on 3.11+: every one of those reads as unknown.
+    if text.isascii() and text.isdigit() and len(text) <= _COUNT_MAX_DIGITS:
+        return int(text)
+    return None
+
+
+def parse_repo_status(text: str) -> list[RepoStatus]:
+    """``repo_status.sh``'s lines. A line that is not five tab-separated
+    fields, or has a field longer than ``REPO_STATUS_MAX_FIELD``, is not a
+    status line and is dropped; at most ``REPO_STATUS_MAX_LINES`` lines are
+    read. Control characters are stripped from every field. A ``dirty`` token
+    other than ``true``/``false`` (``unknown``, ``missing``) and a count that
+    is not a small ASCII number both mean unknown (None)."""
+    out: list[RepoStatus] = []
+    for line in text.split("\n")[:REPO_STATUS_MAX_LINES]:
+        fields = line.split("\t")
+        if len(fields) != 5 or any(len(f) > REPO_STATUS_MAX_FIELD for f in fields):
+            continue
+        remote_dir, head, branch, dirty, unpushed = (
+            _CONTROL_CHARS.sub("", f) for f in fields
+        )
+        state = {"true": True, "false": False}.get(dirty)
+        out.append(RepoStatus(remote_dir, head, branch, state, _count(unpushed)))
+    return out
+
+
+def repo_record_path(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
+    """``<nick>/<sid>/repos.json``. An unsafe ``sid`` raises NodeConfigError
+    here rather than trusting every caller to have run ``pullable_sid``: the
+    sid comes from the node map, and ``../../x`` must never name a file
+    outside the node's own directory."""
+    if not pullable_sid(sid):
+        raise NodeConfigError(f"not a safe session id for a repo record: {sid!r}")
+    return node_dir(nick, nodes_dir=nodes_dir) / sid / "repos.json"  # E's layout owner
+
+
+def write_repo_record(
+    nick: str, sid: str, record: RepoRecord, *, nodes_dir: Path | None = None
+) -> bool:
+    """Replace ``<nick>/<sid>/repos.json`` through ``write_json_atomic`` (a
+    unique temp file, one replace, no temp left behind). False, with a log
+    line, when nothing was written: an OSError, a non-finite ``ts``
+    (ValueError, since NaN is not JSON), or an unsafe ``sid``
+    (NodeConfigError, also a ValueError). A failed write keeps the old
+    record."""
+    body = {
+        "ts": record.ts,
+        "source": record.source,
+        "repos": [dataclasses.asdict(r) for r in record.repos],
+    }
+    try:
+        write_json_atomic(repo_record_path(nick, sid, nodes_dir=nodes_dir), body)
+    except (OSError, ValueError):
+        get_logger("nodes").warning(
+            "could not write the repo record for %s/%r", nick, sid, exc_info=True
+        )
+        return False
+    return True
+
+
+def _repo_status(row: object) -> RepoStatus | None:
+    if not isinstance(row, dict):
+        return None
+    remote_dir, head, branch = row.get("remote_dir"), row.get("head"), row.get("branch")
+    if not (
+        isinstance(remote_dir, str)
+        and isinstance(head, str)
+        and isinstance(branch, str)
+    ):
+        return None
+    dirty, unpushed = row.get("dirty"), row.get("unpushed")
+    return RepoStatus(
+        remote_dir=remote_dir,
+        head=head,
+        branch=branch,
+        dirty=dirty if isinstance(dirty, bool) else None,
+        unpushed=unpushed
+        if isinstance(unpushed, int) and not isinstance(unpushed, bool)
+        else None,
+    )
+
+
+def read_repo_record(
+    nick: str, sid: str, *, nodes_dir: Path | None = None
+) -> RepoRecord | None:
+    """The stored record, or an error -- never a guess. None means exactly
+    one thing: there is no record file. A file that cannot be read raises
+    its OSError; one that is torn or not UTF-8, is not a record -- not an
+    object, a ``ts`` that is not a finite number (the node map's rule,
+    ``_epoch``), a bad ``source`` or ``repos`` -- or an unsafe ``sid``
+    (NodeConfigError) raises a ValueError. Unknown is never read as "no
+    record was ever written". A malformed row is dropped on its own."""
+    path = repo_record_path(nick, sid, nodes_dir=nodes_dir)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    body = json.loads(text)
+    if not isinstance(body, dict):
+        raise ValueError(f"{path}: not a JSON object")  # noqa: TRY004  # reason: corrupt DATA, the same family as a torn file's JSONDecodeError; callers catch one type for every bad file
+    ts, source, rows = _epoch(body.get("ts")), body.get("source"), body.get("repos")
+    if ts is None or not isinstance(source, str) or not isinstance(rows, list):
+        raise ValueError(f"{path}: not a repo record")
+    repos = tuple(s for s in (_repo_status(r) for r in rows) if s is not None)
+    return RepoRecord(ts=ts, source=source, repos=repos)
