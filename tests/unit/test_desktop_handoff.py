@@ -990,12 +990,15 @@ class _PollClock:
 
 
 class _HeldExitCode:
-    """rc.txt the way the launcher's ``Set-Content`` writes it: CREATED first,
+    """rc.txt the way a writer that is not atomic leaves it: CREATED first,
     empty, and held open while the value goes in.
 
-    ``locked`` holds it with no sharing, so a reader gets a sharing violation --
-    which is what Windows PowerShell measurably does (298 of 300 first reads
-    after the file appeared). ``shared`` holds a zero-byte file a reader CAN
+    The launcher itself renames a finished file into place; the reader keeps
+    its rule for everything else -- a scanner holding the file, and the
+    PowerShell launcher before this one, whose ``Set-Content`` did exactly
+    this. ``locked`` holds it with no sharing, so a reader gets a sharing
+    violation -- what that ``Set-Content`` measurably did (298 of 300 first
+    reads after the file appeared). ``shared`` holds a zero-byte file a reader CAN
     open, and reads as empty: the other half of the same window. ``partial``
     is ``shared`` with the first digit of a longer value already written and
     no line end yet. ``_winapi`` and not ``open()``, because Python's own open
@@ -1019,7 +1022,7 @@ class _HeldExitCode:
             self._winapi.WriteFile(self._handle, text.encode("ascii"))
 
     def finish(self, text: str) -> None:
-        """Write the rest and close -- the moment Set-Content returns."""
+        """Write the rest and close -- the moment the writer is done."""
         self.write(text)
         self.close()
 
@@ -1033,14 +1036,16 @@ class _HeldExitCode:
 class TestTheExitCodeIsFinalOnlyAsAnInteger:
     """rc.txt EXISTING is not the exit code being WRITTEN.
 
-    The launcher's ``Set-Content`` creates rc.txt before it writes the value
-    and holds it while it does, so a poll can see the file and read nothing.
-    That read used to be terminal -- ``rc=None``, "unreadable exit code ''" --
-    for a command that had succeeded: ``assert None == 7`` in
+    The PowerShell launcher's ``Set-Content`` created rc.txt before it wrote
+    the value and held it while it did, so a poll could see the file and read
+    nothing. That read used to be terminal -- ``rc=None``, "unreadable exit
+    code ''" -- for a command that had succeeded: ``assert None == 7`` in
     ``test_the_command_really_runs_and_its_streams_come_back``, on five CI runs
     of unrelated PRs. The pid.txt read already knew that "present but not an
-    integer" means "not yet"; both now also require the line end Set-Content
-    writes after the value, so a prefix is never final either.
+    integer" means "not yet"; both now also require a line end after the
+    value, so a prefix is never final either. The Python launcher renames a
+    finished file into place, but a scanner can still hold one, so the rule
+    stays and so do these tests.
 
     Driven through the poll directly, against real files, with no scheduler at
     all: the window is opened on purpose and held for a known number of poll
@@ -1060,8 +1065,8 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
         files[0].write_text("hello out\n", encoding="utf-8")
         files[1].write_text("hello err\n", encoding="utf-8")
         files[2].write_text("4242\n", encoding="utf-8")
-        # The child is gone -- the launcher writes rc.txt only after
-        # WaitForExit -- which is exactly the state a poll meets mid-write.
+        # The child is gone -- the launcher writes rc.txt only after wait()
+        # returns -- which is exactly the state a poll meets mid-write.
         monkeypatch.setattr("magent.platform.windows.pid_alive", lambda _p: False)
         clock = _PollClock()
         monkeypatch.setattr("magent.platform.windows.time", clock)
@@ -1100,7 +1105,7 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
             assert rc_file.read_text(encoding="utf-8") == ""
 
         def launcher(tick: int) -> None:
-            # Set-Content returns three poll ticks after it created the file.
+            # The writer finishes three poll ticks after it created the file.
             if tick == 3:
                 held.finish("7\r\n")
 
@@ -1123,7 +1128,7 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
         held = hold(files[3], "locked")
 
         def launcher(tick: int) -> None:
-            # Set-Content returns during the poll's LAST sleep.
+            # The writer finishes during the poll's LAST sleep.
             if tick == 2:
                 held.finish("7\r\n")
 
@@ -1139,7 +1144,7 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
         self, handoff, hold, monkeypatch
     ):
         # The budget runs out with rc.txt still held at the poll's final read,
-        # and Set-Content returns an instant later. The read the poll gives up
+        # and the writer finishes an instant later. The read the poll gives up
         # with is decisive: a code complete by then is the answer, not
         # something to print in `detail` and throw away.
         from magent.platform import windows
@@ -1165,7 +1170,7 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
         assert not work.exists()
 
     def test_a_partial_exit_code_is_not_yet_an_answer(self, handoff, hold):
-        # The "1" of "12": a value without the line end Set-Content writes
+        # The "1" of "12": a value without the line end every writer puts
         # after it may be a prefix, and a prefix must never be final.
         work, files, clock = handoff
         rc_file = files[3]
@@ -1190,7 +1195,7 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
 
         work, files, clock = handoff
         # The child died at t=0. rc.txt appears just inside the exit grace and
-        # Set-Content returns just after it -- the loaded-runner shape that
+        # the writer finishes just after it -- the loaded-runner shape that
         # grace exists for. A poll that ran the pid checks while the file was
         # there would call this a lost child at the grace, mid-write.
         created = round((_HANDOFF_EXIT_GRACE_S - 0.5) / _HANDOFF_POLL_S)
@@ -1280,7 +1285,7 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
 
     def _assert_unreadable_answer(self, result, work, mode, waited):
         assert result.rc is None
-        # rc.txt exists only after WaitForExit, so the command FINISHED: not
+        # rc.txt exists only after wait() returns, so the command FINISHED: not
         # "may still be running", and no fabricated exit code either.
         assert result.timed_out is False
         assert f"never became readable within {waited:.1f}s -- " in result.detail

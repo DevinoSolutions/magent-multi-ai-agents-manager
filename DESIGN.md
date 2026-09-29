@@ -1751,15 +1751,17 @@ under its imports. The command gets `CREATE_NEW_CONSOLE` with the window hidden
 (what `-WindowStyle Hidden` gave it) and stdin on the null device: nobody is at
 the desktop to type, and an inherited stdin is the task's console.
 
-A second one, on the reading side: `rc.txt` EXISTING is not the exit code being
-WRITTEN. `Set-Content` creates the file, then writes, and refuses readers until
-it closes -- measured, 298 of 300 first reads after the file appeared were a
-sharing violation. The poll treated that read as final and reported the same
-"unreadable exit code ''" for succeeded commands, a windows-latest unit flake
-on five unrelated PRs. So rc.txt goes through the same reader as pid.txt
-(`_read_recorded_int`), and only a COMPLETE integer ends the wait -- complete
-meaning ended by the newline `Set-Content` writes after every value, so the
-`1` of `12` can never be final. While rc.txt is present the lost-child check
+The reading side has its own rule: `rc.txt` EXISTING is not the exit code being
+READABLE. The PowerShell launcher's `Set-Content` created the file, then wrote,
+and refused readers until it closed -- measured, 298 of 300 first reads after
+the file appeared were a sharing violation. The poll treated that read as final
+and reported the same "unreadable exit code ''" for succeeded commands, a
+windows-latest unit flake on five unrelated PRs. The Python launcher renames a
+finished file into place, which closes its own window, but a scanner can still
+hold a file it has just seen written. So rc.txt goes through the same reader as
+pid.txt (`_read_recorded_int`), and only a COMPLETE integer ends the wait --
+complete meaning ended by a newline, so the `1` of `12` can never be final
+whoever wrote the file. While rc.txt is present the lost-child check
 stands down: a launcher still writing it has not lost anything. A present
 rc.txt that stays anything else past `_HANDOFF_RC_GRACE_S` (10s) or the budget
 gets one last, decisive read, and failing that is its own answer -- the

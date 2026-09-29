@@ -110,16 +110,17 @@ _HANDOFF_START_GRACE_S = 30.0
 # after this grace, not before.
 _HANDOFF_EXIT_GRACE_S = 15.0
 # How long a PRESENT rc.txt gets to become an integer. rc.txt existing is not
-# the exit code being written: `Set-Content` creates the file, then writes, and
-# refuses readers until it closes (measured: 298 of 300 first reads after the
-# file appeared were a sharing violation, a sub-millisecond window on an idle
-# box and an unbounded one on a loaded runner). Treating that read as final
-# reported "unreadable exit code ''" for commands that had succeeded, on five
-# windows-latest CI runs. Only a complete (newline-terminated) integer ends the
-# wait; this bounds the wait on an rc.txt that never becomes one (a launcher
-# that wrote no value, a file something keeps locked). It errs long because a
-# false answer here is a succeeded bring-up reported as failed, while the cost
-# of a long one falls only on an rc.txt that is broken anyway.
+# the exit code being readable: the launcher renames a finished file into
+# place, but a scanner can hold a file it has just seen written, and the
+# PowerShell launcher before it created the file first and refused readers
+# until it closed (measured: 298 of 300 first reads after the file appeared
+# were a sharing violation). Treating that read as final reported "unreadable
+# exit code ''" for commands that had succeeded, on five windows-latest CI
+# runs. Only a complete (newline-terminated) integer ends the wait; this bounds
+# the wait on an rc.txt that never becomes one (a file something keeps locked,
+# a value that is not a number). It errs long because a false answer here is a
+# succeeded bring-up reported as failed, while the cost of a long one falls
+# only on an rc.txt that is broken anyway.
 _HANDOFF_RC_GRACE_S = 10.0
 # How long to keep retrying the scratch-directory delete after success. The
 # launcher and the powershell.exe running it are still exiting for the few
@@ -302,9 +303,9 @@ def _read_recorded_int(path: Path) -> int | None:
     or None until it has written one.
 
     None covers every "not yet": the file is absent, present but empty,
-    present but still held by the writer (``Set-Content`` creates the file
-    before it writes the value and refuses readers until it closes, and this
-    poll reads every 250ms), or present with a value that is not complete. All
+    present but held by something else (a scanner that has just seen it
+    written, and this poll reads every 250ms), or present with a value that is
+    not complete. All
     of them mean "no answer yet", never "it failed"; only a complete integer
     (see ``_recorded_int``) is an answer.
     """
@@ -328,8 +329,8 @@ def _settle_exit_code(
     the poll's last look is the answer, like any other. Otherwise this is the
     fourth answer, distinct from the other three: not "never started" and not
     "lost its child" (the launcher got as far as its exit code), and not "may
-    still be running" (rc.txt is written after WaitForExit, so the command is
-    done). The command FINISHED and we cannot say how, so no exit code is
+    still be running" (the launcher writes rc.txt after ``wait()`` returns, so
+    the command is done). The command FINISHED and we cannot say how, so no exit code is
     fabricated -- but its output, complete by now, is relayed.
 
     ``detail`` names what that read saw, in our words: a file that refused the
@@ -346,8 +347,8 @@ def _settle_exit_code(
             waited_s,
             exc,
         )
-        # Say only what is known: errno 13 is usually Set-Content's share
-        # lock, but an ACL denial and a delete-pending file raise it too.
+        # Say only what is known: errno 13 is usually a share lock (a
+        # scanner's), but an ACL denial and a delete-pending file raise it too.
         why = (
             "was locked or refused"
             if isinstance(exc, PermissionError)
@@ -1290,12 +1291,12 @@ class WindowsPlatform(Platform):
             if time.monotonic() >= deadline:
                 break
             if rc_file.exists():
-                # The launcher is mid-Set-Content: the file is there and the
-                # value is not yet. Not a lost child either -- the launcher got
-                # as far as its exit code -- so the pid checks below are moot,
-                # and running them would be wrong: a child gone longer than the
-                # exit grace whose launcher is only now writing rc.txt is the
-                # loaded-runner success path, not a lost child.
+                # The file is there and a readable value is not yet. Not a
+                # lost child either -- the launcher got as far as its exit
+                # code -- so the pid checks below are moot, and running them
+                # would be wrong: a child gone longer than the exit grace whose
+                # rc.txt is only now becoming readable is the loaded-runner
+                # success path, not a lost child.
                 if rc_seen_since is None:
                     rc_seen_since = time.monotonic()
                 waited = time.monotonic() - rc_seen_since
@@ -1340,9 +1341,10 @@ class WindowsPlatform(Platform):
                     )
             time.sleep(_HANDOFF_POLL_S)
         if rc_file.exists():
-            # The budget ran out mid-write: the command is done (rc.txt lands
-            # after WaitForExit), so this is not "may still be running" -- and
-            # the settling read may yet find the code complete.
+            # The budget ran out before rc.txt read as a number: the command
+            # is done (rc.txt lands after wait() returns), so this is not "may
+            # still be running" -- and the settling read may yet find the code
+            # complete.
             waited = 0.0 if rc_seen_since is None else time.monotonic() - rc_seen_since
             return _settle_exit_code(files, task, work, waited)
         # Deliberately NO kill. A bring-up still running on the desktop past
