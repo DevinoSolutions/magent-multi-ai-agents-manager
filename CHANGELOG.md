@@ -5,6 +5,74 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.19.4] - 2026-09-29
+
+### Fixed
+
+- **A desktop hand-off from a folder whose path has non-ASCII characters
+  works again (Windows).** Since 3.18.0, magent wrote the hand-off script as
+  UTF-8 without a byte-order mark, so Windows PowerShell 5.1 read it in the
+  legacy code page. A hand-off from such a folder therefore failed, and some
+  letters, such as `Ñ` or `т`, even ended the quoted path early. The script
+  is now written with a byte-order mark, so PowerShell reads it as UTF-8.
+  magent also now escapes all five characters PowerShell ends a quoted
+  string on: the curly quotes `‘` `’` `‚` `‛` as well as `'`.
+
+- **A settings file magent cannot read is refused by name, never with a
+  traceback and never by rewriting it.** This covers the Windows Terminal
+  `settings.json` (`magent terminal`, `doctor`), Claude Code's
+  `settings.json` (`magent hooks`) and `~/.magent/.env`.
+  - A file nested deeper than the JSON parser allows used to crash
+    `terminal`, `hooks` and `doctor`, and `doctor --json` printed nothing at
+    all.
+  - A `.env` that is not UTF-8, or that another program holds locked, used to
+    crash every command. It now fails like any invalid environment, with one
+    line naming the file and the repair. A `.env` saved with a byte-order
+    mark now loads.
+  - `magent hooks install` could rewrite a Claude `settings.json` whose shape
+    it did not understand, replacing your values. It now refuses. `magent
+    hooks status` says it cannot tell what is wired and exits 1, instead of
+    crashing or listing every hook as missing.
+  - When `hooks install` rewrites `settings.json`, the file keeps its
+    permissions. A file that can hold API keys no longer comes back readable
+    by everyone on Linux and macOS, and a read-only file is refused rather
+    than silently replaced.
+  - `magent terminal` gives its "comments and trailing commas" advice only
+    when the file really has a JSON syntax error.
+  - A Claude `settings.json` saved with a byte-order mark, as Windows
+    PowerShell 5.1's `-Encoding utf8` writes it, is now read by `magent hooks
+    install` and `magent hooks status` instead of being refused as invalid
+    JSON. `hooks install` writes the file back without the mark.
+
+- **A name your console cannot print no longer crashes a command (Windows).**
+  When output was piped or redirected, one character outside the Windows
+  code page, such as a CJK letter in a project path, ended `magent config
+  show`, `magent up --json` and every other printing command with a
+  `UnicodeEncodeError` traceback. For a desktop hand-off, whose output is
+  always redirected, that could happen after the sessions were already up.
+  Such a character now prints as a Python escape (`\u4e2d`), and everything
+  else prints as before. A desktop hand-off from a folder such as `café` now
+  relays its accents instead of garbling them.
+
+- **Bringing up the fleet can no longer hang forever on one stuck psmux
+  session (Windows).** `magent --go`, `magent up` (also the host side of
+  `magent attach`) and the menu's `u` waited, with no limit, on every psmux
+  command they ran. One session that stopped answering held the whole
+  bring-up, so the command never returned. Every wait now has a deadline. A
+  session magent cannot get an answer from is left alone, never killed and
+  re-created, because an unresponsive session can still be a live agent in
+  the middle of a turn. The rest of the fleet comes up, and each session that
+  could not is listed under "failed to come up" with the reason.
+
+- **A desktop hand-off no longer loses a fast command's exit code
+  (Windows).** Since 3.18.0, a `magent up` that arrives over ssh re-runs
+  itself on the host's desktop and reports that copy's exit code. Windows
+  PowerShell started that copy and let go of it, so a command that finished
+  quickly lost its exit code, and a bring-up that had worked came back with
+  none. A small Python launcher now starts the command and keeps hold of it,
+  so the exit code always comes back. A command that cannot start at all is
+  now reported at once, with the reason, instead of after a wait.
+
 ## [3.19.3] - 2026-09-28
 
 ### Fixed
@@ -1518,6 +1586,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.19.4]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.3...v3.19.4
 [3.19.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.2...v3.19.3
 [3.19.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.1...v3.19.2
 [3.19.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.0...v3.19.1
