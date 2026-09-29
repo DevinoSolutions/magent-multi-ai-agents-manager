@@ -2186,7 +2186,7 @@ which predates win32-input-mode and may pass the CR through unencoded.
 residuals of "The bring-up never waits forever" in §2. Items 1-3 and 5 were
 found by reading the code, and none has been seen on the fleet. Item 4 was
 reproduced.
-(A fifth, "a timed-out new-session may still produce its session and be
+(A sixth, "a timed-out new-session may still produce its session and be
 counted created", is closed: a refusal is now final, see §2.)
 
 1. *Four helpers on the bring-up path are bounded only on paper on Windows.*
@@ -2242,11 +2242,13 @@ counted created", is closed: a refusal is now final, see §2.)
    `launch_psmux_session`'s refusals: the only trace is a WARNING in
    `launch.log`. `launch_verified` finds the session live, so it is counted
    created, possibly with no agent running. That is the shape the late-created
-   session had before a refusal became final. `magent up`'s revive finds such
-   a pane; `--go` does not. Refusing it would be wrong too, since the command
-   may be running. The fix is a third outcome: return the unsure names beside
-   the refusals, and have `report_bring_up_casualties` name them on their own
-   line ("may not have its agent") without counting them as failed.
+   session had before a refusal became final. The NEXT `magent up` revives
+   such a pane; the run that created it does not, because `up` only revives
+   sessions that were live before it began, and `--go` never revives. Refusing
+   it would be wrong too, since the command may be running. The fix is a third
+   outcome: return the unsure names beside the refusals, and have
+   `report_bring_up_casualties` name them on their own line ("may not have its
+   agent") without counting them as failed.
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
