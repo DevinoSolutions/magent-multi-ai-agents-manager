@@ -1650,30 +1650,45 @@ in the PAST, so a task stranded by a killed caller (an ssh drop takes the
 host-side `magent up` with it) can never fire on its own; `/Run` ignores the
 trigger entirely.
 
-**The task runs a PowerShell file, and both quoting layers are load-bearing.**
+**The task runs a three-line PowerShell file, and the command is not in it.**
 `/TR` truncates SILENTLY past ~261 characters, so it carries only a fixed
-launcher (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File <script>`;
-Windows PowerShell, not `pwsh`, which is not on every box) and the real argv
-lives in the script. PowerShell rather than a `.cmd` shim fixes three things a
-batch file gets wrong: `-WindowStyle Hidden` means the desktop is not shown a
-console window for a command nobody typed; `$p.ExitCode` is the real exit
-status rather than a parsed `%ERRORLEVEL%`; and cmd would read an `&` in an
-unquoted argument as a command separator, which `list2cmdline` does not defend
-against (it quotes for whitespace and quotes only) -- on a machine whose
-project path literally contains `&`, that is not hypothetical. The two layers
-are `subprocess.list2cmdline(argv)` building one command line by the MS
-C-runtime rules the child's own parser uses, then `_ps_quote` making that whole
-string ONE PowerShell literal for `-ArgumentList`. Passing a LIST to
-`-ArgumentList` skips the first layer: PowerShell joins array elements with
-bare spaces and does not re-quote, so `--config C:\A B\magent.json` arrives as
-two arguments.
+launcher (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File <run.ps1>`;
+Windows PowerShell, not `pwsh`, which is not on every box). `run.ps1` sets
+`$ErrorActionPreference = 'Stop'`, exports `MAGENT_SESSION0_POLICY=refuse`, and
+runs `& '<python>' -I '<scratch>\launch.py'` -- the interpreter magent itself is
+running under, and `launch.py` a byte-for-byte copy of
+`platform/_handoff_launcher.py`. The argv travels in `argv.json` (ASCII json:
+every non-ASCII code point escaped, lone surrogates included), never as a
+command line, so there is no quoting layer between the user's arguments and the
+child: the launcher hands the list to `subprocess.Popen`, whose `list2cmdline`
+is the one quoting pass, by the MS C-runtime rules the child's own parser uses.
+The only things PowerShell sees are two paths, each ONE `_ps_quote`d literal.
+The file is written UTF-8 WITH a BOM, because 5.1's `-File` reads a BOM-less
+script as the ANSI code page and a scratch or interpreter path holding `Ñ` or
+`т` would reach PowerShell corrupted; a path with no UTF-8 form at all (a lone
+surrogate, which Windows allows in a directory name) is refused before any
+task exists.
 
-One measured trap worth keeping: a `Start-Process -PassThru` object's
-`.ExitCode` is `$null` forever unless `$p.Handle` is touched while the process
-is still alive. PowerShell does not hold the handle, so once the child exits
-the OS has nothing left to ask. `rc.txt` came back EMPTY on every run until
-that line existed, and the hand-off then reported an "unreadable exit code" for
-commands that had succeeded.
+**The launcher is Python because PowerShell cannot hold the handle.** The
+previous launcher was `Start-Process -PassThru -RedirectStandard*`, then
+`$null = $p.Handle` and `$p.WaitForExit()`, and it lost exit codes. Windows
+PowerShell 5.1's redirecting `Start-Process` closes the handle CreateProcess
+returned, and `.Handle` re-opens the process BY PID, after the fact: a child
+that had already exited left `.ExitCode` at `$null` and `rc.txt` empty, and the
+hand-off reported an "unreadable exit code" for a bring-up that had worked.
+Touching `.Handle` early only narrowed that window; nothing in PowerShell can
+close it. `subprocess.Popen` keeps the CreateProcess handle, so `wait()` reads
+the code however fast the child was. The race is pinned deterministically, not
+by timing: `tests/unit/_jobhook.py` puts the task in a named job object whose
+watcher kills the command with code 7 the moment its first thread runs --
+before any launcher can look -- and the test asserts that kill happened before
+it asserts `rc == 7`. The launcher is stdlib only and imports nothing from
+magent (it runs outside the package), and it reads and sets no environment
+variable; `-I` keeps PYTHONPATH, PYTHONHOME and the scratch directory off
+`sys.path`, so nothing in the user's environment can put a different module
+under its imports. The command gets `CREATE_NEW_CONSOLE` with the window hidden
+(what `-WindowStyle Hidden` gave it) and stdin on the null device: nobody is at
+the desktop to type, and an inherited stdin is the task's console.
 
 **`schtasks` comes from the system directory, not PATH.** `run_on_desktop` is
 reached from an ssh login, and letting that login's PATH choose what runs as
@@ -1714,20 +1729,27 @@ that setting cannot change a normal desktop launch. Off Windows every platform
 reports interactive and nothing changes at all -- tmux over ssh is how people
 work there.
 
-Three smaller details that are load-bearing. The launcher passes
-`-WorkingDirectory` the caller's directory (a scheduled task starts in
-`system32`, and `find_config` walks up from the cwd, so the desktop copy would
-otherwise bring up a different config's projects). It exports
-`MAGENT_SESSION0_POLICY=refuse` for its child, so a hand-off that somehow
+Three smaller details that are load-bearing. `argv.json` carries the caller's
+working directory and the launcher starts the command there (a scheduled task
+starts in `system32`, and `find_config` walks up from the cwd, so the desktop
+copy would otherwise bring up a different config's projects). `run.ps1` exports
+`MAGENT_SESSION0_POLICY=refuse` for the child, so a hand-off that somehow
 landed in Session 0 again cannot recurse -- a recursion whose every level
-writes a scheduled task. And it writes `pid.txt` the moment `Start-Process`
-returns and `rc.txt` only after `WaitForExit`, which is what lets the poll tell
-three failures apart: no pid after the start grace means Task Scheduler never
-ran the task, a pid that is gone with no rc means the launcher lost its child
-and nothing is coming, and neither is the caller's budget simply running out.
-On that last one the delegated child is deliberately NOT killed: a bring-up
-still running on the desktop is doing the work that was asked for, and the pid
-is a number Windows recycles freely.
+writes a scheduled task. And the launcher writes `pid.txt` the moment the child
+exists and `rc.txt` only after `wait()` returns, each one decimal integer and a
+newline written to a temporary name and renamed into place, so the 250ms poll
+never reads a half-written one (the exit code is the signed Int32 Windows
+tools print, so an NTSTATUS arrives as `-1073741510`, not `3221225786`). That
+order is what lets the poll tell three failures apart: no pid after the start
+grace means Task Scheduler never ran the task, a pid that is gone with no rc
+means the launcher lost its child and nothing is coming, and neither is the
+caller's budget simply running out. On that last one the delegated child is
+deliberately NOT killed: a bring-up still running on the desktop is doing the
+work that was asked for, and the pid is a number Windows recycles freely. A
+command that cannot be started at all -- a missing executable, a working
+directory that is gone -- gets its reason appended to `err.txt` and `rc.txt` =
+1 with no `pid.txt`, so the caller hears it at once instead of after the start
+grace.
 
 Diagnostics are the other half: `doctor`'s `psmux-session0` check and one
 `status` stderr line count psmux servers still stranded there (by image name
@@ -1737,9 +1759,11 @@ high-integrity ones). WARN, never FAIL, and additive in `status --json`
 must not move the 0/1/3 exit contract.
 
 Proof: `tests/unit/test_desktop_handoff.py` (the policy, the refusal wordings,
-the relay, both quoting layers, and the real create/run/poll/delete
+the relay, the staged files read back exactly and `run.ps1`'s parsed shape,
+the job-object exit-code pin, and the real create/run/poll/delete
 choreography against a FAKE `schtasks` installed through the `_schtasks_exe`
-seam), `tests/unit/test_attach.py::
+seam), `tests/unit/test_handoff_launcher.py` (the launcher itself, on every
+OS, against real child processes), `tests/unit/test_attach.py::
 TestUpHandsOffFromSessionZero`, `tests/unit/test_serve_port.py::
 TestEnsureHandsOffFromSessionZero`, and `tests/e2e/test_session0_handoff.py`
 (a REAL `magent up` child told it is an ssh login). `tests/conftest.py` pins
