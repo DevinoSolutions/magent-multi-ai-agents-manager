@@ -1426,9 +1426,9 @@ def up_cmd(
         decorate_psmux_sessions_async,
         psmux_status,
         relay_handoff,
+        report_bring_up_casualties,
         revive_psmux,
         session0_disposition,
-        session0_note,
         session0_refusal,
     )
 
@@ -1557,23 +1557,12 @@ def up_cmd(
         # `created` now means "the verify proved it is up", so the sessions it
         # does NOT contain have to be named -- this line is what `magent attach`
         # relays from the host, and a silent casualty there reads as success.
-        if failed:
-            click.echo(
-                f"  {style('x', fg='red')} {style(str(len(failed)), fg='red', bold=True)}"
-                f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
-                f" {style('(see ~/.magent/logs/launch.log on the host)', dim=True)}"
-            )
-            # A session the bring-up deliberately left alone says why (e.g. it
-            # could not tell whether the session was running).
-            for why in failed.values():
-                if why:
-                    click.echo(f"    {style(why, dim=True)}")
-            # Only ever set when the choke point refused -- the hand-off and
-            # refusal above have already returned on every other Session-0
-            # path -- so this is the "policy said no" case wearing its reason.
-            note = session0_note()
-            if note:
-                click.echo(f"  {style(note, dim=True)}")
+        # Its Session-0 note is only ever set when the choke point refused: the
+        # hand-off and refusal above have already returned on every other
+        # Session-0 path.
+        report_bring_up_casualties(
+            failed, log_hint="(see ~/.magent/logs/launch.log on the host)"
+        )
 
     # Unconditional on the interactive path: a session that is up but parked at
     # a bare shell is exactly what this command is asked to fix, and there is

@@ -36,7 +36,7 @@ from magent.titles import generate_titles, get_leaf_name, make_title, parse_titl
 
 if TYPE_CHECKING:
     import subprocess
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from magent.config import MagentConfig, ProjectConfig
     from magent.env import MagentEnv
@@ -160,6 +160,34 @@ def session0_note() -> str | None:
     if session0_disposition(plat) == "run":
         return None
     return session0_refusal(plat)
+
+
+def report_bring_up_casualties(
+    failed: Mapping[str, str], *, log_hint: str = "(see ~/.magent/logs/launch.log)"
+) -> None:
+    """Print the "N session(s) failed to come up" block; nothing when none did.
+
+    THE one printer for a bring-up's casualties -- `--go`, the menu's "u" and
+    `magent up` (the block `magent attach` relays from the host) all report
+    through it, so the three cannot drift apart again. The count and names,
+    then one dimmed line per KNOWN reason (a session the bring-up deliberately
+    left alone says why: "could not tell" is not "dead"), then
+    ``session0_note``: a casualty list with no cause is what sent a user
+    hunting through launch.log last time.
+    """
+    if not failed:
+        return
+    click.echo(
+        f"  {style('x', fg='red')} {style(str(len(failed)), fg='red', bold=True)}"
+        f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
+        f" {style(log_hint, dim=True)}"
+    )
+    for why in failed.values():
+        if why:
+            click.echo(f"    {style(why, dim=True)}")
+    note = session0_note()
+    if note:
+        click.echo(f"  {style(note, dim=True)}")
 
 
 def relay_handoff(plat: Platform, argv: list[str], *, timeout_s: float) -> int:
@@ -1079,27 +1107,14 @@ def _start_psmux_and_upload(
         from magent import psmux
 
         failed = psmux.launch_verified(plat, psmux_windows)
+        # Same honesty the attach/menu bring-up paths now have: a session the
+        # verify proved never came up must not be counted among the ones this
+        # path reports below. `--go` never hands off (it is a local,
+        # interactive command by definition), so a Session-0 casualty here
+        # means the choke point refused, and the note names it.
         if failed:
-            # Same honesty the attach/menu bring-up paths now have: a session
-            # the verify proved never came up must not be counted among the
-            # ones this path reports below.
-            click.echo(
-                f"\n  {style('x', fg='red')} {style(str(len(failed)), fg='red', bold=True)}"
-                f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
-                f" {style('(see ~/.magent/logs/launch.log)', dim=True)}"
-            )
-            # A session the bring-up deliberately left alone says why (e.g. it
-            # could not tell whether the session was running).
-            for why in failed.values():
-                if why:
-                    click.echo(f"    {style(why, dim=True)}")
-            # `--go` never hands off (it is a local, interactive command by
-            # definition), so reaching here in Session 0 means the choke point
-            # refused -- and a casualty list with no cause is what sent a user
-            # hunting through launch.log last time.
-            note = session0_note()
-            if note:
-                click.echo(f"  {style(note, dim=True)}")
+            click.echo()
+        report_bring_up_casualties(failed)
         for pw in psmux_windows:
             plat.attach_psmux(
                 pw.window_name,
