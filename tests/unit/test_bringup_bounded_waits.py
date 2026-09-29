@@ -377,22 +377,38 @@ class _Fake:
         launcher they followed down: a stall that ended because its launcher
         was killed is proof the product killed it, and ``released`` (the
         fixture's teardown) can only happen after this runs.
+
+        Stalls and ends are matched by record, and re-read until they agree:
+        a client killed at the deadline before it reached its hang keeps
+        running (killing the .cmd leaves the interpreter), so it can publish
+        its stall AND its end after a first read. Counting one snapshot
+        against a later one failed 5 of 150 loaded runs (6 ends, 5 stalls).
         """
-        stalls = self.stalls()
-        assert stalls, "the pin never reached its hanging client"
         deadline = time.monotonic() + _GONE_GRACE_S
-        for s in stalls:
-            pids = [int(s["pid"])]
-            if sys.platform == "win32":
-                pids.append(int(s["ppid"]))
-            while any(pid_alive(p) for p in pids) and time.monotonic() < deadline:
-                time.sleep(0.1)
-            assert not any(pid_alive(p) for p in pids), (
-                f"a timed-out psmux client was left running: {s['argv']}"
-            )
+        while True:
+            stalls = self._by_stem("stalls")
+            ends = self._by_stem("ends")
+            running = {
+                stem: s
+                for stem, s in stalls.items()
+                if pid_alive(int(s["pid"]))
+                or (sys.platform == "win32" and pid_alive(int(s["ppid"])))
+            }
+            unended = [
+                stem for stem in stalls if sys.platform == "win32" and stem not in ends
+            ]
+            if (not running and not unended) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        assert stalls, "the pin never reached its hanging client"
+        assert not running, (
+            "a timed-out psmux client was left running: "
+            f"{[s['argv'] for s in running.values()]}"
+        )
         if sys.platform == "win32":
-            ends = [str(e["how"]) for e in self._records("ends")]
-            assert ends.count("launcher-killed") == len(stalls), ends
+            assert not unended, f"hung clients that never ended: {unended}"
+            hows = {stem: ends[stem]["how"] for stem in stalls}
+            assert set(hows.values()) == {"launcher-killed"}, hows
 
 
 @pytest.fixture
