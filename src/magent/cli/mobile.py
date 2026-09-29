@@ -183,6 +183,7 @@ def serve_cmd(
     Claude session via psmux send-keys.
     """
     from magent.upload_server import (  # heavy subsystem: in-body per policy
+        BindFailed,
         run_server,
     )
 
@@ -238,6 +239,12 @@ def serve_cmd(
         run_server(port=port, config_path=config_path, host=host)
     except KeyboardInterrupt:
         click.echo(f"\n  {style('Server stopped.', dim=True)}")
+    except BindFailed as e:
+        # Never started, so a sentence rather than a traceback. The common case
+        # is another serve already holding the port -- which is fine, and is
+        # exactly what a racing watchdog or --ensure spawn should run into.
+        click.echo(f"  {style('x', fg='red')} {e}", err=True)
+        sys.exit(1)
 
 
 @main.command("mobile")

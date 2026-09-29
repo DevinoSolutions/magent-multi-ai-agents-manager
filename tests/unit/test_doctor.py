@@ -59,6 +59,26 @@ class TestCheckConfig:
         assert result[0] == OK
         assert cfg is not None
 
+    def test_text_with_no_utf8_form_fails_in_our_words(self, tmp_config):
+        # F-SUR-1: a colorless title with a lone surrogate used to escape this
+        # check as the tab-color hash's UnicodeEncodeError (not a ConfigError),
+        # taking doctor down with a traceback instead of reporting the config.
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "projects": [{"path": "api", "title": "api\ud83d"}],
+            }
+        )
+        (result, cfg) = _check_config(Path(path))
+        assert result == (
+            FAIL,
+            (
+                "config invalid: projects[0].title has text with no UTF-8 form"
+                " (UnicodeEncodeError): 'api\\ud83d'"
+            ),
+        )
+        assert cfg is None
+
 
 class TestCheckEnv:
     def test_invalid_field_fails_naming_the_full_var(self, monkeypatch):

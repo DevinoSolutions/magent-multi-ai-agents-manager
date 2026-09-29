@@ -336,7 +336,10 @@ and its exit codes (0/2/3/4) make it safe to drive from a script. `model` only
 switches a session while it is **idle** — never mid-turn — and re-reads the
 `<Model> · <effort>` footer to verify the change took, retrying anything busy
 until `--max-minutes` runs out. All three resolve a session name
-case-insensitively and refuse a name that is not live.
+case-insensitively and refuse a name that is not live. A pane psmux does not
+answer within a few seconds (a loaded box) is reported as unread, never as
+empty: `send` exits 4 (not confirmed), `peek` exits 3, and `sessions --json`
+shows `"state": "timeout"` rather than `"nopane"`.
 
 > The slash-commands `send`/`model` issue (`/compact`, `/model`, `/effort`) are
 > built inside magent and handed to psmux as a list argument, never through a

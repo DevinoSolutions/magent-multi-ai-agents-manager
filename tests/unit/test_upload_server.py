@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import sys
 import threading
 import time
 from http.client import HTTPConnection
@@ -1478,6 +1479,499 @@ class TestBindAddresses:
             assert srv.server_port != 0
         finally:
             srv.server_close()
+
+
+class TestOnePortOneServer:
+    """A second ``magent serve`` on a port one already holds must FAIL to bind.
+
+    The defect: ``ThreadingHTTPServer`` sets ``allow_reuse_address``, i.e.
+    SO_REUSEADDR, and on Windows that option lets a second process bind a port
+    that is already LISTENING. Measured: two live servers on one port, both
+    logging ``listening ... :15505``, the pid file naming only the later one --
+    so the watchdog killed or revived the wrong one and ``/health`` was answered
+    by whichever server the kernel happened to pick. Linux SO_REUSEADDR never
+    allowed two live listeners on the same address, which is why only Windows
+    ever showed it.
+
+    Every port here is ephemeral (bind 0, then reuse what the kernel handed
+    out); a real ``magent serve`` port is never touched.
+    """
+
+    def test_a_second_server_on_a_held_port_is_refused(self):
+        import magent.upload_server as mod
+
+        first = mod._NoFqdnHTTPServer(("127.0.0.1", 0), mod.UploadHandler)
+        try:
+            port = first.server_address[1]
+            with pytest.raises(OSError) as refused:
+                second = mod._NoFqdnHTTPServer(("127.0.0.1", port), mod.UploadHandler)
+                second.server_close()  # only reached on the regression
+            assert mod._port_taken(refused.value)
+        finally:
+            first.server_close()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="SO_EXCLUSIVEADDRUSE")
+    def test_windows_claims_the_port_exclusively(self):
+        import socket
+
+        import magent.upload_server as mod
+
+        srv = mod._NoFqdnHTTPServer(("127.0.0.1", 0), mod.UploadHandler)
+        try:
+            opt = srv.socket.getsockopt
+            assert opt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE) == 1
+            assert opt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
+        finally:
+            srv.server_close()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="SO_EXCLUSIVEADDRUSE")
+    def test_windows_refuses_a_foreign_reuseaddr_socket_too(self):
+        """A regression guard, not the exclusivity pin (the getsockopt test above
+        is): this build of Windows refuses a same-address SO_REUSEADDR socket
+        -- the stdlib default -- even against a plain holder. Guards that the
+        server never regresses to a holder such a socket CAN join."""
+        import socket
+
+        import magent.upload_server as mod
+
+        srv = mod._NoFqdnHTTPServer(("127.0.0.1", 0), mod.UploadHandler)
+        thief = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            thief.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with pytest.raises(OSError):
+                thief.bind(("127.0.0.1", srv.server_address[1]))
+        finally:
+            thief.close()
+            srv.server_close()
+
+    def test_the_options_are_set_before_the_bind(self, monkeypatch):
+        """Microsoft: SO_EXCLUSIVEADDRUSE only works if set BEFORE bind. After
+        it, a loopback-only test cannot tell the difference -- so pin the order
+        by reading the socket at the moment the stdlib bind runs."""
+        import socket
+        import socketserver
+
+        import magent.upload_server as mod
+
+        seen = []
+        stdlib_bind = socketserver.TCPServer.server_bind
+
+        def _bind(self):
+            opt = self.socket.getsockopt
+            if sys.platform == "win32":
+                seen.append(opt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE))
+            else:
+                seen.append(opt(socket.SOL_SOCKET, socket.SO_REUSEADDR))
+            stdlib_bind(self)
+
+        monkeypatch.setattr(socketserver.TCPServer, "server_bind", _bind)
+        srv = mod._NoFqdnHTTPServer(("127.0.0.1", 0), mod.UploadHandler)
+        srv.server_close()
+        assert len(seen) == 1
+        assert seen[0] != 0
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX keeps SO_REUSEADDR")
+    def test_posix_keeps_reuseaddr(self):
+        import socket
+
+        import magent.upload_server as mod
+
+        srv = mod._NoFqdnHTTPServer(("127.0.0.1", 0), mod.UploadHandler)
+        try:
+            assert srv.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0
+        finally:
+            srv.server_close()
+
+    def test_a_restart_right_after_serving_traffic_rebinds_the_port(self):
+        """The reason SO_REUSEADDR existed at all. The server closes each
+        connection first, so its side sits in TIME_WAIT after every request:
+        POSIX refuses the rebind without SO_REUSEADDR, and Windows must keep
+        rebinding with SO_EXCLUSIVEADDRUSE (an upgrade restarts serve at once).
+        """
+        import urllib.request
+        from http.server import BaseHTTPRequestHandler
+
+        import magent.upload_server as mod
+
+        class _Ok(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        first = mod._NoFqdnHTTPServer(("127.0.0.1", 0), _Ok)
+        port = first.server_address[1]
+        loop = threading.Thread(target=first.serve_forever, daemon=True)
+        loop.start()
+        try:
+            for _ in range(5):
+                url = f"http://127.0.0.1:{port}/"
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    assert resp.read() == b"ok"
+        finally:
+            first.shutdown()
+            first.server_close()
+            loop.join(timeout=10)
+
+        again = mod._NoFqdnHTTPServer(("127.0.0.1", port), _Ok)
+        again.server_close()
+
+    def test_the_stdlib_default_is_switched_off(self):
+        """TCPServer.server_bind adds SO_REUSEADDR itself when this is true --
+        on Windows that alone re-opens the double bind."""
+        import magent.upload_server as mod
+
+        assert mod._NoFqdnHTTPServer.allow_reuse_address is False
+
+
+class _RecordingSocket:
+    def __init__(self):
+        self.options = []
+
+    def setsockopt(self, level, name, value):
+        self.options.append((level, name, value))
+
+
+class TestClaimPortOptions:
+    """The per-OS bind policy, driven with a fake socket so BOTH branches run
+    on every OS. The real-socket half is TestOnePortOneServer."""
+
+    def test_windows_sets_exclusive_and_never_reuseaddr(self):
+        import socket
+
+        import magent.upload_server as mod
+
+        sock = _RecordingSocket()
+        mod._claim_port_options(sock, platform="win32")
+        assert sock.options == [(socket.SOL_SOCKET, -5, 1)]
+        assert not [o for o in sock.options if o[1] == socket.SO_REUSEADDR]
+
+    def test_the_exclusive_constant_is_winsocks(self):
+        import socket
+
+        import magent.upload_server as mod
+
+        if sys.platform == "win32":
+            assert mod._SO_EXCLUSIVEADDRUSE == socket.SO_EXCLUSIVEADDRUSE
+        assert mod._SO_EXCLUSIVEADDRUSE == -5  # ((int)(~SO_REUSEADDR)), SO_REUSEADDR=4
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    def test_posix_sets_reuseaddr_only(self, platform):
+        import socket
+
+        import magent.upload_server as mod
+
+        sock = _RecordingSocket()
+        mod._claim_port_options(sock, platform=platform)
+        assert sock.options == [(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)]
+
+
+class _WinError(OSError):
+    """An OSError carrying a Windows socket code, constructible on every OS."""
+
+    def __init__(self, err, winerror):
+        super().__init__(err, "refused")
+        self.winerror = winerror
+
+
+class TestPortTaken:
+    def test_addr_in_use_is_taken(self):
+        import errno
+
+        import magent.upload_server as mod
+
+        assert mod._port_taken(OSError(errno.EADDRINUSE, "Address already in use"))
+
+    def test_wsaeacces_is_ambiguous_not_taken(self):
+        """Measured: an exclusive wildcard holder refuses loopback with
+        WSAEACCES -- and so does a Windows-reserved port with no holder at all
+        (127.0.0.1:17000). The code alone cannot say "taken"."""
+        import errno
+
+        import magent.upload_server as mod
+
+        exc = _WinError(errno.EACCES, 10013)
+        assert not mod._port_taken(exc)
+        assert mod._access_refused(exc, platform="win32")
+
+    def test_eacces_on_posix_is_a_privileged_port_not_a_holder(self):
+        import errno
+
+        import magent.upload_server as mod
+
+        exc = OSError(errno.EACCES, "denied")
+        assert not mod._port_taken(exc)
+        assert not mod._access_refused(exc, platform="linux")
+
+    def test_an_address_that_is_not_ours_is_not_taken(self):
+        """A Tailscale IP that went away keeps the degraded path it always had."""
+        import errno
+
+        import magent.upload_server as mod
+
+        exc = OSError(errno.EADDRNOTAVAIL, "Cannot assign requested address")
+        assert not mod._port_taken(exc)
+        assert not mod._access_refused(exc, platform="win32")
+
+
+class TestHolderAnswers:
+    """The probe that splits WSAEACCES into held and reserved. Real loopback
+    sockets on ephemeral ports only; nothing binds the wildcard."""
+
+    def test_a_listening_port_answers(self):
+        import socket
+
+        import magent.upload_server as mod
+
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(8)  # room for both probes; nothing ever accepts
+            port = holder.getsockname()[1]
+            assert mod._holder_answers("127.0.0.1", port)
+            # A wildcard refusal is asked on loopback, where the holder is.
+            assert mod._holder_answers("0.0.0.0", port)
+        finally:
+            holder.close()
+
+    def test_a_port_nobody_listens_on_does_not(self):
+        import socket
+
+        import magent.upload_server as mod
+
+        spare = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        spare.bind(("127.0.0.1", 0))  # bound, never listening: nothing accepts
+        try:
+            assert not mod._holder_answers("127.0.0.1", spare.getsockname()[1])
+        finally:
+            spare.close()
+
+
+class TestRunServerOnAHeldPort:
+    """A second serve must END, quickly and by name, and leave the holder's
+    port and pid file exactly as it found them."""
+
+    def _isolate(self, mod, monkeypatch, tmp_path, addrs):
+        monkeypatch.setattr(mod, "_bind_addresses", lambda host: list(addrs))
+        monkeypatch.setattr(
+            mod, "_pid_path", lambda port: tmp_path / f"upload-{port}.pid"
+        )
+        # Never install a system-wide keyboard hook from a unit test.
+        monkeypatch.setattr(
+            mod,
+            "_supervise_hotkey",
+            lambda *a, **kw: pytest.fail("a server that never bound supervised"),
+        )
+
+    def test_a_real_held_port_ends_the_second_server_by_name(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import magent.upload_server as mod
+
+        holder = mod._NoFqdnHTTPServer(("127.0.0.1", 0), mod.UploadHandler)
+        try:
+            port = holder.server_address[1]
+            self._isolate(mod, monkeypatch, tmp_path, ["127.0.0.1"])
+            # On the regression the second bind SUCCEEDS and run_server would
+            # serve forever; fail instead of hanging the run.
+            monkeypatch.setattr(
+                mod._NoFqdnHTTPServer,
+                "serve_forever",
+                lambda self, *a, **kw: pytest.fail("a second server bound the port"),
+            )
+            pid_file = tmp_path / f"upload-{port}.pid"
+            pid_file.write_text("424242")  # the holder's record
+
+            with (
+                caplog.at_level("INFO", logger="magent.upload"),
+                pytest.raises(mod.PortInUse),
+            ):
+                mod.run_server(port=port)
+
+            assert pid_file.read_text() == "424242"
+            assert "already in use" in caplog.text
+            # A held port is not a reserved one; that wording is the other path.
+            assert "reserved" not in caplog.text
+            assert "listening" not in caplog.text
+            # Losing a race is the designed outcome, not a crash for Sentry.
+            assert not [r for r in caplog.records if r.levelname == "ERROR"]
+        finally:
+            holder.server_close()
+
+    def test_a_held_secondary_address_gives_back_the_loopback_bind(
+        self, tmp_path, monkeypatch
+    ):
+        """Serving the addresses that were free would be two servers and one pid
+        file again -- so what was bound is closed and nothing serves."""
+        import errno
+
+        import magent.upload_server as mod
+
+        closed = []
+
+        class _Server:
+            def __init__(self, address, handler_cls):
+                if address[0] == "100.64.1.2":
+                    raise OSError(errno.EADDRINUSE, "Address already in use")
+                self.server_address = address
+
+            def serve_forever(self):
+                pytest.fail("a refused server must never serve")
+
+            def server_close(self):
+                closed.append(self.server_address)
+
+        self._isolate(mod, monkeypatch, tmp_path, ["127.0.0.1", "100.64.1.2"])
+        monkeypatch.setattr(mod, "_NoFqdnHTTPServer", _Server)
+
+        with pytest.raises(mod.PortInUse):
+            mod.run_server(port=8034)
+
+        assert closed == [("127.0.0.1", 8034)]
+        assert not (tmp_path / "upload-8034.pid").exists()
+
+    def test_an_unavailable_secondary_address_still_degrades(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Unchanged: a Tailscale IP that cannot be bound for any OTHER reason
+        is a warning, and loopback keeps serving."""
+        import errno
+
+        import magent.upload_server as mod
+
+        class _Server:
+            def __init__(self, address, handler_cls):
+                if address[0] == "100.64.1.2":
+                    raise OSError(errno.EADDRNOTAVAIL, "Cannot assign")
+                self.server_address = address
+
+            def serve_forever(self):
+                raise KeyboardInterrupt
+
+            def shutdown(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        self._isolate(mod, monkeypatch, tmp_path, ["127.0.0.1", "100.64.1.2"])
+        monkeypatch.setattr(mod, "_supervise_hotkey", lambda url, stop, **kw: None)
+        monkeypatch.setattr(mod, "_NoFqdnHTTPServer", _Server)
+
+        with (
+            caplog.at_level("INFO", logger="magent.upload"),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            mod.run_server(port=8034)
+
+        assert "cannot bind 100.64.1.2:8034" in caplog.text
+        assert "listening on 127.0.0.1:8034" in caplog.text
+
+    def _refuse_with_wsaeacces(self, mod, monkeypatch, refused_addr, answers):
+        """Drive the WSAEACCES branch on every OS: the fake raises winerror
+        10013 for ``refused_addr``, the real classifier is pinned to win32, and
+        the holder probe is a recorded stub answering ``answers``."""
+        import errno
+        import functools
+
+        probed = []
+
+        class _Server:
+            def __init__(self, address, handler_cls):
+                if address[0] == refused_addr:
+                    raise _WinError(errno.EACCES, 10013)
+                self.server_address = address
+
+            def serve_forever(self):
+                raise KeyboardInterrupt
+
+            def shutdown(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        def _probe(addr, port):
+            probed.append((addr, port))
+            return answers
+
+        monkeypatch.setattr(mod, "_NoFqdnHTTPServer", _Server)
+        monkeypatch.setattr(
+            mod,
+            "_access_refused",
+            functools.partial(mod._access_refused, platform="win32"),
+        )
+        monkeypatch.setattr(mod, "_holder_answers", _probe)
+        return probed
+
+    def test_wsaeacces_with_a_holder_answering_is_a_held_port(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import magent.upload_server as mod
+
+        self._isolate(mod, monkeypatch, tmp_path, ["127.0.0.1"])
+        probed = self._refuse_with_wsaeacces(mod, monkeypatch, "127.0.0.1", True)
+
+        with (
+            caplog.at_level("INFO", logger="magent.upload"),
+            pytest.raises(mod.PortInUse),
+        ):
+            mod.run_server(port=8034)
+
+        assert probed == [("127.0.0.1", 8034)]
+        assert "already in use" in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+    def test_wsaeacces_with_nobody_answering_is_a_reserved_port(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """No holder means no "second server" and nobody to defer to: a serve
+        that can never start is a fatal ERROR (what Sentry captures) that names
+        the reservation and where to look, not a lost race at WARNING."""
+        import magent.upload_server as mod
+
+        self._isolate(mod, monkeypatch, tmp_path, ["127.0.0.1"])
+        probed = self._refuse_with_wsaeacces(mod, monkeypatch, "127.0.0.1", False)
+
+        with (
+            caplog.at_level("INFO", logger="magent.upload"),
+            pytest.raises(mod.BindFailed) as failed,
+        ):
+            mod.run_server(port=8034)
+
+        assert not isinstance(failed.value, mod.PortInUse)
+        assert probed == [("127.0.0.1", 8034)]
+        message = str(failed.value)
+        assert "port 8034 is reserved or not permitted on 127.0.0.1" in message
+        assert "excludedportrange" in message
+        assert "second server" not in caplog.text
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert errors == [message]
+        assert not (tmp_path / "upload-8034.pid").exists()
+
+    def test_a_reserved_secondary_address_degrades_like_any_other(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import magent.upload_server as mod
+
+        self._isolate(mod, monkeypatch, tmp_path, ["127.0.0.1", "100.64.1.2"])
+        monkeypatch.setattr(mod, "_supervise_hotkey", lambda url, stop, **kw: None)
+        probed = self._refuse_with_wsaeacces(mod, monkeypatch, "100.64.1.2", False)
+
+        with (
+            caplog.at_level("INFO", logger="magent.upload"),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            mod.run_server(port=8034)
+
+        assert probed == [("100.64.1.2", 8034)]
+        assert "reserved or not permitted on 100.64.1.2" in caplog.text
+        assert "listening on 127.0.0.1:8034" in caplog.text
 
 
 class TestLocalUrl:
