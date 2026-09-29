@@ -72,16 +72,69 @@ _GONE_GRACE_S = 10.0
 # that read it patch the process snapshot to hold exactly this pid.
 _PANE_PID = 4242
 
+# How a fake that raised something it was not told to exits: EX_SOFTWARE, an
+# internal error. Not 0 or 1 -- has-session's two answers -- so a crash that
+# still reaches a caller reads as what it is in a returncode.
+_CRASH_RC = 70
+
 _FAKE = r"""
-import json, os, sys, time
+import json, os, sys, threading, time, traceback
 
 BASE = {base!r}
 STALL_S = {stall!r}
 PANE_PID = {pane_pid!r}
+CRASH_RC = {crash_rc!r}
 argv = sys.argv[1:]
 # Every psmux command magent issues is `-L <socket> <verb> ...`.
 name = argv[1] if len(argv) > 2 and argv[0] == "-L" else ""
 verb = argv[2] if name else ""
+
+
+def crashed(kind, value, tb, where="main"):
+    # An exception the fake did not script is a harness defect, and Python's
+    # default exit for it -- rc 1 -- is exactly has-session's "no such
+    # session": the product reads a crashed fake as a real "absent" (it did,
+    # on two hosted Windows legs). So the traceback goes where the fixture
+    # fails on it by name, and the exit code is one no psmux verb uses.
+    try:
+        d = os.path.join(BASE, "crashes")
+        os.makedirs(d, exist_ok=True)
+        with open(
+            os.path.join(d, "%d-%s.txt" % (os.getpid(), where)), "w", encoding="utf-8"
+        ) as fh:
+            fh.write("argv: %r\n" % (argv,))
+            traceback.print_exception(kind, value, tb, file=fh)
+    finally:
+        os._exit(CRASH_RC)
+
+
+sys.excepthook = crashed
+threading.excepthook = lambda a: crashed(
+    a.exc_type, a.exc_value, a.exc_traceback, "thread"
+)
+
+
+def patient(fn, *args):
+    # A record another fake published a moment ago can refuse to open:
+    # measured, PermissionError (errno 13) opening a sibling's calls record
+    # 1-50ms after its rename, three clients at once on the same file, on the
+    # desktop under load. The e2e shims already retry their replace for the
+    # same reason. Transient, so bounded -- and a last failure still raises
+    # into crashed() above, never into an answer.
+    for _ in range(50):
+        try:
+            return fn(*args)
+        except PermissionError:
+            time.sleep(0.02)
+    return fn(*args)
+
+
+def read(path):
+    def load():
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    return patient(load)
 
 
 def put(folder, stem, payload):
@@ -90,16 +143,21 @@ def put(folder, stem, payload):
     d = os.path.join(BASE, folder)
     os.makedirs(d, exist_ok=True)
     tmp = os.path.join(d, "." + stem)
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload))
-    os.replace(tmp, os.path.join(d, stem + ".json"))
+
+    def write():
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload))
+
+    patient(write)
+    patient(os.replace, tmp, os.path.join(d, stem + ".json"))
 
 
 me = "%020d-%08d" % (time.time_ns(), os.getpid())
 put("calls", me, {{"pid": os.getpid(), "ppid": os.getppid(), "argv": argv}})
 
-with open(os.path.join(BASE, "rules.json"), encoding="utf-8") as fh:
-    rules = json.load(fh)
+rules = read(os.path.join(BASE, "rules.json"))
+if [verb, name] in rules["crash"]:
+    raise RuntimeError("scripted crash: %s %s" % (verb, name))
 
 
 def hangs():
@@ -110,12 +168,19 @@ def hangs():
         if rule[:2] != [verb, name]:
             continue
         nth = rule[2] if len(rule) > 2 else 1
+        if nth <= 1:
+            # Nothing to count, so no scan: the scan is the one step that
+            # opens records other clients are publishing right now.
+            return True
         d = os.path.join(BASE, "calls")
         seen = 0
         for f in os.listdir(d):
             if f.endswith(".json"):
-                with open(os.path.join(d, f), encoding="utf-8") as fh:
-                    seen += json.load(fh)["argv"][:3] == ["-L", name, verb]
+                try:
+                    record = read(os.path.join(d, f))
+                except FileNotFoundError:
+                    continue  # listed, then gone: not a call to count
+                seen += record["argv"][:3] == ["-L", name, verb]
         return seen >= nth
     return False
 
@@ -135,7 +200,7 @@ if hangs():
         # and killing it leaves THIS interpreter behind -- a real psmux.exe is
         # one process. Follow the launcher down, so the fake dies exactly when
         # the client it stands in for would.
-        import ctypes, threading
+        import ctypes
 
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.OpenProcess.restype = ctypes.c_void_p
@@ -201,6 +266,21 @@ def _interpreter() -> str:
     return sys.executable
 
 
+def _read_record(path: Path) -> dict[str, object]:
+    """One published record, read with the fake's own patience.
+
+    The pins read while fakes may still be publishing (a straggler, see
+    ``assert_no_client_left_behind``), and a record that has only just been
+    renamed into place can refuse to open for a moment on Windows.
+    """
+    for _ in range(50):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except PermissionError:
+            time.sleep(0.02)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 class _Fake:
     """A real ``psmux`` on disk: records every argv, hangs where told to."""
 
@@ -212,6 +292,7 @@ class _Fake:
         live: tuple[str, ...] = (),
         bare: tuple[str, ...] = (),
         late: tuple[str, ...] = (),
+        crash: tuple[tuple[str, str], ...] = (),
     ) -> None:
         self.base = base
         self.bin_dir = base / "bin"
@@ -223,13 +304,16 @@ class _Fake:
                     "live": list(live),
                     "bare": list(bare),
                     "late": list(late),
+                    "crash": [list(c) for c in crash],
                 }
             ),
             encoding="utf-8",
         )
         script = base / "fake_psmux.py"
         script.write_text(
-            _FAKE.format(base=str(base), stall=_STALL_S, pane_pid=_PANE_PID),
+            _FAKE.format(
+                base=str(base), stall=_STALL_S, pane_pid=_PANE_PID, crash_rc=_CRASH_RC
+            ),
             encoding="utf-8",
         )
         if sys.platform == "win32":
@@ -246,13 +330,14 @@ class _Fake:
             launcher.chmod(0o755)
         self.path = str(launcher)
 
-    def _records(self, folder: str) -> list[dict[str, object]]:
+    def _by_stem(self, folder: str) -> dict[str, dict[str, object]]:
         d = self.base / folder
         if not d.exists():
-            return []
-        return [
-            json.loads(p.read_text(encoding="utf-8")) for p in sorted(d.glob("*.json"))
-        ]
+            return {}
+        return {p.stem: _read_record(p) for p in sorted(d.glob("*.json"))}
+
+    def _records(self, folder: str) -> list[dict[str, object]]:
+        return list(self._by_stem(folder).values())
 
     def calls(self) -> list[list[str]]:
         return [list(r["argv"]) for r in self._records("calls")]
@@ -265,6 +350,25 @@ class _Fake:
 
     def release(self) -> None:
         (self.base / "release").touch()
+
+    def take_crashes(self) -> list[str]:
+        """Every traceback a crashed fake left, removed as it is read."""
+        d = self.base / "crashes"
+        found = sorted(d.glob("*.txt")) if d.exists() else []
+        texts = [p.read_text(encoding="utf-8") for p in found]
+        for p in found:
+            p.unlink()
+        return texts
+
+    def assert_never_crashed(self) -> None:
+        """No fake raised anything it was not scripted to.
+
+        A crash exits non-zero, which a has-session caller reads as a real
+        "absent" -- a harness defect wearing a product answer. This is what
+        turns it back into a failure that says what happened.
+        """
+        crashes = self.take_crashes()
+        assert not crashes, "the fake psmux crashed:\n" + "\n".join(crashes)
 
     def assert_no_client_left_behind(self) -> None:
         """Every client that hung was killed AND is gone -- not merely abandoned.
@@ -342,6 +446,8 @@ def fake_psmux(
     for fake in fakes:
         fake.release()
     psmux.find_psmux.cache_clear()
+    for fake in fakes:
+        fake.assert_never_crashed()
 
 
 def _within(budget_s: float, fake: _Fake, fn: Callable[[], object]) -> object:
@@ -372,6 +478,9 @@ def _within(budget_s: float, fake: _Fake, fn: Callable[[], object]) -> object:
             f" wait (hanging clients: {stalled})"
         )
     box["elapsed"] = time.monotonic() - started
+    # Before the result is handed over: an answer read off a crashed fake is
+    # the harness talking, not the product.
+    fake.assert_never_crashed()
     if "error" in box:
         raise box["error"]
     return box["result"]
@@ -434,6 +543,40 @@ class TestOneDeadlinePerFanOut:
         fake = fake_psmux(hang=(("has-session", "web"),))
         states = psmux.probe_sessions(["web", "db"], fake.path, timeout=_SHRUNK_S)
         assert states == {"web": "unknown", "db": "absent"}
+
+
+class TestACrashedFakeIsNeverAnAnswer:
+    """The harness's own defects fail by name.
+
+    A fake that raises exits non-zero, and a non-zero has-session IS the
+    product's "absent" -- so an unguarded crash does not fail a pin, it hands
+    the pin a wrong answer to fail on (the red main: one of ten hung clients
+    hit a PermissionError reading a sibling's record, and read "absent").
+    """
+
+    def test_a_crash_exits_with_neither_has_session_answer(self, fake_psmux):
+        fake = fake_psmux(crash=(("has-session", "web"),))
+        rc = subprocess.run(
+            [fake.path, "-L", "web", "has-session", "-t", "web"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_BUDGET_S,
+            check=False,
+        ).returncode
+        assert rc == _CRASH_RC
+        # What the fixture's teardown runs: the traceback, by name.
+        with pytest.raises(AssertionError, match="scripted crash: has-session web"):
+            fake.assert_never_crashed()
+
+    def test_an_answer_read_off_a_crashed_fake_fails_as_the_crash(self, fake_psmux):
+        fake = fake_psmux(crash=(("has-session", "web"),))
+        with pytest.raises(AssertionError, match="the fake psmux crashed") as err:
+            _within(
+                _BUDGET_S,
+                fake,
+                lambda: psmux.probe_sessions(["web"], fake.path, timeout=_BUDGET_S),
+            )
+        assert "RuntimeError: scripted crash: has-session web" in str(err.value)
 
 
 class TestClearingAStaleServer:
