@@ -168,10 +168,11 @@ def _ps_quote(value: str) -> str:
     """Wrap ``value`` as ONE PowerShell single-quoted literal.
 
     Single-quoted, so nothing inside is expanded: these are paths, and a
-    ``$`` or a backtick in one must arrive exactly as written. Doubling is the only escape a single-quoted
-    PowerShell string has, and PowerShell ends such a string on FIVE code
-    points, not one: U+0027 and the typographic U+2018, U+2019, U+201A and
-    U+201B. Every one of them is doubled, or a value holding one breaks out.
+    ``$`` or a backtick in one must arrive exactly as written. Doubling is the
+    only escape a single-quoted PowerShell string has, and PowerShell ends
+    such a string on FIVE code points, not one: U+0027 and the typographic
+    U+2018, U+2019, U+201A and U+201B. Every one of them is doubled, or a
+    value holding one breaks out.
     """
     return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", value) + "'"
 
@@ -235,10 +236,13 @@ def _stage_handoff(work: Path, argv: list[str]) -> Path:
 def _remove_scratch(work: Path) -> None:
     """Delete a finished hand-off's scratch directory, retrying briefly.
 
-    The launcher still holds the redirect files open for the few milliseconds
-    between writing rc.txt and exiting, and an open file makes rmtree fail on
-    Windows. Bounded by ``_HANDOFF_CLEANUP_GRACE_S``; a directory that outlives
-    it is left behind rather than fought over (the next call uses a new one).
+    A file in it can still be open for a moment after rc.txt lands. The
+    launcher closed its own copies of the redirect files right after starting
+    the command, but it and the powershell.exe running it are still exiting,
+    and a scanner may be reading a file it has just seen written. An open file
+    makes rmtree fail on Windows. Bounded by ``_HANDOFF_CLEANUP_GRACE_S``; a
+    directory that outlives it is left behind rather than fought over (the
+    next call uses a new one).
     """
     deadline = time.monotonic() + _HANDOFF_CLEANUP_GRACE_S
     while True:
@@ -1167,10 +1171,12 @@ class WindowsPlatform(Platform):
         the moment its CreateProcess returns, before the command has produced a
         byte. Two different failures hide behind "no rc.txt yet", and both
         deserve a precise answer instead of the caller's whole budget spent in
-        silence: no pid.txt after the start grace means TASK SCHEDULER never
-        ran the task (nobody logged on, a policy refusal), while a pid that is
-        gone with no rc.txt means the LAUNCHER died mid-flight and nothing will
-        ever write one.
+        silence. No pid.txt after the start grace, from a task that is not
+        running, means TASK SCHEDULER never ran it (nobody logged on, a policy
+        refusal); a launcher that merely could not record its pid is still
+        running, and its rc.txt still answers. A pid that is gone with no
+        rc.txt means the LAUNCHER died mid-flight and nothing will ever write
+        one.
         """
         out, err, pid_file, rc_file = files
         deadline = time.monotonic() + timeout_s
