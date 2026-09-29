@@ -8,12 +8,14 @@ end-to-end, not mocked away.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 
 import pytest
+from click.testing import CliRunner
 
-from magent import cli
+from magent import cli, psmux
 from tests.unit._fake_psmux import make_fake_psmux
 
 MID = "·"
@@ -25,6 +27,21 @@ CARET = chr(0x276F)
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda *_: None)
+
+
+@pytest.fixture(autouse=True)
+def _patient_capture(monkeypatch):
+    # The capture budget in these tests only. The fake psmux is a Python shim;
+    # on a loaded Windows box its start alone has overrun the product's 3s, and
+    # green tests failed as "nopane" / exit 0. The tests that pin what a
+    # capture TIMEOUT does set their own tiny budget and a slow fake.
+    monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 60.0)
+
+
+def _slow_capture(fake, monkeypatch):
+    """Make the fake's capture-pane answer well after a tiny budget."""
+    fake.set_capture_delay(1.5)
+    monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 0.3)
 
 
 def _cfg(tmp_config, tmp_path, titles):
@@ -124,6 +141,30 @@ class TestSend:
         )
 
         assert result.exit_code == 4
+
+    def test_a_pane_that_cannot_be_read_back_is_unconfirmed_exit_4(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The prompt is still sitting on the input line, but the capture that
+        # would show it ran out the clock. An unread pane confirms nothing:
+        # this used to exit 0 ("OK sent") on exactly the pane exit 4 is for.
+        fake = make_fake_psmux(
+            tmp_path,
+            pane="scrollback\nPlease do the big refactor now",
+            live=["caramel"],
+        )
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        _slow_capture(fake, monkeypatch)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel"])
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", cfg, "send", "caramel", "Please do the big refactor now"],
+        )
+
+        assert result.exit_code == 4
+        assert "could not read" in result.stderr
+        assert "OK" not in result.stdout
 
     def test_file_source(self, runner, tmp_config, tmp_path, monkeypatch):
         fake = make_fake_psmux(
@@ -308,6 +349,20 @@ class TestPeek:
 
         assert result.exit_code == 2
 
+    def test_a_pane_that_does_not_answer_is_an_error_not_an_empty_tail(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, pane="line1\nline2", live=["caramel"])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        _slow_capture(fake, monkeypatch)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel"])
+
+        result = runner.invoke(cli.main, ["--config", cfg, "peek", "caramel"])
+
+        assert result.exit_code == 3
+        assert "could not read" in result.stderr
+        assert result.stdout == ""
+
     def test_a_legacy_code_page_stdout_loses_glyphs_not_the_command(self, monkeypatch):
         # The pane is the AGENT's UI and carries its glyphs; a redirected
         # Windows stdout is cp1252. This used to raise UnicodeEncodeError out of
@@ -323,6 +378,25 @@ class TestPeek:
         assert f"Fable 5.1 {MID} high" in out
         assert "? prompt" in out
         assert out.encode("cp1252")  # the whole point: it can now be written
+
+    def test_peek_keeps_its_question_marks_under_the_entry_escape(
+        self, tmp_config, tmp_path, monkeypatch
+    ):
+        # The entry point escapes what stdout cannot encode, but a pane is the
+        # AGENT's screen and peek is a lossy glance: _stdout_safe still turns
+        # the caret into "?" before the stream ever sees it, rather than into
+        # an escape nobody asked to read.
+        fake = make_fake_psmux(tmp_path, pane=f"{CARET} prompt", live=["caramel"])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel"])
+
+        result = CliRunner(charset="cp1252").invoke(
+            cli.main, ["--config", cfg, "peek", "caramel"]
+        )
+
+        assert result.exit_code == 0, result.exception
+        assert "? prompt" in result.stdout
+        assert "\\u276f" not in result.stdout
 
     def test_a_utf8_stdout_keeps_every_glyph(self, monkeypatch):
         from magent.cli import fleet_cmd
@@ -355,6 +429,23 @@ class TestSessionsJson:
         assert by_name["upup"]["live"] is False
         assert by_name["upup"]["state"] == "dead"
 
+    def test_a_live_pane_that_does_not_answer_reads_timeout_not_nopane(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(
+            tmp_path, pane=f"PS> claude\nFable 5.1 {MID} high", live=["caramel"]
+        )
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        _slow_capture(fake, monkeypatch)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel"])
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        assert result.exit_code == 0
+        (row,) = json.loads(result.stdout)
+        assert row["live"] is True
+        assert row["state"] == "timeout"
+
     def test_empty_config_is_empty_array(
         self, runner, tmp_config, tmp_path, monkeypatch
     ):
@@ -366,6 +457,299 @@ class TestSessionsJson:
 
         assert result.exit_code == 0
         assert json.loads(result.stdout) == []
+
+    def test_local_rows_carry_node_none(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(
+            tmp_path, pane=f"PS> claude\nFable 5.1 {MID} high", live=["caramel"]
+        )
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel", "upup"])
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        rows = json.loads(result.stdout)
+        # Live and dead alike: the key is on every row, never only some.
+        assert [(r["name"], r.get("node", "absent")) for r in rows] == [
+            ("caramel", None),
+            ("upup", None),
+        ]
+
+    def test_a_config_without_a_node_never_loads_the_typed_config(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The raw-loader fast path stays: no load_config, so no version
+        # warning and no typed-validation exit for a config with no node.
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+
+        def _refuse(*_a, **_k):
+            raise AssertionError("load_config called")
+
+        monkeypatch.setattr("magent.cli.config_io.load_config", _refuse)
+        cfg = tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "caramel"), "title": "caramel"},
+                    {"path": str(tmp_path / "sky"), "title": "sky", "node": "cloud"},
+                ]
+            }
+        )
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        assert result.exit_code == 0
+        assert all(r["node"] is None for r in json.loads(result.stdout))
+
+    def _node_config(self, tmp_config, tmp_path, *extra):
+        return tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "caramel"), "title": "caramel"},
+                    {"path": str(tmp_path / "api"), "title": "api", "node": "second"},
+                    *extra,
+                ],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
+                },
+            }
+        )
+
+    def _node_state(self, monkeypatch, tmp_path, *, ts, cwd="/home/demo/magent/api"):
+        from magent import nodes
+        from magent.nodes import NodeMapEntry
+
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": ts, "sessions": ["api"]}
+        )
+        nodes.update_node_map(
+            "api",
+            NodeMapEntry(
+                nick="second",
+                sid="api",
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="~/magent/api",
+                target="demo@devino-second",
+                cwd=cwd,
+            ),
+        )
+
+    def test_a_node_row_names_its_node_and_where_it_runs(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        rows = json.loads(result.stdout)
+        assert [r["name"] for r in rows] == ["caramel", "api"]
+        assert rows[1] == {
+            "name": "api",
+            "cwd": "/home/demo/magent/api",
+            "live": True,
+            "state": "live",
+            "model": None,
+            "effort": None,
+            "node": "second",
+        }
+
+    def test_a_node_row_is_named_by_the_session_it_was_started_under(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # A local row's name is its session id; a node row's is the map's
+        # recorded sid, not the project title it may since have drifted from.
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        from magent import nodes
+
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        entry = nodes.read_node_map()["api"]
+        nodes.update_node_map("api", dataclasses.replace(entry, sid="api-old"))
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": time.time(), "sessions": ["api-old"]}
+        )
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        row = json.loads(result.stdout)[1]
+        assert (row["name"], row["state"]) == ("api-old", "live")
+        # The map is keyed by PROJECT, so the folder survives the sid drift.
+        assert row["cwd"] == "/home/demo/magent/api"
+
+    def test_a_node_config_that_fails_validation_answers_the_json_envelope(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The one path where sessions --json is not an array: the typed load a
+        # node config needs. stdout must still be ONE JSON document (NF-S3-005).
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        cfg = tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "api"), "title": "api", "node": "nope"}
+                ],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
+                },
+            }
+        )
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        assert result.exit_code == 1
+        # Empty stdout is the failure this pins: the error went to stderr.
+        assert result.stdout.strip().startswith("{")
+        body = json.loads(result.stdout)
+        assert isinstance(body, dict)
+        assert body["ok"] is False
+        assert isinstance(body["error"], str)
+        assert body["error"]
+        assert set(body) == {"ok", "error"}
+
+    def test_a_missing_config_is_an_empty_array(self, runner, tmp_path, monkeypatch):
+        fake = make_fake_psmux(tmp_path)
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", str(tmp_path / "missing.json"), "sessions", "--json"],
+        )
+
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == []
+
+    def test_a_fresh_pull_without_the_session_reads_dead(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        from magent import nodes
+
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": time.time(), "sessions": []}
+        )
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        row = json.loads(result.stdout)[1]
+        assert (row["live"], row["state"]) == (False, "dead")
+
+    def test_a_stale_node_row_is_live_none_never_false(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=0.0)
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        row = json.loads(result.stdout)[1]
+        assert (row["live"], row["state"]) == (None, "stale")
+
+    def test_a_node_row_without_an_absolute_folder_reports_the_remote_root(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time(), cwd="")
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        assert json.loads(result.stdout)[1]["cwd"] == "~/magent/api"
+
+    def test_an_unplaced_auto_project_is_a_dead_row_with_no_node(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        auto = {"path": str(tmp_path / "web"), "title": "web", "node": "auto"}
+
+        result = runner.invoke(
+            cli.main,
+            [
+                "--config",
+                self._node_config(tmp_config, tmp_path, auto),
+                "sessions",
+                "--json",
+            ],
+        )
+
+        assert json.loads(result.stdout)[2] == {
+            "name": "web",
+            "cwd": "",
+            "live": False,
+            "state": "dead",
+            "model": None,
+            "effort": None,
+            "node": None,
+        }
+
+    @pytest.mark.parametrize("damage", ["torn", "busy"])
+    def test_an_unreadable_node_map_reads_stale_and_never_raises(
+        self, runner, tmp_config, tmp_path, monkeypatch, damage
+    ):
+        # Both map reads meet the damage: session_rows' strict one (every row
+        # stale, the node known only where the config pins it) and the
+        # cwd-only tolerant one (no folder). Neither may fail the listing.
+        from magent import nodes
+
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        entry = nodes.read_node_map()["api"]
+        nodes.update_node_map("web", dataclasses.replace(entry, sid="web"))
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"),
+            {"ts": time.time(), "sessions": ["api", "web"]},
+        )
+        auto = {"path": str(tmp_path / "web"), "title": "web", "node": "auto"}
+        cfg = self._node_config(tmp_config, tmp_path, auto)
+        if damage == "torn":
+            text = nodes.NODE_MAP_PATH.read_text(encoding="utf-8")
+            nodes.NODE_MAP_PATH.write_text(text[: len(text) // 2], encoding="utf-8")
+        else:
+            monkeypatch.setattr(nodes, "NODE_MAP_PATH", _BusyMap())
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        assert result.exit_code == 0
+        stale = {"cwd": "", "live": None, "state": "stale"}
+        stale |= {"model": None, "effort": None}
+        assert json.loads(result.stdout)[1:] == [
+            {"name": "api", **stale, "node": "second"},
+            {"name": "web", **stale, "node": None},
+        ]
+
+
+class _BusyMap:
+    """A stand-in NODE_MAP_PATH that stays busy: every read is the Windows
+    PermissionError of a reader racing an os.replace, past every retry."""
+
+    def read_text(self, encoding: str) -> str:
+        raise PermissionError(13, "busy")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -10,14 +10,29 @@ config *discovery* entirely, so no test ever searches the real filesystem.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import json
+import logging
+import math
+import os
 import sys
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
-from magent import agent_state, cli
+from magent import agent_state, cli, psmux
 from magent.cli import status as status_mod
+from magent.config import SCHEMA_VERSION
+from magent.lockfile import LockHeld, exclusive_lock, lock_path
+from tests.unit._fake_panes import fake_process_side, pane_tree
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 def _no_psmux(monkeypatch):
@@ -51,12 +66,26 @@ def _listener(monkeypatch, state):
     monkeypatch.setattr("magent.cli.status._listener_state", lambda upload: state)
 
 
-def _fake_psmux(monkeypatch, up, projects=None, apps=None, down=()):
+def _fake_psmux(
+    monkeypatch,
+    up,
+    projects=None,
+    apps=None,
+    down=(),
+    *,
+    pids=None,
+    trees=None,
+    snapshot_fails=False,
+):
     """Pretend psmux reports `up` live sessions whose panes run `apps`.
 
-    Never touches a real psmux server: `psmux_status` (the liveness fan-out)
-    and `pane_current_commands` (the foreground-app fan-out) are both faked, so
-    this machine's ~40 real sessions are never probed.
+    Never touches a real psmux server or the real process list: `psmux_status`
+    (the liveness fan-out), `pane_current_commands` (the foreground-app
+    fan-out), the pane-pid fan-out and the process snapshot are all faked, so
+    this machine's ~40 real sessions are never probed. Each pane is a pwsh with
+    `trees[name]` running under it -- nothing by default, so a "pwsh" app
+    really is a pane at its prompt; `pids` overrides a pane's pid (None =
+    unreadable) and `snapshot_fails` makes the snapshot fail.
     """
     monkeypatch.setattr(
         "magent.launch.psmux_status",
@@ -66,6 +95,25 @@ def _fake_psmux(monkeypatch, up, projects=None, apps=None, down=()):
     monkeypatch.setattr(
         "magent.psmux.pane_current_commands",
         lambda names, psmux=None: {n: (apps or {}).get(n, "") for n in names},
+    )
+    # The Session-0 scan reads the same (now fake) process snapshot and would
+    # ask the real OS about each fake pid's logon session -- see `_no_psmux`.
+    monkeypatch.setattr("magent.cli.status.session0_server_pids", list)
+    pane_pid = {
+        str(u.get("session") or u.get("name")): 100 * (i + 1) for i, u in enumerate(up)
+    }
+    pane_pid.update(pids or {})
+    fake_process_side(
+        monkeypatch,
+        pids=pane_pid,
+        snapshot=None
+        if snapshot_fails
+        else [
+            entry
+            for sid, pid in pane_pid.items()
+            if pid is not None
+            for entry in pane_tree(pid, *(trees or {}).get(sid, ()))
+        ],
     )
 
 
@@ -100,6 +148,94 @@ class TestJsonInvalidConfig:
         payload = json.loads(result.stdout)
         assert payload["ok"] is False
         assert payload["error"]
+
+
+# F-SUR-1: the load-time refusal of a title with no UTF-8 form, as each surface
+# shows it. Before, the config loaded (it has a color) and `status` crashed on
+# the title at its first echo; `--json` escaped it into an ok envelope.
+_NO_UTF8_REFUSAL = (
+    "projects[0].title has text with no UTF-8 form (UnicodeEncodeError): 'api\\ud83d'"
+)
+# A live OSC 0 (set the window title) and SGR 31 (red), as a config can spell.
+_ESC_SEQUENCES = "\x1b]0;x\x07\x1b[31m"
+
+
+class TestTextWithNoUtf8FormIsAConfigError:
+    def _config(self, tmp_config):
+        return tmp_config(
+            {
+                "version": 3,
+                "projects": [{"path": "api", "title": "api\ud83d", "color": "#22c55e"}],
+            }
+        )
+
+    def test_json_gets_the_config_error_envelope(self, runner, tmp_config, monkeypatch):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config), "status", "--json"]
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.stdout) == {"ok": False, "error": _NO_UTF8_REFUSAL}
+
+    def test_plain_gets_the_error_line_and_nothing_else(
+        self, runner, tmp_config, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config), "status"]
+        )
+        assert result.exit_code == 1
+        assert result.stderr == f"Error: {_NO_UTF8_REFUSAL}\n"
+        assert result.stdout == ""
+
+    @pytest.mark.parametrize(
+        ("config", "refusal"),
+        [
+            (
+                {"projects": [{"path": "api", "title": _ESC_SEQUENCES + "api\ud83d"}]},
+                (
+                    "projects[0].title has text with no UTF-8 form (UnicodeEncodeError):"
+                    " '\\x1b]0;x\\x07\\x1b[31mapi\\ud83d'"
+                ),
+            ),
+            (
+                {
+                    "settings": {"tools": {_ESC_SEQUENCES + "red": "api\ud83d"}},
+                    "projects": [{"path": "api"}],
+                },
+                (
+                    "settings.tools.\\x1b]0;x\\x07\\x1b[31mred has text with no UTF-8"
+                    " form (UnicodeEncodeError): 'api\\ud83d'"
+                ),
+            ),
+            (
+                {"projects": [{"path": "api", "title": "C:\\Users\\api\ud83d"}]},
+                (
+                    "projects[0].title has text with no UTF-8 form (UnicodeEncodeError):"
+                    " 'C:\\\\Users\\\\api\\ud83d'"
+                ),
+            ),
+        ],
+        ids=["in-the-value", "in-the-field-path", "a-backslash-is-doubled"],
+    )
+    def test_control_characters_reach_stderr_as_escape_text(
+        self, runner, tmp_config, monkeypatch, config, refusal
+    ):
+        # The refusal quotes text already known to be broken. An ESC or BEL in
+        # it reached a real terminal live (an OSC 0 title change, SGR red), so
+        # controls are escaped like the surrogate is; a backslash doubles, as
+        # the JSON file itself spells it, so a literal "\ud83d" folder name
+        # cannot read like the lone surrogate.
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"version": 3, **config}), "status"]
+        )
+        assert result.exit_code == 1
+        assert result.stderr == f"Error: {refusal}\n"
+        assert all(" " <= c <= "~" for c in result.stderr.rstrip("\n"))
 
 
 class TestStatusLines:
@@ -378,9 +514,12 @@ class TestJson:
             "upload_server": "on",
             "listener": "off",
             "attention": "off",
+            "node_sync": "off",
             "agents": [],
             "psmux_sessions": [],
             "psmux_session0": 0,
+            "node_sessions": [],
+            "node_sync_paused": None,
         }
 
     def test_degraded_emits_parseable_status_and_exit_3(
@@ -403,9 +542,12 @@ class TestJson:
             "upload_server": "dead",
             "listener": "off",
             "attention": "off",
+            "node_sync": "off",
             "agents": [],
             "psmux_sessions": [],
             "psmux_session0": 0,
+            "node_sessions": [],
+            "node_sync_paused": None,
         }
 
 
@@ -531,7 +673,7 @@ class TestMenuUpReportsCasualties:
         )
         monkeypatch.setattr(
             "magent.launch.bring_up_psmux",
-            lambda cfg, only=None, group=None: (list(created), list(failed)),
+            lambda cfg, only=None, group=None: (list(created), dict(failed)),
         )
         monkeypatch.setattr(status_mod.click, "prompt", lambda *a, **k: "a")
         monkeypatch.setattr(status_mod.click, "pause", lambda *a, **k: None)
@@ -539,16 +681,42 @@ class TestMenuUpReportsCasualties:
         status_mod._menu_up(Path(cfgpath))
 
     def test_failed_sessions_are_named_in_red(self, monkeypatch, tmp_config, capsys):
-        self._drive(monkeypatch, tmp_config, created=["web"], failed=["api"])
+        self._drive(monkeypatch, tmp_config, created=["web"], failed={"api": ""})
         out = capsys.readouterr().out
         assert "Brought up 1 session(s)" in out
         assert "1 session(s) failed to come up" in out
         assert "api" in out
 
+    def test_a_refused_session_says_why(self, monkeypatch, tmp_config, capsys):
+        # "Could not tell whether it is running" is not "dead", and the menu
+        # has to say which one it is. The Session-0 note still follows.
+        why = "could not tell whether api is running (has-session gave no answer)"
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+        self._drive(monkeypatch, tmp_config, created=[], failed={"api": why})
+        out = capsys.readouterr().out
+        assert "1 session(s) failed to come up" in out
+        assert why in out
+        assert "S0-NOTE" in out
+
+    def test_the_casualty_block_is_byte_for_byte(self, monkeypatch, tmp_config, capsys):
+        # Characterization: the whole block, in order -- the count and names
+        # with the local log hint, one dimmed line per KNOWN reason (none for
+        # an empty one), then the Session-0 note.
+        why = "could not tell whether web is running (has-session gave no answer)"
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+        self._drive(monkeypatch, tmp_config, created=[], failed={"api": "", "web": why})
+        out = capsys.readouterr().out
+        assert (
+            "  x 2 session(s) failed to come up: api, web"
+            " (see ~/.magent/logs/launch.log)\n"
+            f"    {why}\n"
+            "  S0-NOTE\n"
+        ) in out
+
     def test_a_clean_wave_says_nothing_about_failures(
         self, monkeypatch, tmp_config, capsys
     ):
-        self._drive(monkeypatch, tmp_config, created=["api", "web"], failed=[])
+        self._drive(monkeypatch, tmp_config, created=["api", "web"], failed={})
         out = capsys.readouterr().out
         assert "Brought up 2 session(s)" in out
         assert "failed to come up" not in out
@@ -634,6 +802,133 @@ class TestPsmuxSessionSection:
         result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
 
         assert result.exit_code == 0
+
+
+class TestIdleColumnNeedsPositiveProof:
+    """The idle column is the same verdict revive acts on, so it carries the
+    same proof: psmux's foreground reading is the pane's foreground DESCENDANT,
+    and it read ``bash`` for 4 of 31 live sessions whose claude.exe was running
+    a tool. A row says idle only when the pane's own process was read and no
+    agent runs anywhere under it."""
+
+    def _rows(self, runner, tmp_config, tmp_path, monkeypatch, apps, **panes):
+        _both_off(monkeypatch)
+        up, projects = [], []
+        for sid in apps:
+            (tmp_path / sid).mkdir()
+            up.append({"name": sid, "session": sid, "group": None})
+            projects.append(
+                {"name": sid, "session": sid, "resolved": str(tmp_path / sid)}
+            )
+        _fake_psmux(monkeypatch, up, projects, apps, **panes)
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+
+        assert result.exit_code == 0
+        return {r["name"]: r for r in json.loads(result.stdout)["psmux_sessions"]}
+
+    @pytest.mark.parametrize("app", ["bash", "pwsh"])
+    def test_a_live_agent_under_a_shell_foreground_is_not_idle(
+        self, runner, tmp_config, tmp_path, monkeypatch, app
+    ):
+        rows = self._rows(
+            runner,
+            tmp_config,
+            tmp_path,
+            monkeypatch,
+            {"api": app, "web": "pwsh"},
+            trees={"api": ("cmd.exe", "claude.exe", f"{app}.exe")},
+        )
+        assert rows["api"] == {"name": "api", "app": app, "idle": False, "state": ""}
+        # The pane next to it has no agent under it: that one IS idle.
+        assert rows["web"]["idle"] is True
+
+    def test_a_tool_outside_the_registry_is_not_idle(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        rows = self._rows(
+            runner,
+            tmp_config,
+            tmp_path,
+            monkeypatch,
+            {"api": "bash"},
+            trees={"api": ("cmd.exe", "cursor-agent.exe", "bash.exe")},
+        )
+        assert rows["api"]["idle"] is False
+
+    def test_the_human_table_shows_the_tool_not_idle(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        (tmp_path / "api").mkdir()
+        _fake_psmux(
+            monkeypatch,
+            [{"name": "api", "session": "api", "group": None}],
+            [{"name": "api", "session": "api", "resolved": str(tmp_path / "api")}],
+            {"api": "bash"},
+            trees={"api": ("cmd.exe", "claude.exe", "bash.exe")},
+        )
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert result.exit_code == 0
+        assert "idle" not in result.output
+        assert "bash" in result.output
+
+    def test_an_unreadable_pane_pid_is_not_idle(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        rows = self._rows(
+            runner,
+            tmp_config,
+            tmp_path,
+            monkeypatch,
+            {"api": "pwsh"},
+            pids={"api": None},
+        )
+        assert rows["api"]["idle"] is False
+
+    def test_a_failed_process_snapshot_is_not_idle(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        rows = self._rows(
+            runner,
+            tmp_config,
+            tmp_path,
+            monkeypatch,
+            {"api": "pwsh"},
+            snapshot_fails=True,
+        )
+        assert rows["api"]["idle"] is False
+
+    def test_the_verdict_reuses_the_tables_foreground_readings(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        (tmp_path / "api").mkdir()
+        _fake_psmux(
+            monkeypatch,
+            [{"name": "api", "session": "api", "group": None}],
+            [{"name": "api", "session": "api", "resolved": str(tmp_path / "api")}],
+            {"api": "pwsh"},
+        )
+        fan_outs: list[list[str]] = []
+        table = psmux.pane_current_commands  # the fake _fake_psmux installed
+
+        def _counting(names, psmux=None):
+            fan_outs.append(list(names))
+            return table(names, psmux=psmux)
+
+        monkeypatch.setattr("magent.psmux.pane_current_commands", _counting)
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["psmux_sessions"][0]["idle"] is True
+        assert fan_outs == [["api"]]
 
 
 class TestPsmuxSessionsJson:
@@ -1068,6 +1363,180 @@ class TestDownStopsWhatItPromisesAndReportsWhatItProved:
         assert "Stopped" not in out.output.split("Upload server")[0]
 
 
+class TestDownStopsANodeProjectsOrphanedLocalSession:
+    """A project ran here, then gained ``"node": "second"``. From then on every
+    local psmux path skips it (it runs on the node), so its old LOCAL session
+    vanished from status, the picker and `down` -- alive and unstoppable.
+
+    `down` acting locally therefore also targets the in-scope node projects'
+    session ids. Killing a socket with no server is a no-op, and the report
+    names only what the re-probe PROVED stopped, so a node project with no
+    local session costs nothing and claims nothing.
+    """
+
+    def _run(self, runner, tmp_config, monkeypatch, argv, *, projects, live_local):
+        cfgpath = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"nodes": {"second": {"host": "devino-second"}}},
+                "projects": projects,
+            }
+        )
+        # The REAL psmux_status -- it is the thing that hides the node project.
+        # Only the psmux binary is substituted: its lookup and its liveness probe.
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda *a, **k: "psmux")
+        monkeypatch.setattr(
+            "magent.psmux.live_sessions",
+            lambda names, *a, **k: [n for n in names if n in live_local],
+        )
+        killed: list[list[str]] = []
+
+        def fake_stop(targets):
+            killed.append(list(targets))
+            return [t for t in targets if t in live_local], []
+
+        monkeypatch.setattr("magent.launch.stop_psmux", fake_stop)
+        # PR-D: `down` now also asks each node for its own session. These tests
+        # pin the LOCAL half, so the node half answers "not running there";
+        # TestDownStopsNodeSessionsWhereTheyRun owns the node half.
+        self.node_calls: list[list[str]] = []
+
+        def no_node_session(cfg, sids):
+            self.node_calls.append(list(sids))
+            return [], []
+
+        monkeypatch.setattr("magent.launch.stop_node_sessions", no_node_session)
+        monkeypatch.setattr("magent.cli.attach._read_last_host", lambda: None)
+        monkeypatch.setattr("magent.upload_server.stop_server", lambda port: False)
+        monkeypatch.setattr("magent.cli.attention_cmd.stop_daemon", lambda: False)
+        if sys.platform == "win32":
+            monkeypatch.setattr("magent.hotkey.stop_listener", lambda: False)
+        out = runner.invoke(cli.main, ["--config", cfgpath, "down", *argv])
+        return out, killed
+
+    def test_down_all_stops_the_orphaned_local_session(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local={"api"},
+        )
+        assert out.exit_code == 0, out.output
+        assert killed == [["api"]]
+        assert "Stopped 1 session(s): api" in out.output
+
+    def test_a_node_project_with_no_local_session_is_tried_but_never_claimed(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local=set(),
+        )
+        assert out.exit_code == 0, out.output
+        assert killed == [["api"]]
+        assert "No running sessions to stop." in out.output
+        assert "Stopped" not in out.output.split("Upload server")[0]
+        assert "would NOT stop" not in out.output
+
+    def test_local_and_node_targets_go_to_one_stop_call(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        (tmp_path / "web").mkdir()
+        out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[
+                {"path": str(tmp_path / "web")},
+                {"path": str(tmp_path / "api"), "node": "second"},
+            ],
+            live_local={"web", "api"},
+        )
+        assert out.exit_code == 0, out.output
+        assert killed == [["web", "api"]]
+        assert self.node_calls == [["api"]]  # a local id is never dialed
+        assert "Stopped 2 session(s): web, api" in out.output
+
+    @pytest.mark.parametrize(("name", "expected"), [("api", "api"), ("web", "web")])
+    def test_a_named_down_selects_node_sids_like_any_other(
+        self, runner, tmp_config, monkeypatch, tmp_path, name, expected
+    ):
+        (tmp_path / "web").mkdir()
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            [name],
+            projects=[
+                {"path": str(tmp_path / "web")},
+                {"path": str(tmp_path / "api"), "node": "second"},
+            ],
+            live_local={"web", "api"},
+        )
+        assert killed == [[expected]]
+
+    def test_the_group_scope_applies_to_node_projects(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--group", "a"],
+            projects=[
+                {"path": str(tmp_path / "api"), "node": "second", "group": "a"},
+                {"path": str(tmp_path / "db"), "node": "second", "group": "b"},
+            ],
+            live_local={"api", "db"},
+        )
+        assert killed == [["api"]]
+
+    def test_a_cloud_project_is_already_a_local_target_and_not_doubled(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        (tmp_path / "sky").mkdir()
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "sky"), "node": "cloud"}],
+            live_local={"sky"},
+        )
+        assert killed == [["sky"]]
+
+    def test_forwarding_to_a_host_kills_nothing_here(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        from magent.cli import attach as attach_mod
+
+        monkeypatch.setattr(
+            attach_mod,
+            "_ssh_capture",
+            lambda target, remote_cmd, timeout=30, stdin_text=None: (0, "", ""),
+        )
+        monkeypatch.setattr(attach_mod, "_close_attach_windows", lambda names: 0)
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--host", "user@box", "--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local={"api"},
+        )
+        assert killed == []
+        assert self.node_calls == []
+
+
 class TestDownActsOnTheAttachHost:
     """`magent down` on an attach CLIENT used to be a near no-op: there are no
     local psmux sessions on a laptop, so it stopped the local Alt+V listener and
@@ -1310,3 +1779,2409 @@ class TestSessionZeroServers:
         result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
 
         assert json.loads(result.stdout)["psmux_session0"] == 3
+
+
+class TestStatusShowsNodeSessions:
+    """A node session's row comes from the sync daemon's last pull, never
+    from a live ssh call -- and a stale one is a row state, not a degraded
+    daemon, so the 0/1/3 exit contract is untouched."""
+
+    def _config(self, tmp_config, tmp_path):
+        return tmp_config(
+            {
+                "projects": [{"path": str(tmp_path), "title": "api", "node": "second"}],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
+                },
+            }
+        )
+
+    def _snapshot(self, monkeypatch, tmp_path, ts):
+        from magent import nodes
+
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": ts, "sessions": ["api"]}
+        )
+
+    def test_json_carries_the_node_and_its_state(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        self._snapshot(monkeypatch, tmp_path, ts=time.time())
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._config(tmp_config, tmp_path), "status", "--json"],
+        )
+        assert json.loads(result.stdout)["node_sessions"] == [
+            {"name": "api", "session": "api", "node": "second", "state": "live"}
+        ]
+
+    def test_the_node_key_sits_right_after_psmux_session0(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        self._snapshot(monkeypatch, tmp_path, ts=time.time())
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._config(tmp_config, tmp_path), "status", "--json"],
+        )
+        keys = list(json.loads(result.stdout))
+        assert keys[keys.index("psmux_session0") + 1] == "node_sessions"
+
+    def test_an_unreachable_node_reads_stale_and_is_not_degraded(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        self._snapshot(monkeypatch, tmp_path, ts=0.0)
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._config(tmp_config, tmp_path), "status", "--json"],
+        )
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sessions"][0]["state"] == "stale"
+
+    def test_the_report_lists_them_with_their_node(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        self._snapshot(monkeypatch, tmp_path, ts=time.time())
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config, tmp_path), "status"]
+        )
+        assert "Nodes" in result.stdout
+        assert "api" in result.stdout
+        assert "@second" in result.stdout
+        assert "live" in result.stdout
+
+    def test_a_stale_report_row_does_not_degrade_the_exit(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        self._snapshot(monkeypatch, tmp_path, ts=0.0)
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config, tmp_path), "status"]
+        )
+        assert result.exit_code == 0
+        assert "stale" in result.stdout
+
+    def test_an_unplaced_auto_project_reads_not_placed(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        self._snapshot(monkeypatch, tmp_path, ts=time.time())
+        cfg = tmp_config(
+            {
+                "projects": [{"path": str(tmp_path), "title": "new", "node": "auto"}],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
+                },
+            }
+        )
+        result = runner.invoke(cli.main, ["--config", cfg, "status"])
+        assert "(not placed)" in result.stdout
+        assert "dead" in result.stdout
+
+    def test_the_report_prints_the_session_id_not_the_title(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The map's sid is what runs on the node; the title only names the row.
+        from magent import nodes
+
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"),
+            {"ts": time.time(), "sessions": ["api-old"]},
+        )
+        nodes.update_node_map(
+            "api",
+            nodes.NodeMapEntry(
+                nick="second",
+                sid="api-old",
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="/home/demo/magent/api",
+            ),
+        )
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config, tmp_path), "status"]
+        )
+        assert "api-old" in result.stdout
+        assert "live" in result.stdout
+
+    @pytest.mark.parametrize(
+        ("sid", "shown"),
+        [("api\x1b[31mold", "api?[31mold"), ("\u00e9pi\u200b", "?pi?")],
+        ids=["escape", "non-ascii"],
+    )
+    def test_the_maps_sid_reaches_the_screen_only_as_printable_ascii(
+        self, runner, tmp_config, tmp_path, monkeypatch, sid, shown
+    ):
+        # The sid is whatever the node map holds. CliRunner strips ANSI, so a
+        # raw escape would read as "apiold": the pin is the '?' printable put
+        # there.
+        from magent import nodes
+
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": time.time(), "sessions": [sid]}
+        )
+        nodes.update_node_map(
+            "api",
+            nodes.NodeMapEntry(
+                nick="second",
+                sid=sid,
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="/home/demo/magent/api",
+            ),
+        )
+        cfgpath = self._config(tmp_config, tmp_path)
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+        as_json = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+
+        nodes_block = result.stdout.split("Nodes", 1)[1]
+        assert f"    {shown}  @second" in nodes_block
+        # --json is the map's value, and json.dumps escapes it: no raw
+        # control byte reaches the terminal either way.
+        assert "\x1b" not in as_json.stdout
+        assert json.loads(as_json.stdout)["node_sessions"][0]["session"] == sid
+
+    def test_an_unreadable_node_map_reads_stale_never_dead(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The cq-D17 probe, end to end: a placed auto project and a pinned one
+        # under a mapped sid, both live, then the map torn in half. Neither
+        # row may read dead or unplaced, status must not raise, and a stale
+        # row still does not degrade the exit.
+        from magent import nodes
+
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        node_map = tmp_path / "node-map.json"
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", node_map)
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"),
+            {"ts": time.time(), "sessions": ["api", "web-old"]},
+        )
+        for name, sid in (("api", "api"), ("web", "web-old")):
+            nodes.update_node_map(
+                name,
+                nodes.NodeMapEntry(
+                    nick="second",
+                    sid=sid,
+                    placed_ts=1.0,
+                    attached_existing=False,
+                    remote_root=f"/home/demo/magent/{name}",
+                ),
+            )
+        for sub in ("api", "web"):
+            (tmp_path / sub).mkdir()
+        cfgpath = tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "api"), "title": "api", "node": "auto"},
+                    {"path": str(tmp_path / "web"), "title": "web", "node": "second"},
+                ],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
+                },
+            }
+        )
+        text = node_map.read_text(encoding="utf-8")
+        node_map.write_text(text[: len(text) // 2], encoding="utf-8")
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sessions"] == [
+            {"name": "api", "session": "api", "node": None, "state": "stale"},
+            {"name": "web", "session": "web", "node": "second", "state": "stale"},
+        ]
+        human = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+        assert human.exit_code == 0
+        nodes_block = human.stdout.split("Nodes", 1)[1]
+        assert "stale" in nodes_block
+        assert "dead" not in nodes_block
+        assert "(not placed)" not in nodes_block
+        assert "(node unknown)" in nodes_block
+
+    def test_a_config_without_node_projects_prints_no_nodes_section(
+        self, runner, tmp_config, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"projects": []}), "status"]
+        )
+        assert "Nodes" not in result.stdout
+
+
+class TestAStaleNodeSyncDaemonDegradesStatus:
+    """Exit 3 when a project runs on a node and the sync daemon's heartbeat has
+    gone stale: every node row would then be frozen at a pull nobody refreshes.
+    A STOPPED daemon is not degraded (serve starts one; with serve off the
+    upload-server line already says so), and without a node project -- or
+    with the MAGENT_NODE_SYNC switch off -- nobody expects a daemon at all.
+    Driven through the real heartbeat file; the switch is set back on here
+    (conftest turns it off for every tier)."""
+
+    def _config(self, tmp_config, tmp_path, *, on_node=True, tool=None):
+        project = {"path": str(tmp_path), "title": "api"}
+        if on_node:
+            project["node"] = "second"
+        if tool:
+            project["tool"] = tool
+        return tmp_config(
+            {
+                "projects": [project],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
+                },
+            }
+        )
+
+    def _beat(self, age_s):
+        """The daemon's heartbeat, last touched ``age_s`` seconds ago."""
+        import os
+
+        from magent import log, node_sync
+
+        log.write_heartbeat(node_sync.HEARTBEAT_NAME)
+        path = log.HEARTBEAT_DIR / f"{node_sync.HEARTBEAT_NAME}.heartbeat"
+        then = time.time() - age_s
+        os.utime(path, (then, then))
+
+    def _status(self, runner, cfgpath, *extra):
+        return runner.invoke(cli.main, ["--config", cfgpath, "status", *extra])
+
+    @staticmethod
+    def _switch(monkeypatch, value):
+        """MAGENT_NODE_SYNC, re-read: the env singleton is cached."""
+        monkeypatch.setenv("MAGENT_NODE_SYNC", value)
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+    @pytest.fixture(autouse=True)
+    def _healthy_otherwise(self, monkeypatch, tmp_path):
+        from magent import nodes
+
+        self._switch(monkeypatch, "1")
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+
+    def test_stale_with_a_node_project_exits_3_and_says_so(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        result = self._status(runner, self._config(tmp_config, tmp_path), "--json")
+        assert result.exit_code == 3
+        assert json.loads(result.stdout)["node_sync"] == "stale"
+
+    def test_the_report_names_the_stale_daemon_and_its_repair(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        result = self._status(runner, self._config(tmp_config, tmp_path))
+        assert result.exit_code == 3
+        assert "node sync daemon stale" in result.stdout
+        assert status_mod.NODE_SYNC_REPAIR_HINT in result.stdout
+        assert "magent node sync --stop" in status_mod.NODE_SYNC_REPAIR_HINT
+
+    def test_stale_without_a_node_project_changes_nothing(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        cfgpath = self._config(tmp_config, tmp_path, on_node=False)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "off"
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        assert "node sync daemon stale" not in human.stdout
+
+    def test_status_expects_a_daemon_exactly_when_serve_spawns_one(
+        self, runner, tmp_config, tmp_path
+    ):
+        # A node-pinned IDE project has no node SESSION (it stays on this PC),
+        # but serve still spawns the daemon for it (node_sync.wanted) -- so a
+        # stale one is degraded, and is named even with no Nodes rows to show.
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        cfgpath = self._config(tmp_config, tmp_path, tool="code")
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 3
+        payload = json.loads(result.stdout)
+        assert (payload["node_sync"], payload["node_sessions"]) == ("stale", [])
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 3
+        assert "Nodes" in human.stdout
+        assert "node sync daemon stale" in human.stdout
+        assert status_mod.NODE_SYNC_REPAIR_HINT in human.stdout
+
+    def test_a_fresh_heartbeat_is_ok_and_exits_0(self, runner, tmp_config, tmp_path):
+        self._beat(1)
+        cfgpath = self._config(tmp_config, tmp_path)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "ok"
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        assert "node sync daemon stale" not in human.stdout
+
+    def test_a_stopped_daemon_is_not_degraded(self, runner, tmp_config, tmp_path):
+        cfgpath = self._config(tmp_config, tmp_path)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "stopped"
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        # Named, as the JSON names it -- but never as the degraded "stale".
+        assert status_mod.NODE_SYNC_STOPPED_LINE in human.stdout
+        assert "node sync daemon stale" not in human.stdout
+        assert status_mod.NODE_SYNC_REPAIR_HINT not in human.stdout
+
+    def test_the_switch_off_means_no_daemon_is_expected(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # serve's own gate is the switch AND wanted: a heartbeat left by a
+        # daemon that died before MAGENT_NODE_SYNC=0 was set is nobody's, and
+        # "serve starts a fresh one" would be a promise serve never keeps.
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        self._switch(monkeypatch, "0")
+        cfgpath = self._config(tmp_config, tmp_path)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "off"
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        assert "node sync daemon" not in human.stdout
+        assert "serve starts a fresh one" not in human.stdout
+
+    def test_the_verdict_counts_node_sync_alongside_the_other_daemons(self):
+        healthy = {
+            "upload_server": "on",
+            "listener": "on",
+            "attention": "on",
+        }
+        for state, degraded in (
+            ("stale", True),
+            ("ok", False),
+            ("stopped", False),
+            ("off", False),
+        ):
+            assert (
+                status_mod._is_degraded({**healthy, "node_sync": state}) is degraded
+            ), state
+        # Q1 ruling: a sync paused on an unreadable node map degrades
+        # too, whatever its heartbeat says.
+        for state in ("ok", "stopped"):
+            assert (
+                status_mod._is_degraded(
+                    {**healthy, "node_sync": state}, sync_paused=True
+                )
+                is True
+            ), state
+
+
+# One readable node-map entry, as update_node_map writes it.
+_MAP_ENTRY = {
+    "nick": "second",
+    "sid": "api",
+    "placed_ts": 1.0,
+    "attached_existing": False,
+    "remote_root": "/home/demo/magent/api",
+}
+
+
+class TestANodeMapTheSyncCannotReadIsShownAsSyncPaused:
+    """Round-2 ruling 3: a node map the sync cannot read -- one malformed
+    entry makes the strict read refuse the whole file -- pauses every pull
+    (node_sync's _map_unreadable dials no node). Visible, never silent:
+    status names the pause, the entry through node_sync.printable and the
+    repair, and --json carries it additively. A busy map is a moment the next
+    tick retries, not a pause. Degraded, exit 3 (the Q1 ruling on the
+    round-2 report-back): like a stale daemon, a pause freezes every node
+    row until a human repairs something (_node_sync_state)."""
+
+    @pytest.fixture(autouse=True)
+    def _sync_expected(self, monkeypatch, tmp_path):
+        from magent import nodes
+
+        TestAStaleNodeSyncDaemonDegradesStatus._switch(monkeypatch, "1")
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+
+    @staticmethod
+    def _config(tmp_config, tmp_path):
+        (tmp_path / "api").mkdir(exist_ok=True)
+        return tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "api"), "title": "api", "node": "auto"}
+                ],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
+                },
+            }
+        )
+
+    @staticmethod
+    def _write_map(raw):
+        from magent import nodes
+
+        nodes.NODE_MAP_PATH.write_text(json.dumps(raw), encoding="utf-8")
+
+    def _malformed(self, key="api"):
+        # placed_ts is not a time: _map_entry refuses the entry.
+        self._write_map({key: {**_MAP_ENTRY, "placed_ts": "soon"}})
+
+    @staticmethod
+    def _status(runner, cfgpath, *extra):
+        return runner.invoke(cli.main, ["--config", cfgpath, "status", *extra])
+
+    def test_a_malformed_entry_names_the_pause_the_entry_and_the_repair(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import nodes
+
+        cfgpath = self._config(tmp_config, tmp_path)
+        self._malformed()
+
+        result = self._status(runner, cfgpath)
+
+        # Degraded (Q1), and the reason is on screen with its repair.
+        assert result.exit_code == 3, result.output
+        assert (
+            "node sync paused  (the node map could not be read (ValueError):"
+            " entry 'api' is malformed; nothing is pulled from any node)"
+        ) in result.stdout
+        assert (
+            f"Repair: fix entry 'api' in {nodes.NODE_MAP_PATH}, or move the file"
+            " aside  (nodes.log says what is wrong)"
+        ) in result.stdout
+        # The why is nodes.log's: the screen has our words, the class, the key.
+        assert "not a finite number" not in result.output
+        # The row still says unknown, never unplaced.
+        assert "(node unknown)" in result.stdout
+        assert "(not placed)" not in result.stdout
+
+    @pytest.mark.parametrize(
+        ("key", "shown"),
+        [("\x1b[2Jevil", "?[2Jevil"), ("\u00e9vil\u200b", "?vil?")],
+        ids=["escape", "non-ascii"],
+    )
+    def test_the_entry_reaches_the_screen_only_as_printable_ascii(
+        self, runner, tmp_config, tmp_path, key, shown
+    ):
+        # The key is whatever the file holds. CliRunner strips ANSI, so a raw
+        # escape would read as "evil": the pin is the '?' printable put there.
+        cfgpath = self._config(tmp_config, tmp_path)
+        self._malformed(key)
+
+        result = self._status(runner, cfgpath)
+        as_json = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 3, result.output
+        assert as_json.exit_code == 3, as_json.output
+        assert f"entry '{shown}' is malformed" in result.stdout
+        assert f"fix entry '{shown}' in" in result.stdout
+        assert json.loads(as_json.stdout)["node_sync_paused"] == {
+            "error": "ValueError",
+            "entry": shown,
+        }
+
+    def test_a_torn_map_is_a_pause_that_names_no_entry(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import nodes
+
+        cfgpath = self._config(tmp_config, tmp_path)
+        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+
+        result = self._status(runner, cfgpath)
+
+        assert result.exit_code == 3, result.output
+        assert (
+            "node sync paused  (the node map could not be read (ValueError);"
+            " nothing is pulled from any node)"
+        ) in result.stdout
+        assert (
+            f"Repair: fix {nodes.NODE_MAP_PATH}, or move it aside"
+            "  (nodes.log says what is wrong)"
+        ) in result.stdout
+        assert "is malformed" not in result.output
+
+    def test_a_busy_map_is_a_moment_not_a_pause(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # Another process's write in flight: the next tick retries it. Its
+        # rows still read unknown, never unplaced (inv-unknown).
+        from magent import nodes
+
+        def busy() -> dict[str, nodes.NodeMapEntry]:
+            raise PermissionError(13, "The process cannot access the file")
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        cfgpath = self._config(tmp_config, tmp_path)
+
+        result = self._status(runner, cfgpath)
+        as_json = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 0, result.output
+        assert "node sync paused" not in result.stdout
+        assert "(node unknown)" in result.stdout
+        assert json.loads(as_json.stdout)["node_sync_paused"] is None
+
+    def test_a_map_unreadable_for_any_other_os_reason_is_a_pause_and_exits_3(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # Only a PermissionError is busy. Any other OSError (EIO here; EROFS,
+        # a folder at the map path on POSIX) is a pause the sync sits in, so
+        # unknown must not read as clean in the exit code either. The OS's
+        # words are nodes.log's.
+        from magent import nodes
+
+        def broken() -> dict[str, nodes.NodeMapEntry]:
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", broken)
+        cfgpath = self._config(tmp_config, tmp_path)
+
+        result = self._status(runner, cfgpath)
+        as_json = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 3, result.output
+        assert (
+            "node sync paused  (the node map could not be read (OSError);"
+            " nothing is pulled from any node)"
+        ) in result.stdout
+        assert "Input/output error" not in result.output
+        assert "(node unknown)" in result.stdout
+        assert as_json.exit_code == 3, as_json.output
+        assert json.loads(as_json.stdout)["node_sync_paused"] == {
+            "error": "OSError",
+            "entry": None,
+        }
+
+    def test_with_the_sync_switched_off_nothing_is_paused(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # No daemon is expected, so none is paused.
+        TestAStaleNodeSyncDaemonDegradesStatus._switch(monkeypatch, "0")
+        cfgpath = self._config(tmp_config, tmp_path)
+        self._malformed()
+
+        result = self._status(runner, cfgpath)
+        payload = json.loads(self._status(runner, cfgpath, "--json").stdout)
+
+        assert result.exit_code == 0, result.output
+        assert "node sync paused" not in result.stdout
+        assert (payload["node_sync"], payload["node_sync_paused"]) == ("off", None)
+
+    def test_a_readable_map_shows_no_pause(self, runner, tmp_config, tmp_path):
+        cfgpath = self._config(tmp_config, tmp_path)
+        self._write_map({"api": _MAP_ENTRY})
+
+        result = self._status(runner, cfgpath)
+        as_json = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 0, result.output
+        assert "node sync paused" not in result.stdout
+        assert json.loads(as_json.stdout)["node_sync_paused"] is None
+
+    def test_a_healthy_map_with_a_live_daemon_exits_0(
+        self, runner, tmp_config, tmp_path
+    ):
+        # The other side of the Q1 ruling: a readable map, a fresh heartbeat
+        # and a fresh pull listing the session -- nothing is degraded.
+        from magent import log, node_sync, nodes
+
+        cfgpath = self._config(tmp_config, tmp_path)
+        self._write_map({"api": _MAP_ENTRY})
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": time.time(), "sessions": ["api"]}
+        )
+        log.write_heartbeat(node_sync.HEARTBEAT_NAME)
+
+        result = self._status(runner, cfgpath)
+        as_json = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 0, result.output
+        assert "node sync paused" not in result.stdout
+        assert as_json.exit_code == 0, as_json.output
+        payload = json.loads(as_json.stdout)
+        assert (payload["node_sync"], payload["node_sync_paused"]) == ("ok", None)
+        assert payload["node_sessions"] == [
+            {"name": "api", "session": "api", "node": "second", "state": "live"}
+        ]
+
+    def test_a_malformed_map_under_a_live_daemon_is_paused_and_exits_3(
+        self, runner, tmp_config, tmp_path
+    ):
+        # The case the pause is for: the daemon is up and heartbeating --
+        # node_sync reads ok -- and pulls nothing. Its heartbeat must not hide
+        # the pause.
+        from magent import log, node_sync
+
+        cfgpath = self._config(tmp_config, tmp_path)
+        self._malformed()
+        log.write_heartbeat(node_sync.HEARTBEAT_NAME)
+
+        result = self._status(runner, cfgpath)
+        as_json = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 3, result.output
+        assert "node sync paused" in result.stdout
+        assert as_json.exit_code == 3, as_json.output
+        payload = json.loads(as_json.stdout)
+        assert payload["node_sync"] == "ok"
+        assert payload["node_sync_paused"] == {"error": "ValueError", "entry": "api"}
+
+    @pytest.mark.parametrize(
+        ("damage", "paused"),
+        [
+            ("malformed", {"error": "ValueError", "entry": "api"}),
+            ("torn", {"error": "ValueError", "entry": None}),
+        ],
+    )
+    def test_json_carries_the_pause_and_exits_3(
+        self, runner, tmp_config, tmp_path, damage, paused
+    ):
+        from magent import nodes
+
+        cfgpath = self._config(tmp_config, tmp_path)
+        if damage == "malformed":
+            self._malformed()
+        else:
+            nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+
+        result = self._status(runner, cfgpath, "--json")
+
+        # Degraded (Q1), with the reason in the payload.
+        assert result.exit_code == 3, result.output
+        payload = json.loads(result.stdout)
+        assert payload["node_sync_paused"] == paused
+        assert payload["node_sync"] == "stopped"
+        assert payload["node_sessions"] == [
+            {"name": "api", "session": "api", "node": None, "state": "stale"}
+        ]
+
+
+def _hold_lock_file(path: Path) -> int:
+    """Lock ``path`` (a ``lockfile.lock_path``) on a fresh fd and return it,
+    retrying until the path still names the locked file. exclusive_lock's
+    holder -- every ``daemon_running`` probe -- deletes the file AFTER it lets
+    go: on POSIX an opener in that window can lock an orphaned inode nobody
+    else will open again, and on Windows the open itself fails (EACCES) while
+    the file is pending delete. Those are lockfile properties, not what these
+    pins are about, and a thread here widens the window, so the stand-ins
+    close it."""
+    from magent import lockfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        except PermissionError:
+            time.sleep(0.005)
+            continue
+        if lockfile._try_lock(fd):
+            try:
+                if os.stat(path).st_ino == os.fstat(fd).st_ino:
+                    return fd
+            except FileNotFoundError:
+                pass
+            lockfile._unlock(fd)
+        os.close(fd)
+        time.sleep(0.005)
+    raise AssertionError(f"could not lock {path}")
+
+
+def _let_go(fd: int) -> None:
+    from magent import lockfile
+
+    lockfile._unlock(fd)
+    os.close(fd)
+
+
+def _supervisor_refusals(monkeypatch) -> threading.Event:
+    """Set once ``down`` asked for serve's supervisor lock and was REFUSED,
+    so a stand-in tick holding it lets go after that, however long down took
+    to get there. The real lock is still what is asked and what refuses."""
+    from magent import node_sync
+
+    refused = threading.Event()
+    real_lock = node_sync.exclusive_lock
+
+    @contextlib.contextmanager
+    def spy(name: str) -> Iterator[None]:
+        try:
+            with real_lock(name):
+                yield
+        except LockHeld:
+            if name == node_sync.SUPERVISOR_LOCK_NAME:
+                refused.set()
+            raise
+
+    monkeypatch.setattr(node_sync, "exclusive_lock", spy)
+    return refused
+
+
+def _tick_holding_serves_lock(monkeypatch, spawns: _FakeDaemon | None) -> None:
+    """A stand-in serve supervisor tick, on the REAL supervisor lock: it
+    holds the lock until ``down``'s ask for it is refused, starts ``spawns``
+    and lets go once that daemon is parked at its gate. Whatever the fake
+    holds by then, it holds before down's first look."""
+    from magent import node_sync
+
+    ticking = threading.Event()
+    refused = _supervisor_refusals(monkeypatch)
+    supervisor = lock_path(node_sync.SUPERVISOR_LOCK_NAME)
+
+    def tick() -> None:
+        fd = _hold_lock_file(supervisor)
+        ticking.set()
+        refused.wait(10)
+        if spawns is not None:
+            spawns.start()
+            spawns.parked.wait(5)
+        _let_go(fd)
+
+    threading.Thread(target=tick, daemon=True).start()
+    assert ticking.wait(5)
+
+
+def _once_down_looks_for_a_late_daemon(monkeypatch) -> threading.Event:
+    """Set when ``down``'s look for a late daemon
+    (``node_sync.await_late_daemon``) has looked once and found none it can
+    stop -- its first wait between looks. A ``_FakeDaemon`` let in by it
+    locks after every read of the lock before that look, and after that
+    look's own first read: late by construction, not by a delay a slow
+    runner outruns.
+
+    Not down's literal first ``daemon_running()`` (``before_pulls``' probe):
+    the first stop reads the lock twice more after it (``stop_daemon``'s own
+    look and ``_stop_node_sync``'s recheck), so a lock taken right after that
+    probe still lands inside the first stop."""
+    from magent import node_sync
+
+    looked = threading.Event()
+    real = node_sync.await_late_daemon
+
+    def sleep(s: float) -> None:
+        looked.set()
+        time.sleep(s)
+
+    monkeypatch.setattr(
+        node_sync, "await_late_daemon", lambda **k: real(sleep=sleep, **k)
+    )
+    return looked
+
+
+class _FakeDaemon:
+    """A node sync daemon on the REAL daemon lock, in a thread: once
+    ``after`` is set (at once without one) it takes ``node_sync.LOCK_NAME``,
+    then writes its pid file -- the real daemon's order (``run_sync_loop``),
+    ``pid_gap`` apart -- and holds both until killed. ``parked`` is set as it
+    starts waiting for ``after``. Both paths are bound at construction: a
+    thread that outlived its test must never lock in the next test's HOME."""
+
+    def __init__(
+        self, pid: int, pid_gap: float = 0.0, after: threading.Event | None = None
+    ) -> None:
+        from magent import lockfile, node_sync
+
+        self.pid = pid
+        self.pid_gap = pid_gap
+        self.after = after
+        self.lock = lockfile.lock_path(node_sync.LOCK_NAME)
+        self.pid_path = node_sync._PID_PATH
+        self.parked = threading.Event()
+        self.locked = threading.Event()
+        self.killed = threading.Event()
+        self.gone = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        # Published once started: a teardown racing a late start() must never
+        # join a thread that has not begun.
+        thread = threading.Thread(target=self._live, daemon=True)
+        thread.start()
+        self.thread = thread
+
+    def _let_in(self) -> bool:
+        """Wait for ``after``; False when killed first."""
+        self.parked.set()
+        after = self.after
+        while after is not None and not after.wait(0.05):
+            if self.killed.is_set():
+                return False
+        return not self.killed.is_set()
+
+    def _live(self) -> None:
+        try:
+            if not self._let_in():
+                return  # torn down before it was let in
+            fd = _hold_lock_file(self.lock)
+            try:
+                if self.killed.wait(self.pid_gap):
+                    return
+                self.pid_path.parent.mkdir(parents=True, exist_ok=True)
+                self.pid_path.write_text(str(self.pid))
+                self.locked.set()
+                self.killed.wait(timeout=10)
+            finally:
+                _let_go(fd)
+        finally:
+            self.gone.set()
+
+
+@pytest.fixture
+def daemons(monkeypatch):
+    """Fake daemons by pid: node_sync's kill and pid check see only these, so
+    the REAL stop_daemon stops them (and nothing real is ever signalled)."""
+    from magent import node_sync
+
+    fakes: dict[int, _FakeDaemon] = {}
+
+    def kill(pid: int) -> bool:
+        fake = fakes.get(pid)
+        if fake is None:
+            return False
+        fake.killed.set()
+        return fake.gone.wait(timeout=5)
+
+    monkeypatch.setattr(node_sync, "_kill", kill)
+    monkeypatch.setattr(
+        node_sync,
+        "pid_alive",
+        lambda pid: pid in fakes and not fakes[pid].gone.is_set(),
+    )
+    yield fakes
+    for fake in fakes.values():
+        fake.killed.set()
+    for fake in fakes.values():
+        if fake.thread is not None:
+            fake.thread.join(timeout=5)
+
+
+@pytest.fixture
+def supervisor_tick(monkeypatch):
+    """One REAL serve supervisor tick (``upload_server._supervise_node_sync``)
+    against the REAL supervisor lock, with node sync switched on; only the
+    detached spawn is recorded instead of run."""
+    from magent import launch, upload_server
+
+    monkeypatch.setenv("MAGENT_NODE_SYNC", "1")
+    monkeypatch.setattr("magent.env._cached_env", None)
+    monkeypatch.setattr(launch, "_node_sync_report", launch._NodeSyncReport())
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(launch, "spawn_detached", spawned.append)
+
+    def tick(config_path: str) -> list[list[str]]:
+        stop = threading.Event()
+        stop.set()  # one iteration, then its wait returns at once
+        upload_server._supervise_node_sync(config_path, stop, interval=0.0)
+        return spawned
+
+    return tick
+
+
+class _Clock:
+    """A fake monotonic clock: a sleep moves it on, and nothing waits.
+    ``hold_at`` is the reading at which ``down`` took serve's supervisor
+    lock (``clocked_hold``)."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+        self.hold_at: float | None = None
+
+    def now(self) -> float:
+        return self.t
+
+    def sleep(self, s: float) -> None:
+        self.t += s
+
+
+@pytest.fixture
+def clocked_hold(monkeypatch) -> _Clock:
+    """``down``'s node sync stops on a ``_Clock``: serve's supervisor lock is
+    refused once -- a tick held it -- then taken, and down's wait for that
+    lock and its look for a late daemon both run on the clock."""
+    from magent import node_sync
+    from magent.cli import node_cmd
+
+    clock = _Clock()
+    monkeypatch.setattr(
+        node_cmd, "time", SimpleNamespace(monotonic=clock.now, sleep=clock.sleep)
+    )
+    real_held = node_sync.supervisor_held
+    real_wait = node_sync.await_late_daemon
+    monkeypatch.setattr(
+        node_sync,
+        "supervisor_held",
+        lambda **k: real_held(sleep=clock.sleep, now=clock.now, **k),
+    )
+    monkeypatch.setattr(
+        node_sync,
+        "await_late_daemon",
+        lambda **k: real_wait(sleep=clock.sleep, now=clock.now, **k),
+    )
+    real_lock = node_sync.exclusive_lock
+    refusals = [LockHeld("the supervisor lock is held by another process")]
+
+    def lock(name: str) -> contextlib.AbstractContextManager[None]:
+        if name == node_sync.SUPERVISOR_LOCK_NAME:
+            if refusals:
+                raise refusals.pop()
+            clock.hold_at = clock.t
+        return real_lock(name)
+
+    monkeypatch.setattr(node_sync, "exclusive_lock", lock)
+    return clock
+
+
+class _ClockDaemon:
+    """A node sync daemon on a ``_Clock``: from ``after`` seconds past down's
+    hold it holds its lock, pid 4242, until it is killed. With ``again``, a
+    second one (pid 4243) holds it from ``again`` seconds past the hold once
+    the first is killed, until it is killed too. It stands in for node_sync's
+    lock probe, pid, kill and pid check, so the REAL stop_daemon stops it."""
+
+    def __init__(
+        self, monkeypatch, clock: _Clock, after: float, again: float | None = None
+    ) -> None:
+        from magent import node_sync
+
+        self.clock = clock
+        self.after = after
+        self.again = again
+        self.kills: list[int] = []
+        monkeypatch.setattr(node_sync, "daemon_running", self.running)
+        monkeypatch.setattr(
+            node_sync,
+            "daemon_pid",
+            lambda: (4243 if self.kills else 4242) if self.running() else None,
+        )
+        monkeypatch.setattr(node_sync, "_kill", self.kill)
+        monkeypatch.setattr(node_sync, "pid_alive", lambda pid: self.running())
+
+    def kill(self, pid: int) -> bool:
+        self.kills.append(pid)
+        return True
+
+    def running(self) -> bool:
+        hold_at = self.clock.hold_at
+        if hold_at is None:
+            return False
+        if not self.kills:
+            return self.clock.t >= hold_at + self.after
+        return (
+            self.again is not None
+            and len(self.kills) == 1
+            and self.clock.t >= hold_at + self.again
+        )
+
+
+class TestDownStopsNodeSessionsWhereTheyRun:
+    """PR-D: a node project's id names TWO sessions -- the one on its node,
+    and the local one it may have left here before it gained a ``node`` (D9).
+    `down` kills each exactly once, on its own path (``stop_psmux`` here,
+    ``remote_mux.kill_session`` there), and reports the id once: never "No
+    running sessions to stop." above "Stopped 1 session(s): api"."""
+
+    @pytest.fixture(autouse=True)
+    def _map(self, monkeypatch, tmp_path):
+        from magent import nodes
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+
+    def _run(
+        self,
+        runner,
+        tmp_config,
+        monkeypatch,
+        argv,
+        *,
+        projects,
+        live_local=frozenset(),
+        answers=None,
+        last_host=None,
+        real_stop=False,
+        pull=None,
+        sync_daemon=False,
+        real_sync=False,
+        stop_server=None,
+    ):
+        from magent import node_sync
+        from magent.cli import attach as attach_mod
+
+        cfgpath = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {
+                    "nodes": {
+                        "second": {"host": "devino-second", "user": "demo"},
+                        "third": {"host": "devino-third", "user": "demo"},
+                    }
+                },
+                "projects": projects,
+            }
+        )
+        killed: list[list[str]] = []
+        if real_stop:
+            # The REAL stop_psmux on a machine with no psmux at all: it answers
+            # ([], []) -- the half that used to print "No running sessions to
+            # stop." above the node half's "Stopped".
+            monkeypatch.setattr("magent.psmux.find_psmux", lambda *a, **k: None)
+        else:
+            monkeypatch.setattr("magent.psmux.find_psmux", lambda *a, **k: "psmux")
+            monkeypatch.setattr(
+                "magent.psmux.live_sessions",
+                lambda names, *a, **k: [n for n in names if n in live_local],
+            )
+
+            def fake_stop(targets):
+                killed.append(list(targets))
+                return [t for t in targets if t in live_local], []
+
+            monkeypatch.setattr("magent.launch.stop_psmux", fake_stop)
+        dialed: list[tuple[str, str]] = []
+
+        def kill(node, sid):
+            dialed.append((node.nick, sid))
+            return (answers or {}).get(sid, True)
+
+        monkeypatch.setattr("magent.remote_mux.kill_session", kill)
+        monkeypatch.setattr(attach_mod, "_read_last_host", lambda: last_host)
+        sent: list[tuple[str, str]] = []
+
+        def fake_ssh(target, remote_cmd, timeout=30, stdin_text=None):
+            sent.append((target, remote_cmd))
+            return 0, "", ""
+
+        monkeypatch.setattr(attach_mod, "_ssh_capture", fake_ssh)
+        monkeypatch.setattr(attach_mod, "_close_attach_windows", lambda names: 0)
+        # The moment serve dies, for a test that acts there.
+        monkeypatch.setattr(
+            "magent.upload_server.stop_server", stop_server or (lambda port: False)
+        )
+        monkeypatch.setattr("magent.cli.attention_cmd.stop_daemon", lambda: False)
+        if sys.platform == "win32":
+            monkeypatch.setattr("magent.hotkey.stop_listener", lambda: False)
+        # The last turn comes home before each kill (Task 16): a pull that
+        # never dials unless the test says how it goes.
+        pulled = node_sync.remote_mux.PullResult(files=(), since=0.0)
+        pull = pull or (lambda config, name, **_k: pulled)
+        # What `down` asked of the node sync daemon and of the nodes, in order.
+        self.events: list[str] = []
+
+        def final_pull(config, name, **k):
+            self.events.append(f"pull {name}")
+            return pull(config, name, **k)
+
+        monkeypatch.setattr(node_sync, "final_pull", final_pull)
+        if not real_sync:
+            # One answer per stop_daemon call, an exception raised; the last
+            # one repeats.
+            stops = (
+                [sync_daemon] if isinstance(sync_daemon, bool) else list(sync_daemon)
+            )
+
+            def stop_daemon():
+                self.events.append("stop")
+                answer = stops.pop(0) if len(stops) > 1 else stops[0]
+                if isinstance(answer, BaseException):
+                    raise answer
+                return answer
+
+            monkeypatch.setattr(node_sync, "stop_daemon", stop_daemon)
+        self.cfgpath = cfgpath
+        out = runner.invoke(cli.main, ["--config", cfgpath, "down", *argv])
+        return out, killed, dialed, sent
+
+    @staticmethod
+    def _hold(name, nick="second", sid=None):
+        from magent import nodes
+        from magent.nodes import NodeMapEntry
+
+        nodes.update_node_map(
+            name,
+            NodeMapEntry(
+                nick=nick,
+                sid=sid or name,
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root=f"~/magent/{name}",
+            ),
+        )
+
+    @staticmethod
+    def _session_lines(out):
+        return out.output.split("Upload server")[0]
+
+    def test_the_node_half_is_the_only_report_when_nothing_runs_here(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # THE regression: the local half found nothing, the node half killed
+        # api. One truthful line -- not "No running sessions", then "Stopped".
+        from magent import nodes
+
+        self._hold("api")
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["api"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert dialed == [("second", "api")]
+        assert sent == []
+        lines = self._session_lines(out)
+        assert "No running sessions to stop." not in lines
+        assert lines.count("Stopped") == 1
+        assert "Stopped 1 session(s): api" in lines
+        assert nodes.read_node_map() == {}
+
+    def test_an_orphan_here_and_a_session_there_are_two_kills_and_one_name(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        self._hold("api")
+        out, killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local={"api"},
+        )
+        assert out.exit_code == 0, out.output
+        # Each session exactly once, each on its own path.
+        assert killed == [["api"]]
+        assert dialed == [("second", "api")]
+        lines = self._session_lines(out)
+        assert lines.count("Stopped") == 1
+        assert "Stopped 1 session(s): api" in lines
+
+    def test_local_and_node_sessions_share_one_stopped_line(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        (tmp_path / "web").mkdir()
+        self._hold("api")
+        out, killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[
+                {"path": str(tmp_path / "web")},
+                {"path": str(tmp_path / "api"), "node": "second"},
+            ],
+            live_local={"web"},
+        )
+        assert killed == [["web", "api"]]
+        assert dialed == [("second", "api")]
+        assert "Stopped 2 session(s): web, api" in self._session_lines(out)
+
+    def test_a_node_that_cannot_be_asked_is_named_and_never_claimed(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # The local orphan died, but the node session may still be running:
+        # the name is a survivor -- not a stop, and not "nothing to stop".
+        from magent import nodes
+
+        self._hold("api")
+        out, _killed, _dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["api"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local={"api"},
+            answers={"api": None},
+        )
+        assert out.exit_code == 0, out.output
+        lines = self._session_lines(out)
+        assert "1 session(s) would NOT stop: api" in lines
+        assert "nodes.log" in lines
+        assert "Stopped" not in lines
+        assert "No running sessions to stop." not in lines
+        assert "api" in nodes.read_node_map()
+
+    def test_nothing_anywhere_still_says_so(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        out, killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            answers={"api": False},
+        )
+        assert killed == [["api"]]
+        assert dialed == [("second", "api")]
+        lines = self._session_lines(out)
+        assert "No running sessions to stop." in lines
+        assert "Stopped" not in lines
+
+    def test_a_session_placed_from_here_keeps_down_off_the_attach_host(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # Nothing psmux-live here, but this PC's node map placed api: only a
+        # LOCAL down reaches it, so the remembered host must not take over --
+        # and the user is told how to reach the host's sessions anyway.
+        self._hold("api")
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert dialed == [("second", "api")]
+        hints = [ln for ln in out.output.splitlines() if "--host" in ln]
+        assert len(hints) == 1, out.output
+        assert "magent down --host me@host" in hints[0]
+
+    @pytest.mark.parametrize(
+        ("answer", "report"),
+        [
+            (None, "1 session(s) would NOT stop: api"),
+            (False, "No running sessions to stop."),
+        ],
+        ids=["unreachable", "already-gone"],
+    )
+    def test_the_hint_never_claims_a_stop_the_report_did_not(
+        self, runner, tmp_config, monkeypatch, tmp_path, answer, report
+    ):
+        # The hint follows the report whatever it said: after a survivor or
+        # "nothing to stop", a hint reading "Stopped" would be the very
+        # contradiction the folded report exists to remove.
+        self._hold("api")
+        out, _killed, _dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            answers={"api": answer},
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        lines = self._session_lines(out)
+        assert report in lines
+        assert "magent down --host me@host" in lines
+        assert "Stopped" not in lines
+
+    def test_a_placement_with_no_remembered_host_prints_no_hint(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        self._hold("api")
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+        )
+        assert out.exit_code == 0, out.output
+        assert (sent, dialed) == ([], [("second", "api")])
+        assert "--host" not in out.output
+
+    def test_a_down_that_live_sessions_keep_local_prints_no_hint(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # Local work was running: `down` was local before PR-D too, so the
+        # placement is not the reason and there is nothing new to say.
+        (tmp_path / "web").mkdir()
+        self._hold("api")
+        out, _killed, _dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[
+                {"path": str(tmp_path / "web")},
+                {"path": str(tmp_path / "api"), "node": "second"},
+            ],
+            live_local={"web"},
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert "--host" not in out.output
+
+    def test_a_node_project_only_in_config_still_forwards_to_the_attach_host(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # An attach client sharing the host's config holds no placement: its
+        # `down --all` is still the host's, exactly as before PR-D.
+        out, killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == [("me@host", "magent down --all")]
+        assert killed == []
+        assert dialed == []
+
+    def test_an_explicit_host_dials_no_node(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        self._hold("api")
+        out, killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--host", "u@h", "--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local={"api"},
+        )
+        assert sent == [("u@h", "magent down --all")]
+        assert killed == []
+        assert dialed == []
+        assert "magent down --host" not in out.output
+
+    def test_where_down_acts_and_what_it_kills_read_one_placement(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # The map records api under a session id other than the derived one:
+        # the node half kills that one, so `down` must also count it as
+        # placed here and stay off the attach host.
+        self._hold("api", sid="api-2")
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert dialed == [("second", "api-2")]
+
+    def test_a_retitled_placed_project_keeps_down_here(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # Placed as "my.web", retitled "my web" since: the name misses, the
+        # recorded sid still names its running session. Found by sid, so it
+        # counts as placed here and never forwards to the attach host.
+        self._hold("my.web", "third", sid="my-web")
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[
+                {"path": str(tmp_path / "web"), "title": "my web", "node": "auto"}
+            ],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert dialed == [("third", "my-web")]
+
+    @pytest.mark.parametrize("state", ["torn", "busy", "malformed-entry"])
+    def test_an_unreadable_map_is_a_survivor_line_not_nothing_to_stop(
+        self, runner, tmp_config, monkeypatch, tmp_path, state
+    ):
+        from magent import nodes
+
+        if state == "torn":
+            nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        elif state == "malformed-entry":
+            # Round-2 ruling: dropped, web read as never placed and `down`
+            # found nothing to stop while its node session ran on.
+            self._hold("web", "third")
+            raw = json.loads(nodes.NODE_MAP_PATH.read_text(encoding="utf-8"))
+            raw["web"]["attached_existing"] = "yes"
+            nodes.NODE_MAP_PATH.write_text(json.dumps(raw), encoding="utf-8")
+        else:
+            # Intact on disk, but another process has it open (Windows).
+            self._hold("web", "third")
+
+            def busy() -> dict[str, nodes.NodeMapEntry]:
+                raise PermissionError(13, "The process cannot access the file")
+
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        out, _killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "web"), "node": "auto"}],
+        )
+        assert out.exit_code == 0, out.output
+        assert dialed == []
+        lines = self._session_lines(out)
+        assert "1 session(s) would NOT stop: web" in lines
+        assert "No running sessions to stop." not in lines
+
+    @staticmethod
+    def _unreadable(state):
+        from magent import nodes
+
+        if state == "torn":
+            nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+            return None
+
+        def busy() -> dict[str, nodes.NodeMapEntry]:
+            raise PermissionError(13, "The process cannot access the file")
+
+        return busy
+
+    @pytest.mark.parametrize(
+        ("state", "cls"), [("torn", "ValueError"), ("busy", "PermissionError")]
+    )
+    def test_an_unreadable_map_never_hands_down_to_the_attach_host(
+        self, runner, tmp_config, monkeypatch, tmp_path, state, cls
+    ):
+        # Nothing psmux-live here and a remembered host: a READABLE map naming
+        # api keeps `down` local. An unreadable one proves nothing either way
+        # -- read as "nothing placed", it forwarded, stopping the host's
+        # fleet while this PC's node session kept running. Unknown acts here,
+        # and one line names the map (class only) and the host's command.
+        from magent import nodes
+
+        self._hold("api")
+        busy = self._unreadable(state)
+        if busy is not None:
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        out, killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        # "Acted here" is both halves: the local session a node project may
+        # have left on this PC, and the one on its node.
+        assert killed == [["api"]]
+        assert dialed == [("second", "api")]
+        hints = [ln for ln in out.output.splitlines() if "--host" in ln]
+        assert len(hints) == 1, out.output
+        assert f"the node map could not be read ({cls})" in hints[0]
+        assert "magent down --host me@host" in hints[0]
+        assert "node-map.json" not in out.output
+
+    @pytest.mark.parametrize(
+        ("state", "cls", "words"),
+        [
+            ("torn", "ValueError", "Expecting value"),
+            ("busy", "PermissionError", "The process cannot access the file"),
+        ],
+    )
+    def test_a_map_that_heals_at_once_still_leaves_its_whole_error_in_the_log(
+        self, runner, tmp_config, monkeypatch, tmp_path, caplog, state, cls, words
+    ):
+        # `down` could not read the map when deciding where to act; the node
+        # half's own read, a moment later, went through and so logged nothing.
+        # The screen names the class; nodes.log must still say what refused
+        # the map, path and all.
+        from magent import nodes
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        self._hold("api")
+        real = nodes.load_node_map_strict
+        reads: list[None] = []
+
+        def heals() -> dict[str, nodes.NodeMapEntry]:
+            reads.append(None)
+            if len(reads) > 1:
+                return real()
+            if state == "torn":
+                raise ValueError(f"{nodes.NODE_MAP_PATH}: {words}: line 1 column 3")
+            raise PermissionError(13, words)
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", heals)
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert len(reads) > 1, "the node half never re-read the map"
+        assert dialed == [("second", "api")]
+        hints = [ln for ln in out.output.splitlines() if "--host" in ln]
+        assert len(hints) == 1, out.output
+        assert f"the node map could not be read ({cls})" in hints[0]
+        assert words not in out.output
+        assert "node-map.json" not in out.output
+        logged = [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
+        assert any(words in m for m in logged), logged
+        if state == "torn":
+            assert any(str(nodes.NODE_MAP_PATH) in m for m in logged), logged
+
+    @pytest.mark.parametrize(
+        "error",
+        [ValueError("Expecting value"), PermissionError(13, "busy")],
+        ids=["torn", "busy"],
+    )
+    def test_a_held_back_down_all_stops_the_sync_daemon_before_the_pull(
+        self, runner, tmp_config, monkeypatch, tmp_path, error
+    ):
+        # Held back from the host by a map it could not read, `down --all`
+        # acts here -- and is still `down --all` here: the daemon stops before
+        # the pull (a sync tick mid-pull holds the node-pull lock the final
+        # pull would wait out), and again at the end. The map heals at once,
+        # so the node half reads the entry and pulls.
+        from magent import nodes
+
+        self._hold("api")
+        real = nodes.load_node_map_strict
+        reads: list[None] = []
+
+        def heals() -> dict[str, nodes.NodeMapEntry]:
+            reads.append(None)
+            if len(reads) == 1:
+                raise error
+            return real()
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", heals)
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+            sync_daemon=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert "magent down --host me@host" in out.output
+        assert dialed == [("second", "api")]
+        assert self.events == ["stop", "pull api", "stop"]
+
+    @pytest.mark.parametrize("state", ["torn", "busy"])
+    def test_an_unreadable_map_leaves_an_explicit_host_in_charge(
+        self, runner, tmp_config, monkeypatch, tmp_path, state
+    ):
+        from magent import nodes
+
+        self._hold("api")
+        busy = self._unreadable(state)
+        if busy is not None:
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        out, killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--host", "u@h", "--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == [("u@h", "magent down --all")]
+        assert (killed, dialed) == ([], [])
+        assert "could not be read" not in out.output
+
+    @pytest.mark.parametrize("state", ["torn", "busy"])
+    def test_an_unreadable_map_with_live_sessions_here_adds_no_line(
+        self, runner, tmp_config, monkeypatch, tmp_path, state
+    ):
+        # Local work was running: `down` stays here whatever the map says,
+        # so the map is not the reason and there is nothing new to say.
+        from magent import nodes
+
+        (tmp_path / "web").mkdir()
+        self._hold("api")
+        busy = self._unreadable(state)
+        if busy is not None:
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        out, killed, _dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[
+                {"path": str(tmp_path / "web")},
+                {"path": str(tmp_path / "api"), "node": "second"},
+            ],
+            live_local={"web"},
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert killed == [["web", "api"]]
+        assert "--host" not in out.output
+
+    def test_down_all_stops_the_node_sync_daemon(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert "Stopped the node sync daemon." in out.stdout
+
+    def test_down_all_with_node_projects_says_the_daemon_was_not_running(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert "Node sync daemon was not running." in out.stdout
+
+    @pytest.mark.parametrize("with_nodes", [True, False], ids=["nodes", "no-nodes"])
+    def test_down_all_names_a_daemon_that_outlived_its_stop(
+        self, runner, tmp_config, monkeypatch, tmp_path, with_nodes
+    ):
+        # stop_daemon's False is also "the kill did not land": the daemon's
+        # lock says which, as `node sync --stop` asks it. Never "was not
+        # running" about a daemon that is -- and never silence either.
+        from magent import node_sync
+
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: 4242)
+        projects = [{"path": str(tmp_path / "api"), "node": "second"}]
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=projects if with_nodes else [],
+            real_stop=True,
+        )
+        assert out.exit_code == 0, out.output
+        # Once: the end re-stop does not repeat what the first stop said.
+        assert out.stdout.count("Could not stop the node sync daemon (pid 4242).") == 1
+        assert "Node sync daemon was not running." not in out.stdout
+
+    def test_down_all_stops_the_node_sync_daemon_before_the_first_pull(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # A sync tick mid-pull holds node-pull-<nick>, which down's own final
+        # pull would wait out: the daemon goes first, and again at the end.
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=(True, False),
+        )
+        assert out.exit_code == 0, out.output
+        assert self.events == ["stop", "pull api", "stop"]
+        said = out.stdout.index("Stopped the node sync daemon.")
+        assert said < out.stdout.index("Pulling the last turn of 1 node session(s)")
+
+    @pytest.mark.parametrize(
+        ("answers", "said"),
+        [
+            ((True, False), ["Stopped the node sync daemon."]),
+            ((False, False), ["Node sync daemon was not running."]),
+        ],
+        ids=["stopped-once", "never-running"],
+    )
+    def test_the_end_re_stop_is_silent_when_nothing_came_back(
+        self, runner, tmp_config, monkeypatch, tmp_path, answers, said
+    ):
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=answers,
+        )
+        assert out.exit_code == 0, out.output
+        assert self.events.count("stop") == 2
+        lines = [
+            ln for ln in out.stdout.splitlines() if "node sync daemon" in ln.lower()
+        ]
+        assert [ln.split(None, 1)[1] for ln in lines] == said
+
+    def test_the_end_re_stop_names_a_daemon_that_started_late(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=(True, True),
+        )
+        assert out.exit_code == 0, out.output
+        assert self.events == ["stop", "pull api", "stop"]
+        assert "Stopped the node sync daemon." in out.stdout
+        assert (
+            "Stopped the node sync daemon again (a daemon that started late)."
+            in out.stdout
+        )
+
+    def test_a_survivor_that_died_by_the_end_is_not_called_late(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # The first stop could not kill it; by the end it is gone. That is the
+        # plain "Stopped" -- nothing started late.
+        from magent import node_sync
+
+        # Held until the end stop's kill lands (the second stop_daemon answer).
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: 4242)
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=(False, True),
+        )
+        assert out.exit_code == 0, out.output
+        assert "Could not stop the node sync daemon (pid 4242)." in out.stdout
+        assert "Stopped the node sync daemon." in out.stdout
+        assert "again" not in out.stdout
+
+    def test_a_late_daemon_the_end_stop_could_not_kill_is_named(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # The first stop stopped one; another started late, and the end
+        # stop's kill did not land. That is news: never silence.
+        from magent import node_sync
+
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: 4242)
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=(True, False),
+        )
+        assert out.exit_code == 0, out.output
+        lines = [
+            ln for ln in out.stdout.splitlines() if "node sync daemon" in ln.lower()
+        ]
+        assert [ln.split(None, 1)[1] for ln in lines] == [
+            "Stopped the node sync daemon.",
+            "Could not stop the node sync daemon (pid 4242).",
+        ]
+
+    @pytest.mark.parametrize("pid_gap", [0.0, 0.5], ids=["pid-with-lock", "pid-after"])
+    @pytest.mark.parametrize("why", ["seen", "contended"])
+    def test_a_daemon_that_locks_late_is_re_stopped(
+        self, runner, tmp_config, monkeypatch, tmp_path, daemons, why, pid_gap
+    ):
+        # Spawned, but not yet holding its lock when the first stop looked --
+        # the only proof of a daemon reads "none". The end stop waits for it,
+        # but only on a hint that one may be on its way: the first stop found
+        # a daemon (whatever spawned it may spawn another), or a supervisor
+        # tick held serve's lock when down asked for it (that tick may have
+        # spawned one). It waits for its pid too: the kill needs one, and the
+        # daemon writes it just after taking the lock. The late one locks only
+        # once that end look has looked: every read of the first stop is
+        # before its lock, however slow the runner.
+        from magent import node_sync
+
+        late = _FakeDaemon(
+            4302, pid_gap=pid_gap, after=_once_down_looks_for_a_late_daemon(monkeypatch)
+        )
+        daemons[late.pid] = late
+        if why == "seen":
+            first = _FakeDaemon(4301)
+            daemons[first.pid] = first
+            first.start()
+            assert first.locked.wait(5)
+
+            def respawn() -> None:
+                if first.gone.wait(10):
+                    late.start()
+
+            threading.Thread(target=respawn, daemon=True).start()
+        else:
+            _tick_holding_serves_lock(monkeypatch, spawns=late)
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            real_sync=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert late.killed.is_set(), out.output
+        assert not node_sync.daemon_running()
+        lines = [
+            ln for ln in out.stdout.splitlines() if "node sync daemon" in ln.lower()
+        ]
+        assert [ln.split(None, 1)[1] for ln in lines] == (
+            [
+                "Stopped the node sync daemon.",
+                "Stopped the node sync daemon again (a daemon that started late).",
+            ]
+            if why == "seen"
+            else ["Node sync daemon was not running.", "Stopped the node sync daemon."]
+        )
+
+    def test_with_no_node_project_a_tick_holding_serves_lock_is_still_waited_out(
+        self, runner, tmp_config, monkeypatch, tmp_path, daemons
+    ):
+        # No node project left in the config, so no stop runs ahead of the
+        # pulls: the end stop is the only one and down's hold starts there. A
+        # tick holding serve's lock then may have spawned a daemon that has not
+        # locked yet, and it is waited for all the same. It locks only once
+        # that look has looked and found none.
+        from magent import node_sync
+
+        late = _FakeDaemon(4302, after=_once_down_looks_for_a_late_daemon(monkeypatch))
+        daemons[late.pid] = late
+        _tick_holding_serves_lock(monkeypatch, spawns=late)
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "web")}],
+            real_stop=True,
+            real_sync=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert "Pulling the last turn" not in out.stdout
+        assert late.killed.is_set(), out.output
+        assert not node_sync.daemon_running()
+        lines = [
+            ln for ln in out.stdout.splitlines() if "node sync daemon" in ln.lower()
+        ]
+        assert [ln.split(None, 1)[1] for ln in lines] == [
+            "Stopped the node sync daemon."
+        ]
+
+    def _clocked_down(self, runner, tmp_config, monkeypatch, tmp_path, *, pulls, **k):
+        """``down --all`` on a ``clocked_hold``: with ``pulls``, one node
+        session is pulled at the end; without, no project has a node."""
+        if pulls:
+            self._hold("api")
+        project = {"path": str(tmp_path / "api"), "node": "second"}
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[project] if pulls else [{"path": str(tmp_path / "web")}],
+            real_stop=True,
+            real_sync=True,
+            **k,
+        )
+        assert out.exit_code == 0, out.output
+        return [
+            ln.split(None, 1)[1]
+            for ln in out.stdout.splitlines()
+            if "node sync daemon" in ln.lower()
+        ]
+
+    @pytest.mark.parametrize("pulls", [True, False], ids=["pulls", "no-pulls"])
+    def test_a_daemon_a_held_tick_spawned_is_stopped_however_soon_the_end_comes(
+        self, runner, tmp_config, monkeypatch, tmp_path, clocked_hold, pulls
+    ):
+        # A tick held serve's lock when down asked for it, so it may have just
+        # spawned a daemon -- which locks only once its interpreter is up,
+        # seconds later (a cold start). The end stop comes at once here, and
+        # still finds it: the look is counted from the hold, not from the end.
+        late = _ClockDaemon(monkeypatch, clocked_hold, after=5.0)
+        said = self._clocked_down(
+            runner, tmp_config, monkeypatch, tmp_path, pulls=pulls
+        )
+        assert late.kills == [4242]
+        assert said == (
+            ["Node sync daemon was not running.", "Stopped the node sync daemon."]
+            if pulls
+            else ["Stopped the node sync daemon."]
+        )
+        # Found the moment it locked; the rest of the look was not waited out.
+        assert clocked_hold.hold_at is not None
+        assert clocked_hold.t == pytest.approx(clocked_hold.hold_at + 5.0, abs=0.06)
+
+    @pytest.mark.parametrize("pulls", [True, False], ids=["pulls", "no-pulls"])
+    def test_a_held_tick_is_looked_after_for_a_cold_start_past_the_hold(
+        self, runner, tmp_config, monkeypatch, tmp_path, clocked_hold, pulls
+    ):
+        # No daemon ever comes: the look ends one cold start after the hold
+        # (node sync -d's own start budget), and the stop finds nothing.
+        from magent.cli import node_cmd
+
+        never = _ClockDaemon(monkeypatch, clocked_hold, after=math.inf)
+        said = self._clocked_down(
+            runner, tmp_config, monkeypatch, tmp_path, pulls=pulls
+        )
+        assert never.kills == []
+        assert said == (["Node sync daemon was not running."] if pulls else [])
+        budget = node_cmd._START_POLLS * node_cmd._START_POLL_S
+        assert clocked_hold.hold_at is not None
+        assert clocked_hold.t == pytest.approx(clocked_hold.hold_at + budget, abs=0.06)
+
+    def test_after_pulls_longer_than_a_cold_start_the_end_stop_does_not_wait(
+        self, runner, tmp_config, monkeypatch, tmp_path, clocked_hold
+    ):
+        # 30 s of pulls: a daemon the held tick spawned would have locked long
+        # ago, so the end stop asks once and does not wait.
+        from magent import node_sync
+
+        _ClockDaemon(monkeypatch, clocked_hold, after=math.inf)
+        pulled = node_sync.remote_mux.PullResult(files=(), since=0.0)
+
+        def slow_pull(config, name, **_k):
+            clocked_hold.sleep(30.0)
+            return pulled
+
+        said = self._clocked_down(
+            runner, tmp_config, monkeypatch, tmp_path, pulls=True, pull=slow_pull
+        )
+        assert said == ["Node sync daemon was not running."]
+        assert clocked_hold.hold_at is not None
+        assert clocked_hold.t == pytest.approx(clocked_hold.hold_at + 30.0)
+
+    def test_a_daemon_the_first_stop_found_is_still_looked_after_from_the_end(
+        self, runner, tmp_config, monkeypatch, tmp_path, clocked_hold
+    ):
+        # Both hints at once: the tick held serve's lock AND the first stop
+        # found a daemon. After 30 s of pulls the hold's look is long over,
+        # but the found daemon's is not: it runs STOP_SETTLE_S from the end.
+        from magent import node_sync
+
+        found = _ClockDaemon(monkeypatch, clocked_hold, after=0.0)
+        pulled = node_sync.remote_mux.PullResult(files=(), since=0.0)
+
+        def slow_pull(config, name, **_k):
+            clocked_hold.sleep(30.0)
+            return pulled
+
+        said = self._clocked_down(
+            runner, tmp_config, monkeypatch, tmp_path, pulls=True, pull=slow_pull
+        )
+        assert found.kills == [4242]
+        assert said == ["Stopped the node sync daemon."]
+        assert clocked_hold.hold_at is not None
+        assert clocked_hold.t == pytest.approx(
+            clocked_hold.hold_at + 30.0 + node_sync.STOP_SETTLE_S, abs=0.06
+        )
+
+    def test_with_both_hints_the_holds_later_deadline_stands(
+        self, runner, tmp_config, monkeypatch, tmp_path, clocked_hold
+    ):
+        # Both hints, and this time the hold's look ends later: the first stop
+        # kills the daemon it found, the held tick's own daemon locks 5 s after
+        # the hold, and the end comes at once. STOP_SETTLE_S from the end would
+        # give up at 2 s and leave it running.
+        pair = _ClockDaemon(monkeypatch, clocked_hold, after=0.0, again=5.0)
+        said = self._clocked_down(runner, tmp_config, monkeypatch, tmp_path, pulls=True)
+        assert pair.kills == [4242, 4243]
+        assert said == [
+            "Stopped the node sync daemon.",
+            "Stopped the node sync daemon again (a daemon that started late).",
+        ]
+        assert clocked_hold.hold_at is not None
+        assert clocked_hold.t == pytest.approx(clocked_hold.hold_at + 5.0, abs=0.06)
+
+    def test_a_held_tick_outlasts_a_first_look_that_could_not_tell(
+        self, runner, tmp_config, monkeypatch, tmp_path, clocked_hold
+    ):
+        # Both hints, and the hold's is the later: a tick held serve's lock,
+        # and the first look could not tell (Windows EACCES on a lock file
+        # pending delete). The pulls are quick, so the look still runs a cold
+        # start past the hold -- STOP_SETTLE_S from the end would miss it.
+        from magent import node_sync
+
+        late = _ClockDaemon(monkeypatch, clocked_hold, after=5.0)
+        refusals = [PermissionError(13, "Access is denied")] * 2
+
+        def running() -> bool:
+            if refusals:
+                raise refusals.pop()
+            return late.running()
+
+        monkeypatch.setattr(node_sync, "daemon_running", running)
+        said = self._clocked_down(runner, tmp_config, monkeypatch, tmp_path, pulls=True)
+        assert late.kills == [4242]
+        assert said == [
+            (
+                "Could not tell whether the node sync daemon stopped"
+                " (PermissionError); see nodes.log"
+            ),
+            "Stopped the node sync daemon.",
+        ]
+
+    @pytest.mark.parametrize("first", [True, False], ids=["stopped", "absent"])
+    def test_an_end_stop_that_cannot_tell_is_said_after_a_first_stop_that_could(
+        self, runner, tmp_config, monkeypatch, tmp_path, first
+    ):
+        # News at the end is always said: the first stop's answer was clean,
+        # the end stop's lock would not open.
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=(first, PermissionError(13, "Access is denied")),
+        )
+        assert out.exit_code == 0, out.output
+        assert self.events == ["stop", "pull api", "stop"]
+        lines = [
+            ln for ln in out.stdout.splitlines() if "node sync daemon" in ln.lower()
+        ]
+        assert [ln.split(None, 1)[1] for ln in lines] == [
+            "Stopped the node sync daemon."
+            if first
+            else "Node sync daemon was not running.",
+            (
+                "Could not tell whether the node sync daemon stopped"
+                " (PermissionError); see nodes.log"
+            ),
+        ]
+
+    @pytest.mark.parametrize("nodes_here", [True, False], ids=["pulls", "no-pulls"])
+    def test_with_no_daemon_and_a_free_lock_the_end_stop_does_not_wait(
+        self, runner, tmp_config, monkeypatch, tmp_path, nodes_here
+    ):
+        # Nothing was running and nobody held serve's lock: no hint of a
+        # restart on its way, so the end stop is one stop, not a 2 s poll.
+        from magent import node_sync
+
+        waits: list[None] = []
+        monkeypatch.setattr(
+            node_sync, "await_late_daemon", lambda **_k: waits.append(None) or False
+        )
+        if nodes_here:
+            self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            real_sync=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert waits == []
+        assert "Node sync daemon was not running." in out.stdout
+
+    @pytest.mark.parametrize("held_at_start", [False, True], ids=["free", "tick-first"])
+    def test_serve_ticking_while_down_all_runs_spawns_no_daemon(
+        self,
+        runner,
+        tmp_config,
+        monkeypatch,
+        tmp_path,
+        supervisor_tick,
+        held_at_start,
+    ):
+        # The race: serve's supervisor ticks after the first stop and before
+        # serve dies, and starts the daemon down just stopped. down holds
+        # serve's supervisor lock from its first stop to its last, so that
+        # tick -- the REAL one, on the REAL lock -- stands down. A tick that
+        # held the lock when down asked for it is waited out, never raced.
+        if held_at_start:
+            from magent.cli import node_cmd
+
+            # No daemon comes: the end stop's look for one is kept short.
+            monkeypatch.setattr(node_cmd, "_START_POLLS", 3)
+            _tick_holding_serves_lock(monkeypatch, spawns=None)
+        during: list[list[list[str]]] = []
+
+        def stop_server(port: int) -> bool:
+            during.append(list(supervisor_tick(self.cfgpath)))
+            return False
+
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            stop_server=stop_server,
+        )
+        assert out.exit_code == 0, out.output
+        assert during == [[]]
+
+    def test_the_same_tick_with_no_down_running_does_spawn_one(
+        self, tmp_config, tmp_path, supervisor_tick
+    ):
+        # The control: without down's hold, that tick spawns the daemon -- so
+        # the pin above sees a hold, not a tick that could never spawn.
+        cfgpath = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"nodes": {"second": {"host": "h", "user": "demo"}}},
+                "projects": [{"path": str(tmp_path / "api"), "node": "second"}],
+            }
+        )
+        (argv,) = supervisor_tick(cfgpath)
+        assert argv[-2:] == ["node", "sync"]
+
+    def test_a_daemon_check_that_cannot_open_its_lock_keeps_the_node_half(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # The first stop now runs AHEAD of the pulls: a lock file Windows still
+        # has pending delete (EACCES) must not take the node half of down with
+        # it -- and no answer is never "not running". Once is enough to say it.
+        # The end stop's wait is the real one, shortened: it keeps looking
+        # past a probe that will not open.
+        from magent import node_sync
+
+        def unopenable():
+            raise PermissionError(13, "Access is denied")
+
+        waits: list[None] = []
+        real_wait = node_sync.await_late_daemon
+        monkeypatch.setattr(node_sync, "STOP_SETTLE_S", 0.3)
+        monkeypatch.setattr(node_sync, "daemon_running", unopenable)
+        monkeypatch.setattr(
+            node_sync,
+            "await_late_daemon",
+            lambda **k: waits.append(None) or real_wait(**k),
+        )
+        self._hold("api")
+        out, _killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            real_sync=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert self.events == ["pull api"]
+        assert dialed == [("second", "api")]
+        assert "Stopped 1 session(s): api" in out.stdout
+        unknown = (
+            "Could not tell whether the node sync daemon stopped (PermissionError);"
+            " see nodes.log"
+        )
+        assert out.stdout.count(unknown) == 1
+        assert "Node sync daemon was not running" not in out.stdout
+        # Unknown is no proof of "none": the end stop waits for a late lock.
+        assert waits == [None]
+
+    @pytest.mark.parametrize("how", ["held", "unopenable"])
+    def test_a_supervisor_lock_not_had_by_the_wait_is_warned_and_the_stop_still_runs(
+        self, runner, tmp_config, monkeypatch, tmp_path, caplog, how
+    ):
+        # Held by a tick past the wait, or a lock file Windows will not open
+        # while it is pending delete: either way the stops run, unprotected,
+        # and nodes.log says why.
+        from magent import node_sync
+        from magent.cli import node_cmd
+        from magent.log import get_logger
+
+        monkeypatch.setattr(node_sync, "STOP_SETTLE_S", 0.3)
+        monkeypatch.setattr(node_cmd, "_START_POLLS", 3)
+        get_logger(node_sync.LOG_NAME)
+        caplog.set_level(logging.WARNING, logger=f"magent.{node_sync.LOG_NAME}")
+        release = threading.Event()
+        if how == "held":
+            holding = threading.Event()
+
+            def hold() -> None:
+                with exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME):
+                    holding.set()
+                    release.wait(10)
+
+            threading.Thread(target=hold, daemon=True).start()
+            assert holding.wait(5)
+            why = "supervisor lock stayed held"
+        else:
+            real_lock = node_sync.exclusive_lock
+
+            def unopenable(name: str):
+                if name == node_sync.SUPERVISOR_LOCK_NAME:
+                    raise PermissionError(13, "Access is denied")
+                return real_lock(name)
+
+            monkeypatch.setattr(node_sync, "exclusive_lock", unopenable)
+            why = "could not take serve's supervisor lock"
+        self._hold("api")
+        try:
+            out, *_ = self._run(
+                runner,
+                tmp_config,
+                monkeypatch,
+                ["--all"],
+                projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+                real_stop=True,
+                sync_daemon=(True, False),
+            )
+        finally:
+            release.set()
+        assert out.exit_code == 0, out.output
+        assert self.events == ["stop", "pull api", "stop"]
+        assert "Stopped the node sync daemon." in out.stdout
+        warned = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any(why in w for w in warned), warned
+
+    def test_down_of_one_name_leaves_the_node_sync_daemon_alone(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # stop_daemon would answer True: only --all may ask it.
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["api"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert "node sync daemon" not in out.stdout.lower()
+        assert "stop" not in self.events
+
+    def test_a_config_without_nodes_says_nothing_about_it(
+        self, runner, tmp_config, monkeypatch
+    ):
+        from magent import node_sync
+
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda *a, **k: None)
+        monkeypatch.setattr(node_sync, "stop_daemon", lambda: False)
+        monkeypatch.setattr("magent.cli.attention_cmd.stop_daemon", lambda: False)
+        monkeypatch.setattr("magent.upload_server.stop_server", lambda port: False)
+        if sys.platform == "win32":
+            monkeypatch.setattr("magent.hotkey.stop_listener", lambda: False)
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"projects": []}), "down", "--all"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "node sync" not in result.stdout.lower()
+
+    def test_a_last_turn_that_did_not_come_home_is_said_and_the_kill_still_counts(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        from magent import nodes
+        from magent.remote_mux import RemoteError
+
+        self._hold("api")
+
+        def pull(config: object, name: str, **_k: object) -> None:
+            raise RemoteError(0, "magent: could not store every file", ("pull.sh",))
+
+        out, _killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["api"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            pull=pull,
+        )
+        assert out.exit_code == 0, out.output
+        assert dialed == [("second", "api")]
+        lines = self._session_lines(out)
+        assert "api: last turn not pulled (could not store every file)" in lines
+        assert "magent node sync --once" in lines
+        assert "Stopped 1 session(s): api" in lines
+        assert "api" in nodes.read_node_map()
+
+
+class TestTheShutdownReportFoldsBothHalves:
+    """``_report_shutdown`` directly: one name, two sessions, no line that
+    contradicts another."""
+
+    def _report(self, capsys, *halves):
+        status_mod._report_shutdown(*halves)
+        return capsys.readouterr().out
+
+    def test_a_local_survivor_is_never_claimed_by_a_node_stop(self, capsys):
+        out = self._report(capsys, [], ["api"], ["api"], [])
+        assert "Stopped" not in out
+        assert out.count("would NOT stop: api") == 1
+        assert "launch.log" in out
+
+    def test_survivors_on_both_halves_each_get_their_reason(self, capsys):
+        out = self._report(capsys, [], ["api"], [], ["api"])
+        assert out.count("would NOT stop: api") == 2
+        assert "launch.log" in out
+        assert "nodes.log" in out
+        assert "Stopped" not in out
+        assert "No running sessions" not in out
+
+    def test_no_node_half_prints_what_it_always_did(self, capsys):
+        assert self._report(capsys, ["web"], []) == ("  + Stopped 1 session(s): web\n")

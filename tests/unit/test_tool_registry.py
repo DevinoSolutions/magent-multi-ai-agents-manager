@@ -14,8 +14,10 @@ from magent.sessions import (
     IDE_COMMANDS,
     IDE_TOOLS,
     AgentTool,
+    agent_image_names,
     build_resume_command,
     build_start_command,
+    fresh_start_command,
     ide_command,
     is_ide_tool,
 )
@@ -34,6 +36,16 @@ class TestRegistryShape:
     def test_happy_agents_derived_from_registry(self):
         assert {t for t, c in AGENT_TOOLS.items() if c.happy} == HAPPY_AGENTS
 
+    def test_every_agent_names_the_process_it_runs_as(self):
+        # An agent with no image could never be seen under a pane, so revive
+        # would type into it: every registry entry must name one.
+        assert all(caps.images for caps in AGENT_TOOLS.values())
+
+    def test_the_agent_images_cover_both_tools_and_their_node_host(self):
+        # claude.exe (native install), codex, and node.exe -- the npm shim both
+        # can run under, which a snapshot cannot tell from any other node.
+        assert {"claude", "codex", "node"} <= agent_image_names()
+
 
 class TestOneEditExtensionProof:
     def test_adding_a_tool_is_one_dict_entry(self, monkeypatch):
@@ -51,6 +63,15 @@ class TestOneEditExtensionProof:
             build_resume_command("mytool", "mytool run", "id-1") == "mytool run R id-1"
         )
 
+    def test_its_process_image_is_one_field_on_the_same_entry(self, monkeypatch):
+        """The idle proof learns a new agent's process from its registry entry
+        -- no second list to keep in step, any case."""
+        monkeypatch.setattr(
+            "magent.sessions.AGENT_TOOLS",
+            dict(AGENT_TOOLS, mytool=AgentTool(images=("MyTool",))),
+        )
+        assert "mytool" in agent_image_names()
+
     def test_new_entry_defaults_are_unset(self):
         """A minimal AgentTool (no session_ids/happy) is a valid, inert entry --
         confirms the dataclass's defaults, not just the fields this repo's two
@@ -59,8 +80,10 @@ class TestOneEditExtensionProof:
         assert minimal.session_ids is None
         assert minimal.resume_command is None
         assert minimal.fresh_command is None
+        assert minimal.fresh_form is None
         assert minimal.happy is False
         assert minimal.multi_window is False
+        assert minimal.images == ()
 
     def test_fresh_start_is_one_dict_entry_too(self, monkeypatch):
         """A tool teaches the fresh-start dispatcher about its own
@@ -81,6 +104,23 @@ class TestOneEditExtensionProof:
             build_start_command("mytool", "mytool --pickup", "/old")
             == "mytool --pickup"
         )
+
+    def test_the_fresh_form_is_one_dict_entry_too(self, monkeypatch):
+        """A tool teaches the store-free fresh form (what a pool node is
+        shipped) with one more field on its registry entry --
+        fresh_start_command needs no code change to honor it."""
+        extended = dict(
+            AGENT_TOOLS,
+            mytool=AgentTool(
+                fresh_form=lambda base: (
+                    base.replace(" --pickup", "") if " --pickup" in base else None
+                ),
+            ),
+        )
+        monkeypatch.setattr("magent.sessions.AGENT_TOOLS", extended)
+
+        assert fresh_start_command("mytool", "mytool --pickup") == "mytool"
+        assert fresh_start_command("mytool", "mytool") is None
 
     def test_a_tool_decides_for_itself_what_a_config_dir_means(self, monkeypatch):
         """The registry asks each tool WHICH store answers for a project; the

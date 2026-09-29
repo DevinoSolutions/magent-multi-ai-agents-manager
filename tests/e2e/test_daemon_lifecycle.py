@@ -59,7 +59,6 @@ import contextlib
 import http.client
 import json
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -70,6 +69,8 @@ import uuid
 import pytest
 
 from magent.procs import pid_alive
+from tests.e2e._procs import kill_everything_carrying
+from tests.e2e._procs import kill_pid as _kill_pid
 
 pytestmark = pytest.mark.e2e
 
@@ -100,6 +101,7 @@ def _child_env(home, **extra: str) -> dict[str, str]:
     # no HOME redirect contains: a test-spawned serve/daemon must never
     # re-prioritise the developer's real psmux fleet.
     env["MAGENT_PSMUX_BOOST"] = "0"
+    env["MAGENT_NODE_SYNC"] = "0"
     # ...and the Session-0 hand-off must never fire from a test: a runner
     # (or an ssh-driven leg) is legitimately non-interactive, and the
     # default policy would create a REAL scheduled task on somebody's
@@ -155,37 +157,17 @@ def _read_pid(path) -> int | None:
         return None
 
 
-def _kill_pid(pid) -> None:
-    """Kill exactly one pid (its tree, on Windows) and tolerate it already being
-    gone. Never raises. Only ever called with a pid this test created."""
-    if not pid:
-        return
-    if sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            check=False,
-        )
-        return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return
-    for _ in range(30):
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return
-        time.sleep(0.1)
-    with contextlib.suppress(OSError):
-        os.kill(pid, signal.SIGKILL)
-
-
-def _spawn_dummy() -> subprocess.Popen:
+def _spawn_dummy() -> tuple[subprocess.Popen, str]:
     """A real, live, non-serving process whose pid we can plant in a pid file to
     stage a 'live but not the server' condition (upload "dead" / attention
-    "stale")."""
-    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    "stale"). Returns it with a uuid marker carried in its argv: under a venv
+    the interpreter is a launcher with a same-argv child, and teardown ends
+    both by that marker (see _procs) rather than by a tree walk."""
+    marker = f"magent-dummy-{uuid.uuid4().hex[:10]}"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)", marker]
+    )
+    return proc, marker
 
 
 def _make_world(tmp_path, *, attention=None, projects=None):
@@ -198,7 +180,9 @@ def _make_world(tmp_path, *, attention=None, projects=None):
     settings: dict[str, object] = {"uploadPort": port}
     if attention is not None:
         settings["attention"] = attention
-    cfg = tmp_path / "magent.config.json"
+    # The uuid in the NAME is load-bearing: this path is in the argv of every
+    # process a test causes, so teardown can find them by it (see _procs).
+    cfg = tmp_path / f"magent-{uuid.uuid4().hex[:10]}.config.json"
     cfg.write_text(
         json.dumps({"version": 3, "projects": projects or [], "settings": settings}),
         encoding="utf-8",
@@ -229,19 +213,33 @@ def _run(args, env, timeout: float = 90):
 
 def _run_detaching(args, env, err_path, timeout: float = 90) -> int:
     """Run a command that DETACHES a long-lived grandchild (`serve --ensure`,
-    `attention -d`). stdout -> DEVNULL so the grandchild, which inherits these
-    fds, can never SIGPIPE on a pipe whose reader has gone; stderr -> a file for
-    failure diagnostics. Assert on OBSERVABLE state (pid files / health), not on
-    captured stdout. Returns the launcher's exit code."""
-    with err_path.open("w", encoding="utf-8") as e:
+    `attention -d`). stdout and stderr -> files, never pipes, so the grandchild,
+    which inherits these fds, can never SIGPIPE on a pipe whose reader has gone.
+    stdout is kept (next to ``err_path``, as ``.out``) because the launcher's
+    verdict -- "attention daemon failed to start" -- is printed THERE; read both
+    with ``_launch_diag``. Assert on OBSERVABLE state (pid files / health).
+    Returns the launcher's exit code."""
+    with (
+        err_path.with_suffix(".out").open("w", encoding="utf-8") as o,
+        err_path.open("w", encoding="utf-8") as e,
+    ):
         p = subprocess.run(
             [sys.executable, "-m", "magent", *args],
-            stdout=subprocess.DEVNULL,
+            stdout=o,
             stderr=e,
             env=env,
             timeout=timeout,
         )
     return p.returncode
+
+
+def _launch_diag(err_path) -> str:
+    """Both halves of a ``_run_detaching`` launch, for a failure message."""
+    parts = []
+    for path in (err_path.with_suffix(".out"), err_path):
+        if path.is_file():
+            parts.append(f"--- {path.name} ---\n{path.read_text(errors='replace')}")
+    return "\n".join(parts)
 
 
 @contextlib.contextmanager
@@ -251,7 +249,8 @@ def _serve(w):
     os.getpid(), which is what status/stop_server target. On a uv/venv Windows
     box that pid differs from the Popen pid (the venv python.exe is a trampoline
     that spawns the real interpreter as a child), so we key off the pid file, not
-    the launcher. Killed (recorded pid + launcher tree) afterwards. No
+    the launcher. Killed afterwards: the recorded pid, the launcher, and then
+    anything still carrying the cfg marker (see _procs; no tree walk). No
     grandchild: plain serve runs run_server in-process, so file-backed stdio is
     safe."""
     pidfile = w.md / f"upload_server-{w.port}.pid"
@@ -290,6 +289,8 @@ def _serve(w):
     finally:
         _kill_pid(_read_pid(pidfile))  # the real server process
         _kill_pid(proc.pid)  # the launcher/trampoline (may already be gone)
+        # A serve that never wrote its pid file still carries the cfg marker.
+        kill_everything_carrying(str(w.cfg))
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=30)
         out_f.close()
@@ -345,7 +346,7 @@ def test_serve_ensure_idempotent_then_survivor(tmp_path):
             w.env,
             w.workdir / "ensure1.err",
         )
-        assert rc == 0
+        assert rc == 0, _launch_diag(w.workdir / "ensure1.err")
         assert _health_ok(w.port)
         assert _read_pid(pidfile) == pid_a, "ensure spawned a duplicate/new pid"
         assert len(list(w.md.glob("upload_server-*.pid"))) == 1
@@ -368,10 +369,10 @@ def test_serve_ensure_idempotent_then_survivor(tmp_path):
             w.env,
             w.workdir / "ensure2.err",
         )
-        assert rc == 0
+        assert rc == 0, _launch_diag(w.workdir / "ensure2.err")
         assert _wait_until(lambda: _health_ok(w.port), 30), (
             "ensure did not bring up a survivor server:\n"
-            f"{(w.workdir / 'ensure2.err').read_text(errors='replace')}"
+            f"{_launch_diag(w.workdir / 'ensure2.err')}"
         )
         survivor_pid = _read_pid(pidfile)
         assert survivor_pid is not None and pid_alive(survivor_pid)
@@ -381,7 +382,8 @@ def test_serve_ensure_idempotent_then_survivor(tmp_path):
             _kill_pid(first.pid)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 first.wait(timeout=30)
-        _kill_pid(survivor_pid)
+        _kill_pid(survivor_pid or _read_pid(pidfile))
+        kill_everything_carrying(str(w.cfg))
         for f in (out_f, err_f):
             if f is not None:
                 f.close()
@@ -412,13 +414,12 @@ def test_attention_daemonizes_persists_heartbeats_and_dedups(tmp_path):
             timeout=60,
         )
         assert rc == 0, (
-            "attention -d did not exit 0:\n"
-            f"{(w.workdir / 'att-d.err').read_text(errors='replace')}"
+            f"attention -d did not exit 0:\n{_launch_diag(w.workdir / 'att-d.err')}"
         )
         # The launcher has returned; the DETACHED daemon must persist.
         assert _wait_until(lambda: pid_alive(_read_pid(pidfile) or 0), 30), (
             "attention daemon pid never became alive:\n"
-            f"{(w.workdir / 'att-d.err').read_text(errors='replace')}"
+            f"{_launch_diag(w.workdir / 'att-d.err')}"
         )
         daemon_pid = _read_pid(pidfile)
         assert daemon_pid and pid_alive(daemon_pid)
@@ -441,11 +442,13 @@ def test_attention_daemonizes_persists_heartbeats_and_dedups(tmp_path):
             w.workdir / "att-d2.err",
             timeout=60,
         )
-        assert rc2 == 0
+        assert rc2 == 0, _launch_diag(w.workdir / "att-d2.err")
         assert _read_pid(pidfile) == daemon_pid, "second -d started a duplicate"
         assert pid_alive(daemon_pid)
     finally:
+        daemon_pid = daemon_pid or _read_pid(pidfile)
         _kill_pid(daemon_pid)
+        kill_everything_carrying(str(w.cfg))
         if daemon_pid:
             _wait_until(lambda: not pid_alive(daemon_pid), 15)
 
@@ -486,7 +489,7 @@ def test_status_json_upload_dead_reports_dead_and_exits_3(tmp_path):
     # port => "off", not degraded). "dead" means a live process (or bound port)
     # that is NOT answering /health -- so plant a REAL live non-serving pid in
     # the upload pid file, leaving the port free.
-    dummy = _spawn_dummy()
+    dummy, dummy_marker = _spawn_dummy()
     try:
         w.md.mkdir(parents=True, exist_ok=True)
         (w.md / f"upload_server-{w.port}.pid").write_text(
@@ -498,6 +501,7 @@ def test_status_json_upload_dead_reports_dead_and_exits_3(tmp_path):
         assert data["upload_server"] == "dead", data
     finally:
         _kill_pid(dummy.pid)
+        kill_everything_carrying(dummy_marker)
 
 
 def test_status_json_attention_stale_reports_stale_and_exits_3(tmp_path):
@@ -505,7 +509,7 @@ def test_status_json_attention_stale_reports_stale_and_exits_3(tmp_path):
     # "stale" = a LIVE daemon pid whose heartbeat aged past HEARTBEAT_MAX_AGE
     # (30s). A killed daemon reads as "crashed", not "stale" -- so we need a real
     # live pid AND a backdated heartbeat file.
-    dummy = _spawn_dummy()
+    dummy, dummy_marker = _spawn_dummy()
     try:
         w.md.mkdir(parents=True, exist_ok=True)
         (w.md / "attention.pid").write_text(str(dummy.pid), encoding="utf-8")
@@ -518,6 +522,7 @@ def test_status_json_attention_stale_reports_stale_and_exits_3(tmp_path):
         assert data["attention"] == "stale", data
     finally:
         _kill_pid(dummy.pid)
+        kill_everything_carrying(dummy_marker)
 
 
 def test_status_json_attention_crashed_reports_crashed_and_exits_3(tmp_path):
@@ -574,10 +579,10 @@ def test_down_all_stops_serve_and_attention_scoped_to_home(tmp_path):
                 w.workdir / "down-att.err",
                 timeout=60,
             )
-            assert rc == 0
+            assert rc == 0, _launch_diag(w.workdir / "down-att.err")
             assert _wait_until(lambda: pid_alive(_read_pid(att_pidfile) or 0), 30), (
                 "attention daemon never came up:\n"
-                f"{(w.workdir / 'down-att.err').read_text(errors='replace')}"
+                f"{_launch_diag(w.workdir / 'down-att.err')}"
             )
             daemon_pid = _read_pid(att_pidfile)
 
@@ -613,6 +618,7 @@ def test_down_all_stops_serve_and_attention_scoped_to_home(tmp_path):
             assert "attention daemon" in out.lower(), out
         finally:
             _kill_pid(_read_pid(att_pidfile))
+            kill_everything_carrying(str(w.cfg))
             leftover = _read_pid(att_pidfile)
             if leftover:
                 _wait_until(lambda: not pid_alive(leftover), 15)

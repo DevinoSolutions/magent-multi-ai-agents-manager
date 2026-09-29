@@ -20,6 +20,10 @@ from tests.conftest import FakePlatform
 CTRL_W_ESCAPE = "\\u0017"
 ESC_CR_ESCAPE = "\\u001b\\r"
 
+# A settings file nested past the JSON parser's depth: json.loads raises
+# RecursionError on it, which is not a ValueError.
+_NESTED = '{"actions": ' + "[" * 200_000 + "]" * 200_000 + "}"
+
 
 @pytest.fixture(autouse=True)
 def _on_windows(monkeypatch):
@@ -215,6 +219,9 @@ class TestJsoncRefusal:
         assert "sendInput" in result.output
         assert CTRL_W_ESCAPE in result.output
         assert ESC_CR_ESCAPE in result.output
+        assert "Windows Terminal accepts comments and trailing commas" in (
+            result.output
+        )
 
     def test_status_reports_unreadable_without_writing(self, runner, tmp_path):
         path = tmp_path / "settings.json"
@@ -222,6 +229,137 @@ class TestJsoncRefusal:
         result = _status(runner, path)
         assert result.exit_code == 0
         assert "unreadable" in result.output
+        assert "Windows Terminal allows JSONC" in result.output
+
+
+class TestNestedPastTheParsersDepth:
+    """json.loads raises RecursionError, not ValueError, on a document nested
+    past its depth. It is a file we cannot parse like any other, so it takes
+    the same refusal: named, never a traceback, never rewritten."""
+
+    def _nested(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_bytes(_NESTED.encode("utf-8"))
+        return path
+
+    def test_load_settings_raises_the_parse_error(self, tmp_path):
+        with pytest.raises(wt_keys.SettingsParseError, match="nested too deeply"):
+            wt_keys.load_settings(self._nested(tmp_path))
+
+    def test_install_refuses_by_name_and_leaves_the_file_byte_identical(
+        self, runner, tmp_path
+    ):
+        path = self._nested(tmp_path)
+
+        result = _install(runner, path)
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert f"Cannot edit {path}: " in result.stderr
+        assert "nested too deeply" in result.stderr
+        assert path.read_bytes() == _NESTED.encode("utf-8")
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["settings.json"]
+
+    def test_status_reports_unparseable_never_absent(self, runner, tmp_path):
+        # Unknown must never read as absent: no per-key "not bound" rows, and
+        # never "Windows Terminal not found".
+        path = self._nested(tmp_path)
+
+        result = _status(runner, path)
+
+        assert result.exit_code == 0, result.exception
+        assert "unreadable: " in result.output
+        assert "nested too deeply" in result.output
+        assert "ctrl+backspace" not in result.output
+        assert "shift+enter" not in result.output
+        assert "not found" not in result.output
+        assert path.read_bytes() == _NESTED.encode("utf-8")
+
+
+_NOT_A_SYNTAX_ERROR = [
+    pytest.param(_NESTED.encode("utf-8"), id="nested"),
+    pytest.param(b'{"actions": "\xff"}', id="not-utf8"),
+    pytest.param(b"[]", id="not-an-object"),
+]
+_A_SYNTAX_ERROR = '{\n  // Windows Terminal allows comments\n  "actions": [],\n}\n'
+
+
+class TestTheJsoncHintFollowsOnlyASyntaxError:
+    """Windows Terminal's JSONC (comments, trailing commas) explains exactly
+    one refusal: a JSON syntax error. A file nested past the parser's depth,
+    one that is not UTF-8 and one that parses but is not an object are none
+    of that, and the hint would send their owner looking for syntax that is
+    not there."""
+
+    @staticmethod
+    def _plant(tmp_path, content):
+        path = tmp_path / "settings.json"
+        path.write_bytes(content)
+        return path
+
+    @staticmethod
+    def _reason(path):
+        with pytest.raises(wt_keys.SettingsParseError) as caught:
+            wt_keys.load_settings(path)
+        return str(caught.value)
+
+    @pytest.mark.parametrize("content", _NOT_A_SYNTAX_ERROR)
+    def test_install_refuses_without_the_hint(self, runner, tmp_path, content):
+        path = self._plant(tmp_path, content)
+
+        result = _install(runner, path)
+
+        assert result.exit_code == 1
+        assert result.stderr == f"  x Cannot edit {path}: {self._reason(path)}\n"
+        assert result.stdout.startswith(
+            "  magent never rewrites a file it could not read. "
+            "Add this by hand instead:\n\n    "
+        )
+        assert "comments" not in result.output
+        assert "JSONC" not in result.output
+        assert path.read_bytes() == content
+
+    @pytest.mark.parametrize("content", _NOT_A_SYNTAX_ERROR)
+    def test_status_reports_without_the_hint(self, runner, tmp_path, content):
+        path = self._plant(tmp_path, content)
+
+        result = _status(runner, path)
+
+        assert result.output == (
+            f"  {path}\n"
+            f"  ! unreadable: {self._reason(path)}\n"
+            "  magent will not rewrite a file it cannot parse. Run\n"
+            "  `magent terminal install` for the snippet to paste by hand.\n"
+        )
+
+    def test_a_syntax_error_keeps_the_hint_byte_for_byte_on_install(
+        self, runner, tmp_path
+    ):
+        path = self._plant(tmp_path, _A_SYNTAX_ERROR.encode())
+
+        result = _install(runner, path)
+
+        assert result.stderr == f"  x Cannot edit {path}: {self._reason(path)}\n"
+        assert result.stdout.startswith(
+            "  Windows Terminal accepts comments and trailing commas; the\n"
+            "  stdlib JSON parser does not, and magent never rewrites a file\n"
+            "  it could not read. Add this by hand instead:\n\n    "
+        )
+
+    def test_a_syntax_error_keeps_the_hint_byte_for_byte_on_status(
+        self, runner, tmp_path
+    ):
+        path = self._plant(tmp_path, _A_SYNTAX_ERROR.encode())
+
+        result = _status(runner, path)
+
+        assert result.output == (
+            f"  {path}\n"
+            f"  ! unreadable: {self._reason(path)}\n"
+            "  Windows Terminal allows JSONC; magent will not rewrite a\n"
+            "  file it cannot parse. Run `magent terminal install` for the\n"
+            "  snippet to paste by hand.\n"
+        )
 
 
 class TestBackup:

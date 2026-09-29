@@ -57,7 +57,6 @@ import hashlib
 import http.client
 import json
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -70,6 +69,8 @@ import pytest
 
 from magent import log as mlog
 from magent.procs import pid_alive
+from tests.e2e._procs import kill_everything_carrying
+from tests.e2e._procs import kill_pid as _kill_pid
 
 _SOAK_ENABLED = bool(os.environ.get("MDTEST_SOAK"))
 # Full active-soak duration in seconds. 1500 == 25 min, comfortably inside the
@@ -124,6 +125,7 @@ def _child_env(home, extra_path: str | None = None) -> dict[str, str]:
     # no HOME redirect contains: a test-spawned serve/daemon must never
     # re-prioritise the developer's real psmux fleet.
     env["MAGENT_PSMUX_BOOST"] = "0"
+    env["MAGENT_NODE_SYNC"] = "0"
     # ...and the Session-0 hand-off must never fire from a test: a runner
     # (or an ssh-driven leg) is legitimately non-interactive, and the
     # default policy would create a REAL scheduled task on somebody's
@@ -175,45 +177,33 @@ def _read_pid(path) -> int | None:
         return None
 
 
-def _kill_pid(pid) -> None:
-    """Kill exactly one pid (its tree, on Windows) and tolerate it already being
-    gone. Never raises. Only ever called with a pid this test created."""
-    if not pid:
-        return
-    if sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            check=False,
-        )
-        return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return
-    for _ in range(30):
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return
-        time.sleep(0.1)
-    with contextlib.suppress(OSError):
-        os.kill(pid, signal.SIGKILL)
-
-
 def _run_detaching(args, env, err_path, timeout: float = 90) -> int:
     """Run a command that DETACHES a long-lived grandchild (``attention -d``).
-    stdout -> DEVNULL so the grandchild can't SIGPIPE; stderr -> a file for
-    diagnostics. Returns the launcher's exit code."""
-    with err_path.open("w", encoding="utf-8") as e:
+    stdout and stderr -> files, never pipes, so the grandchild can't SIGPIPE.
+    stdout is kept (``.out`` next to ``err_path``) because the launcher's
+    verdict is printed there; read both with ``_launch_diag``. Returns the
+    launcher's exit code."""
+    with (
+        err_path.with_suffix(".out").open("w", encoding="utf-8") as o,
+        err_path.open("w", encoding="utf-8") as e,
+    ):
         p = subprocess.run(
             [sys.executable, "-m", "magent", *args],
-            stdout=subprocess.DEVNULL,
+            stdout=o,
             stderr=e,
             env=env,
             timeout=timeout,
         )
     return p.returncode
+
+
+def _launch_diag(err_path) -> str:
+    """Both halves of a ``_run_detaching`` launch, for a failure message."""
+    parts = []
+    for path in (err_path.with_suffix(".out"), err_path):
+        if path.is_file():
+            parts.append(f"--- {path.name} ---\n{path.read_text(errors='replace')}")
+    return "\n".join(parts)
 
 
 # --- agent-state writes into the REDIRECTED home ------------------------------
@@ -408,7 +398,9 @@ def _make_world(tmp_path):
     proj.mkdir()
     shim_path = _install_psmux_shim(tmp_path / "shim")
     port = _free_port()
-    cfg = tmp_path / "magent.config.json"
+    # The uuid in the NAME is load-bearing: this path is in the argv of every
+    # process the test causes, so teardown can find them by it (see _procs).
+    cfg = tmp_path / f"magent-{uuid.uuid4().hex[:10]}.config.json"
     cfg.write_text(
         json.dumps(
             {
@@ -496,12 +488,11 @@ def _start_attention(w):
         timeout=60,
     )
     assert rc == 0, (
-        "attention -d did not exit 0:\n"
-        f"{(w.workdir / 'att-d.err').read_text(errors='replace')}"
+        f"attention -d did not exit 0:\n{_launch_diag(w.workdir / 'att-d.err')}"
     )
     assert _wait_until(lambda: pid_alive(_read_pid(pidfile) or 0), 30), (
         "attention daemon pid never became alive:\n"
-        f"{(w.workdir / 'att-d.err').read_text(errors='replace')}"
+        f"{_launch_diag(w.workdir / 'att-d.err')}"
     )
     daemon_pid = _read_pid(pidfile)
     assert daemon_pid and pid_alive(daemon_pid)
@@ -671,7 +662,9 @@ def test_soak_serve_and_attention_stay_healthy(tmp_path):
         if serve_files is not None:
             for f in serve_files:
                 f.close()
+        daemon_pid = daemon_pid or _read_pid(w.md / "attention.pid")
         _kill_pid(daemon_pid)
+        kill_everything_carrying(str(w.cfg))
         if daemon_pid:
             _wait_until(lambda: not pid_alive(daemon_pid), 15)
         _wait_until(lambda: not _health_ok(w.port), 10)

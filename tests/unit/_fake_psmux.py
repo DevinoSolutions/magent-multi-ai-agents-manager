@@ -8,8 +8,9 @@ RECEIVES -- including that no shell splits or rewrites ``/model`` on the way.
 
 ``make_fake_psmux`` writes a tiny launcher (``.cmd`` on Windows, a ``sh`` script
 elsewhere) that shells to a Python recorder. Every invocation appends its argv
-to ``calls.jsonl``; ``capture-pane`` prints ``pane.txt``; ``has-session`` exits
-0 unless ``live.txt`` exists and omits the queried session. The base directory
+to ``calls.jsonl``; ``capture-pane`` prints ``pane.txt`` (after sleeping
+``capture_delay.txt`` seconds, if set); ``has-session`` exits 0 unless
+``live.txt`` exists and omits the queried session. The base directory
 is baked into the recorder as a literal, so no environment plumbing is needed.
 """
 
@@ -58,6 +59,12 @@ if "has-session" in args:
     sys.exit(0)
 
 if "capture-pane" in args:
+    # A pane that answers late: what a loaded box does to a real capture, made
+    # deterministic. Only capture-pane is slowed, so liveness and send-keys
+    # still answer at once.
+    delay = BASE / "capture_delay.txt"
+    if delay.exists():
+        time.sleep(float(delay.read_text(encoding="utf-8")))
     pane = BASE / "pane.txt"
     if pane.exists():
         # Write raw UTF-8 bytes: the parent (psmux.capture_pane) decodes with
@@ -81,6 +88,10 @@ class FakePsmux:
 
     def set_pane(self, text: str) -> None:
         (self.base / "pane.txt").write_text(text, encoding="utf-8")
+
+    def set_capture_delay(self, seconds: float) -> None:
+        """Make every later ``capture-pane`` sleep ``seconds`` before answering."""
+        (self.base / "capture_delay.txt").write_text(str(seconds), encoding="utf-8")
 
     def set_live(self, names: list[str] | None) -> None:
         live = self.base / "live.txt"

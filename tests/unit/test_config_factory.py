@@ -6,17 +6,20 @@ from pathlib import Path
 import pytest
 
 from magent.config import (
+    _MIGRATIONS,
     DEFAULT_TOOLS,
     SCHEMA_VERSION,
     ConfigError,
     LayoutConfig,
     Settings,
     _migrate_2_to_3,
+    _migrate_3_to_4,
     _parse_settings,
     default_config,
     layout_to_dict,
     load_config,
     migrate_config_file,
+    migrate_raw,
     settings_to_dict,
 )
 from magent.discover import projects_to_config
@@ -155,6 +158,42 @@ class TestMigrateConfigFile:
         with pytest.raises(ConfigError, match="valid JSON"):
             migrate_config_file(str(p))
 
+    @pytest.mark.parametrize("color", [None, "#22c55e"], ids=["colorless", "colored"])
+    def test_migrate_refuses_text_with_no_utf8_form_and_writes_nothing(
+        self, tmp_config, color
+    ):
+        # F-SUR-1: the same refusal load_config gives, before migrate's own
+        # color hash (colorless: it used to raise the codec's words) and before
+        # its write (colored: it used to stamp the version onto the file).
+        project: dict[str, object] = {"path": "api", "title": "api\ud83d"}
+        if color:
+            project["color"] = color
+        path = tmp_config({"projects": [project]})
+        before = Path(path).read_bytes()
+        with pytest.raises(ConfigError) as exc:
+            migrate_config_file(path)
+        assert str(exc.value) == (
+            "projects[0].title has text with no UTF-8 form (UnicodeEncodeError):"
+            " 'api\\ud83d'"
+        )
+        assert Path(path).read_bytes() == before
+
+    def test_migrate_refuses_before_it_reshapes_anything(self, tmp_config):
+        # The refusal names the field the FILE holds. A v2 legacy window is a
+        # bare string; checked after migrate_raw, it would be named by its v3
+        # shape, projects[0].windows[0].name, which the file does not contain.
+        path = tmp_config(
+            {"version": 2, "projects": [{"path": "api", "windows": ["x\ud83d"]}]}
+        )
+        before = Path(path).read_bytes()
+        with pytest.raises(ConfigError) as exc:
+            migrate_config_file(path)
+        assert str(exc.value) == (
+            "projects[0].windows[0] has text with no UTF-8 form (UnicodeEncodeError):"
+            " 'x\\ud83d'"
+        )
+        assert Path(path).read_bytes() == before
+
 
 class TestMigrate2To3Windows:
     """Characterization pins for _migrate_2_to_3, which normalizes the v2
@@ -224,3 +263,72 @@ class TestExampleConfigMatchesFactory:
         assert cfg.version == SCHEMA_VERSION
         assert len(cfg.projects) == len(example["projects"])
         assert capsys.readouterr().err == ""
+
+
+class TestMigrations:
+    """Invariants of the migration chain itself, true at every schema version."""
+
+    def test_every_version_below_the_schema_has_a_step(self):
+        assert sorted(_MIGRATIONS) == list(range(SCHEMA_VERSION))
+
+
+class TestMigrateToFour:
+    """v4 adds the node pool (settings.nodes / nodeSync) and a project's
+    node / push. Every new key is optional -- absent means "no nodes" -- so the
+    step only stamps the version.
+
+    Expected values are literals, never derived from the input: a shallow
+    copy shares nested objects, so an expectation built from ``raw`` would
+    move in lockstep with a step that mutated them."""
+
+    def test_the_schema_is_four(self):
+        assert SCHEMA_VERSION == 4
+
+    def test_three_to_four_only_stamps(self):
+        raw = {"version": 3, "settings": {"psmux": True}, "projects": [{"path": "a"}]}
+        assert _migrate_3_to_4(raw) == {
+            "version": 4,
+            "settings": {"psmux": True},
+            "projects": [{"path": "a"}],
+        }
+
+    def test_the_step_never_mutates_its_input(self):
+        raw = {"version": 3, "settings": {"psmux": True}, "projects": [{"path": "a"}]}
+        _migrate_3_to_4(raw)
+        assert raw == {
+            "version": 3,
+            "settings": {"psmux": True},
+            "projects": [{"path": "a"}],
+        }
+
+    def test_a_v3_config_reaches_four_with_its_projects_intact(self):
+        raw = migrate_raw(
+            {"version": 3, "projects": [{"path": "a", "windows": [{"name": "x"}]}]}
+        )
+        assert raw == {
+            "version": 4,
+            "projects": [{"path": "a", "windows": [{"name": "x"}]}],
+        }
+
+    def test_a_v3_file_loads_warns_and_is_left_alone(self, tmp_config, capsys):
+        # The user-visible effect of this bump: an existing v3 config still
+        # loads, says it is behind, and is never rewritten by a load.
+        path = tmp_config({"version": 3, "projects": [{"path": "api"}]})
+        before = Path(path).read_bytes()
+        cfg = load_config(path)
+        assert cfg.projects[0].path == "api"
+        assert (
+            "Warning: config schema v3 < v4; run: magent config migrate"
+            in capsys.readouterr().err
+        )
+        assert Path(path).read_bytes() == before
+
+    def test_an_unversioned_config_reaches_four(self):
+        assert migrate_raw({"projects": []})["version"] == 4
+
+    def test_migrating_a_v3_file_stamps_four_on_disk(self, tmp_config):
+        path = tmp_config(
+            {"version": 3, "projects": [{"path": "api", "color": "#123456"}]}
+        )
+        assert migrate_config_file(path) is True
+        assert json.loads(Path(path).read_text(encoding="utf-8"))["version"] == 4

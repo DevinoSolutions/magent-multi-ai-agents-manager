@@ -3,8 +3,10 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import ctypes.wintypes
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -12,6 +14,7 @@ from ctypes import POINTER, WINFUNCTYPE, byref, create_unicode_buffer, windll
 from pathlib import Path
 from typing import Literal
 
+from magent.attach_client import ssh_program
 from magent.grid import MonitorRect, Rect
 from magent.log import get_logger
 from magent.platform import (
@@ -22,6 +25,7 @@ from magent.platform import (
     TerminalLaunchOpts,
     TerminalNotFoundError,
     VSCodeLaunchOpts,
+    _handoff_launcher,
     find_psmux,
 )
 from magent.procs import (
@@ -32,12 +36,15 @@ from magent.procs import (
     spawn_unjobbed,
 )
 from magent.psmux import (
+    SEND_KEYS_TIMEOUT_S,
+    await_clients,
     capture_pane,
     child_env,
+    clear_stale_servers,
     code_on_path,
     decoration_argv,
-    is_idle_command,
-    pane_current_commands,
+    idle_sessions,
+    probe_sessions,
 )
 
 user32 = windll.user32
@@ -64,6 +71,39 @@ _SEND_VERIFY_SETTLE_S = 2.0
 # hammering: each attempt costs the batch another settle.
 _SEND_MAX_ATTEMPTS = 3
 
+# Budgets for every psmux client the bring-up waits on. Each of these was a
+# bare `wait()`, so one socket that stopped answering held `magent up` -- and
+# the `magent attach` driving it over ssh -- forever; in the 2026-08-18 wedge
+# every control command hung from any console. Each fan-out gets ONE deadline
+# for the whole set (`psmux.await_clients`: the clients run concurrently, so a
+# budget per client would cost N budgets), and a client still running at it is
+# killed and reaped, never left behind.
+#
+# Every number errs long: erring short costs a session, erring long costs only
+# time, and the bound exists for "never", not for "slow".
+#
+# The dedupe probe and the stale-server kill are one cheap round-trip per
+# socket fanned out across the whole fleet, and the measured worst case for
+# exactly that shape is ~19 s for a 46-socket has-session fan-out on a loaded
+# host (see psmux.live_sessions): 30 s is that with half again on top. A probe
+# that outruns it is UNKNOWN and its session is left alone -- never killed,
+# never re-created -- so a false timeout costs a report line, not an agent.
+_DEDUPE_TIMEOUT_S = 30.0
+_CLEAR_TIMEOUT_S = _DEDUPE_TIMEOUT_S
+# One wave's new-session clients. Healthy creation measured under a second
+# (892 ms, right after the wedge cleared -- during it, forever), but it is the
+# heaviest call here: it forks a server and a ConPTY in the middle of a spawn
+# storm. A false timeout leaves a session without its agent command, so it gets
+# the product's ceiling for one delivery attempt (upload_server.INJECT_TIMEOUT_S).
+_CREATE_TIMEOUT_S = 60.0
+# One wave's send-keys, and each round of re-sends. A control command against a
+# busy socket has been measured from 3 s to past 70 s (DESIGN.md, "The upload
+# reply is not hostage to the paste"), and a send that is killed may still have
+# landed, so it is never re-sent -- the paste's one-attempt law, with the same
+# 60 s cap. The status-line decorations are cosmetic and get the plain
+# SEND_KEYS_TIMEOUT_S.
+_SEND_TIMEOUT_S = 60.0
+
 # Geometry-reclaim nudge (see Platform.nudge_windows). The delta must be large
 # enough to change the terminal's character grid -- a sub-cell nudge resizes
 # the window without changing the rows/cols it reports, which tells the psmux
@@ -77,6 +117,10 @@ _NUDGE_SETTLE_S = 0.15
 # than stall the flow; a timeout is reported as "we could not look", and the
 # caller then leaves every window alone.
 _PROC_SCAN_TIMEOUT_S = 10.0
+
+# Characters that make `cmd /k` quote-strip or re-parse an argv[0]; an ssh
+# client path carrying one is handed to cmd as its bare name instead.
+_CMD_METACHARS = frozenset(' &()^%!"')
 
 # --- Session-0 desktop hand-off (see run_on_desktop) --------------------------
 # Scratch root for one per-call directory holding the launcher script and its
@@ -94,12 +138,12 @@ _HANDOFF_POLL_S = 0.25
 # abandoning a 900s budget for. Generous because the signal comes from a COLD
 # powershell.exe: ~1.6s measured on an idle desktop, but a loaded box (CI
 # proved it -- 5s was not enough on 2 of 5 windows-latest runners) can take
-# well over 5s just to reach `Start-Process`. A false "never started" here
+# well over 5s just to reach the launcher. A false "never started" here
 # abandons a bring-up that is in fact under way, so the grace errs long; a
 # task that truly never ran is still reported, only 30s later.
 _HANDOFF_START_GRACE_S = 30.0
 # How long a child that is GONE gets to still have its exit code written. The
-# launcher writes rc.txt only after its WaitForExit returns, so between the
+# launcher writes rc.txt only after its wait() returns, so between the
 # child's last breath and rc.txt landing there is a window in which "pid dead,
 # no rc.txt" is the ordinary success path mid-flight, not a lost child. CI
 # proved the window is real: on 3 of 5 windows-latest runners a `-c "exit 7"`
@@ -107,18 +151,31 @@ _HANDOFF_START_GRACE_S = 30.0
 # disk. A launcher that truly died never writes it, and that is still caught --
 # after this grace, not before.
 _HANDOFF_EXIT_GRACE_S = 15.0
+# How long a PRESENT rc.txt gets to become an integer. rc.txt existing is not
+# the exit code being readable: the launcher renames a finished file into
+# place, but a scanner can hold a file it has just seen written, and the
+# PowerShell launcher before it created the file first and refused readers
+# until it closed (measured: 298 of 300 first reads after the file appeared
+# were a sharing violation). Treating that read as final reported "unreadable
+# exit code ''" for commands that had succeeded, on five windows-latest CI
+# runs. Only a complete (newline-terminated) integer ends the wait; this bounds
+# the wait on an rc.txt that never becomes one (a file something keeps locked,
+# a value that is not a number). It errs long because a false answer here is a
+# succeeded bring-up reported as failed, while the cost of a long one falls
+# only on an rc.txt that is broken anyway.
+_HANDOFF_RC_GRACE_S = 10.0
 # How long to keep retrying the scratch-directory delete after success. The
-# launcher (powershell.exe) still holds the two redirect files open for the few
-# milliseconds between writing rc.txt and exiting, and on Windows an open file
-# makes rmtree fail -- silently, with ignore_errors, which is how CI grew a
-# scratch directory per successful hand-off.
+# launcher and the powershell.exe running it are still exiting for the few
+# milliseconds after rc.txt lands, and on Windows a file still open makes rmtree
+# fail -- silently, with ignore_errors, which is how CI grew a scratch directory
+# per successful hand-off.
 _HANDOFF_CLEANUP_GRACE_S = 5.0
 # Every schtasks call itself is bounded -- Create/Run/Query/Delete are local and
 # instant, so a hang is a wedge, not work.
 _SCHTASKS_TIMEOUT_S = 15.0
 # schtasks truncates /TR at ~261 characters -- silently, so past it the task
 # runs a DIFFERENT command. That is why /TR carries only a fixed-length launcher
-# and the real argv lives in the script file.
+# and the real argv lives in a file next to it (argv.json).
 _TR_MAX_CHARS = 261
 # Bare `powershell.exe`, not an absolute path, and not `pwsh`: Windows PowerShell
 # ships on every Windows box while PowerShell 7 does not, and /TR's length budget
@@ -127,6 +184,14 @@ _TR_MAX_CHARS = 261
 # Task Scheduler inside the logged-on user's session, against the user's own
 # PATH, not against the possibly-hostile PATH of an ssh login.
 _HANDOFF_SHELL = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File"
+# The script that shell runs is written WITH a BOM. Windows PowerShell 5.1
+# decodes a `-File` script that has none in the ANSI code page, which turns
+# every non-ASCII character of the two paths it holds into mojibake -- and can
+# end a literal early: the UTF-8 bytes of U+00D1 (C3 91) and U+0442 (D1 82)
+# each hold one that cp1252 reads as a typographic single quote. One constant,
+# because the tests that run a launcher script stage it with this too; a copy
+# written any other way is not the file production runs.
+_HANDOFF_SCRIPT_ENCODING = "utf-8-sig"
 
 
 def _schtasks_exe() -> str | None:
@@ -157,83 +222,82 @@ def _schtasks_exe() -> str | None:
 def _ps_quote(value: str) -> str:
     """Wrap ``value`` as ONE PowerShell single-quoted literal.
 
-    Single-quoted, so nothing inside is expanded: these are paths and a whole
-    Windows command line, and a ``$`` or a backtick in either must arrive at
-    the child exactly as written. Doubling is the only escape a single-quoted
-    PowerShell string has.
+    Single-quoted, so nothing inside is expanded: these are paths, and a
+    ``$`` or a backtick in one must arrive exactly as written. Doubling is the
+    only escape a single-quoted PowerShell string has, and PowerShell ends
+    such a string on FIVE code points, not one: U+0027 and the typographic
+    U+2018, U+2019, U+201A and U+201B. Every one of them is doubled, or a
+    value holding one breaks out.
     """
-    return "'" + value.replace("'", "''") + "'"
+    return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", value) + "'"
 
 
-def _handoff_script(
-    argv: list[str], cwd: str, out: Path, err: Path, pid: Path, rc: Path
-) -> str:
+def _handoff_script(python: str, launcher: Path) -> str:
     """The PowerShell the scheduled task runs in the user's own session.
 
-    PowerShell rather than a ``.cmd`` shim, for three reasons that are all
-    defects in the batch version: ``-WindowStyle Hidden`` means the desktop
-    does not get a console window flashed at it by a command the user did not
-    type; ``$p.ExitCode`` is the real exit status rather than a parsed
-    ``%ERRORLEVEL%``; and cmd would interpret an ``&`` in an unquoted argument
-    as a command separator, which ``list2cmdline`` does not protect against
-    (it only quotes for whitespace and quotes).
+    Three lines, and none of them is the command. PowerShell cannot be the
+    launcher: 5.1's ``Start-Process`` with redirection drops the handle
+    CreateProcess returned, and ``$p.Handle`` then re-opens the child by pid,
+    after the fact -- so a child that has already exited leaves ``ExitCode``
+    at ``$null`` and rc.txt empty (the measured "hand-off failed" for a
+    bring-up that worked). The launcher is ``launch.py`` (a copy of
+    ``_handoff_launcher``), run by the interpreter magent itself is running
+    under; it holds the handle, and the argv reaches it through
+    ``argv.json``, never through a quoted command line.
 
-    TWO QUOTING LAYERS, both load-bearing. ``subprocess.list2cmdline`` builds
-    the command line by the MS C-runtime rules the child's own argv parser
-    uses, so a path with spaces survives; ``_ps_quote`` then makes that whole
-    string ONE PowerShell literal. Passing a LIST to ``-ArgumentList`` would
-    skip the first layer entirely -- PowerShell joins array elements with bare
-    spaces and does not re-quote them, so ``--config C:\\A B\\magent.json``
-    would arrive at magent as two arguments.
-
-    Three other things it must do, all load-bearing:
-
-    * ``-WorkingDirectory`` the CALLER's directory. ``find_config`` walks up
-      from the working directory and a scheduled task starts in ``system32``,
-      so a hand-off without this could bring up a different config's projects
-      than the command the user actually typed.
     * export ``MAGENT_SESSION0_POLICY=refuse`` for the child, so a hand-off
       that somehow landed in Session 0 again refuses instead of handing off in
       turn -- a recursion whose every level writes a scheduled task.
-    * write ``pid.txt`` as soon as the process exists and ``rc.txt`` LAST.
-      pid.txt is the "it really started" signal the start-grace check reads;
-      rc.txt is the completion signal, and the redirections are closed by the
-      time it is written, so a reader that sees it can never read a
-      half-written out.txt.
+    * ``-I``: PYTHONPATH, PYTHONHOME and the script's directory stay off
+      ``sys.path``, so nothing in the user's environment or the scratch
+      directory can put a different module under the launcher's imports.
+    * ``&`` with both paths as single-quoted literals: nothing in either is
+      expanded, and PowerShell hands each to CreateProcess as ONE argument.
     """
-    command_line = subprocess.list2cmdline(argv[1:])
     return "\n".join(
         (
             "$ErrorActionPreference = 'Stop'",
             "$env:MAGENT_SESSION0_POLICY = 'refuse'",
-            "$p = Start-Process -PassThru -WindowStyle Hidden"
-            f" -FilePath {_ps_quote(argv[0])}"
-            + (f" -ArgumentList {_ps_quote(command_line)}" if command_line else "")
-            + f" -WorkingDirectory {_ps_quote(cwd)}"
-            f" -RedirectStandardOutput {_ps_quote(str(out))}"
-            f" -RedirectStandardError {_ps_quote(str(err))}",
-            # Touching .Handle is not decoration -- it is the documented
-            # workaround for a `Start-Process -PassThru` object whose
-            # `.ExitCode` is $null forever. PowerShell does not cache the
-            # process handle, so once the child exits the OS has nothing left
-            # to ask and the exit code is lost. Measured here first: rc.txt
-            # came back EMPTY on every run until this line existed.
-            "$null = $p.Handle",
-            f"Set-Content -LiteralPath {_ps_quote(str(pid))} -Value $p.Id",
-            "$p.WaitForExit()",
-            f"Set-Content -LiteralPath {_ps_quote(str(rc))} -Value $p.ExitCode",
+            f"& {_ps_quote(python)} -I {_ps_quote(str(launcher))}",
             "",
         )
     )
 
 
+def _stage_handoff(work: Path, argv: list[str]) -> Path:
+    """Write one hand-off's three files into ``work`` and return ``run.ps1``.
+
+    ``argv.json`` carries the command and the CALLER's working directory:
+    ``find_config`` walks up from the working directory and a scheduled task
+    starts in ``system32``, so without it a hand-off could bring up a
+    different config's projects than the command the user actually typed.
+    ``launch.py`` is ``_handoff_launcher``'s own source, byte for byte.
+    ``run.ps1`` is written WITH a BOM -- see _HANDOFF_SCRIPT_ENCODING.
+
+    Raises OSError, or UnicodeEncodeError for a path that has no UTF-8 form
+    (a lone surrogate in the scratch or interpreter path).
+    """
+    work.mkdir(parents=True, exist_ok=True)
+    _handoff_launcher.write_spec(work, argv, str(Path.cwd()))
+    launcher = work / _handoff_launcher.LAUNCHER
+    launcher.write_bytes(Path(_handoff_launcher.__file__).read_bytes())
+    script = work / "run.ps1"
+    script.write_text(
+        _handoff_script(sys.executable, launcher), encoding=_HANDOFF_SCRIPT_ENCODING
+    )
+    return script
+
+
 def _remove_scratch(work: Path) -> None:
     """Delete a finished hand-off's scratch directory, retrying briefly.
 
-    The launcher still holds the redirect files open for the few milliseconds
-    between writing rc.txt and exiting, and an open file makes rmtree fail on
-    Windows. Bounded by ``_HANDOFF_CLEANUP_GRACE_S``; a directory that outlives
-    it is left behind rather than fought over (the next call uses a new one).
+    A file in it can still be open for a moment after rc.txt lands. The
+    launcher closed its own copies of the redirect files right after starting
+    the command, but it and the powershell.exe running it are still exiting,
+    and a scanner may be reading a file it has just seen written. An open file
+    makes rmtree fail on Windows. Bounded by ``_HANDOFF_CLEANUP_GRACE_S``; a
+    directory that outlives it is left behind rather than fought over (the
+    next call uses a new one).
     """
     deadline = time.monotonic() + _HANDOFF_CLEANUP_GRACE_S
     while True:
@@ -243,6 +307,14 @@ def _remove_scratch(work: Path) -> None:
         time.sleep(0.1)
 
 
+def _printable(text: str) -> str:
+    """``text`` with every lone surrogate written as an escape. The argv and
+    the paths a hand-off names may hold one (Windows allows it), and the log
+    file is UTF-8: a record that cannot be encoded is not written at all --
+    logging prints a traceback on stderr instead."""
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _one_line(text: str, limit: int = 200) -> str:
     """The last non-empty line of a tool's output, clipped -- diagnostics go in
     a single ``detail`` string, and schtasks answers in a multi-line table."""
@@ -250,30 +322,127 @@ def _one_line(text: str, limit: int = 200) -> str:
     return lines[-1][:limit] if lines else ""
 
 
-def _read_pid(path: Path) -> int | None:
-    """The pid the launcher recorded, or None until it has written one.
+def _recorded_int(raw: str) -> int | None:
+    """What the launcher recorded, as an integer -- or None if it is not one
+    YET.
 
-    None covers every "not yet": the file is absent, or it is present but
-    half-written (``Set-Content`` is not atomic, and this poll reads every
-    250ms). Both mean "no answer yet", never "it failed".
+    Complete means newline-terminated. The launcher writes ``<n>\\n`` to a
+    temporary name and renames it into place, so it never shows a prefix; the
+    rule stays because a prefix -- the ``1`` of ``12`` -- must never be
+    final, whoever wrote the file. The one rule every read of pid.txt and
+    rc.txt goes through.
     """
-    raw = _read_handoff_text(path).strip()
+    if not raw.endswith("\n"):
+        return None
     try:
-        return int(raw)
+        return int(raw.strip())
     except ValueError:
         return None
 
 
-def _read_handoff_text(path: Path) -> str:
-    """Read one of the shim's output files; absent or unreadable reads empty.
+def _read_recorded_int(path: Path) -> int | None:
+    """The integer the launcher recorded in ``path`` (its pid.txt or rc.txt),
+    or None until it has written one.
 
-    ``errors="replace"`` rather than a codepage guess: the child's console
-    encoding is the machine's, this text is RELAYED to a human, and a mojibake
-    character in a diagnostic is strictly better than losing the diagnostic to a
-    UnicodeDecodeError.
+    None covers every "not yet": the file is absent, present but empty,
+    present but held by something else (a scanner that has just seen it
+    written, and this poll reads every 250ms), or present with a value that is
+    not complete. All of them mean "no answer yet", never "it failed"; only a
+    complete integer (see ``_recorded_int``) is an answer.
+    """
+    return _recorded_int(_read_handoff_text(path))
+
+
+def _handoff_finished(out: Path, err: Path, work: Path, rc: int) -> HandoffResult:
+    """The command's own exit code came back: the hand-off itself worked,
+    whatever the command decided, so its scratch directory goes."""
+    stdout, stderr = _read_handoff_text(out), _read_handoff_text(err)
+    _remove_scratch(work)
+    return HandoffResult(rc=rc, stdout=stdout, stderr=stderr)
+
+
+def _settle_exit_code(
+    files: tuple[Path, Path, Path, Path], task: str, work: Path, waited_s: float
+) -> HandoffResult:
+    """The last word on an rc.txt the poll has stopped waiting on.
+
+    One more read, and it is decisive: an exit code that became complete since
+    the poll's last look is the answer, like any other. Otherwise this is the
+    fourth answer, distinct from the other three: not "never started" and not
+    "lost its child" (the launcher got as far as its exit code), and not "may
+    still be running" (the launcher writes rc.txt after ``wait()`` returns, so
+    the command is done). The command FINISHED and we cannot say how, so no exit code is
+    fabricated -- but its output, complete by now, is relayed.
+
+    ``detail`` names what that read saw, in our words: a file that refused the
+    read and a launcher that wrote no value are different bugs. The OS's own
+    text for a failed read goes to the log, not the screen.
+    """
+    out, err, _pid, rc_file = files
+    try:
+        raw = rc_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        get_logger("launch").warning(
+            "session-0 hand-off %s: rc.txt unreadable after %.1fs: %s",
+            task,
+            waited_s,
+            exc,
+        )
+        # Say only what is known: errno 13 is usually a share lock (a
+        # scanner's), but an ACL denial and a delete-pending file raise it too.
+        why = (
+            "was locked or refused"
+            if isinstance(exc, PermissionError)
+            else "could not be read"
+        )
+        seen = f"{why} ({type(exc).__name__})"
+    else:
+        rc = _recorded_int(raw)
+        if rc is not None:
+            return _handoff_finished(out, err, work, rc)
+        text = raw.strip()
+        seen = f"held {text[:40]!r}, not a complete exit code" if text else "was empty"
+    return HandoffResult(
+        rc=None,
+        stdout=_read_handoff_text(out),
+        stderr=_read_handoff_text(err),
+        detail=(
+            f"the desktop command finished but its exit code never became "
+            f"readable within {waited_s:.1f}s -- rc.txt {seen}; task {task}, "
+            f"scratch left at {work}"
+        ),
+    )
+
+
+def _read_handoff_text(path: Path) -> str:
+    """Read the command's out.txt or err.txt, which the launcher hands it as
+    its stdout and stderr; absent or unreadable reads empty.
+
+    UTF-8 first, then the ANSI code page. The child's stdout is a FILE, so a
+    default Python child writes it in the ANSI code page, not UTF-8, and reading
+    that as UTF-8 relayed every accented letter as U+FFFD. UTF-8 still goes
+    first because a child in Python's UTF-8 mode writes it, and ANSI text that
+    also parses as UTF-8 is already mojibake (``Ã©``). ``mbcs`` is the ANSI
+    code page whatever Python's own UTF-8 mode says; it exists only on Windows,
+    the only place this module imports (its module-level ``windll`` import fails
+    anywhere else, so the LookupError ``mbcs`` would raise there is
+    unreachable). ``errors="replace"`` on that last step: this text is RELAYED
+    to a human, and a mojibake character in a diagnostic is strictly better
+    than losing the diagnostic to a UnicodeDecodeError. A character the code
+    page cannot hold never reaches this file raw: a magent child writes it as
+    an escape (``\\u4e2d``, see ``cli/app.py``), relayed as written.
+
+    Known limit: the fallback is WHOLE-FILE. One byte that is not UTF-8
+    anywhere decodes the entire file as ANSI, so a UTF-8 child whose output
+    also holds such a byte -- or whose last character was cut mid-sequence
+    because a timeout read the file while it was still being written -- reads
+    as mojibake throughout. Accepted: the text is a relayed diagnostic.
     """
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        try:
+            return path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return path.read_text(encoding="mbcs", errors="replace")
     except OSError:
         return ""
 
@@ -559,6 +728,9 @@ class WindowsPlatform(Platform):
     def supports_wt_keybindings(self) -> bool:
         return True
 
+    def supports_attach_windows(self) -> bool:
+        return True
+
     def set_window_title(self, handle: object, title: str) -> bool:
         return bool(user32.SetWindowTextW(handle, title))
 
@@ -622,7 +794,17 @@ class WindowsPlatform(Platform):
             # is a single, cleanly-quoted token. Building one `ssh ... "..."`
             # string and handing it to `cmd /k` double-nests the quotes, which
             # cmd mangles (the inner quotes leak to the remote shell).
-            args.extend(["--", "cmd", "/k", "ssh", "-t", opts.ssh_host, remote])
+            # argv[0] by attach_client's rule, so this pane dials the same
+            # client (and agent) as the attach panes and the node calls.
+            client = ssh_program()
+            # `cmd /k` strips the first and last quote of a line that starts
+            # with one, so a client path that needs quoting (C:\Program Files)
+            # would eat the remote command's closing quote, and one carrying
+            # `&` or `^` is re-parsed by cmd. Only the PATH fallback yields
+            # such a path, and the bare name finds it again.
+            if any(c in _CMD_METACHARS for c in client):
+                client = "ssh"
+            args.extend(["--", "cmd", "/k", client, "-t", opts.ssh_host, remote])
         else:
             args.extend(["--", "cmd", "/k", opts.command])
 
@@ -661,42 +843,64 @@ class WindowsPlatform(Platform):
         # Same monarch caveat as `wt` -- `code` forwards to a running instance.
         subprocess.Popen(args, env=spawn_child_env())
 
-    def launch_psmux_session(self, windows: list[PsmuxWindowOpts]) -> None:
+    def launch_psmux_session(self, windows: list[PsmuxWindowOpts]) -> dict[str, str]:
         psmux = find_psmux()
         if not psmux:
             raise FileNotFoundError("psmux not found on PATH")
         if not windows:
-            return
+            return {}
+        log = get_logger("platform")
+        # Windows deliberately NOT created, each with the reason the report
+        # prints (psmux.launch_verified carries it to every bring-up printer).
+        refused: dict[str, str] = {}
 
-        checks = [
-            (
-                w,
-                subprocess.Popen(
-                    # `-t <name>`: a bare has-session exits 0 even for a socket
-                    # with no server, which made this dedupe skip creating every
-                    # session on a cold machine. See psmux.has_session.
-                    [psmux, "-L", w.window_name, "has-session", "-t", w.window_name],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                ),
+        # The dedupe has THREE answers (psmux.probe_sessions), and only a
+        # positive "no such session" may lead to kill-server + new-session. A
+        # probe that never answered says nothing about the session -- in the
+        # 2026-08-18 wedge the sockets that stopped answering were FROZEN LIVE
+        # agents, and killing and re-creating them is the mass restart that
+        # would have thrown every one of them away.
+        states = probe_sessions(
+            [w.window_name for w in windows], psmux, timeout=_DEDUPE_TIMEOUT_S
+        )
+        for w in windows:
+            if states[w.window_name] == "unknown":
+                refused[w.window_name] = (
+                    f"could not tell whether {w.window_name} is running"
+                    f" (has-session gave no answer within {_DEDUPE_TIMEOUT_S:g}s);"
+                    " left it alone -- not killed, not re-created"
+                )
+        if refused:
+            log.error(
+                "has-session gave no answer for %s; leaving them alone rather"
+                " than killing or re-creating a session whose state is unknown",
+                ", ".join(refused),
             )
-            for w in windows
-        ]
-        to_create = [w for w, p in checks if p.wait() != 0]
-
+        to_create = [w for w in windows if states[w.window_name] == "absent"]
         if not to_create:
-            return
+            return refused
 
-        kills = [
-            subprocess.Popen(
-                [psmux, "-L", w.window_name, "kill-server"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+        uncleared = set(
+            clear_stale_servers(
+                [w.window_name for w in to_create], psmux, timeout=_CLEAR_TIMEOUT_S
             )
-            for w in to_create
-        ]
-        for p in kills:
-            p.wait()
+        )
+        for w in to_create:
+            if w.window_name in uncleared:
+                refused[w.window_name] = (
+                    f"could not clear {w.window_name}'s old psmux server"
+                    f" (kill-server gave no answer within {_CLEAR_TIMEOUT_S:g}s),"
+                    " so it was not re-created on top of it"
+                )
+        if uncleared:
+            log.error(
+                "kill-server gave no answer for %s; not creating a session on"
+                " top of a server that could not be cleared",
+                ", ".join(sorted(uncleared)),
+            )
+        to_create = [w for w in to_create if w.window_name not in uncleared]
+        if not to_create:
+            return refused
 
         # One probe for the whole bring-up: the launching machine IS the one
         # whose windows these are, and `code` is not going to appear on PATH
@@ -776,16 +980,33 @@ class WindowsPlatform(Platform):
             # name right after this returns, respawns what is missing, and
             # reports what stayed down -- that is the component that owns the
             # "did it come up?" answer, and it can only do its job if it runs.
+            #
+            # A client that outruns the wave's one deadline is killed and its
+            # window refused -- contained exactly like a refusal: the rest of
+            # the wave, and every later wave, carry on.
             batch = []
-            for w, p in zip(wave, creates, strict=True):
-                if p.wait() == 0:
+            codes = await_clients(creates, _CREATE_TIMEOUT_S)
+            for w, rc in zip(wave, codes, strict=True):
+                if rc == 0:
                     batch.append(w)
+                elif rc is None:
+                    refused[w.window_name] = (
+                        f"psmux new-session for {w.window_name} gave no answer"
+                        f" within {_CREATE_TIMEOUT_S:g}s"
+                    )
+                    log.error(
+                        "psmux new-session for %s gave no answer within %gs;"
+                        " killed it, skipping the window and continuing the"
+                        " bring-up",
+                        w.window_name,
+                        _CREATE_TIMEOUT_S,
+                    )
                 else:
-                    get_logger("platform").error(
+                    log.error(
                         "psmux new-session for %s exited %s; skipping it and"
                         " continuing the bring-up",
                         w.window_name,
-                        p.returncode,
+                        rc,
                     )
             if not batch:
                 continue
@@ -804,30 +1025,48 @@ class WindowsPlatform(Platform):
             # host side of attach), sshd kills the whole process tree the
             # moment the CLI exits, and fire-and-forget senders die before
             # the keystrokes land -- every session then sits at a bare shell
-            # with no agent running.
-            for p in senders:
-                p.wait()
+            # with no agent running. Bounded like everything else here, and a
+            # send that is killed is NEVER re-sent: it may still have landed,
+            # and a second copy types the command into a running agent.
+            sent = await_clients(senders, _SEND_TIMEOUT_S)
+            unsure = {
+                w.window_name for w, rc in zip(batch, sent, strict=True) if rc is None
+            }
+            if unsure:
+                log.warning(
+                    "send-keys gave no answer within %gs for %s; killed it and"
+                    " not re-sending -- it may still have landed",
+                    _SEND_TIMEOUT_S,
+                    ", ".join(sorted(unsure)),
+                )
 
             # A send-keys that *exits 0* still proves nothing: the keystrokes
             # reached psmux, not necessarily the shell reading its console.
-            self._verify_sends_landed(psmux, batch)
+            self._verify_sends_landed(
+                psmux, [w for w in batch if w.window_name not in unsure]
+            )
 
             self._decorate_batch(psmux, batch, code_hint)
+
+        return refused
 
     @staticmethod
     def _verify_sends_landed(psmux: str, batch: list[PsmuxWindowOpts]) -> None:
         """Re-type the agent command into any pane the send-keys never reached.
 
-        Detection is the same primitive ``revive_sessions`` uses -- a pane
-        whose ``#{pane_current_command}`` is a bare shell has no agent. The
-        probe runs immediately before each re-send and is the ONLY guard
-        against the dangerous edge: re-sending into a live agent would type
-        the command text into its input box. So anything that is not a shell
-        is left alone, and an empty/unreadable reading counts as "not a
-        casualty" -- never inject into a pane whose state we could not
-        establish (``psmux.agent_idle`` takes the same posture).
+        Detection is the same verdict ``revive_sessions`` acts on,
+        ``psmux.idle_sessions``: a pane is a casualty only when it rests at
+        its shell with no agent anywhere under it. The probe runs immediately
+        before each re-send and is the ONLY guard against the dangerous edge:
+        re-sending into a live agent would type the command text into its
+        input box -- and an agent that is already up and running its Bash tool
+        reads ``bash`` in the foreground, so the foreground reading alone
+        cannot be the guard. Anything unknown (an unreadable pane, a failed
+        process snapshot) counts as "not a casualty": never inject into a
+        pane whose state we could not establish.
 
-        Probed as one fan-out per round (``pane_current_commands``), not a
+        One verdict per round for the whole pending set (one foreground
+        fan-out, one pane-pid fan-out, one process snapshot), not a
         round-trip per session: a full batch would otherwise serialize five.
 
         Never raises. A pane that stays bare through every attempt is logged
@@ -839,12 +1078,8 @@ class WindowsPlatform(Platform):
         sends = 1  # the caller already typed the command once
         while True:
             time.sleep(_SEND_VERIFY_SETTLE_S)
-            readings = pane_current_commands(list(pending), psmux=psmux)
-            pending = {
-                name: w
-                for name, w in pending.items()
-                if is_idle_command(readings.get(name, ""))
-            }
+            idle = idle_sessions(list(pending), psmux=psmux)
+            pending = {name: w for name, w in pending.items() if name in idle}
             if not pending:
                 return
             names = ", ".join(pending)
@@ -863,6 +1098,7 @@ class WindowsPlatform(Platform):
                 sends,
                 _SEND_MAX_ATTEMPTS,
             )
+            retry = list(pending.values())
             try:
                 resends = [
                     subprocess.Popen(
@@ -870,7 +1106,7 @@ class WindowsPlatform(Platform):
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
-                    for w in pending.values()
+                    for w in retry
                 ]
             except OSError:
                 # Spawning the retry itself failed -- same outcome as a pane
@@ -878,8 +1114,24 @@ class WindowsPlatform(Platform):
                 # level, with the traceback since this one is a host fault.
                 log.exception("could not spawn a send-keys re-send for %s", names)
                 return
-            for p in resends:
-                p.wait()
+            # A re-send that is killed may still land, so it is never followed
+            # by another: that pane leaves the retry set.
+            answered = await_clients(resends, _SEND_TIMEOUT_S)
+            unsure = [
+                w.window_name
+                for w, rc in zip(retry, answered, strict=True)
+                if rc is None
+            ]
+            if unsure:
+                log.warning(
+                    "send-keys re-send gave no answer within %gs for %s; not"
+                    " sending to them again",
+                    _SEND_TIMEOUT_S,
+                    ", ".join(unsure),
+                )
+                pending = {n: w for n, w in pending.items() if n not in unsure}
+                if not pending:
+                    return
 
     @staticmethod
     def _decorate_batch(
@@ -905,8 +1157,14 @@ class WindowsPlatform(Platform):
         except OSError as exc:
             get_logger("platform").warning("status-line decoration failed: %s", exc)
             return
-        for p in decorations:
-            p.wait()
+        unanswered = await_clients(decorations, SEND_KEYS_TIMEOUT_S).count(None)
+        if unanswered:
+            get_logger("platform").warning(
+                "%d status-line decoration command(s) gave no answer within %gs;"
+                " killed them",
+                unanswered,
+                SEND_KEYS_TIMEOUT_S,
+            )
 
     def attach_psmux(
         self,
@@ -1063,18 +1321,19 @@ class WindowsPlatform(Platform):
         nonce = uuid.uuid4().hex[:12]
         task = f"{_HANDOFF_TASK_PREFIX}{nonce}"
         work = Path(tempfile.gettempdir()) / _HANDOFF_DIR_NAME / nonce
-        script = work / "run.ps1"
-        out, err = work / "out.txt", work / "err.txt"
-        pid_file, rc_file = work / "pid.txt", work / "rc.txt"
+        out = work / _handoff_launcher.OUT
+        err = work / _handoff_launcher.ERR
+        pid_file = work / _handoff_launcher.PID
+        rc_file = work / _handoff_launcher.RC
         try:
-            work.mkdir(parents=True, exist_ok=True)
-            script.write_text(
-                _handoff_script(argv, str(Path.cwd()), out, err, pid_file, rc_file),
-                encoding="utf-8",
-            )
-        except OSError as exc:
+            script = _stage_handoff(work, argv)
+        except (OSError, UnicodeEncodeError) as exc:
+            # A lone surrogate lands here: legal in a Windows path, but run.ps1
+            # is UTF-8 and cannot hold one. Refused before anything runs, in
+            # words that can themselves be printed and logged.
             return HandoffResult(
-                rc=None, detail=f"could not stage the hand-off in {work}: {exc}"
+                rc=None,
+                detail=_printable(f"could not stage the hand-off in {work}: {exc}"),
             )
 
         run_spec = f'{_HANDOFF_SHELL} "{script}"'
@@ -1087,7 +1346,11 @@ class WindowsPlatform(Platform):
                 ),
             )
 
-        log.info("session-0 hand-off %s: %s", task, subprocess.list2cmdline(argv)[:500])
+        log.info(
+            "session-0 hand-off %s: %s",
+            task,
+            _printable(subprocess.list2cmdline(argv))[:500],
+        )
         # `/sc once` demands a trigger, and `/run` fires the task now, so the
         # trigger time exists only to satisfy schtasks. `/st 00:00` is TODAY at
         # midnight -- already in the past, so the trigger can never fire on its
@@ -1144,43 +1407,54 @@ class WindowsPlatform(Platform):
         files: tuple[Path, Path, Path, Path],
         timeout_s: float,
     ) -> HandoffResult:
-        """Poll for the launcher's ``rc.txt``, bailing early on a task that
+        """Poll for the launcher's exit code, bailing early on a task that
         never started or a child that died without writing one.
 
         ``pid.txt`` is the "it really started" signal -- the launcher writes it
-        the moment ``Start-Process`` returns, before the command has produced a
+        the moment its CreateProcess returns, before the command has produced a
         byte. Two different failures hide behind "no rc.txt yet", and both
         deserve a precise answer instead of the caller's whole budget spent in
-        silence: no pid.txt after the start grace means TASK SCHEDULER never
-        ran the task (nobody logged on, a policy refusal), while a pid that is
-        gone with no rc.txt means the LAUNCHER died mid-flight and nothing will
-        ever write one.
+        silence. No pid.txt after the start grace, from a task that is not
+        running, means TASK SCHEDULER never ran it (nobody logged on, a policy
+        refusal); a launcher that merely could not record its pid is still
+        running, and its rc.txt still answers. A pid that is gone with no
+        rc.txt means the LAUNCHER died mid-flight and nothing will ever write
+        one.
+
+        rc.txt existing is not the exit code being read (see
+        ``_HANDOFF_RC_GRACE_S``): only a complete integer ends the wait, and
+        an rc.txt that stays anything else past that grace -- or past the
+        budget -- is a fourth answer of its own (``_settle_exit_code``).
         """
         out, err, pid_file, rc_file = files
         deadline = time.monotonic() + timeout_s
         start_deadline = time.monotonic() + _HANDOFF_START_GRACE_S
         checked_start = False
         gone_since: float | None = None
-        while time.monotonic() < deadline:
+        rc_seen_since: float | None = None
+        while True:
+            rc = _read_recorded_int(rc_file)
+            if rc is not None:
+                return _handoff_finished(out, err, work, rc)
+            # Read first, THEN check the budget: an exit code that landed
+            # during the last sleep is the answer, not a timeout.
+            if time.monotonic() >= deadline:
+                break
             if rc_file.exists():
-                stdout, stderr = _read_handoff_text(out), _read_handoff_text(err)
-                raw = _read_handoff_text(rc_file).strip()
-                try:
-                    rc = int(raw)
-                except ValueError:
-                    return HandoffResult(
-                        rc=None,
-                        stdout=stdout,
-                        stderr=stderr,
-                        detail=(
-                            f"the desktop launcher wrote an unreadable exit code "
-                            f"{raw!r}; task {task}, scratch left at {work}"
-                        ),
-                    )
-                # The hand-off itself worked, whatever the command decided.
-                _remove_scratch(work)
-                return HandoffResult(rc=rc, stdout=stdout, stderr=stderr)
-            pid = _read_pid(pid_file)
+                # The file is there and a readable value is not yet. Not a
+                # lost child either -- the launcher got as far as its exit
+                # code -- so the pid checks below are moot, and running them
+                # would be wrong: a child gone longer than the exit grace whose
+                # rc.txt is only now becoming readable is the loaded-runner
+                # success path, not a lost child.
+                if rc_seen_since is None:
+                    rc_seen_since = time.monotonic()
+                waited = time.monotonic() - rc_seen_since
+                if waited >= _HANDOFF_RC_GRACE_S:
+                    return _settle_exit_code(files, task, work, waited)
+                time.sleep(_HANDOFF_POLL_S)
+                continue
+            pid = _read_recorded_int(pid_file)
             if pid is not None and not pid_alive(pid):
                 # It ran and is gone with no exit code. Usually the launcher
                 # is a few milliseconds from writing one; only after the exit
@@ -1216,6 +1490,13 @@ class WindowsPlatform(Platform):
                         ),
                     )
             time.sleep(_HANDOFF_POLL_S)
+        if rc_file.exists():
+            # The budget ran out before rc.txt read as a number: the command
+            # is done (rc.txt lands after wait() returns), so this is not "may
+            # still be running" -- and the settling read may yet find the code
+            # complete.
+            waited = 0.0 if rc_seen_since is None else time.monotonic() - rc_seen_since
+            return _settle_exit_code(files, task, work, waited)
         # Deliberately NO kill. A bring-up still running on the desktop past
         # our budget is doing the work that was asked for, and the pid we hold
         # is a number Windows recycles freely -- killing it could take out an

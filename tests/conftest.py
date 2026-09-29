@@ -3,12 +3,13 @@ import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
-from magent import agent_state, env, log
+from magent import agent_state, env, log, node_sync
 from magent.grid import MonitorRect
 from magent.platform import (
     HandoffResult,
@@ -18,6 +19,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
 )
 from magent.titles import get_leaf_name
+from tests.unit._fake_ssh import SteppedClock, make_fake_ssh
 
 # --- Real-home isolation ------------------------------------------------------
 # Captured at conftest IMPORT time, i.e. before any fixture has had the chance
@@ -30,6 +32,10 @@ REAL_MAGENT_DIR = REAL_HOME / ".magent"
 # on Windows the pytest tmp root lives at %LOCALAPPDATA%\Temp, i.e. inside it.
 # These are the trees a leaking test actually damages.
 _REAL_STATE_ROOTS = (REAL_MAGENT_DIR, REAL_HOME / ".claude")
+# The inherited APPDATA, captured here for the same reason. On Windows it IS
+# env.config_base(), so the developer's real config sits at
+# REAL_APPDATA\magent\config.json. None where it is unset (off Windows).
+REAL_APPDATA = Path(os.environ["APPDATA"]) if os.environ.get("APPDATA") else None
 
 # Tests under this directory keep the machine's own home. tests/platform is the
 # CI-only tier that drives REAL windows, monitors and psmux against the session
@@ -68,12 +74,15 @@ PLAYWRIGHT_BROWSERS_PATH = _playwright_browsers_path()
 _IMPORT_BOUND_PATHS = (
     ("magent.cli.attach", "_LAST_HOST_FILE", "last-attach-host"),
     ("magent.cli.attention_cmd", "_PID_PATH", "attention.pid"),
+    ("magent.node_sync", "_PID_PATH", f"{node_sync.HEARTBEAT_NAME}.pid"),
     ("magent.cli.session_picker", "_FOCUS_TARGET_FILE", "focus-target"),
     ("magent.cli.session_picker", "_PICKER_ATTACHED_FILE", "picker-attached"),
     ("magent.upload_server", "_FOCUS_TARGET_FILE", "focus-target"),
     ("magent.upload_server", "_PICKER_ATTACHED_FILE", "picker-attached"),
     ("magent.upload_server", "_UPLOAD_DIR", "uploads"),
     ("magent.psmux", "DECOR_STAMP", "decor.stamp"),
+    ("magent.nodes", "NODES_DIR", "nodes"),
+    ("magent.nodes", "NODE_MAP_PATH", "nodes/node-map.json"),
     # win32-only module (it raises ImportError elsewhere by design), so this
     # entry is skipped rather than imported off-Windows.
     ("magent.hotkey", "_PID_PATH", "hotkey.pid"),
@@ -101,7 +110,14 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     1. the module-level path constants magent binds at import (LOG_DIR &c),
     2. the HOME family in the process environment, which covers every
        call-time ``Path.home()`` (``lockfile.exclusive_lock`` is one) AND
-       every child process, since they inherit ``os.environ``,
+       every child process, since they inherit ``os.environ``. With it go
+       ``APPDATA`` (to ``<home>/AppData/Roaming``) and ``XDG_CONFIG_HOME``
+       (to ``<home>/.config``), the variables ``env.config_base()`` reads
+       instead of ~, so a test that forgets ``--config`` cannot find the
+       real config. The empty ``<home>/AppData/Local`` and
+       ``<home>/AppData/Roaming`` folders are created for the Windows
+       known-folder lookups, which need them to exist. ``LOCALAPPDATA``
+       stays inherited on purpose (``find_psmux``'s fallback),
     3. the import-bound ``~/.magent`` constants layer 2 is too late for.
 
     Layer 2 is the one that was missing, and its absence is not theoretical: a
@@ -121,6 +137,32 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
         # answers. Same lifetime, no collisions with the fixture's own tree.
         home = tmp_path.parent / f"{tmp_path.name}-home"
         home.mkdir(exist_ok=True)
+        # The profile folders the Windows known-folder lookups name. The
+        # USERPROFILE redirect below moves those folders into this home, but
+        # the lookup also checks that the folder EXISTS: against an empty home
+        # .NET's GetFolderPath('LocalApplicationData') answers '' in a
+        # powershell.exe child, its ModuleAnalysisCache path turns
+        # CWD-relative, and a long-lived hand-off launcher wrote
+        # Microsoft\Windows\PowerShell\ModuleAnalysisCache into the repo
+        # checkout. The lookup does not read LOCALAPPDATA/APPDATA; creating
+        # the folders is the fix. Empty dirs; harmless off Windows.
+        (home / "AppData" / "Local").mkdir(parents=True, exist_ok=True)
+        (home / "AppData" / "Roaming").mkdir(parents=True, exist_ok=True)
+        # APPDATA is a door of its own: on Windows it IS env.config_base(),
+        # so a test that forgot --config resolved the developer's real
+        # %APPDATA%\magent\config.json (and discover scanned the real VS Code
+        # storage). Point it at this home's Roaming folder -- the path
+        # appdata_dir() falls back to where APPDATA is unset, so every OS
+        # gets the same answer. LOCALAPPDATA stays inherited: find_psmux's
+        # %LOCALAPPDATA%\psmux fallback must still find the real install, and
+        # wt_keys resolves through its own seam.
+        monkeypatch.setenv("APPDATA", str(home / "AppData" / "Roaming"))
+        # The same door on Linux: config_base() is xdg_config_home(), and an
+        # exported XDG_CONFIG_HOME (a login's, a runner's) wins over
+        # ~/.config, so moving HOME alone left it pointing at the real one.
+        # <home>/.config is what xdg_config_home() falls back to when the
+        # variable is unset, so a box that never exported it sees no change.
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
         drive, tail = os.path.splitdrive(str(home))
         values = (str(home), str(home), drive, tail or os.sep)
         for var, value in zip(_HOME_VARS, values, strict=True):
@@ -183,9 +225,111 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # machine the suite runs on. Tests that are ABOUT the hand-off set the
     # policy explicitly.
     monkeypatch.setenv("MAGENT_SESSION0_POLICY", "allow")
+    # ...and a fourth, with the longest reach of all: `magent serve` keeps the
+    # node sync daemon alive, and that daemon ssh-es into every machine in
+    # settings.nodes with the developer's own keys, every pull interval. A test
+    # that starts a real serve would dial real machines. Off for every tier; the
+    # tests that are ABOUT the supervisor set it back to "1".
+    monkeypatch.setenv("MAGENT_NODE_SYNC", "0")
     log.reset_logging()
     yield
     log.reset_logging()
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_git_repo_env(monkeypatch):
+    """No test inherits a variable that AIMS git at a repo (every name in
+    ``env.GIT_LOCAL_ENV_VARS``, i.e. ``git rev-parse --local-env-vars``).
+
+    Same family as the HOME redirect, and not theoretical: the husky pre-push
+    hook runs the full gate, pytest included, with the hook's GIT_DIR exported
+    -- an ABSOLUTE path when pushing from a worktree, which is how this
+    project works. Under it a fixture's ``git init --bare`` rewrote the real
+    repo's shared config to ``core.bare=true``, its commit landed on the real
+    checked-out branch, and its ``push -u origin main`` went to the real
+    origin (reproduced against a scratch victim). Deleting them here covers
+    every fixture's git child and every product git read under test at once.
+    """
+    for name in env.GIT_LOCAL_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_ssh(monkeypatch):
+    """No test resolves the REAL ``ssh`` client. A test that installed no fake
+    sees "not installed" (``remote_mux.run`` raises RemoteError rc 127), a
+    shape every caller already handles.
+
+    Same family as ``MAGENT_PSMUX_BOOST=0``, for its sharpest reason: a node
+    call dials a real machine on the network under the developer's own keys,
+    and no HOME redirect contains a binary on PATH. Patched on the MODULE
+    attribute, so ``test_remote_mux.py``'s by-value import of ``find_ssh`` (the
+    test that proves PATH resolution) still gets the real resolver; the
+    ``fake_ssh`` fixture patches the same attribute afterwards and wins. The
+    ``needs_ssh`` node tier re-points it at the real client deliberately.
+
+    The attach pane's resolver is guarded too, at both of its halves:
+    ``attach_client.find_ssh`` (so an in-process pane argv names bare ``ssh``)
+    and ``attach_client._system_directory`` (so no test reads the real
+    Windows OpenSSH, including through the by-value real resolvers).
+    """
+    monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: None)
+    monkeypatch.setattr("magent.attach_client.find_ssh", lambda: None)
+    monkeypatch.setattr("magent.attach_client._system_directory", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_gh(monkeypatch):
+    """No test resolves the REAL ``gh``: it holds the developer's GitHub token,
+    and ``node setup`` registers an ssh key to their account with it. Same
+    device as ``_no_real_ssh``; the ``fake_gh`` fixture wins over it."""
+    monkeypatch.setattr("magent.remote_mux.find_gh", lambda: None)
+
+
+@pytest.fixture
+def fake_ssh(tmp_path, monkeypatch):
+    """A real on-disk fake ``ssh`` wired in as remote_mux's client (THE fake:
+    tests/unit/_fake_ssh.py)."""
+    fake = make_fake_ssh(tmp_path)
+    monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: fake.path)
+    return fake
+
+
+# Every fake gh call is a cold cmd.exe (Windows) + interpreter start, ~130ms
+# on an idle box; under a loaded desktop one took past the product's 20s bound
+# and a pin that never meant to test a timeout read the timeout row. A test
+# that does mean it sets its own short GH_TIMEOUT_S, which wins over this.
+FAKE_GH_TIMEOUT_S = 120.0
+
+
+@pytest.fixture
+def fake_gh(tmp_path, monkeypatch):
+    """A fake ``gh`` (the one fake, tests/unit/_fake_ssh.py, under another
+    name) wired in as remote_mux's local gh, with headroom for a slow spawn
+    (``FAKE_GH_TIMEOUT_S``)."""
+    fake = make_fake_ssh(tmp_path, name="gh")
+    monkeypatch.setattr("magent.remote_mux.find_gh", lambda: fake.path)
+    monkeypatch.setattr("magent.remote_mux.GH_TIMEOUT_S", FAKE_GH_TIMEOUT_S)
+    return fake
+
+
+@pytest.fixture
+def stepped_clock(monkeypatch):
+    """remote_mux's clock replaced by a ``SteppedClock`` (tests/unit/
+    _fake_ssh.py): a flood pin's first words come before the cap on any
+    platform's clock. remote_mux reads ``time.monotonic`` alone, so the
+    stand-in carries only that -- any other ``time`` use there would fail
+    loudly, never read the real clock.
+
+    Flood pins only: ``_finish``'s deadline reads this same clock, so a call
+    that does NOT pass the cap finds its whole bound spent at the next read
+    (``deadline - 1000.0`` is below zero) and stops waiting on its drains
+    and the child at once -- a false timeout, not the reply."""
+    clock = SteppedClock()
+    monkeypatch.setattr(
+        "magent.remote_mux.time", types.SimpleNamespace(monotonic=clock.monotonic)
+    )
+    return clock
 
 
 # --- The tripwire -------------------------------------------------------------
@@ -455,6 +599,7 @@ class FakePlatform(Platform):
         supports_attention: bool = False,
         supports_hotkey: bool = False,
         supports_wt_keybindings: bool = False,
+        supports_attach_windows: bool = False,
         supports_nudge: bool = False,
         nudge_error: Exception | None = None,
         supports_close: bool = False,
@@ -479,6 +624,7 @@ class FakePlatform(Platform):
         self._supports_attention = supports_attention
         self._supports_hotkey = supports_hotkey
         self._supports_wt_keybindings = supports_wt_keybindings
+        self._supports_attach_windows = supports_attach_windows
         self._supports_nudge = supports_nudge
         self._nudge_error = nudge_error
         self._supports_close = supports_close
@@ -544,7 +690,7 @@ class FakePlatform(Platform):
     def snapshot_windows(self):
         return self._windows
 
-    def launch_psmux_session(self, windows) -> None:
+    def launch_psmux_session(self, windows) -> dict[str, str]:
         self.launched_psmux.extend(windows)
         self.psmux_launches.append([w.window_name for w in windows])
         for w in windows:
@@ -552,6 +698,7 @@ class FakePlatform(Platform):
                 self._psmux_launch_failures.discard(w.window_name)
                 continue
             self.psmux_sessions.add(w.window_name)
+        return {}
 
     def attach_psmux(self, session_name, title, color=None, config_path=None) -> None:
         self.attached_psmux.append((session_name, title, color, config_path))
@@ -564,6 +711,9 @@ class FakePlatform(Platform):
 
     def supports_wt_keybindings(self) -> bool:
         return self._supports_wt_keybindings
+
+    def supports_attach_windows(self) -> bool:
+        return self._supports_attach_windows
 
     def logon_session_is_interactive(self) -> bool:
         return self._interactive_session

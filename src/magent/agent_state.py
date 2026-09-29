@@ -7,8 +7,8 @@ events (Claude Code via hooks, Codex via its ``notify`` program, ...) writes
 here; the session picker reads here. That keeps status detection out of the
 terminal (no scraping) and uniform across agent types.
 
-Deliberately dependency-light (stdlib only) so the hook handler that imports it
-adds negligible latency to every turn.
+Deliberately dependency-light (stdlib, plus the stdlib-only json_depth leaf) so
+the hook handler that imports it adds negligible latency to every turn.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ import os
 import sys
 import time
 from pathlib import Path
+
+from magent.json_depth import TOO_DEEP, nests_too_deep
 
 STATE_DIR = Path.home() / ".magent" / "state"
 
@@ -177,8 +179,71 @@ def _warn_bad_record(path: Path, why: str) -> None:
     from magent.log import get_logger
 
     get_logger("attention").warning(
-        "skipping unusable agent-state record %s: %s", path.name, why
+        # The FULL path: a bad local record and a bad node-mirror record for
+        # the same cwd hash share a file name and must stay distinguishable.
+        "skipping unusable agent-state record %s: %s",
+        path,
+        why,
     )
+
+
+def read_store(root: Path, *, strict: bool = False) -> list[dict[str, object]]:
+    """Every readable record in the store at ``root`` -- this PC's, or a node
+    session's mirror under ``~/.magent/nodes``. Corrupt, non-object and
+    too deeply nested (``json_depth.MAX_JSON_DEPTH``) files are skipped and named
+    once (``_warn_bad_record``). Never sweeps: a mirror
+    is the node's to age, and a record deleted here would come back on the
+    next pull. A missing or unreadable directory is an empty store (unreadable
+    is logged once). Records are unfiltered (no TTL) and ordered by filename,
+    not by ts.
+
+    ``strict=True`` is for a caller that can do better than "empty" with a
+    broken store (the attention engine holds a node's last good records).
+    It re-raises a DIRECTORY-level ``OSError`` other than
+    ``FileNotFoundError`` -- ``NotADirectoryError``, ``PermissionError``, or
+    any other error listing ``root`` -- from an ``os.scandir`` probe or the
+    glob, and logs nothing for it. A missing directory is still ``[]`` (a
+    mirror not pulled yet is empty, not broken) and a torn or unparseable
+    FILE is still skipped (a partial pull is normal). The probe is needed
+    because ``Path.glob`` swallows these errors itself: a file globs to []."""
+    records: list[dict[str, object]] = []
+    try:
+        if strict:
+            with os.scandir(root):
+                pass
+        paths = sorted(root.glob("*.json"))
+    except OSError as exc:
+        if strict:
+            if isinstance(exc, FileNotFoundError):
+                return records
+            raise
+        key = str(root)
+        if key not in _warned_files:
+            _warned_files.add(key)
+            from magent.log import get_logger  # lazy: see _warn_bad_record
+
+            get_logger("attention").warning(
+                "agent-state: %s is unreadable (%s)", root, exc
+            )
+        return records
+    for p in paths:
+        try:
+            text = p.read_text(encoding="utf-8")
+            # A mirror's files are the node's: nested past the bound is
+            # refused before json parses it, the same on every stack.
+            too_deep = nests_too_deep(text)
+            d = None if too_deep else json.loads(text)
+        # RecursionError: the backstop for any nesting the scan did not refuse.
+        except (OSError, ValueError, RecursionError) as exc:
+            _warn_bad_record(p, f"unreadable ({exc})")
+            continue
+        if too_deep:
+            _warn_bad_record(p, f"unreadable ({TOO_DEEP})")
+        elif isinstance(d, dict):
+            records.append(d)
+        else:
+            _warn_bad_record(p, "not a JSON object")
+    return records
 
 
 def all_states() -> list[dict[str, object]]:
@@ -189,19 +254,4 @@ def all_states() -> list[dict[str, object]]:
     Reading also opportunistically ages out long-dead records (P6-04, see
     ``maybe_sweep_stale``)."""
     maybe_sweep_stale()
-    records: list[dict[str, object]] = []
-    try:
-        paths = sorted(STATE_DIR.glob("*.json"))
-    except OSError:
-        return records
-    for p in paths:
-        try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            _warn_bad_record(p, f"unreadable ({exc})")
-            continue
-        if isinstance(d, dict):
-            records.append(d)
-        else:
-            _warn_bad_record(p, "not a JSON object")
-    return records
+    return read_store(STATE_DIR)

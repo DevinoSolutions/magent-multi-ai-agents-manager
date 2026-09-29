@@ -27,3 +27,10 @@ paths = [
 # next to a real value must not pass.
 regexTarget = "secret"
 regexes = ['''DECOY''']
+
+# The synthetic sentinel test_hooks_cmd.py plants as a fake API key (main's
+# #251, which predates the DECOY convention here); a rename cannot help, the
+# scan reads every commit's patch.
+[[allowlists]]
+description = "synthetic test sentinels"
+regexes = ['''sentinel-secret-9d2a''']

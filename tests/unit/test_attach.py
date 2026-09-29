@@ -191,7 +191,7 @@ class TestDefaultAttachHost:
 
 class TestSplitTarget:
     def test_with_user(self):
-        assert cli._split_target("amin@host.ts.net") == ("amin", "host.ts.net")
+        assert cli._split_target("demo@host.ts.net") == ("demo", "host.ts.net")
 
     def test_without_user(self):
         user, hostname = cli._split_target("host.ts.net")
@@ -229,8 +229,8 @@ class TestLastAttachHost:
     def test_roundtrip(self, monkeypatch, tmp_path):
         attach_mod = self._isolate(monkeypatch, tmp_path)
         assert attach_mod._read_last_host() is None
-        attach_mod._remember_last_host("amin@desktop.ts.net")
-        assert attach_mod._read_last_host() == "amin@desktop.ts.net"
+        attach_mod._remember_last_host("demo@desktop.ts.net")
+        assert attach_mod._read_last_host() == "demo@desktop.ts.net"
 
     def test_blank_file_reads_as_none(self, monkeypatch, tmp_path):
         attach_mod = self._isolate(monkeypatch, tmp_path)
@@ -249,8 +249,8 @@ class TestLastAttachHost:
         import click
 
         attach_mod = self._isolate(monkeypatch, tmp_path)
-        attach_mod._remember_last_host("amin@last-used")
-        monkeypatch.setattr(attach_mod, "_default_attach_host", lambda: "amin@config")
+        attach_mod._remember_last_host("demo@last-used")
+        monkeypatch.setattr(attach_mod, "_default_attach_host", lambda: "demo@config")
         seen: dict[str, object] = {}
 
         def fake_prompt(text, **kwargs):
@@ -262,7 +262,7 @@ class TestLastAttachHost:
 
         with pytest.raises(SystemExit):
             attach_mod._attach_flow(None, no_mux=False, group=None, yes=False)
-        assert seen["default"] == "amin@last-used"
+        assert seen["default"] == "demo@last-used"
 
     def test_successful_status_read_remembers_target(self, monkeypatch, tmp_path):
         import json as json_mod
@@ -828,6 +828,45 @@ class TestUpJsonConfigError:
         assert payload["error"]
 
 
+class TestUpRefusesTextWithNoUtf8Form:
+    """F-SUR-1: a title with no UTF-8 form is a config error for `up` too --
+    refused at load, before any psmux read, not at the first echo of its sid."""
+
+    _REFUSAL = (
+        "projects[0].title has text with no UTF-8 form (UnicodeEncodeError):"
+        " 'api\\ud83d'"
+    )
+
+    def _run(self, runner, tmp_path, monkeypatch, *args):
+        def _unreached(*a, **k):
+            raise AssertionError("a refused config must never reach psmux")
+
+        monkeypatch.setattr("magent.launch.psmux_status", _unreached)
+        monkeypatch.setattr("magent.launch.bring_up_psmux", _unreached)
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [
+                        {"path": "api", "title": "api\ud83d", "color": "#22c55e"}
+                    ],
+                }
+            )
+        )
+        return runner.invoke(cli.main, ["--config", str(cfg), "up", *args])
+
+    def test_json_gets_the_config_error_envelope(self, runner, tmp_path, monkeypatch):
+        result = self._run(runner, tmp_path, monkeypatch, "--json")
+        assert result.exit_code == 1
+        assert json.loads(result.stdout) == {"ok": False, "error": self._REFUSAL}
+
+    def test_plain_gets_the_error_line(self, runner, tmp_path, monkeypatch):
+        result = self._run(runner, tmp_path, monkeypatch)
+        assert result.exit_code == 1
+        assert result.stderr == f"Error: {self._REFUSAL}\n"
+
+
 # The `projects` shape psmux_status returns (up --json serializes every key).
 _PROJECT_ROWS = [
     {
@@ -1020,7 +1059,7 @@ class TestUpDecorates:
         )
         monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
         monkeypatch.setattr(
-            "magent.launch.bring_up_psmux", lambda *a, **k: (list(created), [])
+            "magent.launch.bring_up_psmux", lambda *a, **k: (list(created), {})
         )
         monkeypatch.setattr("magent.launch.decorate_psmux_sessions", seen.append)
         return seen
@@ -1076,21 +1115,52 @@ class TestUpReportsCasualties:
         monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
         monkeypatch.setattr(
             "magent.launch.bring_up_psmux",
-            lambda cfg, only=None, group=None: (list(created), list(failed)),
+            lambda cfg, only=None, group=None, **_k: (list(created), dict(failed)),
         )
 
     def test_failed_sessions_are_named(self, runner, tmp_path, monkeypatch):
-        self._patch(monkeypatch, created=["web"], failed=["api"])
+        self._patch(monkeypatch, created=["web"], failed={"api": ""})
         result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
         assert result.exit_code == 0
         assert "Brought up 1" in result.output
         assert "1 session(s) failed to come up" in result.output
         assert "api" in result.output
 
+    def test_a_refused_session_says_why(self, runner, tmp_path, monkeypatch):
+        # A session the bring-up deliberately left alone (its has-session never
+        # answered) is named WITH its reason: this is the line `magent attach`
+        # relays from the host, and "failed" alone reads as "dead" when the
+        # truth is "could not tell". The Session-0 note still follows it.
+        why = "could not tell whether api is running (has-session gave no answer)"
+        self._patch(monkeypatch, created=[], failed={"api": why})
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+        assert result.exit_code == 0
+        assert "1 session(s) failed to come up" in result.output
+        assert why in result.output
+        assert "S0-NOTE" in result.output
+
+    def test_the_casualty_block_is_byte_for_byte(self, runner, tmp_path, monkeypatch):
+        # Characterization: the whole block, in order -- the count and names
+        # with the host's log hint, one dimmed line per KNOWN reason (none for
+        # an empty one), then the Session-0 note.
+        why = "could not tell whether web is running (has-session gave no answer)"
+        self._patch(monkeypatch, created=[], failed={"api": "", "web": why})
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+        assert result.exit_code == 0
+        assert (
+            "  + Brought up 0 session(s): (none)\n"
+            "  x 2 session(s) failed to come up: api, web"
+            " (see ~/.magent/logs/launch.log on the host)\n"
+            f"    {why}\n"
+            "  S0-NOTE\n"
+        ) in result.output
+
     def test_a_clean_wave_says_nothing_about_failures(
         self, runner, tmp_path, monkeypatch
     ):
-        self._patch(monkeypatch, created=["api"], failed=[])
+        self._patch(monkeypatch, created=["api"], failed={})
         result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
         assert result.exit_code == 0
         assert "failed to come up" not in result.output
@@ -1111,7 +1181,7 @@ class TestUpReportsCasualties:
         brought_up: list[object] = []
         monkeypatch.setattr(
             "magent.launch.bring_up_psmux",
-            lambda *a, **k: (brought_up.append(a), ([], []))[1],
+            lambda *a, **k: (brought_up.append(a), ([], {}))[1],
         )
         result = runner.invoke(
             cli.main, ["--config", self._config(tmp_path), "up", "--json"]
@@ -1167,7 +1237,7 @@ class TestAttachVersionSkew:
     def _warn(self, capsys, status):
         from magent.cli import attach as attach_mod
 
-        attach_mod._warn_version_skew("amin@desktop", status)
+        attach_mod._warn_version_skew("demo@desktop", status)
         return capsys.readouterr()
 
     def test_silent_when_versions_match(self, capsys):
@@ -1179,7 +1249,7 @@ class TestAttachVersionSkew:
 
     def test_warns_when_the_host_reports_an_older_version(self, capsys):
         captured = self._warn(capsys, {"version": "3.1.4"})
-        assert "amin@desktop runs magent 3.1.4" in captured.err
+        assert "demo@desktop runs magent 3.1.4" in captured.err
         assert "pip install -U magent-multi-ai-agents-manager" in captured.err
         # The warning must never contaminate stdout.
         assert captured.out == ""
@@ -1242,10 +1312,10 @@ class TestHotkeyCmdSshHost:
     def test_ssh_host_is_forwarded_to_the_listener(self, runner, monkeypatch):
         seen = self._patch(monkeypatch)
         result = runner.invoke(
-            cli.main, ["hotkey", "-s", "http://h:8033", "--ssh-host", "amin@deck"]
+            cli.main, ["hotkey", "-s", "http://h:8033", "--ssh-host", "demo@deck"]
         )
         assert result.exit_code == 0
-        assert seen == [("http://h:8033", "amin@deck")]
+        assert seen == [("http://h:8033", "demo@deck")]
 
     def test_default_is_none_for_a_local_open(self, runner, monkeypatch):
         seen = self._patch(monkeypatch)
@@ -1266,7 +1336,11 @@ class TestHotkeyCmdServerDefault:
     def _config(path, port):
         path.write_text(
             json.dumps(
-                {"version": 3, "projects": [], "settings": {"uploadPort": port}}
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [],
+                    "settings": {"uploadPort": port},
+                }
             ),
             encoding="utf-8",
         )
@@ -1302,7 +1376,6 @@ class TestMaybeStartHotkeySshHost:
     """The spawned listener's argv carries --ssh-host only when there is one."""
 
     def _args(self, monkeypatch, ssh_host):
-        import magent.launch as launch_mod
         from magent.cli import background
 
         spawned: list[list[str]] = []
@@ -1311,8 +1384,31 @@ class TestMaybeStartHotkeySshHost:
             def supports_hotkey(self) -> bool:
                 return True
 
+        ended: list[str] = []
+
+        class _Exited:
+            # The child is only here for its argv; an exited one ends the
+            # registration wait on its first poll. Any attempt to end it is
+            # recorded, so a regression fails the assertion below rather than
+            # erroring on a missing method.
+            def poll(self) -> int:
+                return 0
+
+            def kill(self) -> None:
+                ended.append("kill")
+
+            def terminate(self) -> None:
+                ended.append("terminate")
+
+            def send_signal(self, sig: int) -> None:
+                ended.append(f"signal {sig}")
+
+        def _spawn(args: list[str]) -> _Exited:
+            spawned.append(args)
+            return _Exited()
+
         monkeypatch.setattr("magent.platform.get_platform", _FakePlat)
-        monkeypatch.setattr("magent.launch.spawn_detached", spawned.append)
+        monkeypatch.setattr("magent.launch.spawn_detached", _spawn)
 
         fake = types.ModuleType("magent.hotkey")
         fake.listener_pid = lambda: None
@@ -1323,14 +1419,26 @@ class TestMaybeStartHotkeySshHost:
         monkeypatch.setitem(sys.modules, "magent.hotkey", fake)
         # The spawn recipe itself moved to launch.start_hotkey_listener so the
         # launch path can share it; background is now just the capability gate.
-        monkeypatch.setattr(launch_mod.time, "sleep", lambda s: None)
+        # `_Exited` ends the registration wait on its first poll; procs' own
+        # clock (never the global time module) is simulated anyway, so a wait
+        # that did not end costs no real seconds.
+        clock = {"now": 0.0}
+
+        def _sleep(seconds: float) -> None:
+            clock["now"] += seconds
+
+        monkeypatch.setattr(
+            "magent.procs.time",
+            types.SimpleNamespace(sleep=_sleep, monotonic=lambda: clock["now"]),
+        )
 
         background._maybe_start_hotkey("http://h:8033", ssh_host)
+        assert ended == []  # the launcher never ends the child it spawned
         return spawned[0]
 
     def test_ssh_host_is_passed_through(self, monkeypatch):
-        args = self._args(monkeypatch, "amin@deck")
-        assert args[-4:] == ["-s", "http://h:8033", "--ssh-host", "amin@deck"]
+        args = self._args(monkeypatch, "demo@deck")
+        assert args[-4:] == ["-s", "http://h:8033", "--ssh-host", "demo@deck"]
 
     def test_absent_ssh_host_adds_no_flag(self, monkeypatch):
         assert "--ssh-host" not in self._args(monkeypatch, None)
@@ -1438,7 +1546,7 @@ class TestCorpseDecision:
             [
                 _FAKE_SUPERVISOR,
                 "--target",
-                "amin@devino-second",
+                "demo@devino-second",
                 "--session",
                 "api",
                 "--remote",
@@ -1450,13 +1558,13 @@ class TestCorpseDecision:
         assert self._corpses(["api"], [cmd]) == set()
 
     def test_another_sessions_node_pane_does_not_rescue_this_one(self):
-        cmd = "ssh -t amin@devino-second tmux -L magent attach -t '=web'"
+        cmd = "ssh -t demo@devino-second tmux -L magent attach -t '=web'"
         assert self._corpses(["api", "web"], [cmd]) == {"api"}
 
     def test_a_longer_node_session_name_does_not_rescue_a_shorter_one(self):
         # The spawned target is quoted, `-t '=api2'`, and the closing quote
         # ends the name: a live api2 pane says nothing about api.
-        cmd = "ssh -t amin@devino-second tmux -L magent attach -t '=api2'"
+        cmd = "ssh -t demo@devino-second tmux -L magent attach -t '=api2'"
         assert self._corpses(["api"], [cmd]) == {"api"}
 
     @pytest.mark.parametrize("sid", ["magent", "Magent"])
@@ -1467,7 +1575,7 @@ class TestCorpseDecision:
         # is live. That is the conservative direction (never a false close),
         # and `magent` is a realistic project name -- this repo is one.
         # Matching is case-insensitive, so `Magent` is rescued the same way.
-        cmd = "ssh -t amin@devino-second tmux -L magent attach -t '=api'"
+        cmd = "ssh -t demo@devino-second tmux -L magent attach -t '=api'"
         assert self._corpses([sid], [cmd]) == set()
 
 
@@ -2331,7 +2439,7 @@ _BARE_WT_ARGV = [
     "psmux -L api attach || magent sessions api",
 ]
 # The node analogue of _SUPERVISED_WT_ARGV: the whole wt line a tmux pane for
-# session "api" on "amin@devino-second" opens, hand-written byte for byte
+# session "api" on "demo@devino-second" opens, hand-written byte for byte
 # rather than derived, so a drift in the exact-target attach form, the `--mux`
 # position or the title lock is a diff against one literal.
 _SUPERVISED_TMUX_WT_ARGV = [
@@ -2344,7 +2452,7 @@ _SUPERVISED_TMUX_WT_ARGV = [
     "--",
     _FAKE_SUPERVISOR,
     "--target",
-    "amin@devino-second",
+    "demo@devino-second",
     "--session",
     "api",
     "--remote",
@@ -2456,7 +2564,7 @@ class TestTmuxPaneCommand:
 
         assert (
             attach_client.pane_command(
-                "amin@devino-second",
+                "demo@devino-second",
                 "api",
                 _FAKE_SUPERVISOR,
                 mux="tmux",
@@ -2472,8 +2580,8 @@ class TestTmuxPaneCommand:
         from magent import attach_client
 
         assert attach_client.pane_command(
-            "amin@devino-second", "api", None, mux="tmux", remote=_TMUX_REMOTE
-        ) == [*_BARE_WT_ARGV[_PANE:-2], "amin@devino-second", _TMUX_REMOTE]
+            "demo@devino-second", "api", None, mux="tmux", remote=_TMUX_REMOTE
+        ) == [*_BARE_WT_ARGV[_PANE:-2], "demo@devino-second", _TMUX_REMOTE]
 
     def test_the_remote_defaults_to_the_multiplexers_attach_command(self):
         from magent import attach_client
@@ -2559,7 +2667,7 @@ class TestSpawnAttachWindow:
     def test_a_node_window_is_a_supervised_tmux_pane_under_the_title_lock(
         self, monkeypatch
     ):
-        _title, argv = self._spawn(monkeypatch, "amin@devino-second", "api", mux="tmux")
+        _title, argv = self._spawn(monkeypatch, "demo@devino-second", "api", mux="tmux")
         assert argv == _SUPERVISED_TMUX_WT_ARGV
 
     def test_a_node_window_without_reconnect_is_the_bare_ssh_tmux_pane(
@@ -2570,11 +2678,11 @@ class TestSpawnAttachWindow:
         # only the target and the tmux attach are node-specific. No `--mux`:
         # there is no supervisor to tell.
         _title, argv = self._spawn(
-            monkeypatch, "amin@devino-second", "api", mux="tmux", reconnect=False
+            monkeypatch, "demo@devino-second", "api", mux="tmux", reconnect=False
         )
         assert argv == [
             *_BARE_WT_ARGV[:-2],
-            "amin@devino-second",
+            "demo@devino-second",
             _TMUX_REMOTE,
         ]
 
@@ -2597,7 +2705,7 @@ class TestSpawnAttachWindow:
         # backoff the supervisor is the only process left for this window.
         from magent.cli import attach as attach_mod
 
-        _title, argv = self._spawn(monkeypatch, "amin@devino-second", "api", mux="tmux")
+        _title, argv = self._spawn(monkeypatch, "demo@devino-second", "api", mux="tmux")
         assert attach_mod._corpses({"api"}, [subprocess.list2cmdline(argv)]) == set()
 
     def test_an_unknown_multiplexer_never_opens_a_window(self, monkeypatch):
@@ -2997,3 +3105,272 @@ class TestUpHandsOffFromSessionZero:
 
         assert result.exit_code == 0
         assert plat.handoffs == []
+
+
+class TestHostAttachDialsTheSameClientAsItsPanes:
+    """`magent attach <host>` polls the host, ensures its upload server and
+    (under --no-mux) opens bare panes through the SAME ssh client its
+    supervised panes dial: attach_client's rule, Windows' own OpenSSH first.
+    Two clients share ``~/.ssh`` but not the agent, so a status poll that
+    succeeded through one must not front panes that fail through the other."""
+
+    _CLIENT = r"C:\Windows\System32\OpenSSH\ssh.exe"
+
+    def test_the_status_poll_dials_the_resolved_client(self, monkeypatch):
+        from magent import attach_client
+        from magent.cli import attach as attach_mod
+
+        argvs: list[list[str]] = []
+
+        def fake_run(argv, **_k):
+            argvs.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: self._CLIENT)
+        monkeypatch.setattr(attach_mod.subprocess, "run", fake_run)
+        attach_mod._ssh_capture("u@host", "magent up --json")
+        assert argvs[0][0] == self._CLIENT
+
+    def test_the_status_poll_keeps_the_bare_name_when_nothing_resolves(
+        self, monkeypatch
+    ):
+        from magent.cli import attach as attach_mod
+
+        argvs: list[list[str]] = []
+
+        def fake_run(argv, **_k):
+            argvs.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(attach_mod.subprocess, "run", fake_run)
+        attach_mod._ssh_capture("u@host", "magent up --json")
+        assert argvs[0][0] == "ssh"
+
+    def test_the_serve_ensure_hop_dials_the_resolved_client(self, monkeypatch):
+        from magent import attach_client
+        from magent.cli import attach as attach_mod
+
+        status = {
+            "up": [{"name": "api", "session": "api"}],
+            "down": [],
+            "projects": [{"name": "api"}],
+        }
+        monkeypatch.setattr(
+            attach_mod, "_query_status", lambda *a, **k: (status, 0, "")
+        )
+        monkeypatch.setattr(attach_mod, "_ssh_capture", lambda *a, **k: (0, "", ""))
+        hops: list[list[str]] = []
+
+        def fake_popen(args, **_k):
+            if args and args[0] != "wt":
+                hops.append(args)
+            return _FakeProc()
+
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: self._CLIENT)
+        monkeypatch.setattr(attach_mod.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(attach_mod, "_tile_titles", lambda t: None)
+        monkeypatch.setattr(attach_mod, "_maybe_start_hotkey", lambda url: None)
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
+        monkeypatch.setattr(attach_mod, "_remember_last_host", lambda target: None)
+        _fake_platform(monkeypatch, {"magent:api": 1})
+
+        attach_mod._attach_flow("user@host", no_mux=False, group=None, yes=False)
+        (ensure,) = [h for h in hops if "--ensure" in h[-1]]
+        assert ensure[0] == self._CLIENT
+
+    def test_a_no_mux_pane_dials_the_resolved_client(self, monkeypatch):
+        from magent import attach_client
+        from magent.cli import attach as attach_mod
+
+        calls: list[list[str]] = []
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: self._CLIENT)
+        monkeypatch.setattr(
+            attach_mod.subprocess, "Popen", lambda cmd, *a, **k: calls.append(cmd)
+        )
+        monkeypatch.setattr(attach_mod, "_tile_titles", lambda t: None)
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
+        _fake_platform(monkeypatch)
+        attach_mod._attach_nomux(
+            "u@host", {"projects": [{"path": "api", "name": "api"}]}
+        )
+        (argv,) = calls
+        assert argv[argv.index("--") + 1] == self._CLIENT
+
+
+class TestUpHandsAllowDirtyToTheDesktopCopy:
+    def test_the_relayed_argv_keeps_allow_dirty(self, runner, tmp_config, monkeypatch):
+        seen: list[list[str]] = []
+        monkeypatch.setattr(
+            "magent.launch.session0_disposition", lambda plat: "handoff"
+        )
+        monkeypatch.setattr(
+            "magent.launch.relay_handoff",
+            lambda plat, argv, timeout_s: seen.append(argv) or 0,
+        )
+        path = tmp_config({"projects": []})
+        result = runner.invoke(cli.main, ["--config", path, "up", "--allow-dirty"])
+        assert result.exit_code == 0
+        assert seen[0][-1] == "--allow-dirty"
+
+    def test_allow_dirty_rides_once_beside_every_other_flag(
+        self, runner, tmp_config, monkeypatch
+    ):
+        seen: list[list[str]] = []
+        monkeypatch.setattr(
+            "magent.launch.session0_disposition", lambda plat: "handoff"
+        )
+        monkeypatch.setattr(
+            "magent.launch.relay_handoff",
+            lambda plat, argv, timeout_s: seen.append(argv) or 0,
+        )
+        path = tmp_config({"projects": []})
+        result = runner.invoke(
+            cli.main,
+            ["--config", path, "up", "--allow-dirty", "-g", "x", "--all", "--revive"],
+        )
+        assert result.exit_code == 0
+        (argv,) = seen
+        assert argv.count("--allow-dirty") == 1
+        assert argv[argv.index("up") + 1 :] == [
+            "-g",
+            "x",
+            "--all",
+            "--revive",
+            "--allow-dirty",
+        ]
+
+    def test_a_node_project_is_not_touched_before_the_hand_off(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # The desktop copy owns every bring-up, node projects included: this
+        # Session-0 process only relays, so nothing may be read or started
+        # before relay_handoff -- even with a node project in scope.
+        touched: list[str] = []
+        monkeypatch.setattr(
+            "magent.launch.session0_disposition", lambda plat: "handoff"
+        )
+        monkeypatch.setattr(
+            "magent.launch.relay_handoff", lambda plat, argv, timeout_s: 0
+        )
+        monkeypatch.setattr(
+            "magent.launch.node_session_ids",
+            lambda *a, **k: touched.append("node_session_ids") or ["api"],
+        )
+        monkeypatch.setattr(
+            "magent.launch.bring_up_psmux",
+            lambda *a, **k: touched.append("bring_up_psmux") or ([], {}),
+        )
+        path = tmp_config({"projects": []})
+        result = runner.invoke(cli.main, ["--config", path, "up", "--allow-dirty"])
+        assert result.exit_code == 0
+        assert touched == []
+
+
+class TestUpNodeProjectsBesideLiveLocalSessions:
+    """Every local session already up does not mean nothing to do: node
+    projects are never in psmux_status, so they still reach the bring-up --
+    alone, beside no live local id -- and the created node sid is not
+    decorated as a local session."""
+
+    def _patch(self, monkeypatch, down=(), node_sids=("api",)):
+        calls: list[tuple[object, object]] = []
+        decorated: list[list[str]] = []
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: (
+                [{"name": "web", "session": "web"}],
+                list(down),
+                [{}],
+            ),
+        )
+        monkeypatch.setattr(
+            "magent.launch.node_session_ids",
+            lambda cfg, group=None: list(node_sids),
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions",
+            lambda names, code_hint=None: decorated.append(list(names)) or [],
+        )
+        monkeypatch.setattr(
+            "magent.launch.bring_up_psmux",
+            lambda cfg, only=None, group=None, **k: (
+                calls.append((only, k.get("allow_dirty"))),
+                (["api"], {}),
+            )[1],
+        )
+        return calls, decorated
+
+    def test_live_local_sessions_do_not_skip_the_node_half(
+        self, runner, tmp_config, monkeypatch
+    ):
+        calls, decorated = self._patch(monkeypatch)
+        path = tmp_config({"projects": []})
+        result = runner.invoke(cli.main, ["--config", path, "up"])
+        assert result.exit_code == 0, result.output
+        assert calls == [(["api"], False)]
+        assert "Brought up 1 session(s): api" in result.stdout
+        assert "already up" not in result.stdout
+        assert decorated == [["web"]]
+
+    def test_all_recreates_everything_so_only_stays_none(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # --all is "every session", not "the down ones plus the node ones":
+        # narrowing it to node sids would silently skip every local session.
+        calls, _ = self._patch(monkeypatch, down=[{"name": "db", "session": "db"}])
+        path = tmp_config({"projects": []})
+        result = runner.invoke(cli.main, ["--config", path, "up", "--all"])
+        assert result.exit_code == 0, result.output
+        assert calls == [(None, False)]
+
+    def test_all_with_everything_up_and_no_node_project_still_recreates(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # Nothing down and nothing on a node is still not "already up" under
+        # --all: it asked for every session to be recreated.
+        calls, _ = self._patch(monkeypatch, node_sids=())
+        path = tmp_config({"projects": []})
+        result = runner.invoke(cli.main, ["--config", path, "up", "--all"])
+        assert result.exit_code == 0, result.output
+        assert calls == [(None, False)]
+        assert "already up" not in result.stdout
+
+
+class TestUpNamesTheLogThatHoldsEachCasualty:
+    """A local casualty is in launch.log, a node casualty in nodes.log; the
+    line names exactly the log(s) its failed sessions were written to."""
+
+    def _run(self, runner, tmp_config, monkeypatch, failed):
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: ([], [{"name": "web", "session": "web"}], [{}]),
+        )
+        monkeypatch.setattr(
+            "magent.launch.node_session_ids", lambda cfg, group=None: ["api"]
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "magent.launch.bring_up_psmux",
+            lambda *a, **k: ([], dict.fromkeys(failed, "")),
+        )
+        path = tmp_config({"projects": []})
+        result = runner.invoke(cli.main, ["--config", path, "up"])
+        assert result.exit_code == 0, result.output
+        return result.stdout
+
+    def test_a_local_casualty_points_at_the_launch_log(
+        self, runner, tmp_config, monkeypatch
+    ):
+        out = self._run(runner, tmp_config, monkeypatch, ["web"])
+        assert "(see ~/.magent/logs/launch.log on the host)" in out
+        assert "nodes.log" not in out
+
+    def test_a_local_and_a_node_casualty_name_both_logs(
+        self, runner, tmp_config, monkeypatch
+    ):
+        out = self._run(runner, tmp_config, monkeypatch, ["web", "api"])
+        assert (
+            "(see ~/.magent/logs/launch.log and ~/.magent/logs/nodes.log on the host)"
+        ) in out

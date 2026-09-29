@@ -1,11 +1,59 @@
 from __future__ import annotations
 
 import re
+import struct
 from pathlib import Path
+
+# claude.exe caps an encoded project-dir name at 200 UTF-16 units and makes the
+# cut name unique with the path's Java String.hashCode in base 36.
+_CLAUDE_DIR_MAX = 200
+_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _utf16_units(text: str) -> tuple[int, ...]:
+    """``text`` as JavaScript sees it: UTF-16 code units (a character outside
+    the BMP is two of them, so it becomes two dashes, exactly as in claude)."""
+    raw = text.encode("utf-16-le", "surrogatepass")
+    return struct.unpack(f"<{len(raw) // 2}H", raw)
+
+
+def _java_string_hash(text: str) -> int:
+    """Java's ``String.hashCode`` over UTF-16 units as a signed 32-bit int --
+    the loop claude.exe runs (``(h << 5) - h + unit | 0``)."""
+    h = 0
+    for unit in _utf16_units(text):
+        h = (h * 31 + unit) & 0xFFFFFFFF
+    return h - (1 << 32) if h >= 1 << 31 else h
+
+
+def _base36(n: int) -> str:
+    digits = ""
+    while True:
+        n, rest = divmod(n, 36)
+        digits = _BASE36[rest] + digits
+        if n == 0:
+            return digits
 
 
 def encode_claude_project_path(project_dir: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9._-]", "-", project_dir)
+    """The directory Claude Code files a project's sessions under
+    (``<config dir>/projects/<this>``) -- the ONE encoder in magent.
+
+    Claude's rule, read off claude.exe and measured against the real store
+    (295 of 297 entries; the 2 misses were sessions that cd'd mid-run):
+    every UTF-16 unit outside ``[A-Za-z0-9]`` becomes ``-``, one for one --
+    dots, underscores and the drive-letter colon included, the drive letter's
+    case kept -- and a name over 200 units is cut to 200 and suffixed with
+    ``-`` + base36(|hashCode of the original path|). The previous rule kept '.'
+    and '_', named the wrong directory for every such project, and so made the
+    fresh-start probe drop ``--continue`` there."""
+    encoded = "".join(
+        chr(unit) if chr(unit).isascii() and chr(unit).isalnum() else "-"
+        for unit in _utf16_units(project_dir)
+    )
+    if len(encoded) <= _CLAUDE_DIR_MAX:
+        return encoded
+    return f"{encoded[:_CLAUDE_DIR_MAX]}-{_base36(abs(_java_string_hash(project_dir)))}"
 
 
 def build_claude_resume(base_cmd: str, session_id: str | None) -> str:
@@ -82,6 +130,16 @@ def has_claude_session(project_dir: str, config_dir: Path | None = None) -> bool
     return next(sess_dir.glob("*.jsonl"), None) is not None
 
 
+def claude_fresh_form(base_cmd: str) -> str | None:
+    """``base_cmd`` without its implicit-resume flag, or None when it has none
+    or names a session explicitly. No store is read: whether there is anything
+    to resume is the caller's question -- on this PC ``claude_fresh_command``
+    asks it, and on a pool node ``bring_up.sh`` asks the node's own store."""
+    if _EXPLICIT_RESUME_RE.search(base_cmd) or not _CONTINUE_RE.search(base_cmd):
+        return None
+    return _CONTINUE_RE.sub("", base_cmd).strip()
+
+
 def claude_fresh_command(
     base_cmd: str, project_dir: str, config_dir: Path | None = None
 ) -> str | None:
@@ -108,11 +166,10 @@ def claude_fresh_command(
     found to continue" at a dead shell. That is the honest answer for that
     store; surfacing it to the user is the caller's job.
     """
-    if _EXPLICIT_RESUME_RE.search(base_cmd) or not _CONTINUE_RE.search(base_cmd):
+    fresh = claude_fresh_form(base_cmd)
+    if fresh is None or has_claude_session(project_dir, config_dir):
         return None
-    if has_claude_session(project_dir, config_dir):
-        return None
-    return _CONTINUE_RE.sub("", base_cmd).strip()
+    return fresh
 
 
 def get_claude_session_ids(

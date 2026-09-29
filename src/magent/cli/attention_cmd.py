@@ -11,7 +11,6 @@ import os
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,7 +20,7 @@ from magent.cli.app import main
 from magent.cli.config_io import _load_config_or_exit
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.paths import find_config
-from magent.procs import pid_alive
+from magent.procs import await_registration, pid_alive
 from magent.style import style
 from magent.titles import get_leaf_name
 
@@ -138,13 +137,18 @@ def engine_from_config(cfg: MagentConfig) -> attention.AttentionEngine:
     config-driven windows as the daemon, not the module defaults. The name_map
     is derived from the enabled projects. Daemon-only concerns (renderers, ntfy
     topic) stay at the daemon call site; this helper covers the config-derived
-    kwargs common to all three surfaces."""
-    from magent import attention  # heavy subsystem: in-body per policy
+    kwargs common to all three surfaces. When a project runs on a node, the
+    engine also reads each placed node session's mirrored state store
+    (node_sync.state_stores)."""
+    from magent import attention, node_sync  # heavy subsystem: in-body per policy
 
     return attention.AttentionEngine(
         attention.name_map_from_projects(name_pairs_from_config(cfg)),
         staleness=staleness_from_config(cfg),
         debounce_s=cfg.settings.attention.debounce_s,
+        # Node sessions' states, pulled home by `magent node sync`, keyed by
+        # the node map (project -> nick, sid) and named by their project.
+        extra_stores=node_sync.state_stores if node_sync.wanted(cfg) else None,
     )
 
 
@@ -381,16 +385,13 @@ def attention_cmd(
                     spawn_detached,
                 )
 
-                spawn_detached(args)
-                for _ in range(20):
-                    time.sleep(0.1)
-                    pid = daemon_pid()
-                    if pid:
-                        click.echo(
-                            f"  {style('+', fg='green')} Attention daemon running "
-                            f"{style(f'(pid {pid})', dim=True)}"
-                        )
-                        return
+                pid = await_registration(spawn_detached(args), daemon_pid)
+                if pid:
+                    click.echo(
+                        f"  {style('+', fg='green')} Attention daemon running "
+                        f"{style(f'(pid {pid})', dim=True)}"
+                    )
+                    return
                 click.echo(f"  {style('x', fg='red')} attention daemon failed to start")
                 sys.exit(1)
         except LockHeld:

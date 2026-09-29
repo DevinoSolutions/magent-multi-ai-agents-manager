@@ -18,15 +18,168 @@ from magent.procs import (
     ABOVE_NORMAL_PRIORITY_CLASS,
     CREATE_BREAKAWAY_FROM_JOB,
     NO_CONSOLE_SESSION,
+    REGISTRATION_TIMEOUT_S,
     active_console_session_id,
+    await_registration,
     count_processes,
     current_session_id,
     pid_alive,
     pids_by_image_name,
+    process_tree,
     raise_priority_above_normal,
     session_id_of,
+    snapshot_processes,
     spawn_unjobbed,
 )
+
+
+class TestProcessTree:
+    """The subtree walk behind "is an agent still under this pane". Pure over a
+    snapshot, so the shapes a live Toolhelp list takes are pinned here without
+    reading one; the one real-process pin below uses a child it spawned."""
+
+    SNAPSHOT = (
+        ("psmux.exe", 1, 0),
+        ("pwsh.exe", 10, 1),
+        ("cmd.exe", 11, 10),
+        ("claude.exe", 12, 11),
+        ("bash.exe", 13, 12),
+        ("pwsh.exe", 20, 1),  # a sibling pane: not ours
+        ("node.exe", 21, 20),
+    )
+
+    def test_it_walks_every_depth_under_the_root(self):
+        tree = process_tree(10, self.SNAPSHOT)
+        assert tree is not None
+        assert [pid for _image, pid, _ppid in tree] == [10, 11, 12, 13]
+
+    def test_the_root_comes_first(self):
+        # idle_sessions asks "is the pane's own process a shell" of tree[0].
+        tree = process_tree(12, self.SNAPSHOT)
+        assert tree is not None
+        assert tree[0] == ("claude.exe", 12, 11)
+
+    def test_siblings_and_ancestors_are_not_the_subtree(self):
+        tree = process_tree(20, self.SNAPSHOT)
+        assert tree is not None
+        assert {pid for _image, pid, _ppid in tree} == {20, 21}
+
+    def test_a_root_missing_from_the_snapshot_is_unknown_not_empty(self):
+        # "The pane process is gone" and "nothing runs under it" are different
+        # claims; only the second may make a pane idle.
+        assert process_tree(99, self.SNAPSHOT) is None
+
+    def test_a_parent_cycle_terminates(self):
+        # Windows recycles pids and never rewrites a parent pid, so a stale
+        # parent link can close a loop; the walk must still end.
+        cyclic = [("a.exe", 1, 2), ("b.exe", 2, 1), ("c.exe", 3, 2)]
+        tree = process_tree(1, cyclic)
+        assert tree is not None
+        assert sorted(pid for _image, pid, _ppid in tree) == [1, 2, 3]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+    def test_the_real_snapshot_carries_parent_pids(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            snapshot = snapshot_processes()
+            assert snapshot is not None
+            tree = process_tree(os.getpid(), snapshot)
+            assert tree is not None
+            assert child.pid in {
+                pid for _image, pid, ppid in tree if ppid == os.getpid()
+            }
+        finally:
+            child.kill()
+            child.wait()
+
+
+class _FakeToolhelp:
+    """kernel32's Toolhelp walk, as ``snapshot_processes`` drives it: each
+    Process32*W call fills the next entry, and the call after the last one
+    fails with ``end_error``.
+
+    The error lands where ctypes really keeps it: in the private copy that
+    ``ctypes.get_last_error`` reads, updated only for functions of a library
+    loaded with ``use_last_error=True``. Python code between two foreign calls
+    may clobber the thread's own last error, so that copy is the only one worth
+    reading."""
+
+    def __init__(self, entries, end_error, *, use_last_error):
+        self._pending = list(entries)
+        self._end_error = end_error
+        self._use_last_error = use_last_error
+        self.last_error = 0
+        self.closed = False
+
+    def CreateToolhelp32Snapshot(self, flags, pid):
+        return 0x1234
+
+    def Process32FirstW(self, snapshot, ref):
+        return self._next_into(ref)
+
+    def Process32NextW(self, snapshot, ref):
+        return self._next_into(ref)
+
+    def CloseHandle(self, handle):
+        self.closed = True
+        return 1
+
+    def _next_into(self, ref):
+        if not self._pending:
+            if self._use_last_error:
+                self.last_error = self._end_error
+            return 0
+        entry = ref._obj
+        entry.szExeFile, entry.th32ProcessID, entry.th32ParentProcessID = (
+            self._pending.pop(0)
+        )
+        return 1
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+class TestTheSnapshotWalk:
+    """The Toolhelp walk now feeds a SAFETY verdict: ``idle_sessions`` reads
+    "not in the snapshot" as "nothing runs under this pane", and a yes there
+    types into the pane. So only Windows' own end-of-list error may end the
+    walk; a list cut short by any other failure is a failed snapshot."""
+
+    ENTRIES = (("pwsh.exe", 10, 1), ("cmd.exe", 11, 10), ("claude.exe", 12, 11))
+
+    def _kernel32(self, monkeypatch, entries, end_error):
+        """Serve every way the walk could reach kernel32 -- ``windll`` (no
+        private last-error copy) and ``WinDLL(..., use_last_error=True)`` --
+        from one fake walk, and return that walk."""
+        import ctypes
+
+        libraries: list[_FakeToolhelp] = []
+
+        def _load(name, use_last_error=False, **_kw):
+            library = _FakeToolhelp(entries, end_error, use_last_error=use_last_error)
+            libraries.append(library)
+            return library
+
+        monkeypatch.setattr(ctypes, "WinDLL", _load)
+        monkeypatch.setattr(
+            ctypes, "windll", type("_Loader", (), {"kernel32": _load("kernel32")})
+        )
+        monkeypatch.setattr(ctypes, "get_last_error", lambda: libraries[-1].last_error)
+        return libraries
+
+    def test_a_walk_that_reaches_the_end_returns_every_entry(self, monkeypatch):
+        libraries = self._kernel32(
+            monkeypatch,
+            self.ENTRIES,
+            end_error=18,  # ERROR_NO_MORE_FILES
+        )
+        assert snapshot_processes() == list(self.ENTRIES)
+        assert any(library.closed for library in libraries)
+
+    def test_a_walk_that_fails_partway_is_unknown_not_short(self, monkeypatch):
+        # ERROR_GEN_FAILURE after two entries: the agent's entry never came,
+        # and a short list would say nothing runs under the pane.
+        libraries = self._kernel32(monkeypatch, self.ENTRIES[:2], end_error=31)
+        assert snapshot_processes() is None
+        assert any(library.closed for library in libraries)
 
 
 class TestCountProcesses:
@@ -316,3 +469,151 @@ class TestActiveConsoleSession:
         # 0 is the services session; 0xFFFFFFFF is "nothing attached". Both are
         # "no desktop", and neither may be mistaken for a session id.
         assert NO_CONSOLE_SESSION == (0, 0xFFFFFFFF)
+
+
+class _Child:
+    """A detached child that records every attempt to end it."""
+
+    def __init__(self, returncode: int | None = None) -> None:
+        self.returncode = returncode
+        self.ended: list[str] = []
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.ended.append("kill")
+
+    def terminate(self) -> None:
+        self.ended.append("terminate")
+
+    def send_signal(self, sig: int) -> None:
+        self.ended.append(f"signal {sig}")
+
+
+class _Clock:
+    """A fake clock whose ``sleep`` advances it; nothing really sleeps. A wait
+    that never closes FAILS here instead of hanging the suite."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        assert self.now < 120.0, "the registration wait never closed"
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class TestAwaitRegistration:
+    """The launcher-side wait for a detached child's pid file. The old fixed 2s
+    window reported "failed to start" over children that registered at
+    4.7-11s on a loaded desktop and then kept running."""
+
+    def test_a_child_that_registers_after_five_seconds_is_accepted(self):
+        clock = _Clock()
+
+        def read_pid() -> int | None:
+            return 4242 if clock.now >= 5.0 else None
+
+        pid = await_registration(_Child(), read_pid, sleep=clock.sleep, clock=clock)
+
+        assert pid == 4242
+
+    def test_the_default_window_outlasts_the_slowest_measured_start(self):
+        assert REGISTRATION_TIMEOUT_S >= 11.5  # slowest measured: 11.45s
+
+    def test_a_child_that_exited_is_not_waited_out(self):
+        clock = _Clock()
+
+        pid = await_registration(
+            _Child(returncode=1), lambda: None, sleep=clock.sleep, clock=clock
+        )
+
+        assert pid is None
+        assert clock.now < 1.0
+
+    def test_the_wait_is_bounded(self):
+        clock = _Clock()
+
+        pid = await_registration(
+            _Child(), lambda: None, 20.0, sleep=clock.sleep, clock=clock
+        )
+
+        assert pid is None
+        assert 20.0 <= clock.now < 20.5
+
+    def test_the_old_pid_never_counts_as_the_new_registration(self):
+        # A restart whose kill did not take leaves the old pid in the file.
+        clock = _Clock()
+
+        pid = await_registration(
+            _Child(), lambda: 1234, 3.0, not_pid=1234, sleep=clock.sleep, clock=clock
+        )
+
+        assert pid is None
+
+    def test_a_pid_already_there_is_returned_after_one_poll(self):
+        clock = _Clock()
+
+        pid = await_registration(_Child(), lambda: 99, sleep=clock.sleep, clock=clock)
+
+        assert pid == 99
+        assert clock.now == pytest.approx(0.1)
+
+    def test_a_child_that_exited_zero_is_not_waited_out(self):
+        # `magent hotkey` exits 0 when another listener already runs: a clean
+        # exit is still an exit, not 20 seconds of waiting on a corpse.
+        clock = _Clock()
+
+        pid = await_registration(
+            _Child(returncode=0), lambda: None, sleep=clock.sleep, clock=clock
+        )
+
+        assert pid is None
+        assert clock.now < 1.0
+
+
+class TestTheWaitNeverEndsTheChild:
+    """A timeout means "not registered YET", never "dead": on a loaded box the
+    child may be a second from coming up, so the wait must not end it."""
+
+    def test_a_child_that_never_registers_is_left_running(self):
+        clock = _Clock()
+        child = _Child()
+
+        pid = await_registration(
+            child, lambda: None, 3.0, sleep=clock.sleep, clock=clock
+        )
+
+        assert pid is None
+        assert child.ended == []
+
+    def test_a_restart_whose_kill_did_not_take_leaves_the_new_child_alone(self):
+        clock = _Clock()
+        child = _Child()
+
+        pid = await_registration(
+            child, lambda: 1234, 3.0, not_pid=1234, sleep=clock.sleep, clock=clock
+        )
+
+        assert pid is None
+        assert child.ended == []
+
+
+class TestTheDefaultWindowIsBounded:
+    """Long enough for the slowest measured start, and still a bound: a child
+    that hangs alive without registering must not stall serve's supervisor
+    thread or a `--go` launch forever."""
+
+    def test_the_default_window_is_a_bound_not_a_hang(self):
+        assert REGISTRATION_TIMEOUT_S <= 30.0
+
+    def test_the_default_window_is_what_a_caller_without_one_gets(self):
+        clock = _Clock()
+
+        pid = await_registration(_Child(), lambda: None, sleep=clock.sleep, clock=clock)
+
+        assert pid is None
+        assert REGISTRATION_TIMEOUT_S <= clock.now < REGISTRATION_TIMEOUT_S + 0.5

@@ -33,6 +33,32 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "none",
         'List of window objects `{"name", "tool", "command"}` with per-window tool/command overrides. Legacy `int` / `["name1", "name2"]` forms still parse (normalized by `magent config migrate`).',
     ),
+    (
+        "node",
+        "string",
+        "none",
+        (
+            "Run this project's session on a pool machine: a nick from "
+            "`settings.nodes`. A node holds a git clone at your current branch. "
+            'Exclusive with `host`. `"auto"` lets magent choose: the node with '
+            "the lowest load score over the sync daemon's last 30 minutes of "
+            "samples (a node under 10% free memory is skipped while another is "
+            "above it), and the project stays there until that node leaves "
+            '`settings.nodes`; `magent node plan` shows the choice. `"cloud"` is '
+            "reserved in this release and runs as an ordinary local session."
+        ),
+    ),
+    (
+        "push",
+        "list",
+        "none",
+        (
+            "Extra files (relative to the project) shipped to the node at bring-up, "
+            "on top of the auto-detected gitignored `.env*`, "
+            "`.claude/settings.local.json`, `CLAUDE.local.md` and `.mcp.json`. A "
+            "missing file is a warning, not an error."
+        ),
+    ),
 ]
 
 
@@ -168,6 +194,41 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "Days a session's state record survives in `~/.magent/state/` before "
             "the sweep deletes it."
         ),
+    ),
+    (
+        "nodes",
+        "object",
+        "`{}`",
+        (
+            'Pool machines a project can run on, keyed by nick: `{"second": {"host": '
+            '"build-box", "user": "alice", "root": "~/magent"}}`. A nick is 1-6 '
+            "characters of `a-z`, `0-9` and `-` (it is drawn in the status bar); "
+            "`auto` and `cloud` are not nicks: they are a project's `node` "
+            "placements. `user` defaults to your local username at use time; "
+            "`root` is where project clones live on the node."
+        ),
+    ),
+    (
+        "nodeSync.pullIntervalS",
+        "int",
+        "`30`",
+        (
+            "Seconds between the sync daemon's pulls of node transcripts and agent "
+            "state. Every pull is one ssh connection per node, so a shorter interval "
+            "costs connections, not just freshness."
+        ),
+    ),
+    (
+        "nodeSync.sampleIntervalS",
+        "int",
+        "`60`",
+        'Seconds between node load samples; `"node": "auto"` placement reads this history.',
+    ),
+    (
+        "nodeSync.historyH",
+        "int",
+        "`24`",
+        "Hours of load history kept per node for placement.",
     ),
 ]
 
@@ -413,6 +474,57 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "Print the last lines of a session's pane, a read-only glance (`-n` for "
             "how many). Safe to redirect: glyphs this console cannot encode become "
             "`?` rather than crashing."
+        ),
+    ),
+    (
+        "magent node sync -d [--once] [--stop]",
+        (
+            "The daemon that pulls transcripts and agent states home and samples "
+            "each node's load. `magent serve` normally keeps it alive; "
+            "`MAGENT_NODE_SYNC=0` stops serve from doing so (a sync run by hand "
+            "still runs)."
+        ),
+    ),
+    (
+        "magent node setup <nick> [--user U]... [--key F]",
+        (
+            "Prepare a machine once: root is used for this one hop only, to install "
+            "packages, create a per-person user and authorize your key; the node's "
+            "own GitHub key is generated there and never leaves it. Idempotent -- "
+            "every step prints ok/did/skip. The Claude login is NOT done for you: "
+            "run `ssh <user>@<host> claude` once."
+        ),
+    ),
+    (
+        "magent node doctor [<nick>]",
+        (
+            "Check a node: tmux/git/claude/gh on PATH, the Claude login, the "
+            "node's GitHub key, locale, free disk, and the sync daemon's heartbeat "
+            "and snapshot age."
+        ),
+    ),
+    (
+        "magent node plan <project|--all>",
+        (
+            "Show where a project would be placed (the load-history score per "
+            "node for `auto`) and which non-git files would be shipped. Writes "
+            "nothing."
+        ),
+    ),
+    (
+        "magent node push <project>",
+        (
+            "Re-ship a project's non-git files (`.env*` etc.) to its running node "
+            "session."
+        ),
+    ),
+    (
+        "magent node recall <project> (--to <nick> | --local)",
+        (
+            "Bring a node session home (`--local` prints the `claude --resume` "
+            "to run after a `git pull`) or move it to another node and resume it "
+            "there. Pulls once more first; a node that does not answer is "
+            "reported, not fatal."
         ),
     ),
     ("magent config show", "Display current config."),

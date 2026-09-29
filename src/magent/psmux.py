@@ -20,10 +20,10 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from magent.config import MagentConfig
     from magent.platform import Platform
@@ -347,6 +347,91 @@ def live_sessions(
     return [n for n in names if n in live]
 
 
+# What the bring-up's dedupe learns about one session. "live" and "absent" are
+# ANSWERS -- has-session exited 0, or exited non-zero -- and mean exactly what
+# ``has_session`` means by True and False. "unknown" is the third state that
+# ``has_session``/``live_sessions`` fold into "not live": the client never
+# answered (or could not even be started). For a status table that fold is the
+# right call; for a bring-up it is not, because "not live" leads to kill-server
+# and a fresh new-session, and in the 2026-08-18 wedge the sessions that stopped
+# answering were FROZEN live agents, not dead ones.
+SessionState = Literal["live", "absent", "unknown"]
+
+# How long a killed client gets to be collected. A kill cannot be refused
+# (TerminateProcess / SIGKILL), so this is only the OS's own teardown -- bounded
+# anyway, so the reap can never become the unbounded wait it exists to end.
+_REAP_TIMEOUT_S = 5.0
+
+
+def _kill_and_reap(proc: subprocess.Popen[bytes]) -> None:
+    """Kill a client that outran its budget, and collect it. Never raises."""
+    with contextlib.suppress(OSError):
+        proc.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=_REAP_TIMEOUT_S)
+
+
+def await_clients(
+    procs: Sequence[subprocess.Popen[bytes] | None], timeout: float
+) -> list[int | None]:
+    """Wait on a fan-out of psmux clients under ONE deadline.
+
+    Returns each client's exit code in order, or None for one that never
+    answered (killed and reaped here, never left running) or was never spawned
+    (a None slot). One deadline for the whole set, not one per client: the
+    clients run concurrently, so a fresh timeout per ``wait`` would make N hung
+    clients cost N budgets -- the ``_display_fan_out`` lesson. Past the deadline
+    a client that already exited still hands over its code (a zero-length wait
+    reads it); only one still running counts as unanswered.
+
+    Output is not read here, and callers spawn with DEVNULL on purpose: a piped
+    client that is killed can leave a grandchild holding the pipe, and draining
+    it is exactly the unbounded wait ``probe_control_plane`` documents.
+    """
+    deadline = time.monotonic() + timeout
+    codes: list[int | None] = []
+    for proc in procs:
+        if proc is None:
+            codes.append(None)
+            continue
+        try:
+            codes.append(proc.wait(timeout=max(0.0, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            _kill_and_reap(proc)
+            codes.append(None)
+    return codes
+
+
+def probe_sessions(
+    names: list[str], psmux: str, *, timeout: float
+) -> dict[str, SessionState]:
+    """The bring-up's dedupe: live, absent or UNKNOWN for each of ``names``.
+
+    The same ``has-session -t`` probe as ``has_session`` -- ``-t`` is
+    load-bearing, see there -- fanned out and bounded by ``await_clients``. A
+    probe that times out, or that could not be spawned, is "unknown", never
+    "absent": only a positive answer that the session is not there may lead to
+    killing its socket and creating it afresh.
+    """
+    procs: list[subprocess.Popen[bytes] | None] = []
+    for name in names:
+        try:
+            procs.append(
+                subprocess.Popen(
+                    [psmux, "-L", name, "has-session", "-t", name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=_SPAWN_FLAGS,
+                )
+            )
+        except OSError:
+            procs.append(None)
+    states: dict[str, SessionState] = {}
+    for name, rc in zip(names, await_clients(procs, timeout), strict=True):
+        states[name] = "unknown" if rc is None else ("live" if rc == 0 else "absent")
+    return states
+
+
 # How long the control plane gets to answer one cheap command before `magent
 # doctor` calls it wedged. Deliberately short: this is a diagnostic, and the
 # failure it looks for is not "slow" but "never" -- a wedged psmux answers
@@ -488,6 +573,40 @@ def kill_servers(names: list[str]) -> list[str]:
         return []
     _kill_batch(names, binary)
     return list(names)
+
+
+def clear_stale_servers(names: list[str], psmux: str, *, timeout: float) -> list[str]:
+    """``kill-server`` every name concurrently; return the ones with no answer.
+
+    The bring-up's step between "has-session said absent" and ``new-session``:
+    a socket can hold a dead server that answers "no session" while still
+    squatting the name. The exit code is deliberately ignored -- "no server
+    running" (rc 1) is the normal answer for an absent name, and psmux 3.3.6
+    exits 0 for kills that do not take -- so the only failure is SILENCE: a
+    client that never answered within ``timeout`` (one deadline for the whole
+    fan-out, killed and reaped by ``await_clients``), or one that could not be
+    spawned. Those names are returned so the caller can refuse to create a
+    session on top of a server it could not clear.
+
+    Not ``kill_server``/``_kill_batch``: those answer "did rc == 0", which folds
+    "no server running" into the same False as "never answered", and their
+    captured pipes are not a real bound on Windows.
+    """
+    procs: list[subprocess.Popen[bytes] | None] = []
+    for name in names:
+        try:
+            procs.append(
+                subprocess.Popen(
+                    [psmux, "-L", name, "kill-server"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=_SPAWN_FLAGS,
+                )
+            )
+        except OSError:
+            procs.append(None)
+    codes = await_clients(procs, timeout)
+    return [n for n, rc in zip(names, codes, strict=True) if rc is None]
 
 
 def stop_sessions(
@@ -652,26 +771,65 @@ def pane_cwd(name: str, psmux: str | None = None) -> str:
         return (result.stdout or "").strip() if result.returncode == 0 else ""
 
 
-def capture_pane(name: str, psmux: str | None = None) -> str:
-    """Return the active pane's visible text, or ``""``. Same guards as
-    ``pane_cwd``: bounded, decode-tolerant, and never raises."""
+# How long one `capture-pane` gets to answer. The bound is there for a WEDGED
+# psmux, which answers nothing at all for as long as the machine stays up --
+# unbounded, `peek` / `sessions --json` / `send` would hang with it. It is NOT
+# a liveness verdict: a merely slow control command on a loaded box has been
+# measured past 3s (see ``SEND_KEYS_TIMEOUT_S``), so running out this clock
+# says "unread", never "no pane". Read at call time, so a test can widen it.
+CAPTURE_PANE_TIMEOUT_S = 3.0
+
+
+@dataclass(frozen=True)
+class PaneCapture:
+    """One ``capture-pane``: the text, and whether the clock ran out first.
+
+    ``timed_out`` is the distinction ``capture_pane``'s bare string cannot
+    carry. ``text == ""`` with ``timed_out=False`` is an ANSWER (an empty pane,
+    a dead socket, an unlaunchable binary); with ``timed_out=True`` nothing is
+    known about the pane at all -- the session may be live and busy.
+    """
+
+    text: str
+    timed_out: bool
+
+
+def read_pane(name: str, psmux: str | None = None) -> PaneCapture:
+    """Capture the active pane's visible text, telling a timeout apart.
+
+    Same guards as ``pane_cwd``: bounded (``CAPTURE_PANE_TIMEOUT_S``),
+    decode-tolerant, and never raises.
+    """
     binary = psmux or find_psmux()
     if not binary:
-        return ""
+        return PaneCapture(text="", timed_out=False)
     try:
         result = subprocess.run(
             [binary, "-L", name, "capture-pane", "-p", "-t", name],
             capture_output=True,
-            timeout=3,
+            timeout=CAPTURE_PANE_TIMEOUT_S,
             encoding="utf-8",
             errors="replace",
             check=False,
             creationflags=_SPAWN_FLAGS,
         )
+    except subprocess.TimeoutExpired:
+        return PaneCapture(text="", timed_out=True)
     except (OSError, subprocess.SubprocessError):
-        return ""
-    else:
-        return (result.stdout or "") if result.returncode == 0 else ""
+        return PaneCapture(text="", timed_out=False)
+    text = (result.stdout or "") if result.returncode == 0 else ""
+    return PaneCapture(text=text, timed_out=False)
+
+
+def capture_pane(name: str, psmux: str | None = None) -> str:
+    """Return the active pane's visible text, or ``""``.
+
+    For callers that only POLL for text to appear (a timed-out read is simply
+    "not yet"). Anything that REPORTS on a pane -- a state, a delivery
+    verdict, a tail -- must use ``read_pane``, because here a timeout and an
+    empty pane are the same ``""``.
+    """
+    return read_pane(name, psmux).text
 
 
 # Foreground commands that mean "this pane is sitting at a prompt with no
@@ -684,53 +842,70 @@ _IDLE_SHELLS: frozenset[str] = frozenset(
     {"pwsh", "powershell", "bash", "zsh", "fish", "sh", "dash", "nu", "ksh", "tcsh"}
 )
 
-
-def pane_current_command(name: str, psmux: str | None = None) -> str:
-    """Return the active pane's foreground command (``pwsh``, ``claude``, ...).
-
-    The explicit ``-t <name>`` is REQUIRED: without it ``display-message``
-    answers for the *calling client's own* pane, and magent commands are often
-    run from inside a psmux session -- ``capture_pane`` passes ``-t`` for the
-    same reason. Same guards as ``pane_cwd``: bounded, decode-tolerant, and
-    any OSError/SubprocessError swallowed to ``""``.
-    """
-    binary = psmux or find_psmux()
-    if not binary:
-        return ""
-    try:
-        result = subprocess.run(
-            [
-                binary,
-                "-L",
-                name,
-                "display-message",
-                "-t",
-                name,
-                "-p",
-                "#{pane_current_command}",
-            ],
-            capture_output=True,
-            timeout=3,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            creationflags=_SPAWN_FLAGS,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    else:
-        return (result.stdout or "").strip() if result.returncode == 0 else ""
+# What magent wraps every command it types into a pane in: ``cmd /c <command>``
+# (``platform/windows.py::_send_argv`` and ``revive_sessions`` here). ``cmd /c``
+# exits exactly when its command does, so a live one under the pane's shell IS
+# the launched command, whatever that command's own image is called -- which is
+# what keeps a shipped tool with no registry image (agy, cursor-agent) from
+# reading idle while it runs. The agent images still matter: a human who typed
+# ``claude`` at the prompt has no cmd above it.
+_LAUNCHER_IMAGES: frozenset[str] = frozenset({"cmd"})
 
 
 def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[str, str]:
-    """``pane_current_command`` for many sessions in ONE process fan-out.
+    """Each session's pane foreground command (``pwsh``, ``claude``, ...), for
+    many sessions in ONE process fan-out.
 
     Every probe is spawned before any is read -- the shape the picker's
     liveness sweep already uses -- so a caller building a table over 40 live
     sessions pays roughly one psmux round-trip instead of 40 sequential ones.
-    Guarded exactly like the single-session form: bounded, decode-tolerant, and
-    a failed, hung, or unlaunchable probe degrades to ``""`` for that session
-    rather than propagating.
+    Bounded and decode-tolerant: a failed, hung, or unlaunchable probe degrades
+    to ``""`` for that session rather than propagating.
+    """
+    return _display_fan_out(names, "#{pane_current_command}", psmux)
+
+
+def pane_pids(names: list[str], psmux: str | None = None) -> dict[str, int | None]:
+    """``#{pane_pid}`` -- the pane's OWN process, not its foreground -- for many
+    sessions in one fan-out; None where it could not be read.
+
+    Same fan-out and guards as ``pane_current_commands`` (surrounding
+    whitespace is stripped). Anything that is not then a positive integer is
+    None: a caller must never walk a process tree from a pid it guessed.
+    """
+    out: dict[str, int | None] = {}
+    for name, raw in _display_fan_out(names, "#{pane_pid}", psmux).items():
+        try:
+            pid = int(raw)
+        except ValueError:
+            pid = 0
+        out[name] = pid if pid > 0 else None
+    return out
+
+
+# The whole pane-probe fan-out's wait budget, and how long a probe that has
+# already exited may take to hand over its output once that budget is spent.
+# Paid once per batch, so it is sized for a loaded host: under a spawn storm a
+# single display-message runs past 3 s (see FLASH_TIMEOUT_S), and a spawn storm
+# is exactly when the bring-up's send-verify reads this. Ceiling: idle_sessions
+# runs two of these fan-outs back to back, so 2x this bounds idle_sessions'
+# SHARE of attach's 30 s `up --json --revive` ssh read, not the read itself.
+# The rest of that path has no finite bound to sum: live_sessions' sweep
+# before it is unbounded on purpose (a slow server must not read dead),
+# revive_sessions' has_session pool runs ceil(n/16) waves in series, and each
+# send_keys after it may take SEND_KEYS_TIMEOUT_S (20 s) per pane.
+_FAN_OUT_TIMEOUT_S = 10.0
+_FAN_OUT_DRAIN_S = 0.1
+
+
+def _display_fan_out(names: list[str], fmt: str, psmux: str | None) -> dict[str, str]:
+    """``display-message -p <fmt>`` against each session's own pane, every
+    probe spawned before any is read; ``""`` for any that failed.
+
+    The explicit ``-t <name>`` is REQUIRED: without it ``display-message``
+    answers for the *calling client's own* pane, and magent commands are often
+    run from inside a psmux session -- ``capture_pane`` passes ``-t`` for the
+    same reason.
     """
     binary = psmux or find_psmux()
     if not binary or not names:
@@ -739,16 +914,7 @@ def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[st
     for name in names:
         try:
             procs[name] = subprocess.Popen(
-                [
-                    binary,
-                    "-L",
-                    name,
-                    "display-message",
-                    "-t",
-                    name,
-                    "-p",
-                    "#{pane_current_command}",
-                ],
+                [binary, "-L", name, "display-message", "-t", name, "-p", fmt],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 encoding="utf-8",
@@ -758,13 +924,24 @@ def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[st
         except OSError:
             procs[name] = None
 
+    # ONE deadline for the whole fan-out, not one timeout per probe: the probes
+    # all run at once, so waiting a fresh timeout on each made a hung server
+    # cost N x timeout. Past it, a probe that already exited still hands over
+    # its output (a zero read budget can time out before the pipe is drained);
+    # one still running is unknown and killed unread.
+    deadline = time.monotonic() + _FAN_OUT_TIMEOUT_S
     out: dict[str, str] = {}
     for name, proc in procs.items():
         if proc is None:
             out[name] = ""
             continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 and proc.poll() is None:
+            proc.kill()
+            out[name] = ""
+            continue
         try:
-            stdout, _ = proc.communicate(timeout=5)
+            stdout, _ = proc.communicate(timeout=max(remaining, _FAN_OUT_DRAIN_S))
         except subprocess.SubprocessError:
             proc.kill()
             out[name] = ""
@@ -773,30 +950,98 @@ def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[st
     return out
 
 
-def is_idle_command(raw: str) -> bool:
-    """True when a ``#{pane_current_command}`` reading is a bare shell.
+def _image_stem(raw: str) -> str:
+    """``C:\\x\\PWSH.EXE`` -> ``pwsh``: the leaf name, lower-cased, ``.exe``
+    dropped -- the one spelling foreground readings and process image names are
+    both compared in."""
+    leaf = raw.strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return leaf.removesuffix(".exe")
 
-    Split out of ``agent_idle`` so a caller that already holds a pane's
-    foreground command (``status``'s session table) classifies it without
-    paying a second psmux round-trip. An empty or unreadable reading is False
-    on purpose -- see ``agent_idle``.
+
+def is_idle_command(raw: str) -> bool:
+    """True when a ``#{pane_current_command}`` reading (or a process image
+    name) is a bare shell.
+
+    A HINT, never a verdict: psmux reports the pane's foreground DESCENDANT, so
+    a live agent running its Bash tool reads ``bash`` -- ``idle_sessions`` is
+    the only place a pane is called idle, and this is one of its conditions.
+    An empty or unreadable reading is False on purpose.
     """
     stripped = raw.strip()
     if not stripped:
         return False
-    leaf = stripped.replace("\\", "/").rsplit("/", 1)[-1]
-    if leaf.lower().endswith(".exe"):
-        leaf = leaf[: -len(".exe")]
-    return leaf.lower() in _IDLE_SHELLS
+    return _image_stem(stripped) in _IDLE_SHELLS
 
 
-def agent_idle(name: str, psmux: str | None = None) -> bool:
-    """True when the session's pane rests at a bare shell -- its agent is gone.
+def idle_sessions(
+    names: list[str],
+    psmux: str | None = None,
+    *,
+    foreground: Mapping[str, str] | None = None,
+) -> set[str]:
+    """The sessions among ``names`` whose agent is POSITIVELY gone: the pane
+    rests at its shell with no agent anywhere under it.
 
-    An empty or unreadable reading is False on purpose: never inject keystrokes
-    into a pane whose state we could not establish.
+    THE one answer to "is this session's agent alive". ``revive_sessions``,
+    the bring-up's send-keys verification and status's idle column all read
+    it, because on a yes each of them types into the pane or tells the user
+    they may.
+
+    ``#{pane_current_command}`` cannot say so on its own. psmux reports the
+    pane's foreground DESCENDANT, so while Claude Code runs a tool the reading
+    is ``bash`` (its Bash tool), ``pwsh``, ``grep`` or an MCP server -- with
+    claude.exe alive under the pane (measured live: 4 of 31 sessions read that
+    way, and revive would have typed ``cmd /c claude --continue`` + Enter into
+    each). A yes therefore needs all three of:
+
+    1. the foreground reading is a bare shell (``is_idle_command``) -- still a
+       necessary condition, since a pane in the user's own program is not a
+       pane at its prompt either, and a cheap filter: a session that fails it
+       costs no further probe;
+    2. the pane's own process (``#{pane_pid}``) was read, is in the process
+       snapshot, and is itself a shell;
+    3. nothing in that process's subtree is an agent image
+       (``sessions.agent_image_names``) or a live launcher
+       (``_LAUNCHER_IMAGES`` -- the ``cmd /c`` magent typed, alive exactly as
+       long as the tool it started, registry image or not).
+
+    Anything unknown is a no -- an unreadable pid, a failed snapshot (always,
+    off Windows), a pane process gone by the time of the snapshot: never inject
+    keystrokes into a pane whose state we could not establish.
+
+    Batched: one ``pane_pids`` fan-out and ONE process snapshot for the whole
+    call, paid only when some reading is a shell. A caller that already holds
+    the foreground readings (status's table) passes them as ``foreground``
+    instead of paying for that fan-out twice.
     """
-    return is_idle_command(pane_current_command(name, psmux=psmux))
+    readings = (
+        foreground
+        if foreground is not None
+        else pane_current_commands(names, psmux=psmux)
+    )
+    shells = [name for name in names if is_idle_command(readings.get(name, ""))]
+    if not shells:
+        return set()
+
+    # In-body, like every procs/sessions use in this module: keeps this leaf
+    # importing only magent.log at load time.
+    from magent.procs import process_tree, snapshot_processes
+    from magent.sessions import agent_image_names
+
+    pids = pane_pids(shells, psmux=psmux)
+    snapshot = snapshot_processes()
+    if snapshot is None:
+        return set()
+    running = agent_image_names() | _LAUNCHER_IMAGES
+    idle: set[str] = set()
+    for name in shells:
+        pid = pids.get(name)
+        tree = process_tree(pid, snapshot) if pid is not None else None
+        if not tree or not is_idle_command(tree[0][0]):
+            continue
+        if not any(_image_stem(image) in running for image, _pid, _ppid in tree):
+            idle.add(name)
+    return idle
 
 
 # How long one status-line flash may take before we give up on it.
@@ -914,8 +1159,11 @@ _STATUS_BRAND = "#[bold,fg=green] magent #[default]"
 # ...and the width budget has to travel with it. tmux truncates status-left at
 # `status-left-length` (default 10, but a personal conf may set it far tighter),
 # so setting the brand without the length can render it mid-word. Style
-# directives don't count toward the limit; " magent " is 8 columns.
-_STATUS_BRAND_LEN = "10"
+# directives don't count toward the limit; " magent " is 8 cells, and the
+# length carries 2 more of headroom -- the 10 every local session has always
+# been given.
+_STATUS_BRAND_CELLS = 8
+_STATUS_LEFT_HEADROOM = 2
 
 # What a raw F2 says when it actually reaches psmux. See `decoration_argv` for
 # why this can never double-fire on a Windows attach window. Pure ASCII for the
@@ -931,7 +1179,7 @@ _F2_FALLBACK_MSG = (
 # `#I:#W#F`, and with one window per session (magent's invariant) the `0:`
 # index is pure noise stealing bar columns from the name. Verified live on
 # psmux 3.3.8: `set -g window-status-format "#W"` renders exactly the name.
-_WINDOW_STATUS_FORMAT = "#W"
+WINDOW_STATUS_FORMAT = "#W"
 
 # ...and the name itself is width-budgeted like every other bar element. A
 # 30-char project name eats the whole bar; longer than this renders as the
@@ -981,16 +1229,73 @@ def status_hints(code_hint: bool) -> tuple[str, str]:
     return _STATUS_HINTS_F1, _STATUS_HINTS_F1_LEN
 
 
+def _check_brand_nick(nick: str) -> None:
+    """Refuse a nick the status line cannot carry verbatim. The brand is a tmux
+    FORMAT string, so a ``#`` would be expanded on every redraw (``#(cmd)`` runs
+    a command, ``#[...]`` restyles the bar), and a non-ASCII or non-printable
+    glyph (a raw newline, a tab, a control character) breaks the "cells ==
+    len" law. Config validates nicks, but the typed view is lenient and not
+    every caller's nick went through ``settings.nodes``."""
+    if not nick or not nick.isascii() or not nick.isprintable() or "#" in nick:
+        msg = (
+            f"status brand nick must be non-empty printable ASCII without '#': {nick!r}"
+        )
+        raise ValueError(msg)
+
+
+def _brand_cells(nick: str | None) -> int:
+    """The brand's visible width in cells for ``nick`` (see ``status_brand``)."""
+    if nick is None:
+        return _STATUS_BRAND_CELLS
+    _check_brand_nick(nick)
+    return _STATUS_BRAND_CELLS + len(f"@{nick} ")
+
+
+def status_brand(nick: str | None) -> tuple[str, str]:
+    """The status-left brand and its width in cells. ``None`` is a session on
+    THIS machine: today's brand, byte for byte. A nick is a session running on
+    that pool machine (the nodes feature), branded ``magent @<nick>`` so a
+    window says where its agent actually is. ASCII only, same law as the hints:
+    the cell count is ``len``, and a wide glyph here would desync the bar.
+
+    Raises ``ValueError`` for an empty, non-ASCII or ``#``-bearing nick."""
+    cells = _brand_cells(nick)
+    if nick is None:
+        return _STATUS_BRAND, str(cells)
+    return _STATUS_BRAND + f"@{nick} ", str(cells)
+
+
+def status_left(nick: str | None) -> tuple[str, str]:
+    """``status-left`` and ``status-left-length`` for a session: the brand and
+    its cells plus the headroom every session gets. The one place both
+    multiplexers read it from, so a psmux bar and a node's tmux bar cannot
+    budget the brand differently."""
+    brand, _ = status_brand(nick)
+    return brand, str(_brand_cells(nick) + _STATUS_LEFT_HEADROOM)
+
+
+def f2_binding_argv(prefix: list[str], code_hint: bool) -> list[str]:
+    """The F2 half of a decoration, after ``prefix`` (``[psmux, "-L", name]``
+    here, ``[tmux, "-L", "magent"]`` on a node). See ``decoration_argv`` for why
+    an advertised F2 binds a fallback message and an unadvertised one is
+    unbound."""
+    if code_hint:
+        return [*prefix, "bind", "-n", "F2", "display-message", _F2_FALLBACK_MSG]
+    return [*prefix, "unbind-key", "-n", "F2"]
+
+
 def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     """The psmux commands that brand ``name`` and advertise its window hotkeys.
 
-    Six of them: magent *owns* F1 -> detach-client per session (the hint has to
-    be truthful on a machine with no personal ``bind -n F1`` in ~/.tmux.conf,
-    and owning the binding keeps the existing "back to the picker" semantics
-    rather than changing them), the status-right carries the hint text plus the
-    width budget it needs, the status-left carries the product brand plus
-    the width budget *it* needs, and the sixth is the F2 fallback below. Each
-    half sets its text and its length together or neither: a personal conf with
+    Ten of them. The first six: magent *owns* F1 -> detach-client per session
+    (the hint has to be truthful on a machine with no personal ``bind -n F1``
+    in ~/.tmux.conf, and owning the binding keeps the existing "back to the
+    picker" semantics rather than changing them), the status-right carries
+    the hint text plus the width budget it needs, the status-left carries
+    the product brand plus the width budget *it* needs, and the sixth is the
+    F2 fallback below. The last four own the window name and its status-bar
+    entry (see the inline comments). Each half sets its text and its length
+    together or neither: a personal conf with
     a tighter ``status-*-length`` would truncate the other half mid-label. All
     are ``-L <name>``-scoped, so they land on that session's own server and
     override whatever its tmux.conf set at start-up.
@@ -1023,17 +1328,14 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     key nothing advertises any more.
     """
     hints, hints_len = status_hints(code_hint)
-    f2 = (
-        [psmux, "-L", name, "bind", "-n", "F2", "display-message", _F2_FALLBACK_MSG]
-        if code_hint
-        else [psmux, "-L", name, "unbind-key", "-n", "F2"]
-    )
+    brand, brand_len = status_left(None)
+    f2 = f2_binding_argv([psmux, "-L", name], code_hint)
     return [
         [psmux, "-L", name, "bind", "-n", "F1", "detach-client"],
         [psmux, "-L", name, "set", "-g", "status-right", hints],
         [psmux, "-L", name, "set", "-g", "status-right-length", hints_len],
-        [psmux, "-L", name, "set", "-g", "status-left", _STATUS_BRAND],
-        [psmux, "-L", name, "set", "-g", "status-left-length", _STATUS_BRAND_LEN],
+        [psmux, "-L", name, "set", "-g", "status-left", brand],
+        [psmux, "-L", name, "set", "-g", "status-left-length", brand_len],
         f2,
         # The window NAME is magent's too (same doctrine as window titles):
         # psmux's automatic-rename shows the pane's current command, so the bar
@@ -1050,7 +1352,7 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
         [psmux, "-L", name, "set", "-g", "automatic-rename", "off"],
         # ...and the entry renders as the name alone: no `0:` index (one
         # window per session makes it noise), no flags suffix.
-        [psmux, "-L", name, "set", "-g", "window-status-format", _WINDOW_STATUS_FORMAT],
+        [psmux, "-L", name, "set", "-g", "window-status-format", WINDOW_STATUS_FORMAT],
         [
             psmux,
             "-L",
@@ -1058,7 +1360,7 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
             "set",
             "-g",
             "window-status-current-format",
-            _WINDOW_STATUS_FORMAT,
+            WINDOW_STATUS_FORMAT,
         ],
     ]
 
@@ -1277,8 +1579,8 @@ def eligible_projects(
     """Projects that map to a persistent psmux session.
 
     A project is eligible when it is enabled, runs a CLI agent (not an IDE),
-    and is local (no ``host``). When ``group`` is given, only projects tagged
-    with that group (case-insensitive) are returned.
+    and is local (no ``host``, no pool ``node``). When ``group`` is given,
+    only projects tagged with that group (case-insensitive) are returned.
 
     The ``cmd`` each entry carries is fresh-start aware: a project directory
     with no stored session for its tool gets the configured command WITHOUT its
@@ -1297,6 +1599,7 @@ def eligible_projects(
     mapping, and the default None, both mean the tool's own default store,
     which is byte-for-byte today's probe for every project.
     """
+    from magent.config import runs_on_node
     from magent.launch import _expand_base_dir, _resolve_path
     from magent.sessions import build_start_command, is_ide_tool
     from magent.titles import get_leaf_name
@@ -1316,6 +1619,11 @@ def eligible_projects(
         if is_ide_tool(tool):
             continue
         if proj.host:
+            continue
+        # A pool-node project runs on that node's tmux, never in a local psmux
+        # session (PR-D). A cloud project is a local pane and stays eligible
+        # (DECISION-15).
+        if runs_on_node(proj):
             continue
         leaf = proj.title or get_leaf_name(proj.path)
         sid = session_name(leaf)
@@ -1412,14 +1720,15 @@ def bring_up(
     config: MagentConfig,
     only: list[str] | None = None,
     group: str | None = None,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], dict[str, str]]:
     """Create detached psmux sessions for eligible projects.
 
     ``only`` restricts creation to the given session names; ``group``
     restricts to a single project group.
 
     Returns ``(created, failed)``: the sessions the creation verify PROVED are
-    up, and the ones still missing after ``launch_verified``'s one respawn.
+    up, and the ones still missing after ``launch_verified``'s one respawn --
+    each mapped to the reason it is down (see ``launch_verified``).
     The casualties used to be discarded here -- ``launch_verified`` logged
     "session never came up after respawn" while this function answered with
     every name it had attempted, so both callers printed "Brought up N
@@ -1444,7 +1753,7 @@ def bring_up(
         )
     names = [w.window_name for w in windows]
     if not windows:
-        return [], []
+        return [], {}
     failed = launch_verified(plat, windows)
     stuck = set(failed)
     return [n for n in names if n not in stuck], failed
@@ -1485,7 +1794,16 @@ def _missing_sessions(names: list[str], binary: str) -> list[str]:
     return [n for n, ok in zip(names, flags, strict=True) if not ok]
 
 
-def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]:
+# Appended to a refusal whose session the verify then found live: the refused
+# client did its job after all, too late for this bring-up to start the agent.
+# `magent up` revives a live session that rests at its shell.
+_LATE_LIVE = (
+    "; it answers now, but this bring-up typed no agent command into it"
+    " -- run `magent up` to revive it"
+)
+
+
+def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str, str]:
     """Create ``windows`` through the platform, then prove each session exists.
 
     ``launch_psmux_session`` reports success the moment its ``new-session``
@@ -1502,8 +1820,23 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]
     agent. Here the remedy is ``new-session``, which ``launch_psmux_session``
     already skips for any session that answers ``has-session`` -- so re-running
     it is safe, and an unknown state (including a probe that TIMED OUT against
-    a wedged server) counts as MISSING and is retried. Unknown is safe to
-    re-create; it is not safe to inject into.
+    a wedged server) counts as MISSING and is handed back for the respawn.
+    That is safe only because the respawn goes through ``launch_psmux_session``
+    again, whose own dedupe is tri-state: a name IT cannot read is never
+    killed and never re-created (psmux.probe_sessions). "Unknown" is safe to
+    re-ask about; it is not safe to kill, re-create, or inject into.
+
+    A name the platform REFUSED (its dedupe or its kill-server got no answer,
+    or its new-session outran the budget) is not respawned when the verify
+    also misses it: the respawn would only repeat the wait that failed, and on
+    a wedged socket double it. It is reported with the platform's reason.
+
+    A refusal is final even when the verify finds that session LIVE. A
+    new-session killed at its deadline can still have created the session
+    late, and then nothing ever typed the agent command into it: counted as
+    brought up, it is a bare shell under a success line (``--go`` never
+    revives). So it stays in the report, its reason extended by what the
+    verify saw (``_LATE_LIVE``).
 
     Never raises out of the verify -- and, since v3.10.10, never raises out of
     the CREATION either: one stuck session must not cost the wave its remaining
@@ -1515,10 +1848,13 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]
     below, which is the component that already knows how to respawn what is
     missing and report what stayed down.
 
-    Returns the names still missing after the one retry.
+    Returns the sessions still missing after the one retry, plus every name
+    the platform refused, in input order, each mapped to why: the platform's
+    refusal reason, or ``""`` when the log is the only account (the Session-0
+    refusal is named by the printers via ``launch.session0_note``).
     """
     if not windows:
-        return []
+        return {}
     names = [w.window_name for w in windows]
     log = get_logger("launch")
 
@@ -1538,10 +1874,11 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]
         log.error(
             "%s (would have created: %s)", session0_refusal(plat), ", ".join(names)
         )
-        return names
+        return dict.fromkeys(names, "")
 
+    refused: dict[str, str] = {}
     try:
-        plat.launch_psmux_session(windows)
+        refused.update(plat.launch_psmux_session(windows))
     except (OSError, subprocess.SubprocessError):
         # Same handling the respawn below has always had. Deliberately NOT a
         # re-raise: the probe decides what actually came up, and a partial
@@ -1553,36 +1890,55 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]
         # Nothing can be probed, so nothing can be claimed. Every name is
         # reported missing rather than silently passed off as created -- with
         # no psmux binary the creation above cannot have succeeded either.
-        return names
+        return dict.fromkeys(names, "")
+
+    def _report(down: list[str]) -> dict[str, str]:
+        gone = set(down)
+        late = [n for n in names if n in refused and n not in gone]
+        if late:
+            log.warning(
+                "refused %s, which answers now: left without its agent command",
+                ", ".join(late),
+            )
+        return {
+            n: refused[n] + _LATE_LIVE
+            if n in refused and n not in gone
+            # ...and the missing ones, refused or not, as the platform left them.
+            else refused.get(n, "")
+            for n in names
+            if n in gone or n in refused
+        }
 
     # Settle first: the storm's timeouts were transient churn, and probing at
     # t=0 would misclassify slow-but-fine servers on a loaded host.
     time.sleep(_CREATE_VERIFY_SETTLE_S)
     missing = _missing_sessions(names, binary)
-    if not missing:
-        return []
-
+    respawn = [n for n in missing if n not in refused]
+    if not respawn:
+        return _report(missing)
     log.warning(
-        "session did not come up after bring-up; respawning: %s", ", ".join(missing)
+        "session did not come up after bring-up; respawning: %s", ", ".join(respawn)
     )
-    stuck = set(missing)
+    stuck = set(respawn)
     try:
         # Back through the full launch path on purpose -- a hand-rolled
         # ``new-session`` here would diverge from the original recipe (batch
         # pacing, send-keys verification, status-line decoration).
-        plat.launch_psmux_session([w for w in windows if w.window_name in stuck])
+        refused.update(
+            plat.launch_psmux_session([w for w in windows if w.window_name in stuck])
+        )
     except (OSError, subprocess.SubprocessError):
-        log.exception("respawn failed for %s", ", ".join(missing))
-        return missing
+        log.exception("respawn failed for %s", ", ".join(respawn))
+        return _report(missing)
 
     time.sleep(_CREATE_VERIFY_SETTLE_S)
-    still_missing = _missing_sessions(missing, binary)
+    still_missing = set(_missing_sessions(respawn, binary))
     if still_missing:
         log.error(
             "session never came up after respawn; left down: %s",
-            ", ".join(still_missing),
+            ", ".join(n for n in respawn if n in still_missing),
         )
-    return still_missing
+    return _report([n for n in missing if n in still_missing or n not in stuck])
 
 
 def revive_sessions(
@@ -1594,9 +1950,11 @@ def revive_sessions(
 
     A session whose agent was Ctrl-C'ed (or whose original send-keys died)
     still answers ``has-session``, so ``up``/``attach`` reuse it and hand the
-    user a window parked at a bare prompt forever. Candidates are probed
-    concurrently -- the check is two psmux round-trips per session and a large
-    config would otherwise serialize them. Returns the session ids revived.
+    user a window parked at a bare prompt forever. Liveness is probed
+    concurrently (a large config would otherwise serialize a round-trip per
+    session), then the live ones get ONE ``idle_sessions`` verdict -- the only
+    thing that may put keystrokes into a pane, since typed into a LIVE agent
+    the resume command is a submitted prompt. Returns the session ids revived.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1614,18 +1972,19 @@ def revive_sessions(
     if not candidates:
         return []
 
-    def _revivable(p: dict[str, object]) -> bool:
-        sid = _field_str(p, "session")
-        return has_session(sid, psmux=binary) and agent_idle(sid, psmux=binary)
+    def _live(p: dict[str, object]) -> bool:
+        return has_session(_field_str(p, "session"), psmux=binary)
 
     with ThreadPoolExecutor(max_workers=16) as pool:
-        flags = list(pool.map(_revivable, candidates))
+        flags = list(pool.map(_live, candidates))
+    live = [p for p, ok in zip(candidates, flags, strict=True) if ok]
+    idle = idle_sessions([_field_str(p, "session") for p in live], psmux=binary)
 
     revived: list[str] = []
-    for p, ok in zip(candidates, flags, strict=True):
-        if not ok:
-            continue
+    for p in live:
         sid = _field_str(p, "session")
+        if sid not in idle:
+            continue
         # The configured command already IS the resume command -- claude's
         # registry default is ``claude --continue``, which picks the dead
         # pane's conversation back up. ``sessions.build_resume_command`` is
@@ -1673,6 +2032,9 @@ def config_sessions(config_path: str | None) -> list[dict[str, object]]:
             continue
         tool = p.get("tool", default_tool)
         if isinstance(tool, str) and is_ide_tool(tool):
+            continue
+        # Raw dict: same rule as eligible_projects' node skip (DECISION-15).
+        if p.get("node") not in (None, "cloud"):
             continue
         proj_name = p.get("title") or Path(p["path"]).name
         out.append(

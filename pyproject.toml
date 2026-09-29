@@ -1,6 +1,6 @@
 [project]
 name = "magent-multi-ai-agents-manager"
-version = "3.19.1"
+version = "3.20.0rc2"
 description = "Launch each project's AI coding agent in its own terminal, auto-tiled across every monitor"
 readme = "README.md"
 license = "AGPL-3.0"
@@ -87,16 +87,22 @@ Issues = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/issu
 Changelog = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/blob/main/CHANGELOG.md"
 
 [build-system]
-# hatchling 1.32.0 (2026-08-11) started emitting Metadata-Version 2.5, which
-# the pinned gh-action-pypi-publish rejects at upload time (its bundled
-# packaging==26.2 predates 2.5 support; packaging 26.3, 2026-08-04, is the
-# first that knows it) — the v3.11.1 tag run failed exactly there while the
-# build job's own `twine check --strict` (unpinned, packaging 26.3) passed.
-# Cap the backend so artifacts stay Metadata-Version 2.4 end-to-end; lift the
-# cap once a Dependabot bump of pypa/gh-action-pypi-publish ships packaging
-# >= 26.3 in its runtime.txt.
-requires = ["hatchling<1.33"]
+# hatchling 1.32.0 (2026-08-11) started emitting Metadata-Version 2.5. The
+# v3.11.1 tag run failed on it at publish time: gh-action-pypi-publish v1.14.0
+# bundled packaging==25.0, which rejects 2.5, while the build job's own
+# `twine check --strict` (unpinned, newer packaging) passed. The pin is now
+# v1.14.2, whose packaging==26.2 accepts 2.5 in `twine check`, but no 2.5 upload
+# to PyPI has been proven, so the cap keeps artifacts at Metadata-Version 2.4
+# (what every release from v3.11.1 on shipped). Dependabot #227 lifted it early;
+# lift it only in a change that proves a 2.5 upload.
+requires = ["hatchling<1.32"]
 build-backend = "hatchling.build"
+
+# With no sdist table, hatchling ships the whole tree minus gitignored files.
+# docs/superpowers holds the agents' working plans and specs. They name local
+# machines and paths, and a source install needs none of them.
+[tool.hatch.build.targets.sdist]
+exclude = ["docs/superpowers"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/magent"]
@@ -117,6 +123,7 @@ markers = [
     "needs_tailscale: e2e tests that require a live Tailscale node (CI-only, gated on MDTEST_TAILSCALE=1; skipped locally)",
     "node_contract: run the REAL published agent-state writer under real node and check magent's reader against it (needs node/npm + npm registry; skips cleanly otherwise)",
     "soak: long-run daemon stability tests (serve + attention -d under sustained churn for tens of minutes; CI-only, gated on MDTEST_SOAK=1)",
+    "nodes_real: magent nodes end to end against a real loopback node over real ssh (the node journey is CI-only, gated on MDTEST_NODES_REAL=1; the stand-in and env pins run everywhere)",
     "real_home: opt OUT of the autouse HOME redirect -- the test legitimately needs the machine's own home (CI-only tiers that seed the real ~/, e.g. the ssh flagship). Never use on a test that can run on a dev box.",
 ]
 

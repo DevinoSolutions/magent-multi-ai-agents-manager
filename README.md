@@ -214,6 +214,41 @@ If it *isn't* working you will be told, rather than left guessing:
 
 To own the listener's lifetime yourself, set `MAGENT_HOTKEY_SUPERVISOR=0`; `status` still reports whether one is running.
 
+## Nodes
+
+### A project on a pool machine
+
+`settings.nodes` lists the pool machines a project can run on, keyed by nick:
+
+```json
+"settings": {
+  "nodes": {"second": {"host": "build-box", "user": "alice", "root": "~/magent"}}
+}
+```
+
+A nick is 1-6 characters of `a-z`, `0-9` and `-` (it is drawn in the status bar); `auto` and `cloud` are not nicks. `user` defaults to your local username at use time; `root` is where project clones live on the node.
+
+A project's `"node": "second"` runs its session on that machine. The node holds a git clone at your current branch, so `magent up` refuses a local tree the node could not reproduce: uncommitted or unpushed work (`--allow-dirty` lets it through, and the node gets origin's copy), no origin, a detached HEAD, or a branch with no commits. `node` is exclusive with `host`. The gitignored files a session needs (`.env*`, `.claude/settings.local.json`, `CLAUDE.local.md`, `.mcp.json`, plus a project's `push` list) are shipped at bring-up.
+
+- `magent node setup <nick> [--user U]... [--key F]` prepares a machine once. Root is used for this one hop only, to install packages, create a per-person user and authorize your key; the node's own GitHub key is generated there and never leaves it. It is idempotent: every step prints ok/did/skip. **The Claude login is yours:** run `ssh <user>@<host> claude` once.
+- `magent node doctor [<nick>]` checks a node: tmux/git/claude/gh on PATH, the Claude login, the node's GitHub key, locale, free disk, and the sync daemon's heartbeat and snapshot age.
+- `magent node sync -d [--once] [--stop]` is the daemon that pulls transcripts and agent states home and samples each node's load. `magent serve` normally keeps it alive; `MAGENT_NODE_SYNC=0` stops serve from doing so (a sync run by hand still runs).
+
+### Placement, plan, push and recall
+
+`"node": "auto"` lets magent pick the machine. It reads each node's load over the last 30 minutes, which the sync daemon samples, never a single reading, so a box used in bursts is not mistaken for an idle one. It penalizes load spikes and low free memory, skips a node under 10% free memory while another is above it, and spreads your own sessions out. A node with fewer than five recent samples gets one live reading (none under `--dry-run`); a node that does not answer it is left out. The choice then sticks: a project stays on its node until that node leaves `settings.nodes`, and the choice is kept in `~/.magent/nodes/node-map.json`, never in your config. `magent --go` and `magent up` place the same way, all of one launch's `auto` projects together so they spread out; an `auto` project that cannot be placed is not launched and its row says why.
+
+- `magent node plan <project|--all>` shows each node's score, which one would be chosen and why, and the files that would be shipped. It changes nothing. A project already placed shows its node and no scores.
+- `magent node push <project>` re-ships the gitignored files (`.env*` and the rest) to the project's running session, after you edit `.env` for example.
+- `magent node recall <project> --local` brings a session home. It pulls once more, prints the node's last commit per repo and whether its tree was dirty, stops the session on the node (and prints the command that does when it cannot), installs the conversation and its memory (the memory alone when no conversation was pulled) into this PC's Claude directory under the project's local folder (resolved exactly as `--go` resolves it), and prints what to run: the `git pull`, then `cd "<folder>"` and `claude --resume <id>` as two lines, never joined by `&&` (plain `claude` when no conversation was pulled, and a `cd /d` reminder for cmd.exe when the folder is on another drive letter). The copy follows no links, refuses a pulled folder that is itself a link, skips the pull's unfinished `.part` files, and names every local file the node's copy changed. It ends with: "@<nick> keeps its copy: a later bring-up there continues the node's conversation, not the turns added here."
+  - A node that does not answer at all (unreachable, or timed out) is reported, not fatal: what was already pulled is used, and the command that stops the session there is printed.
+  - A node that answers but whose last pull did not finish (it answered with an error, some files did not land, or its placement was not found again) stops the recall before anything is stopped, installed or cleared: it exits 1, the project stays placed, and it tells you to run the recall again. A pull stuck at its mark (the node keeps answering from the same point) is the one exception: a re-run would get the same answer, so it names nodes.log, where both marks are, instead. A node map another process holds busy exits 1 the same way. A torn or otherwise unreadable one, a malformed entry in it included, exits 1 too, and names the file to fix or move aside before the re-run (no magent command rebuilds it); a sync daemon that keeps pulling from that node past the wait exits 3, also with nothing touched. A folder of pulled conversations this PC cannot list exits 1 the same way and names the folder: it is never read as "nothing was pulled".
+- `magent node recall <project> --to <nick>` moves an `auto` session to another node and resumes the same conversation there; what was pulled is installed there even when it holds no conversation, only memory, and the session then starts fresh. A pinned project moves by changing its `"node"`. Before anything is touched it refuses (exit 2) a move the new node could not take, with the checks `magent up` makes: a node folder name another project shares, or a local tree the node could not reproduce (uncommitted or unpushed work, no origin, a detached HEAD, a branch with no commits). `--allow-dirty` works as it does for `magent up`: it lets uncommitted or unpushed work through (the node gets origin's copy), and the other three are still refused. Once the session runs on the new node, the node sync daemon is started as after any bring-up.
+
+A session brought up again on the same node continues its newest conversation there (`claude --continue`); only a recall picks a conversation by id.
+
+A `node-map.json` magent cannot read, torn or with one malformed entry, pauses the node sync: no node is pulled until the file reads again. `magent status` shows `node sync paused` under Nodes, naming the malformed entry, with the file to fix or move aside, and `status --json` carries it as `node_sync_paused`. It is degraded, as a stale sync daemon is: `magent status` exits 3 until the map is repaired. A map that is only busy (another process is writing it) is not a pause.
+
 ## Usage
 
 Run `magent` with no arguments for the interactive menu:
@@ -336,7 +371,10 @@ and its exit codes (0/2/3/4) make it safe to drive from a script. `model` only
 switches a session while it is **idle** — never mid-turn — and re-reads the
 `<Model> · <effort>` footer to verify the change took, retrying anything busy
 until `--max-minutes` runs out. All three resolve a session name
-case-insensitively and refuse a name that is not live.
+case-insensitively and refuse a name that is not live. A pane psmux does not
+answer within a few seconds (a loaded box) is reported as unread, never as
+empty: `send` exits 4 (not confirmed), `peek` exits 3, and `sessions --json`
+shows `"state": "timeout"` rather than `"nopane"`.
 
 > The slash-commands `send`/`model` issue (`/compact`, `/model`, `/effort`) are
 > built inside magent and handed to psmux as a list argument, never through a

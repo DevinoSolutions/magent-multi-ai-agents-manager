@@ -1017,6 +1017,64 @@ when the upload server reads DEAD **and** the daemon is off **and** it would
 actually supervise (config on, env not opted out). Suggesting the daemon to
 someone who disabled it would be advice that does nothing.
 
+### One port, one server (2026-09-26)
+
+The watchdog above, `serve --ensure` and a hand-run `magent serve` can each
+start a server while another is still starting, and the design assumed the loser
+would fail its bind. On Windows it did not. `ThreadingHTTPServer` sets
+`SO_REUSEADDR`, and on Windows that option lets a second process bind a port
+that is already **listening**. Measured: two live servers on one port, both
+logging `listening ... :15505`, with the pid file naming only the later one. The
+watchdog then killed or revived the wrong server, and `/health` was answered by
+whichever one the kernel picked. Linux `SO_REUSEADDR` never allowed two live
+listeners on the same address, so only Windows ever showed it. (BSD/macOS let a
+specific address coexist with a listening wildcard; not addressed here.)
+
+`_NoFqdnHTTPServer` now owns its bind options (`_claim_port_options`), set
+before the bind. On Windows it sets `SO_EXCLUSIVEADDRUSE` and not
+`SO_REUSEADDR`, so a second serve is refused. Exclusivity is what refuses a
+`serve --host 0.0.0.0` against a held loopback port. It does not stop a foreign
+program from binding the wildcard over a loopback holder, and a same-address
+`SO_REUSEADDR` socket was refused on this Windows build even before. On POSIX
+it keeps `SO_REUSEADDR`, which on Linux only lets a restart rebind past the
+previous server's `TIME_WAIT` connections. Windows never held a port hostage to
+`TIME_WAIT` (measured with ~20 such connections on the port, and again with
+FIN_WAIT_2, a still-ESTABLISHED accepted connection, and a killed server
+process), so an upgrade still restarts serve at once. The branch is a
+`sys.platform` check, not a capability probe: it is socket semantics, not a
+feature.
+
+A bind refused because the port is held raises `PortInUse`, not the old generic
+error. `EADDRINUSE` always means held. Windows' `WSAEACCES` means one of two
+things. It can be an exclusive wildcard holder refusing a specific address, or
+a port Windows has reserved (a Hyper-V / WSL / Docker excluded range, measured
+at 127.0.0.1:17000). A 0.3s connect tells them apart (`_holder_answers`).
+
+- **Something answers:** a holder, so `PortInUse`.
+- **Nothing answers:** a reservation. There is no first server to defer to, so
+  it degrades like any unbindable address. If it was the only address, the fatal
+  "no bindable address" ERROR (what Sentry captures) names the reservation and
+  points at `netsh int ipv4 show excludedportrange protocol=tcp`.
+
+Held on **any** of serve's addresses counts: serving only the free ones would
+be two servers and one pid file again. Whatever was already bound is closed,
+and the pid file is untouched, because ours is only written after the bind. The
+trade-off is on record: a foreign program holding only the Tailscale address
+now keeps loopback down too, where it used to degrade, and the watchdog retries
+at its cooldown pace. `PortInUse` is logged at WARNING, not ERROR. A watchdog
+or `--ensure` spawn that loses the race is **supposed** to end here, so it is
+not a crash for Sentry. The CLI shell prints the reason and exits 1 instead of
+a traceback. An address that cannot be bound for any other reason (a Tailscale
+IP that went away) still degrades with a warning, as before.
+
+Pins:
+- `tests/unit/test_upload_server.py::TestOnePortOneServer` (real sockets,
+  current OS, including the set-before-bind order);
+- `TestClaimPortOptions` / `TestPortTaken` (both OSes, fake socket);
+- `TestHolderAnswers`;
+- `TestRunServerOnAHeldPort` (held, reserved, and reserved-secondary);
+- `tests/e2e/test_real_upload.py::test_a_second_serve_on_the_same_port_exits_and_leaves_the_first_alone`.
+
 ### One liveness enumeration, and a shutdown that verifies (2026-08-18)
 
 Reported twice on a live 46-session Windows host: after `magent down --all`, a
@@ -1346,13 +1404,16 @@ The price is one lock + one open/close per record: **13 µs → 235 µs** on thi
 box. These are lifecycle logs at a few records a second, not a request stream,
 so the cost is unobservable and the correctness is not.
 
-Two loudness rules ride along, both stricter than the stdlib's. A rotation that
+Three loudness rules ride along, all stricter than the stdlib's. A rotation that
 still fails **writes the record anyway** and reports the rotation failure through
 `handleError` (the stdlib drops the record instead). A lock that cannot be taken
 within `_LOCK_TIMEOUT_S` degrades to an unlocked write — keeping the record,
 which is the whole point — and says so once per process **in the log file
 itself**, because that is the only channel a detached daemon has and reaching for
-`get_logger` from inside a handler would recurse.
+`get_logger` from inside a handler would recurse. And a record that cannot be
+encoded — a filename carrying a lone surrogate — **lands escaped, never
+dropped**: the stream is opened with `errors="backslashreplace"`, where the
+stdlib's strict default prints `--- Logging error ---` and loses the record.
 
 The public seam is unchanged (`get_logger(name)`, one handler, still a
 `RotatingFileHandler`, still `<name>.log` + `<name>.log.N`), so no consumer
@@ -1652,30 +1713,62 @@ in the PAST, so a task stranded by a killed caller (an ssh drop takes the
 host-side `magent up` with it) can never fire on its own; `/Run` ignores the
 trigger entirely.
 
-**The task runs a PowerShell file, and both quoting layers are load-bearing.**
+**The task runs a three-line PowerShell file, and the command is not in it.**
 `/TR` truncates SILENTLY past ~261 characters, so it carries only a fixed
-launcher (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File <script>`;
-Windows PowerShell, not `pwsh`, which is not on every box) and the real argv
-lives in the script. PowerShell rather than a `.cmd` shim fixes three things a
-batch file gets wrong: `-WindowStyle Hidden` means the desktop is not shown a
-console window for a command nobody typed; `$p.ExitCode` is the real exit
-status rather than a parsed `%ERRORLEVEL%`; and cmd would read an `&` in an
-unquoted argument as a command separator, which `list2cmdline` does not defend
-against (it quotes for whitespace and quotes only) -- on a machine whose
-project path literally contains `&`, that is not hypothetical. The two layers
-are `subprocess.list2cmdline(argv)` building one command line by the MS
-C-runtime rules the child's own parser uses, then `_ps_quote` making that whole
-string ONE PowerShell literal for `-ArgumentList`. Passing a LIST to
-`-ArgumentList` skips the first layer: PowerShell joins array elements with
-bare spaces and does not re-quote, so `--config C:\A B\magent.json` arrives as
-two arguments.
+launcher (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File <run.ps1>`;
+Windows PowerShell, not `pwsh`, which is not on every box). `run.ps1` sets
+`$ErrorActionPreference = 'Stop'`, exports `MAGENT_SESSION0_POLICY=refuse`, and
+runs `& '<python>' -I '<scratch>\launch.py'` -- the interpreter magent itself is
+running under, and `launch.py` a byte-for-byte copy of
+`platform/_handoff_launcher.py`. The argv travels in `argv.json` (ASCII json:
+every non-ASCII code point escaped, lone surrogates included), never as a
+command line, so there is no quoting layer between the user's arguments and the
+child: the launcher hands the list to `subprocess.Popen`, whose `list2cmdline`
+is the one quoting pass, by the MS C-runtime rules the child's own parser uses.
+The only things PowerShell sees are two paths, each ONE `_ps_quote`d literal.
+The file is written UTF-8 WITH a BOM, because 5.1's `-File` reads a BOM-less
+script as the ANSI code page and a scratch or interpreter path holding `Ñ` or
+`т` would reach PowerShell corrupted; a path with no UTF-8 form at all (a lone
+surrogate, which Windows allows in a directory name) is refused before any
+task exists.
 
-One measured trap worth keeping: a `Start-Process -PassThru` object's
-`.ExitCode` is `$null` forever unless `$p.Handle` is touched while the process
-is still alive. PowerShell does not hold the handle, so once the child exits
-the OS has nothing left to ask. `rc.txt` came back EMPTY on every run until
-that line existed, and the hand-off then reported an "unreadable exit code" for
-commands that had succeeded.
+**The launcher is Python because PowerShell cannot hold the handle.** The
+previous launcher was `Start-Process -PassThru -RedirectStandard*`, then
+`$null = $p.Handle` and `$p.WaitForExit()`, and it lost exit codes. Windows
+PowerShell 5.1's redirecting `Start-Process` closes the handle CreateProcess
+returned, and `.Handle` re-opens the process BY PID, after the fact: a child
+that had already exited left `.ExitCode` at `$null` and `rc.txt` empty, and the
+hand-off reported an "unreadable exit code" for a bring-up that had worked.
+Touching `.Handle` early only narrowed that window; nothing in PowerShell can
+close it. `subprocess.Popen` keeps the CreateProcess handle, so `wait()` reads
+the code however fast the child was. The race is pinned deterministically, not
+by timing: `tests/unit/_jobhook.py` puts the task in a named job object whose
+watcher kills the command with code 7 the moment its first thread runs --
+before any launcher can look -- and the test asserts that kill happened before
+it asserts `rc == 7`. The launcher is stdlib only and imports nothing from
+magent (it runs outside the package), and it reads and sets no environment
+variable; `-I` keeps PYTHONPATH, PYTHONHOME and the scratch directory off
+`sys.path`, so nothing in the user's environment can put a different module
+under its imports. The command gets `CREATE_NEW_CONSOLE` with the window hidden
+(what `-WindowStyle Hidden` gave it) and stdin on the null device: nobody is at
+the desktop to type, and an inherited stdin is the task's console.
+
+The reading side has its own rule: `rc.txt` EXISTING is not the exit code being
+READABLE. The PowerShell launcher's `Set-Content` created the file, then wrote,
+and refused readers until it closed -- measured, 298 of 300 first reads after
+the file appeared were a sharing violation. The poll treated that read as final
+and reported the same "unreadable exit code ''" for succeeded commands, a
+windows-latest unit flake on five unrelated PRs. The Python launcher renames a
+finished file into place, which closes its own window, but a scanner can still
+hold a file it has just seen written. So rc.txt goes through the same reader as
+pid.txt (`_read_recorded_int`), and only a COMPLETE integer ends the wait --
+complete meaning ended by a newline, so the `1` of `12` can never be final
+whoever wrote the file. While rc.txt is present the lost-child check
+stands down: a launcher still writing it has not lost anything. A present
+rc.txt that stays anything else past `_HANDOFF_RC_GRACE_S` (10s) or the budget
+gets one last, decisive read, and failing that is its own answer -- the
+command finished and we cannot say how -- distinct from "never started",
+"lost its child" and "may still be running".
 
 **`schtasks` comes from the system directory, not PATH.** `run_on_desktop` is
 reached from an ssh login, and letting that login's PATH choose what runs as
@@ -1716,20 +1809,31 @@ that setting cannot change a normal desktop launch. Off Windows every platform
 reports interactive and nothing changes at all -- tmux over ssh is how people
 work there.
 
-Three smaller details that are load-bearing. The launcher passes
-`-WorkingDirectory` the caller's directory (a scheduled task starts in
-`system32`, and `find_config` walks up from the cwd, so the desktop copy would
-otherwise bring up a different config's projects). It exports
-`MAGENT_SESSION0_POLICY=refuse` for its child, so a hand-off that somehow
+Three smaller details that are load-bearing. `argv.json` carries the caller's
+working directory and the launcher starts the command there (a scheduled task
+starts in `system32`, and `find_config` walks up from the cwd, so the desktop
+copy would otherwise bring up a different config's projects). `run.ps1` exports
+`MAGENT_SESSION0_POLICY=refuse` for the child, so a hand-off that somehow
 landed in Session 0 again cannot recurse -- a recursion whose every level
-writes a scheduled task. And it writes `pid.txt` the moment `Start-Process`
-returns and `rc.txt` only after `WaitForExit`, which is what lets the poll tell
-three failures apart: no pid after the start grace means Task Scheduler never
-ran the task, a pid that is gone with no rc means the launcher lost its child
-and nothing is coming, and neither is the caller's budget simply running out.
-On that last one the delegated child is deliberately NOT killed: a bring-up
-still running on the desktop is doing the work that was asked for, and the pid
-is a number Windows recycles freely.
+writes a scheduled task. And the launcher writes `pid.txt` the moment the child
+exists and `rc.txt` only after `wait()` returns, each one decimal integer and a
+newline written to a temporary name and renamed into place, so the 250ms poll
+never reads a half-written one (the exit code is the signed Int32 Windows
+tools print, so an NTSTATUS arrives as `-1073741510`, not `3221225786`). That
+order is what lets the poll tell four failures apart: no pid after the start
+grace, from a task that is not running, means Task Scheduler never ran it (a
+launcher that merely could not record its pid -- a scanner holding the file,
+a full disk -- carries on, and its rc.txt still answers); a pid that is gone
+with no rc means the launcher lost its child and nothing is coming; an rc.txt
+that is there but never reads as a complete integer means the command finished
+and its exit code is lost (see the reading side above -- rc.txt existing is
+not the code being written); and none of those is the caller's budget simply
+running out. On that last one the delegated child is deliberately NOT killed:
+a bring-up still running on the desktop is doing the work that was asked for,
+and the pid is a number Windows recycles freely. A command that cannot be
+started at all -- a missing executable, a working directory that is gone --
+gets its reason appended to `err.txt` and `rc.txt` = 1 with no `pid.txt`, so
+the caller hears it at once instead of after the start grace.
 
 Diagnostics are the other half: `doctor`'s `psmux-session0` check and one
 `status` stderr line count psmux servers still stranded there (by image name
@@ -1739,9 +1843,11 @@ high-integrity ones). WARN, never FAIL, and additive in `status --json`
 must not move the 0/1/3 exit contract.
 
 Proof: `tests/unit/test_desktop_handoff.py` (the policy, the refusal wordings,
-the relay, both quoting layers, and the real create/run/poll/delete
+the relay, the staged files read back exactly and `run.ps1`'s parsed shape,
+the job-object exit-code pin, and the real create/run/poll/delete
 choreography against a FAKE `schtasks` installed through the `_schtasks_exe`
-seam), `tests/unit/test_attach.py::
+seam), `tests/unit/test_handoff_launcher.py` (the launcher itself, on every
+OS, against real child processes), `tests/unit/test_attach.py::
 TestUpHandsOffFromSessionZero`, `tests/unit/test_serve_port.py::
 TestEnsureHandsOffFromSessionZero`, and `tests/e2e/test_session0_handoff.py`
 (a REAL `magent up` child told it is an ssh login). `tests/conftest.py` pins
@@ -1787,9 +1893,479 @@ supervised-pane and `--no-mux` `wt` spawns in `cli/attach.py`. Pins:
 TestAttachClientKeepsNestingMarkersButNotALeakedNoColor`, and
 `tests/unit/test_attach.py::TestAttachPanesLoseOnlyALeakedColourOverride`.
 
+### An idle pane is proven, not read off the foreground (2026-09-26)
+
+`magent up --revive` (and the interactive `up`, which revives without the flag)
+types `cmd /c claude --continue` + Enter into every live session whose agent
+has fallen back to a bare shell. The bring-up's send-keys verification re-sends
+the start command on the same signal, and `status` prints an `idle` column from
+it. That signal was `#{pane_current_command}` read as a shell — and psmux
+reports the pane's foreground DESCENDANT, not the pane's own process. While
+Claude Code runs a tool the reading is `bash` (its Bash tool), `pwsh`, `grep`
+or an MCP server, with claude.exe alive under the pane. Measured live on a
+31-session fleet: 4 sessions read idle while their agent was mid-turn, and
+revive would have typed a second agent's command line into each one's prompt.
+
+The rule now: a pane is idle only on POSITIVE proof, and the one place that
+decides it is `psmux.idle_sessions`. All three consumers read it —
+`revive_sessions`, `WindowsPlatform._verify_sends_landed` and
+`cli/status.py::_psmux_sessions` — and nothing else classifies a pane. A yes
+needs all three of:
+
+1. the foreground reading is a bare shell (`is_idle_command`) — kept, because
+   a pane in the user's own program is not at its prompt either, and as a
+   cheap filter: a session that fails it costs no further probe;
+2. the pane's OWN process (`#{pane_pid}`, read by `psmux.pane_pids`) was read,
+   is present in the process snapshot, and is itself a shell;
+3. nothing in that process's subtree (`procs.process_tree` over the Toolhelp
+   snapshot, which now carries parent pids) is an agent image or a live
+   launcher (`psmux._LAUNCHER_IMAGES`, i.e. `cmd`).
+
+Everything unknown is a no: an unreadable or non-numeric pane pid, a failed
+snapshot, a pane process that is gone by snapshot time, a probe still
+unanswered when the fan-out's deadline passes. Off Windows there is no
+snapshot, so nothing is ever idle there — revive does nothing rather than
+guess. The asymmetry is the point: a false "busy" leaves a dead pane for the
+human to restart, a false "idle" types into a live agent's input.
+
+The launcher rule exists because the image list alone is not the fleet.
+`config.DEFAULT_TOOLS` ships tools with no registry entry and so no image
+(`agy`, `cursor-agent`), and a pane running one of them mid-tool read exactly
+like an idle pane. What every such pane does have is magent's own wrapper:
+every command magent types is `cmd /c <command>` (`platform/windows.py::
+_send_argv`, and revive's own send), and `cmd /c` exits exactly when its
+command does. A live `cmd` under the pane's shell therefore IS the launched
+command, whatever that command's image is called. The agent images still
+matter for the one path with no `cmd` above it: a human who typed `claude` at
+the prompt. The cost errs the safe way — a `cmd` the user started by hand reads
+busy — and a pane whose own shell is `cmd` was never idle to begin with (`cmd`
+is not in `_IDLE_SHELLS`).
+
+The pane probes are bounded as a batch, not one by one. `_display_fan_out`
+spawns every `display-message` before reading any and then waits on ONE
+deadline (`_FAN_OUT_TIMEOUT_S`); a probe still running when it passes is
+killed unread and its session reads unknown, while one that already exited
+gets `_FAN_OUT_DRAIN_S` to hand over its output. The per-probe timeout it
+replaced made a wedged server cost N x timeout across a fleet of N. Because
+the window is paid once, it is sized for a loaded host, not an idle one: 10 s.
+Under a spawn storm a single `display-message` runs past 3 s (the measurement
+behind `FLASH_TIMEOUT_S`), and a storm is exactly when the send-verify reads
+the fan-out. At 5 s one slow start read every pane as unknown and skipped the
+re-send. On attach the window bounds a share, not the whole read:
+`idle_sessions` runs two fan-outs back to back, so 2 x 10 s bounds its SHARE
+of the 30 s ssh read of `up --json --revive`, not that read. The rest of the
+path has no finite bound to sum — `live_sessions`' sweep before it is
+unbounded on purpose (a slow server must not read dead), revive's
+`has_session` pool runs ceil(n/16) waves in series, and each `send_keys` after
+it may take `SEND_KEYS_TIMEOUT_S` (20 s) per pane.
+
+The snapshot the verdict rests on is complete or it is nothing: a Toolhelp
+walk ends only on `ERROR_NO_MORE_FILES`, and a `Process32NextW` that fails
+for any other reason makes `procs.snapshot_processes` return None (unknown,
+so not idle) rather than the shorter list it reached — a partial list would
+read "nothing runs here" for every process the walk never got to.
+
+The agent images come from the registry, not a second list: each
+`AgentTool` carries `images` (`claude`, `codex`), and
+`sessions.agent_image_names()` adds `AGENT_RUNTIME_IMAGES` (`node`, the npm
+shim either agent can run under). A snapshot carries image names, never
+command lines, so ANY node under a pane counts — the reading that errs toward
+busy. The cost is batched: one `pane_pids` fan-out (every probe spawned before
+any is read, like `pane_current_commands`) and ONE snapshot per call, paid only
+when some reading is a shell; status passes the readings it already holds for
+its table instead of probing twice.
+
+Two known edges, both measured against the code rather than the fleet. Windows
+never rewrites a stale parent pid, so a recycled pid can pull a stranger into a
+pane's subtree; that only ever errs toward busy. The other is the one real
+hole: a parent-pid walk cannot reach an ORPHAN. If an agent's `cmd` is killed
+out of band while the agent lives, the agent keeps the dead `cmd`'s pid as its
+parent, nothing in the snapshot leads from the pane's shell to it, and the
+pane can read idle with the agent still attached to its console. A caller that
+only KILLS what the walk finds is safe there, since it finds nothing to kill.
+A caller that TYPES into the pane is not.
+
+The sound closure is known and deliberately not built in this change: ask the
+pane's CONSOLE who is on it, not the parent pids. A helper started with
+`DETACHED_PROCESS` (it has no console of its own to give up, and the caller's
+console is left alone) calls `AttachConsole(pane_pid)` and then
+`GetConsoleProcessList`. The pane is agent-free only if every process on that
+console is in the pane shell's subtree and none is an agent image or a
+launcher; any failure of the helper reads busy. That check is a prerequisite
+for the idle reaper, which types a mode reset and a resume into panes it has
+emptied, and it should land with it.
+
+Pins: `tests/unit/test_psmux.py::TestReviveNeverTypesIntoALiveAgent`,
+`::TestIdleSessions`, `::TestTheFanOutWaitsOnOneDeadline`,
+`tests/unit/test_platform_contract.py::TestWindowsSendKeysVerification`,
+`tests/unit/test_status.py::TestIdleColumnNeedsPositiveProof`,
+`tests/unit/test_procs.py::TestProcessTree`, and against a real psmux pane on a
+private socket (CI's Windows platform leg only),
+`tests/platform/test_real_psmux.py::
+test_real_pane_reads_idle_only_while_nothing_it_launched_runs`.
+### A slow child is not a failed child (2026-09-25)
+
+Both detaching launchers, `attention -d` and the Alt+V listener start
+(`launch.start_hotkey_listener`), learn their child's pid only from the pid
+file the child writes once it is up. Both used to wait a fixed 2 seconds for
+it. On a loaded desktop the daemon took 4.7-11.45s to register (about 1.5s
+idle; the pre-routing build flaked the same way), so `attention -d` printed
+"failed to start" and exited 1 over a daemon that then came up and kept
+running. The serve-watchdog e2e tier went red on it, and its teardown, which
+killed only pids it had learned, left that daemon and the server it supervised
+running.
+
+**One wait, one owner.** `procs.await_registration(child, read_pid, ...)` is the
+launcher-side wait for both callers. It lives in `procs.py` because that stdlib
+leaf is already imported by `launch.py` and by `cli/`: both directions are
+legal, and a src module never imports the cli package (LS-A-001). The window is
+`REGISTRATION_TIMEOUT_S` (20s, about 1.75x the slowest measured start). The
+idle path pays nothing, because the loop returns on the first poll that sees a
+pid. The listener start keeps `not_pid=existing`, so a restart whose kill did
+not take cannot read the old pid back as the new listener.
+
+**An exit ends the wait at once.** A child that exits, for any code including
+the 0 that `magent hotkey` returns when another listener already runs, is
+reported immediately rather than waited out. That check is meaningful on
+Windows because `spawn_detached` Popens `sys.executable`: under a venv that is
+the launcher `python.exe`, which waits for the base interpreter and passes its
+exit code through. The direct child's `poll()` therefore tracks the real
+process.
+
+**The wait never kills the child.** A timeout means "not registered yet", not
+"dead". On the machine this was measured on, the child was usually a few
+seconds from coming up. The launcher still reports failure (rc 1) so a script
+can react, but it leaves the child alone. Killing it would turn a slow start
+into a real failure, which is the bug this fixes.
+
+**The window is a bound.** It is not a knob: there is no env var, because the
+right answer is "long enough for a loaded box, and finite". A child that hangs
+alive without registering must not stall serve's supervisor thread or a `--go`
+launch before tiling. Pins:
+- `tests/unit/test_procs.py::TestAwaitRegistration`
+- `::TestTheWaitNeverEndsTheChild`
+- `::TestTheDefaultWindowIsBounded`
+- the wiring tests in `test_attention_cmd.py::TestTheLauncherWaitsForASlowDaemon`
+  and `test_hotkey.py::TestMaybeStartHotkey`
+
+**The upload watchdog applies the same rule.** `launch.UploadServerSupervisor`
+respawns a dead port at the cooldown rate, and the cooldown used to be the only
+thing between a slow serve and a second one. A serve measured 4.7s to bind
+against the e2e tier's 3s cooldown, the watchdog started another beside it, and
+on Windows the second bind succeeded (`SO_REUSEADDR`, before "One port, one
+server"): two live servers on one port, a pid file naming only the later one.
+Now a serve the supervisor spawned
+that is still alive inside `REGISTRATION_TIMEOUT_S` counts as starting, not
+failed. Once it exits, or the window runs out, the cooldown decides alone as
+before. The supervisor never ends that child either. At the default 60s cooldown
+this guard never engages, because the cooldown check returns first; it matters
+only when the cooldown is both below the 20s window and shorter than a serve's
+startup (the e2e tier's 3s override is one). It is
+not a cure either: a serve measured 28.65s to bind on a loaded desktop, past the
+window, and was doubled all the same. The structural fix is the exclusive bind
+("One port, one server" above): a duplicate now exits with `PortInUse`, and an
+exited child never holds back a respawn. Pins:
+`test_launch.py::TestUploadServerSupervisor`.
+
+The detaching e2e tiers carry the other half of the lesson. A failed launch
+must not leak what it started, so the tiers find it by a uuid argv marker, not
+by learned pid (see CLAUDE.md, serve-watchdog tier).
+
+### magent's stdout escapes rather than raises (2026-09-28)
+
+A redirected Windows stdout (a pipe, a file, the Session-0 hand-off's
+`out.txt`, the ssh channel `magent attach` reads) is the ANSI code page with a
+handler that raises. One CJK or emoji project name ended a command with a
+`UnicodeEncodeError` and rc 1, and `up` got that far only after its sessions
+existed. The entry point (`cli/app.py::_escape_unencodable_output`) now gives
+stdout one error handler, `magent.escape`. What the code page holds is written
+byte-for-byte as before. A lone U+DC80..U+DCFF is written back as the byte
+surrogateescape decoded it from, so a POSIX path that is not UTF-8 still prints
+as that path. Everything else prints as its `\u4e2d` escape. stderr needs
+nothing: Python already gives it backslashreplace.
+
+Only the error handler changes, never the encoding: a parent that reads magent
+in its locale encoding (the hand-off's `_read_handoff_text` falls back to
+`mbcs`, a Python caller uses `text=True`) must keep getting that encoding. Only
+a stream still on a born-with handler (`strict`, `surrogateescape`) is changed;
+a handler somebody chose is kept. It is not `PYTHONIOENCODING` set for the
+hand-off child, because every process that child spawns, the fleet included,
+would inherit it, and magent's child-environment policy is strip-only
+(`env.spawn_child_env`). Known limit: a UTF-16/32 stdout, which only an explicit
+`PYTHONIOENCODING` gives, still raises on a lone U+DC80..U+DCFF. Pins:
+`tests/unit/test_stdout_escape.py`, `tests/e2e/test_cli_flags.py`, and the real
+hand-off runs in `tests/unit/test_desktop_handoff.py`.
+
+### The bring-up never waits forever, and a probe with no answer is not an absent session (2026-09-29)
+
+`WindowsPlatform.launch_psmux_session` is the one call that creates psmux
+sessions, and every path reaches it through `psmux.launch_verified`: `--go`,
+the menu's "u", and `magent up`, which is also the host side of `magent attach`.
+It ran six client fan-outs: the has-session dedupe, kill-server, new-session,
+send-keys, the send verifier's re-sends and the status-line decorations. Each
+ended in a bare `p.wait()`. The wedge described in "Doctor names the wedge"
+above makes every psmux control command hang forever. So one wedged socket held
+the whole bring-up forever. It held every later wave with it, and over ssh the
+attach's read of the host timed out with nothing to show for it.
+
+**One deadline per fan-out.** Every wait is now `psmux.await_clients`: one
+deadline for the whole set, not one per client. With a timeout per client, N
+hung clients cost N budgets, which is the `_display_fan_out` lesson. A client
+still running at the deadline is killed and reaped. The reap is itself bounded
+(`_REAP_TIMEOUT_S`), because a timeout must not leave its own unbounded wait
+behind. A client that exited before the deadline still hands over its code. The
+clients are spawned with `DEVNULL` stdio, because `capture_output` is not a
+bound on Windows (see the 90s answer to a 5s timeout above). Every budget is
+per fan-out and has a measurement behind it:
+
+- the dedupe and the kill-server get 30s each (`_DEDUPE_TIMEOUT_S` /
+  `_CLEAR_TIMEOUT_S`). That is 1.5x the ~19s measured for one 46-socket
+  has-session fan-out on a loaded host.
+- new-session and send-keys get 60s per wave (`_CREATE_TIMEOUT_S` /
+  `_SEND_TIMEOUT_S`). That is `upload_server.INJECT_TIMEOUT_S`, the
+  product's one-attempt ceiling. A healthy new-session was measured at 892ms,
+  and in the wedge it never finished. A send-keys against a busy socket was
+  measured from 3s to past 70s. A send that is killed is never re-sent, because
+  it may still have landed, and a second copy would type the command into a
+  running agent. This is the paste's double-delivery law.
+- the decorations get `SEND_KEYS_TIMEOUT_S` (20s). They are cosmetic.
+
+The total is bounded, not fast: about 30 + 30 s, plus per wave 60 + 10
+(panes-ready) + 60 s plus the verify.
+
+**The dedupe has three answers.** `psmux.probe_sessions` answers `live`,
+`absent` or `unknown`. `has_session` and `live_sessions` fold "never answered"
+into "not live". That is the right fold for a status table. It is the wrong
+fold for a bring-up, because there "not live" leads to kill-server and a fresh
+new-session. Only `absent` (has-session answered, non-zero) may lead to either.
+A probe that timed out, or could not even be spawned, is `unknown`. That window
+is refused with the reason "could not tell whether <name> is running". It gets
+no kill-server, no new-session and no send-keys.
+
+**Why unknown is never killed.** When the wedge was cleared, every session
+probed alive. The sockets that had stopped answering were frozen LIVE agents,
+not dead ones. A bring-up that reads silence as absence kills and re-creates
+each of them. That is the mass restart "Doctor names the wedge" exists to talk a
+human out of, done automatically, and it throws away every agent's running turn
+and context. The two errors have different costs. A false "unknown" costs one
+report line, and the next `up` asks again. A false "absent" destroys a live
+agent. This is the same asymmetry as the idle rule above: when the state cannot
+be proven, the bring-up does not act.
+
+The same rule covers the other two waits:
+
+- A kill-server that never answered means the old server may still hold the
+  name, so nothing is created on top of it.
+- A new-session that outran its wave is refused for that window alone. The rest
+  of the wave and every later wave carry on, exactly as a psmux refusal (rc 1)
+  already did.
+
+**The reason reaches the human.** `launch_psmux_session` returns
+`{name: reason}`. `launch_verified` merges it into its own report, and `bring_up`
+returns `(created, {name: reason})`. All three bring-up surfaces (`--go`, the
+menu's "u", and `magent up`, whose output `magent attach` relays from the host)
+print their casualties through ONE helper, `launch.report_bring_up_casualties`:
+the "N session(s) failed to come up" line, each known reason under it, dimmed,
+then `launch.session0_note()`. The log hint ("on the host" for `up`) is its one
+parameter. The three copies it replaced had already drifted.
+
+**A refusal is final, even when the verify finds the session live.** Killing a
+new-session client at its deadline need not stop the psmux server it already
+forked (the server is a grandchild; that is why priority is a sweep). So psmux
+can create the session late. The verify then reads it live, but nothing ever
+typed its agent command into it. Counted as brought up, it is a bare shell under
+a success line, and `--go` never revives. So `launch_verified` keeps every name
+the platform refused in its report, whatever the verify reads. A refused name
+that answers carries the platform's reason plus what the verify saw: it answers
+now, it got no agent command, and `magent up` revives it. The same holds for a
+dedupe or kill-server refusal whose session answers by the time of the verify.
+This bring-up could not prove it, did not touch it, and says so rather than
+claiming it.
+
+`launch_verified` does not respawn a refused name that its verify also misses.
+The respawn would only repeat the wait that failed, and on a wedged socket it
+would double that wait. A name that is merely missing is still respawned. That
+stays safe because the respawn goes back through the tri-state dedupe:
+"unknown" is safe to ask about again, and not safe to kill, re-create or type
+into.
+
+Pins: `tests/unit/test_bringup_bounded_waits.py` runs against a real executable
+named `psmux` on a tmp PATH. It records every argv and hangs the verb/name pairs
+each test chooses. On Windows it dies with its `.cmd` launcher, so "killed" is
+observable. The pins cover:
+
+- the three answers;
+- one budget for N hung clients;
+- a dedupe hang, a kill-server hang and a stuck new-session, each through the
+  real `WindowsPlatform` bring-up;
+- a hung first send (sent once, never re-sent), a hung re-send (the last send,
+  though the attempt cap allows a third) and a hung decoration. These run the
+  send verifier's REAL `idle_sessions` verdict over a fake bare-shell pane;
+- `launch_verified` reporting the unknown name with its reason, a refused name
+  beside a respawned one, and a session created after its wait gave up.
+
+They run at shrunk budgets. `TestTheProductionBudgets` pins the real ones. The
+printer is pinned byte for byte on all three surfaces
+(`test_the_casualty_block_is_byte_for_byte` in `test_attach.py`,
+`test_status.py` and `test_launch.py`; written green before the three copies
+were folded into one). The residuals are in the known-debt ledger.
+
+### An auto node is chosen by its load history, and a recall is explicit (2026-09-24)
+
+**Placement reads history, not a reading.** `"node": "auto"` is resolved by
+`launch.place_node_projects`, its own phase between selection and launch, so a
+dispatcher only ever sees a nick; `up` runs the same phase once before its
+fan-out so one `up` spreads like `--go`, and an auto project it cannot place
+fails in its own row with the placer's reason. The score is spec §11
+over the sync daemon's last 30 minutes of samples: the p75 of `load1 / nproc`,
+plus half of how far the window's peak rises above 1.5 times that p75, plus
+half of how far the newest free memory falls below 15%, plus 0.05 per session
+of ours; ties go by config order. A node under 10% free memory
+(`MEM_HARD_FLOOR`) is not a candidate while another is above it. A node with
+fewer than five samples in the window gets exactly one live `sample` call,
+which is then its only sample, and none under `--dry-run` or a tile-only pass;
+a node that does not answer it is left unscored. A single reading would place
+a session on a box that happened to be idle for one second of a bursty minute.
+
+**A placement sticks, and placing writes nothing.** A project stays on its
+node until that node leaves `settings.nodes`; only then is it re-placed, with
+the reason printed. The placement phase never writes `node-map.json`: the
+bring-up records it once it has actually happened, so a failed
+launch leaves nothing sticky behind, and `magent node plan` can render the
+very same objects while writing nothing, pinned byte-for-byte. Nothing moves a
+running session on its own; `magent node recall --to` is the only mover.
+
+**The node decides what a plain re-up resumes.** A session brought up again
+passes no resume id: `bring_up.sh` runs `claude --continue` over
+the node's own transcripts, or the fresh form when there are none. The PC's
+pulled copy can be one pull stale, and an explicit `--resume` has no fresh
+fallback on a node that lost the file. `claude --resume <id>` is used only
+where magent installed that conversation first: `recall --to` (installed
+by `install_transcripts.sh`, under the name magent's one encoder
+gives the node's own `realpath`; the node never encodes) and the resume
+`recall --local` prints.
+
+**Recall never races the daemon, and a pull it cannot finish stops it.** The
+last pull goes through `node_sync.final_pull`, under the lock the daemon's tick
+holds. The placement is cleared at the end of a recall and a cleared placement
+is never pulled again, so a pull that a re-run could still complete stops the
+recall before anything is stopped, installed or cleared: a node that answered
+with an error, a pull that left files behind, a placement the pull no longer
+found, or a node map another process holds busy or left torn all exit 1
+with the project still placed and "run the recall again" -- except a pull
+stuck at its mark, which a re-run would only meet again: that stop names
+nodes.log, where both marks are, instead; a daemon still
+holding the node past the wait exits 3 the same way. Only a node that does not
+answer at all (ssh's own 255, or a timeout), or one this config cannot pull
+from, is reported and not fatal, because no re-run helps: the last `repos.json`
+record stands in for the live commit report, and the command that stops the
+session is printed with its target single-quoted, `kill-session -t '=<sid>'`,
+because zsh reads a bare `=word` as a command lookup. That command is one
+`ssh <target> "…"` line only for a plain sid; any other sid gets two steps
+(ssh, then run it on the node) with its `'` escaped, since the local shell
+would expand `$(…)`, a backtick or `!` inside the double quotes. "Stopped" is
+printed only when `remote_mux.kill_session` returned True; when the call
+failed, recall says the session may still be running and prints that command.
+
+**`--local` installs by the rules a `--to` send uses.** The local folder is
+the one a launch opens, resolved by `launch._resolve_path` and never
+`Path.resolve()`d, because Claude files a conversation under the path the
+session was started in, link and all. The pulled mirror is copied by
+`remote_mux.copy_mirror`, which shares its membership rule with the tar that
+ships a mirror to a node: no link is followed, a mirror that is itself a link
+is refused, and a pull's `.part` temp is never copied. A local file the node's
+copy changed is named, because it may be work this PC had.
+
+**Not yet measured (plan G Task 16, a user-run probe):** whether
+`claude --resume <id>` resumes a conversation installed under another
+folder's name. Until it is measured, when the conversation's id is known,
+`recall --local` prints the exact command, `claude --resume <id>`, and
+under it a `resume by hand` line: run `claude --resume` in the project's
+folder and pick the conversation from the list; with no id it prints plain
+`claude`. `recall --to` starts the moved session on the new node with
+`claude --resume <id>`, or fresh when no conversation was pulled.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
+
+**`node setup` keeps one node-key edge (2026-09-27; a second, the dangling
+`.pub`, closed 2026-09-28):** `setup.sh`'s `user_node_key` refuses a symlinked
+`~/.ssh` or `~/.ssh/id_ed25519` and makes the key 0600 on every run (F-ACL-1: a
+default ACL overrides the umask, so ssh-keygen can leave a new key 0644). One
+edge of that is left as it is on purpose.
+
+*Closed: a dangling `.pub` link is refused, not written through.* The derive
+branch's `> "$id.pub"` and ssh-keygen's own `.pub` write at generation run
+whenever no `.pub` resolves, so a dangling link there used to have its target
+created. `user_node_key` now refuses a `.pub` that is a link and does not
+resolve (`[ -h "$id.pub" ] && [ ! -e "$id.pub" ]`) with its own fail row and
+rc 1, before either write. The key's chmod still runs first, and the row
+carries its repair note. Only the dangling case is refused, so the trade this
+entry first named (adding `$id.pub` to the symlink refusal would fail a live
+link too) was never forced: a live symlinked `.pub` is only read and stays
+`skip` + `key`. Pins: `tests/unit/test_node_provision.py::
+TestSetupShUnderRealBash::test_a_dangling_node_key_pub_is_never_written_through`
+and `::test_a_live_symlinked_node_key_pub_is_only_read`.
+
+*A dotfile-managed key now fails setup.* A node whose `~/.ssh/id_ed25519` is a
+symlink to a 0600 key (a dotfile manager's layout) went `skip` + `key` before
+F-ACL-1 and now fails every `node setup` with rc 1. That is deliberate: the
+key's chmod runs on every run and is never done through a link, the rule
+`user_authorized` already applies to `authorized_keys`. The fail row names the
+symlink, so the user knows what to change. Pin: `TestSetupShUnderRealBash::
+test_a_symlinked_node_key_never_reaches_its_target`.
+
+**A failed `.pub` derive deletes a `.pub` link to a directory (2026-09-29):**
+the dangling-`.pub` refusal above leaves a `.pub` link that resolves alone,
+and a link to a directory does resolve, so it is not refused. `[ -f ]` is
+false for it, so with a private key present `user_node_key` takes the derive
+branch: `ssh-keygen -y ... > "$id.pub"` fails on the directory, and the
+cleanup `rm -f -- "$id.pub"` then removes the user's link (never the
+directory it points at) before the fail row. Pre-existing, the same at rc1,
+and left unpinned: the refusal's `[ ! -e ]` is what the spec asked for, and
+the mutant that would tell it from `[ ! -f ]` (R8) survives on exactly this
+case. The fix, if it matters, is to refuse any `.pub` link that is not a
+regular file, before the derive, the way the dangling one is.
+
+**`stop_daemon` can kill a stranger named by a stale pid file (2026-09-29):**
+`node_sync.stop_daemon` kills only while the daemon's lock is held, and kills
+the pid the pid file names if that pid is alive. A daemon that died without
+its own cleanup (a crash, a forced kill) leaves its pid file behind, and a new
+daemon that has taken the lock but not yet written its pid is paired with that
+file. If the OS has handed the old number to another process by then,
+`daemon_pid()` reads it as live and the stop kills that process. The window is the few
+instructions between `run_sync_loop`'s lock and its pid write. Pre-existing;
+the wait for a late pid (2026-09-29) reads the same file first and neither
+widens nor narrows it. The fix would be a pid written under the lock with
+something only the daemon knows (its lock-time stamp, or its start time
+checked against the process's), not a liveness check.
+**Two Session-0 hand-off failures the launcher cannot describe (2026-09-29):**
+both sit before or outside the Python launcher, so its fast, worded answers
+cannot cover them.
+
+- *A missing interpreter reads as "never started".* If the `sys.executable`
+  that `run.ps1` names is gone by the time the task runs (a venv deleted or an
+  upgrade that swapped the interpreter between staging and `/Run`), its `&`
+  fails under `$ErrorActionPreference = 'Stop'` and PowerShell exits before
+  any launcher exists. That leaves no `pid.txt`, no `rc.txt`, and a task that
+  is not running, so after `_HANDOFF_START_GRACE_S` (30s) the caller hears
+  "Task Scheduler never started the hand-off (is anyone logged on?)". The
+  outcome, nothing brought up and `rc=None`, is right. The wording and the 30s
+  wait are not, because only the launcher writes the immediate rc 1 with a
+  reason, and here it never runs. Closing this would need a `catch` in
+  `run.ps1` that writes `err.txt` and `rc.txt` itself, which makes PowerShell a
+  writer again.
+- *A crash of `launch.py` itself leaves no trace in the scratch dir.* The
+  launcher handles a command that cannot start. Anything else it raises (an
+  `rc.txt` still held after the record retries, say) goes to the task's
+  hidden console as a traceback, and that console is gone when the task
+  ends. The caller hears "exited without an exit code", or "never started",
+  and the scratch directory it names holds nothing about why. After a pid
+  record that failed (skipped by design) there is no pid to watch, so a crash
+  past the one start check reads as the budget running out -- "may still be
+  running" -- instead. Closing this would mean wrapping `main()` in a
+  `try/except BaseException` that writes the traceback into a scratch file.
 
 **Typed text cannot be delivered through a nested ConPTY over `ssh -t`
 (2026-08-18):** `tests/e2e/test_ssh_real.py::test_typed_text_survives_a_real
@@ -1812,6 +2388,93 @@ guarantee this test exists for is still covered on Windows by
 by cell, and the test itself runs for real on ubuntu and macOS. Worth trying
 next: pywinpty's WinPTY back end (`PtyProcess.spawn(backend=Backend.WinPTY)`),
 which predates win32-input-mode and may pass the CR through unencoded.
+
+**Auto placement never rebalances (2026-09-24):** an `auto` project stays on
+the node it was placed on until that node leaves `settings.nodes`. A node that
+grows busy keeps its sessions; moving one is a manual
+`magent node recall <project> --to <nick>`. Deliberate: a
+move stops a live session and ships its conversation, which is not something
+to do behind the user's back. If it bites, the fix is a `node plan` hint
+naming the better node, never an automatic move.
+
+**Recall moves Claude Code conversations only (2026-09-24):** `magent node
+recall` refuses a project whose tool is not `claude` (exit 2). Codex has no
+transcript layout magent pulls, and no resume-by-id form recall could print.
+Its sessions come home by git alone: commit and push on the node, pull here.
+
+**A bring-up's repo record knows the commit, not the branch (2026-09-24):**
+`repos.json` written at bring-up carries each repo's sha from
+`bring_up.sh`, with an empty branch and an unknown unpushed count, because the
+bring-up reports only commits. A recall from a node that no longer answers
+therefore prints the last known sha without a branch. A recall from a node
+that answers records the full `repo_status.sh` report and replaces it.
+**What the bounded bring-up still leaves open (2026-09-29):** there are five
+residuals of "The bring-up never waits forever" in §2. Items 1-3 and 5 were
+found by reading the code, and none has been seen on the fleet. Item 4 was
+reproduced.
+(A sixth, "a timed-out new-session may still produce its session and be
+counted created", is closed: a refusal is now final, see §2.)
+
+1. *Four helpers on the bring-up path are bounded only on paper on Windows.*
+   `has_session`, `kill_server`, `send_keys` and `capture_pane` still use
+   `subprocess.run(capture_output=True, timeout=…)`. That is the shape measured
+   answering a 5s timeout in 90s ("Doctor names the wedge", §2), because
+   `communicate()` waits on pipes a grandchild still holds. The bring-up reaches
+   `capture_pane` through `_wait_for_panes_ready`, which makes one call per
+   window, serially. Its 10s batch deadline is checked only between calls, so
+   it cannot cut one short. It reaches `has_session` through
+   `launch_verified`'s creation probe (`_CREATE_PROBE_TIMEOUT_S`, 3s, 16
+   workers). A wedged socket that leaves a
+   grandchild behind can hold each such call for as long as the grandchild
+   lives. The fix is the one `probe_control_plane` took: discard what is not
+   read, and bound what is read without `communicate()`.
+2. *`live_sessions` with a `timeout` pays it once per probe, in turn.*
+   `_probe_live` waits `proc.wait(timeout=timeout)` client by client, so N hung
+   probes cost N x timeout. It `kill()`s a timed-out probe without reaping it.
+   The default (`timeout=None`, unbounded) is deliberate for status, down and
+   the picker, because a slow server (~19s for 46 sockets) must not read dead.
+   So this only bites a caller that passes a timeout. `await_clients` is the
+   drop-in shape.
+3. *A spawn that fails partway through a fan-out leaks the clients already
+   spawned, and can lose the call's refusals.* Every fan-out in
+   `launch_psmux_session` spawns in a list comprehension: `spawn_unjobbed` for
+   new-session, `subprocess.Popen` for send-keys, the re-sends and the
+   decorations. When spawn k raises `OSError`, clients 1..k-1 are never passed
+   to `await_clients`. They are not killed, reaped or waited on, and on a
+   wedged socket they live as long as it does. The re-send and decoration
+   spawns catch the error, so only those clients leak. The new-session and
+   send-keys spawns do not catch it. The error escapes `launch_psmux_session`
+   and discards the `{name: reason}` of every earlier wave. `launch_verified`
+   logs the exception and its verify then sees those names as merely missing,
+   so it respawns them. That is safe, because the respawn goes back through the
+   tri-state dedupe, but a refusal's reason is lost and its wait is paid twice.
+   The shape of the fix is to spawn into a list that is awaited in a `finally`,
+   and to return the refusals gathered so far.
+4. *The pins' fake `psmux.cmd` breaks under a non-ASCII temp root.* The fake
+   in `tests/unit/test_bringup_bounded_waits.py` is a `.cmd` whose one line
+   names the interpreter and the script by absolute path, and it is written as
+   UTF-8. cmd.exe reads a batch file in the OEM code page. On a code-page-437
+   box, a script in a directory named `prøbe-т` was looked up as `pr├╕be-╤é`, so
+   the interpreter found no script (rc 2). Every win32 pin in that module would
+   then fail, and the cause is the harness, not the product. The fix is the
+   Session-0 run.ps1 lesson (§2): do not let a script's bytes be re-read in
+   another code page. Either write the `.cmd` in the OEM code page, or keep
+   every path in it ASCII by passing the script path through the environment.
+   This belongs with the 3.19.4 shim-encoding item.
+5. *A killed send-keys leaves a bare shell counted "Brought up".* A first
+   send-keys (or a re-send) that gives no answer within `_SEND_TIMEOUT_S` is
+   killed and never sent again, because it may still have landed. Its window
+   is then left out of `_verify_sends_landed`, and nothing reaches
+   `launch_psmux_session`'s refusals: the only trace is a WARNING in
+   `launch.log`. `launch_verified` finds the session live, so it is counted
+   created, possibly with no agent running. That is the shape the late-created
+   session had before a refusal became final. The NEXT `magent up` revives
+   such a pane; the run that created it does not, because `up` only revives
+   sessions that were live before it began, and `--go` never revives. Refusing
+   it would be wrong too, since the command may be running. The fix is a third
+   outcome: return the unsure names beside the refusals, and have
+   `report_bring_up_casualties` name them on their own line ("may not have its
+   agent") without counting them as failed.
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
@@ -2159,6 +2822,28 @@ change):
   tiles into a hard-coded `compute_grid(monitors, 2, 1)` regardless of the
   config's `layout.columns`/`layout.rows`, unlike the launch path which
   reads the configured grid.
+- **The test home isolation leaves `find_config`'s CWD door open.**
+  `tests/conftest.py::_isolate_magent_home` moves the HOME family, `APPDATA`
+  and `XDG_CONFIG_HOME` into tmp, which closes the last candidate
+  `find_config(None)` tries (`env.config_base()/magent/config.json`). The
+  first two candidates are relative to the CWD, `./magent.config.json` and
+  then `./scripts/magent.config.json`, and the fixture does not move the
+  CWD. `magent.config.json` is gitignored precisely because a personal one
+  lives at a checkout root, so a test that forgets `--config`, run from
+  such a checkout, loads the developer's own config. The only guard is the
+  convention that CLI tests pass `--config <tmp_path>`; a global
+  `chdir(tmp_path)` would break the tests that rely on a repo-root CWD. The
+  cheapest fix is a guard-A-style tripwire that fails any test whose
+  `find_config(None)` resolves under the repo root while the redirect is
+  active.
+- **The home tripwire stops at the HOME family.** Guard B inspects only
+  `HOME`/`USERPROFILE` in an explicit child `env=`, so a child env carrying
+  the real `APPDATA` or `XDG_CONFIG_HOME` passes it. Guard A's
+  `_REAL_STATE_ROOTS` is `~/.magent` and `~/.claude`, without the real
+  config base (`REAL_APPDATA/magent` on Windows, `~/.config/magent` or an
+  exported `$XDG_CONFIG_HOME/magent` on Linux, `~/Library/Application
+  Support/magent` on macOS), so an import-bound Path under any of them is
+  not flagged.
 
 ## 4. Change guide
 

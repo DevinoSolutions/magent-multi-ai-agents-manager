@@ -1,7 +1,12 @@
+import json
+import re
+import sys
+import tracemalloc
 from pathlib import Path
 
 import pytest
 
+from magent import config as config_module
 from magent.config import SCHEMA_VERSION, ConfigError, MagentConfig, load_config
 from magent.init_config import generate_config, scan_for_projects
 
@@ -104,6 +109,20 @@ class TestLoadConfig:
         p.write_text("not json{{{")
         with pytest.raises(ValueError, match="valid JSON"):
             load_config(str(p))
+
+    def test_nesting_deeper_than_json_can_read_is_refused_in_our_words(self, tmp_path):
+        # Past json.loads' own ceiling (~1,000 levels on 3.10/3.11, ~3,000 on
+        # 3.12/3.13, the C stack on 3.14) it raises RecursionError, which used
+        # to reach the user as a traceback.
+        p = tmp_path / "deep.json"
+        p.write_text(
+            '{"projects": ' + "[" * 1_000_000 + "]" * 1_000_000 + "}",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(str(p))
+        assert str(exc.value) == "Config is nested too deeply to read"
+        assert isinstance(exc.value.__cause__, RecursionError)
 
     def test_file_not_found_raises(self):
         with pytest.raises(FileNotFoundError):
@@ -253,6 +272,254 @@ class TestDeterministicColors:
         cfg = load_config(path)
         assert cfg.version == SCHEMA_VERSION
         assert capsys.readouterr().err == ""
+
+
+# A lone UTF-16 surrogate. JSON can spell one ("\ud83d") and json.loads hands it
+# back as-is, but no console, pipe, window title or argv can encode it.
+_LONE = "api\ud83d"
+_C = "#22c55e"  # an explicit color, so nothing at load ever hashes the text
+
+
+def _refusal(where: str, shown: str = "'api\\ud83d'") -> str:
+    """The exact refusal: our words, the field, the class, the value ESCAPED."""
+    return f"{where} has text with no UTF-8 form (UnicodeEncodeError): {shown}"
+
+
+def _one(**fields: object) -> dict[str, object]:
+    return {
+        "version": SCHEMA_VERSION,
+        "projects": [{"path": "api", "color": _C, **fields}],
+    }
+
+
+def _deep_config(
+    tmp_path: Path, leaf: str, *, siblings: bool = False
+) -> tuple[str, str]:
+    """A config whose unknown ``projects[0].note`` holds ``leaf`` (JSON text)
+    under more containers than the recursion limit, alternating list and
+    object; and the where-label that reaches the leaf. With ``siblings``, each
+    of those containers also holds something AFTER the way down. Built as text
+    because json.dumps recurses and cannot write it."""
+    pairs = sys.getrecursionlimit() // 2 + 100
+    close = ', "m": 1}, 1]' if siblings else "}]"
+    note = '[{"n": ' * pairs + leaf + close * pairs
+    text = (
+        f'{{"version": {SCHEMA_VERSION}, "projects":'
+        f' [{{"path": "api", "color": "{_C}", "note": {note}}}]}}'
+    )
+    try:
+        json.loads(text)
+    except RecursionError:
+        # 3.10/3.11 count json's own nesting against the same limit, so a file
+        # this deep never loaded there and never reaches the walk. On 3.12+ it
+        # must load: a skip there would hide the very walk these pins prove.
+        if sys.version_info >= (3, 12):
+            raise
+        pytest.skip("json.loads refuses this depth itself on this Python")
+    cfg_file = tmp_path / "magent.config.json"
+    cfg_file.write_text(text, encoding="utf-8")
+    return str(cfg_file), "projects[0].note" + "[0].n" * pairs
+
+
+# Every string config.py reads -- each becomes a path, a session name, a window
+# title, an argv or a listing row -- plus the keys and values it only warns about.
+_EVERY_STRING: list[tuple[str, dict[str, object]]] = [
+    ("baseDir", {**_one(), "baseDir": _LONE}),
+    ("settings.defaultTool", {**_one(), "settings": {"defaultTool": _LONE}}),
+    ("settings.ssh.shell", {**_one(), "settings": {"ssh": {"shell": _LONE}}}),
+    ("settings.tools.probe", {**_one(), "settings": {"tools": {"probe": _LONE}}}),
+    # The path is escape text too: a valid accented key on the way is shown so.
+    ("settings.tools.caf\\xe9", {**_one(), "settings": {"tools": {"café": _LONE}}}),
+    ("a key in settings.tools", {**_one(), "settings": {"tools": {_LONE: "x"}}}),
+    ("projects[0].path", _one(path=_LONE, title="t")),
+    ("projects[0].group", _one(group=_LONE)),
+    ("projects[0].color", _one(color=_LONE)),
+    ("projects[0].tool", _one(tool=_LONE)),
+    ("projects[0].title", _one(title=_LONE)),
+    ("projects[0].host", _one(host=_LONE)),
+    ("projects[0].remotePath", _one(remotePath=_LONE)),
+    ("projects[0].windows[0]", _one(windows=[_LONE])),
+    ("projects[0].windows[0].name", _one(windows=[{"name": _LONE}])),
+    ("projects[0].windows[0].tool", _one(windows=[{"tool": _LONE}])),
+    ("projects[0].windows[0].command", _one(windows=[{"command": _LONE}])),
+    # An unknown key's NAME is echoed in a warning, so it counts too.
+    ("a key in the config", {**_one(), _LONE: 1}),
+    ("a key in projects[0]", {"projects": [{"path": "api", _LONE: 1}]}),
+    ("projects[0].note", _one(note=_LONE)),
+    # No known field nests a list directly in a list; an unknown value can.
+    ("junk[0][0]", {**_one(), "junk": [[_LONE]]}),
+]
+
+
+class TestTextWithNoUtf8FormIsRefusedAtLoad:
+    """F-SUR-1: a config string with no UTF-8 form is refused ONCE, at load, in
+    our words. Before, a title like ``"api\\ud83d"`` loaded fine whenever it had
+    a color and then crashed ``--go`` at its first listing row, on every Windows
+    stdout (cp1252 pipe, UTF-8 pipe, a real console); without a color the
+    tab-color hash hit it first and the user read the codec's own message."""
+
+    def test_a_title_is_refused_in_our_words(self, tmp_config):
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "projects": [
+                    {"path": "plain", "title": "plain", "color": "#3b82f6"},
+                    {"path": "api", "title": _LONE, "color": _C},
+                ],
+            }
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value) == _refusal("projects[1].title")
+        # The codec's own message stays off the screen but not out of reach:
+        # it is the refusal's cause, for a traceback or a log.
+        assert isinstance(exc.value.__cause__, UnicodeEncodeError)
+
+    def test_the_refusal_comes_before_the_tab_color_hash(self, tmp_config):
+        # No color: `_derive_tab_color` encodes the title, and used to be the
+        # place that found it ("'utf-8' codec can't encode character ...").
+        path = tmp_config(
+            {"version": SCHEMA_VERSION, "projects": [{"path": "api", "title": _LONE}]}
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value) == _refusal("projects[0].title")
+
+    @pytest.mark.parametrize(
+        ("where", "config"), _EVERY_STRING, ids=[w for w, _ in _EVERY_STRING]
+    )
+    def test_every_string_in_the_document_is_covered(
+        self, capsys, tmp_config, where, config
+    ):
+        with pytest.raises(ConfigError) as exc:
+            load_config(tmp_config(config))
+        assert str(exc.value) == _refusal(where)
+        # Nothing is echoed first: an unknown-key warning carrying the text
+        # would hit a strict console stream and put the codec's words back.
+        assert capsys.readouterr().err == ""
+
+    def test_the_refusal_is_ascii_and_never_the_codecs_words(self, tmp_config):
+        # The refusal must print on the very streams the raw text crashed, so
+        # the whole value is escape text -- valid accents included -- and the
+        # codec's own message ("... in position 7: surrogates not allowed")
+        # stays off the screen.
+        path = tmp_config(_one(title="café " + _LONE))
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        text = str(exc.value)
+        assert text == _refusal("projects[0].title", "'caf\\xe9 api\\ud83d'")
+        assert text.isascii()
+        for codec_words in ("codec", "surrogates not allowed", "position"):
+            assert codec_words not in text
+
+    @pytest.mark.parametrize(
+        "ensure_ascii", [True, False], ids=["escaped", "raw-utf-8"]
+    )
+    def test_valid_non_ascii_text_still_loads(self, tmp_path, ensure_ascii):
+        # Real emoji (a surrogate PAIR once JSON-escaped, which json.loads
+        # joins), accents and CJK all have a UTF-8 form: they load unchanged,
+        # and a colorless one still gets its hashed color.
+        title = "api \U0001f680"
+        path = "café"
+        command = "claude --continue # 日本"
+        cfg_file = tmp_path / "magent.config.json"
+        cfg_file.write_text(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [
+                        {
+                            "path": path,
+                            "title": title,
+                            "windows": [{"command": command}],
+                        }
+                    ],
+                },
+                ensure_ascii=ensure_ascii,
+            ),
+            encoding="utf-8",
+        )
+        proj = load_config(str(cfg_file)).projects[0]
+        assert proj.windows is not None
+        assert (proj.title, proj.path, proj.windows[0].command) == (
+            title,
+            path,
+            command,
+        )
+        assert proj.color is not None
+
+    def test_nesting_deeper_than_the_recursion_limit_still_loads(
+        self, capsys, tmp_path
+    ):
+        # json.loads accepts it (3.12+), and it always loaded with the unknown
+        # key's warning; a walk that recursed turned it into a traceback.
+        path, _ = _deep_config(tmp_path, '"ok"')
+        assert load_config(path).projects[0].path == "api"
+        assert capsys.readouterr().err == (
+            "Warning: unknown config key: projects[0].note\n"
+        )
+
+    @pytest.mark.parametrize(
+        "siblings",
+        [False, True],
+        ids=["a-bare-chain", "a-later-sibling-at-every-level"],
+    )
+    def test_a_lone_surrogate_at_that_depth_is_refused_with_its_path(
+        self, tmp_path, siblings
+    ):
+        path, where = _deep_config(tmp_path, '"api\\ud83d"', siblings=siblings)
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value) == _refusal(where)
+
+    def test_a_later_sibling_at_every_level_costs_memory_linear_in_the_depth(self):
+        from magent.config import _refuse_text_with_no_utf8_form
+
+        # Each level's later sibling waits on the walk's stack while it goes
+        # down. With a spelled-out label apiece those waiting labels summed to
+        # the depth squared: 31 MB here, 450 MB for a 155 KB file. Built in
+        # Python and walked directly, so no json ceiling caps the depth on any
+        # version and the parse is not what gets measured.
+        note: object = "ok"
+        for _ in range(2000):
+            note = [{"n": note, "m": 1}, 1]
+        document: dict[str, object] = {"projects": [{"path": "api", "note": note}]}
+        tracemalloc.start()
+        try:
+            base = tracemalloc.get_traced_memory()[0]
+            tracemalloc.reset_peak()
+            _refuse_text_with_no_utf8_form(document)
+            peak = tracemalloc.get_traced_memory()[1] - base
+        finally:
+            tracemalloc.stop()
+        # A bound, not a measurement: ~1 MB on 3.10-3.14 when only the refused
+        # string's label is ever spelled out.
+        assert peak < 4_000_000
+
+    @pytest.mark.parametrize(
+        ("where", "config"),
+        [
+            ("a key in the config", {_LONE: _LONE, **_one(), "baseDir": _LONE}),
+            (
+                "projects[0].title",
+                {"projects": [{"path": "a", "title": _LONE}, {"path": _LONE}]},
+            ),
+            # Deeper but earlier beats shallower but later: depth-first, not
+            # breadth-first, is "first in the file".
+            ("projects[0].title", {**_one(title=_LONE), "baseDir": _LONE}),
+        ],
+        ids=[
+            "a-key-before-its-value",
+            "an-earlier-list-item",
+            "a-deeper-earlier-string",
+        ],
+    )
+    def test_the_first_offending_string_in_the_file_is_the_one_named(
+        self, tmp_config, where, config
+    ):
+        with pytest.raises(ConfigError) as exc:
+            load_config(tmp_config(config))
+        assert str(exc.value) == _refusal(where)
 
 
 class TestAttentionSettings:
@@ -429,3 +696,44 @@ class TestGenerateConfig:
         assert len(config["projects"]) == 2
         assert config["layout"]["columns"] == 2
         assert config["settings"]["defaultTool"] == "claude"
+
+
+class TestTheOneNodeSkipPredicate:
+    """DECISION-15/22: cloud projects are LOCAL panes, so "runs on a node"
+    is never a bare truthiness test on ``node``."""
+
+    @pytest.mark.parametrize(
+        ("node", "cloud", "on_node"),
+        [
+            (None, False, False),
+            ("cloud", True, False),
+            ("second", False, True),
+            ("auto", False, True),
+        ],
+    )
+    def test_is_cloud_and_runs_on_node(self, node, cloud, on_node):
+        from magent.config import ProjectConfig, is_cloud, runs_on_node
+
+        proj = ProjectConfig(path="C:/a/api", node=node)
+        assert (is_cloud(proj), runs_on_node(proj)) == (cloud, on_node)
+
+
+class TestNobodyHandRollsTheNodePredicate:
+    """DECISION-15 / 26 ix: typed config asks ``runs_on_node`` / ``is_cloud``,
+    and only config.py spells the comparison. The raw-dict form
+    ``p.get("node") not in (None, "cloud")`` (DECISION-22) does not match."""
+
+    HAND_ROLLED = re.compile(
+        r"""\.node\s*(?:!=|==)\s*(?:NODE_CLOUD|["']cloud["'])|\.node\s+(?:not\s+)?in\s*\(\s*None"""
+    )
+
+    def test_only_config_py_compares_a_node_to_cloud(self):
+        src = Path(config_module.__file__).parent
+        offenders = [
+            f"{path.relative_to(src)}:{n}"
+            for path in sorted(src.rglob("*.py"))
+            if path != src / "config.py"
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if self.HAND_ROLLED.search(line)
+        ]
+        assert offenders == []

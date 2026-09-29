@@ -27,6 +27,7 @@ from pydantic import (
     ValidationError,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings
 
 # magent's own dotenv file — module attribute (not baked into model_config)
@@ -48,7 +49,14 @@ class MagentEnv(BaseSettings):
     correct there, because that file belongs to magent alone.
     """
 
-    model_config = {"env_prefix": "MAGENT_", "extra": "forbid"}
+    # utf-8-sig: Notepad and PowerShell's utf8BOM write a byte-order mark, and
+    # read as plain utf-8 it became part of the first key -- a valid setting
+    # refused as an unknown variable. A file without the mark reads the same.
+    model_config = {
+        "env_prefix": "MAGENT_",
+        "extra": "forbid",
+        "env_file_encoding": "utf-8-sig",
+    }
 
     sentry_dsn: HttpUrl | None = None
     ntfy_topic: HttpUrl | None = None
@@ -132,6 +140,15 @@ class MagentEnv(BaseSettings):
     # 42 agents alive in Session 0, unkillable from the desktop and holding
     # every session name the user's own bring-up wanted.
     session0_policy: Literal["handoff", "allow", "refuse"] = "handoff"
+    # Should `magent serve` keep the node sync daemon (a detached
+    # `magent node sync`) alive? (default: 1 / on.) The daemon pulls every node session's
+    # transcripts and agent state home each settings.nodeSync.pullIntervalS,
+    # which is what makes a session on a pool machine durable and resumable
+    # anywhere; it is only ever started when some project has `node` set. Set
+    # to 0 to run the daemon yourself. Like hotkey_supervisor, upload_supervisor
+    # and psmux_boost, 0 is also a TEST-ISOLATION law: a test that starts a real
+    # serve would otherwise start a daemon that dials real machines over ssh.
+    node_sync: bool = True
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:
@@ -156,8 +173,57 @@ def get_env() -> MagentEnv:
     """Return the validated env singleton (instantiated on first call)."""
     global _cached_env  # noqa: PLW0603  # reason: module-level cache singleton pattern
     if _cached_env is None:
-        _cached_env = MagentEnv(_env_file=ENV_FILE)
+        try:
+            _cached_env = MagentEnv(_env_file=ENV_FILE)
+        except UnicodeDecodeError as exc:
+            problem = f"is not valid UTF-8 ({type(exc).__name__}); re-save it as UTF-8"
+        except OSError as exc:
+            problem = (
+                f"could not be read ({type(exc).__name__}); close any program "
+                "holding it open and check you can read it"
+            )
+        else:
+            return _cached_env
+        # Raised here, past the except blocks, and from None: a decode error
+        # carries the whole file in ``.object`` and its frames hold it as
+        # locals, so chaining it -- or raising while it is still being handled,
+        # which chains it as __context__ -- would hand every secret in the file
+        # to Sentry's exception serializer.
+        raise _env_file_unusable(problem) from None
     return _cached_env
+
+
+def _env_file_unusable(problem: str) -> ValidationError:
+    """ENV_FILE could not be used, as a ValidationError naming the file.
+
+    The dotenv read raises UnicodeDecodeError for a file that is not UTF-8 and
+    an OSError (PermissionError) for one it cannot read. Neither is a
+    ValidationError, so each walked straight past every caller and killed the
+    command with a traceback. Both ARE an invalid environment, and every
+    get_env() caller already handles ValidationError: the CLI refuses in one
+    line, doctor FAILs its env check, and the daemons' readers fall back to
+    their defaults. A new exception type would be a new traceback at each
+    caller that missed it. (A directory never gets here: pydantic-settings
+    reads the file only when it ``is_file()``.)
+
+    Our words and the exception's class only -- never the offending bytes or
+    the decode position, which is why this takes the words and not the
+    exception. The empty ``loc`` makes ``validation_error_items`` show the
+    message as-is, and the one ``{message}`` key keeps a brace in the path
+    literal.
+    """
+    message = f"{ENV_FILE} {problem}"
+    return ValidationError.from_exception_data(
+        MagentEnv.__name__,
+        [
+            {
+                "type": PydanticCustomError(
+                    "env_file_unusable", "{message}", {"message": message}
+                ),
+                "input": str(ENV_FILE),
+            }
+        ],
+    )
 
 
 def validation_error_items(exc: ValidationError) -> list[tuple[str, str]]:
@@ -203,6 +269,17 @@ def localappdata_dir() -> Path:
 
 def editor_command() -> str:
     return os.environ.get("EDITOR", "xdg-open")
+
+
+def local_username() -> str:
+    """The login name of the user running magent: USERNAME on Windows, USER on
+    POSIX, "" when neither is set.
+
+    Host-infrastructure, like ``is_ssh_login``: the OS sets it, nobody
+    configures it. A node's ``user`` falls back to it at use time
+    (``nodes.resolve``) and it is never written back into the config.
+    """
+    return os.environ.get("USERNAME") or os.environ.get("USER") or ""
 
 
 # The variables OpenSSH exports into every login it serves. SSH_CONNECTION and
@@ -446,6 +523,50 @@ def attach_client_env() -> dict[str, str] | None:
         key: value
         for key, value in os.environ.items()
         if key.upper() not in _PRESENTATION_VARS
+    }
+
+
+# Git's repo-LOCATING variables: exactly what `git rev-parse --local-env-vars`
+# prints (git 2.52; pinned against the installed git by test_env_schema.py).
+# A git hook exports GIT_DIR -- an ABSOLUTE path inside a worktree -- and every
+# git child of that hook inherits it. A local read aimed by ``-C <path>`` must
+# not be silently answered by the repo the hook was fired in instead.
+GIT_LOCAL_ENV_VARS = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+)
+
+
+def git_child_env() -> dict[str, str]:
+    """The process environment minus ``GIT_LOCAL_ENV_VARS``: THE seam for a
+    local git child that names its repo with ``-C``.
+
+    The incident this closes: magent's launch path (and its test suite, via
+    the husky pre-push gate) can run inside a git hook or an agent's tool
+    shell. With the hook's GIT_DIR inherited, ``git -C <project> status``
+    reads the HOOK's repo, and a test fixture's ``git init --bare`` rewrote a
+    real repo's shared config to ``core.bare=true``. Everything else --
+    PATH, HOME, GIT_CEILING_DIRECTORIES, the user's config -- survives: those
+    bound or configure a search, they do not aim one. (GIT_CONFIG_KEY_<n> /
+    GIT_CONFIG_VALUE_<n> are inert once GIT_CONFIG_COUNT is gone.) Matched on
+    the upper-cased name, as Windows env keys are case-insensitive."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in GIT_LOCAL_ENV_VARS
     }
 
 

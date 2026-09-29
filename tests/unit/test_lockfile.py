@@ -2,17 +2,113 @@
 
 from __future__ import annotations
 
+import contextlib
+import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from magent.lockfile import LockHeld, exclusive_lock
+from magent import lockfile
+from magent.lockfile import LockHeld, exclusive_lock, lock_path, persistent_lock
+
+_real_open = open
 
 
 @pytest.fixture(autouse=True)
 def _isolate_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+
+class _Handle:
+    """A real lock-file handle that can run one scripted step right after it
+    is closed -- the instant its holder's lock is let go -- and one right
+    before its lock call."""
+
+    def __init__(self, fh):
+        self._fh = fh
+        self.after_close = None
+        self.before_lock = None
+
+    @property
+    def closed(self):
+        return self._fh.closed
+
+    def fileno(self):
+        return self._fh.fileno()
+
+    def close(self):
+        self._fh.close()
+        step, self.after_close = self.after_close, None
+        if step is not None:
+            step()
+
+
+class _Opens:
+    """Stands in for ``open`` inside ``lockfile``. Every lock file is the real
+    one; ``after[n]`` runs right after the n-th open (from 0) returns and
+    ``before_lock[n]`` right before that handle's lock call, so another
+    taker's move lands at an exact point of an acquire -- no timing."""
+
+    def __init__(self):
+        self.handles = []
+        self.after = {}
+        self.before_lock = {}
+
+    def __call__(self, *args, **kwargs):
+        handle = _Handle(_real_open(*args, **kwargs))
+        self.handles.append(handle)
+        handle.before_lock = self.before_lock.pop(len(self.handles) - 1, None)
+        step = self.after.pop(len(self.handles) - 1, None)
+        if step is not None:
+            step()
+        return handle
+
+    def locking(self, fd):
+        for handle in self.still_open():
+            if handle.before_lock is not None and handle.fileno() == fd:
+                step, handle.before_lock = handle.before_lock, None
+                step()
+
+    def still_open(self):
+        return [h for h in self.handles if not h.closed]
+
+
+@pytest.fixture
+def opens(monkeypatch):
+    seam = _Opens()
+    monkeypatch.setattr(lockfile, "open", seam, raising=False)
+    if sys.platform == "win32":
+        import msvcrt
+
+        real_locking = msvcrt.locking
+
+        def locking(fd, mode, nbytes):
+            seam.locking(fd)
+            return real_locking(fd, mode, nbytes)
+
+        monkeypatch.setattr(msvcrt, "locking", locking)
+    else:
+        import fcntl
+
+        real_flock = fcntl.flock
+
+        def flock(f, operation):
+            seam.locking(f if isinstance(f, int) else f.fileno())
+            return real_flock(f, operation)
+
+        monkeypatch.setattr(fcntl, "flock", flock)
+    return seam
+
+
+def _enter(stack, name):
+    """Take lock ``name`` into ``stack``: True when taken, False on LockHeld."""
+    try:
+        stack.enter_context(exclusive_lock(name))
+    except LockHeld:
+        return False
+    return True
 
 
 class TestExclusiveLock:
@@ -79,3 +175,175 @@ class TestExclusiveLock:
         monkeypatch.setattr(Path, "home", staticmethod(lambda: nested))
         with exclusive_lock("test"):
             assert (nested / ".magent" / "test.lock").exists()
+
+    def test_a_failed_acquire_leaves_the_holders_lock_in_place(self):
+        """A contender that lost must not delete the file. On POSIX the holder's
+        flock lives on that inode: once the path is gone a THIRD contender
+        creates a fresh file, locks it, and runs beside the holder -- two
+        daemons."""
+        lock_file = Path.home() / ".magent" / "test.lock"
+        with exclusive_lock("test"):
+            with pytest.raises(LockHeld), exclusive_lock("test"):
+                pass
+            assert lock_file.exists()
+            with pytest.raises(LockHeld), exclusive_lock("test"):
+                pass
+
+
+class TestExclusiveLockAcrossARelease:
+    """A taker that meets the holder mid-release. The file is deleted on
+    release, so on POSIX a lock can land on a file no path names any more;
+    taking that as the lock let a third taker create a fresh file and run
+    beside it -- two daemons. Every step is placed by the ``opens`` seam."""
+
+    def test_a_contender_that_opened_before_the_holder_let_go_is_the_only_holder(
+        self, opens
+    ):
+        with (
+            contextlib.ExitStack() as holder,
+            contextlib.ExitStack() as contender,
+            contextlib.ExitStack() as third,
+        ):
+            assert _enter(holder, "race")
+            opens.after[1] = holder.close  # the contender has opened: holder leaves
+            assert _enter(contender, "race"), "nobody held it once the holder left"
+            assert not _enter(third, "race"), "a third taker got in beside it"
+            # Only the holder keeps a handle: every other attempt closed its own.
+            assert len(opens.still_open()) == 1
+
+    def test_a_holder_that_lets_go_while_the_contender_locks_leaves_one_holder(
+        self, opens
+    ):
+        """The path is asked about only AFTER the lock is taken: asked before,
+        it still named the holder's file, which the holder then deleted."""
+        with (
+            contextlib.ExitStack() as holder,
+            contextlib.ExitStack() as contender,
+            contextlib.ExitStack() as third,
+        ):
+            assert _enter(holder, "race")
+            opens.before_lock[1] = holder.close
+            assert _enter(contender, "race"), "nobody held it once the holder left"
+            assert not _enter(third, "race"), "a third taker got in beside it"
+            assert len(opens.still_open()) == 1
+
+    def test_a_contender_that_opened_before_the_holder_let_go_defers_to_a_new_holder(
+        self, opens
+    ):
+        took = []
+        with (
+            contextlib.ExitStack() as holder,
+            contextlib.ExitStack() as contender,
+            contextlib.ExitStack() as third,
+            contextlib.ExitStack() as fourth,
+        ):
+            assert _enter(holder, "race")
+
+            def holder_leaves_and_a_third_takes_it():
+                holder.close()
+                took.append(_enter(third, "race"))
+
+            opens.after[1] = holder_leaves_and_a_third_takes_it
+            assert not _enter(contender, "race"), "the contender got in beside it"
+            assert took == [True]
+            # The contender left the third taker's file where it was.
+            assert lock_path("race").exists()
+            assert not _enter(fourth, "race")
+            # Only the third taker keeps a handle; every refused attempt closed.
+            assert opens.still_open() == [opens.handles[2]]
+
+    def test_a_contender_that_took_it_the_instant_the_holder_let_go_is_the_only_holder(
+        self, opens
+    ):
+        """Had the holder deleted the file only AFTER letting go, this
+        contender's check would pass on a file the delete then strands."""
+        took = []
+        with (
+            contextlib.ExitStack() as holder,
+            contextlib.ExitStack() as contender,
+            contextlib.ExitStack() as third,
+        ):
+            assert _enter(holder, "race")
+            opens.handles[0].after_close = lambda: took.append(
+                _enter(contender, "race")
+            )
+            holder.close()
+            assert took == [True], "nobody held it once the holder let go"
+            assert not _enter(third, "race"), "a third taker got in beside it"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="an open file cannot be deleted on Windows: no lock lands on a nameless file",
+    )
+    def test_a_lock_let_go_under_every_attempt_is_refused_after_three(self, opens):
+        """Each attempt's file is deleted between its open and its lock: a
+        holder leaving every time. Three attempts, then LockHeld -- never a
+        spin, never a lock on a file no path names."""
+        path = lock_path("race")
+        for n in range(10):
+            opens.after[n] = path.unlink
+        with contextlib.ExitStack() as taker:
+            assert not _enter(taker, "race")
+        assert len(opens.handles) == 3
+        assert opens.still_open() == []
+        assert not path.exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX order")
+    def test_on_posix_the_holder_deletes_the_file_before_it_lets_go(self, opens):
+        path = lock_path("race")
+        seen = []
+        with contextlib.ExitStack() as holder:
+            assert _enter(holder, "race")
+            opens.handles[0].after_close = lambda: seen.append(path.exists())
+        assert seen == [False]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="the Windows order")
+    def test_on_windows_the_holder_still_lets_go_before_it_deletes(self, opens):
+        """Unchanged on Windows: an open file cannot be deleted there, so the
+        holder lets go first, deletes after, and the file is gone once out."""
+        path = lock_path("race")
+        seen = []
+        with contextlib.ExitStack() as holder:
+            assert _enter(holder, "race")
+            opens.handles[0].after_close = lambda: seen.append(path.exists())
+        assert seen == [True]
+        assert not path.exists()
+
+
+class TestPersistentLock:
+    """The waiting lock: bounded by ``wait_s``, and its file is never deleted."""
+
+    def test_the_file_outlives_the_holder(self):
+        with persistent_lock("test", wait_s=1):
+            assert lock_path("test").exists()
+        assert lock_path("test").exists()
+        assert lock_path("test") == Path.home() / ".magent" / "test.lock"
+
+    def test_a_contender_gives_up_after_its_wait_with_lock_held(self):
+        with persistent_lock("test", wait_s=1):
+            with pytest.raises(LockHeld), persistent_lock("test", wait_s=0.1):
+                pass
+            assert lock_path("test").exists()
+
+    def test_a_contender_gets_the_lock_once_the_holder_lets_go(self):
+        order: list[str] = []
+        held = threading.Event()
+
+        def holder():
+            with persistent_lock("test", wait_s=1):
+                order.append("holder in")
+                held.set()
+                time.sleep(0.2)
+                order.append("holder out")
+
+        t = threading.Thread(target=holder)
+        t.start()
+        assert held.wait(timeout=5)
+        with persistent_lock("test", wait_s=5):
+            order.append("waiter in")
+        t.join(timeout=5)
+        assert order == ["holder in", "holder out", "waiter in"]
+
+    def test_it_never_conflicts_with_a_different_name(self):
+        with persistent_lock("alpha", wait_s=0), persistent_lock("beta", wait_s=0):
+            pass

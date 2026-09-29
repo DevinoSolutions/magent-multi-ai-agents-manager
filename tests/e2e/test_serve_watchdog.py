@@ -30,8 +30,10 @@ config is a tmp file passed with --config; the port comes from a bind-0 lease,
 never a well-known one. MAGENT_HOTKEY_SUPERVISOR=0 because the Alt+V listener
 installs a SYSTEM-WIDE keyboard hook that no HOME redirect contains -- and
 proving that the REVIVED server inherited that opt-out is itself an assertion
-here, since the daemon spawns it. Teardown kills only pids this test created,
-found through the redirected home's pid files.
+here, since the daemon spawns it. Teardown kills only processes this test
+created: the pids in the redirected home's pid files, then every process whose
+argv carries this test's uuid-named config path -- the net that still holds
+when `attention -d` exits nonzero and no pid was ever learned.
 
 Every wait is bounded and the whole test is clamped by a single wall-clock
 budget: a blocked wait does not fail a test, it burns the job's
@@ -41,11 +43,9 @@ budget: a blocked wait does not fail a test, it burns the job's
 
 from __future__ import annotations
 
-import contextlib
 import http.client
 import json
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -56,6 +56,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 from magent.procs import pid_alive
+from tests.e2e._procs import kill_everything_carrying
+from tests.e2e._procs import kill_pid as _kill_pid
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -141,32 +143,6 @@ def _read_pid(path: Path) -> int | None:
         return None
 
 
-def _kill_pid(pid: int | None) -> None:
-    """Kill exactly one pid (its tree, on Windows) and tolerate it already being
-    gone. Never raises. Only ever called with a pid this test created."""
-    if not pid:
-        return
-    if sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            check=False,
-        )
-        return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return
-    for _ in range(30):
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return
-        time.sleep(0.1)
-    with contextlib.suppress(OSError):
-        os.kill(pid, signal.SIGKILL)
-
-
 def _install_psmux_shim(shim_dir: Path) -> str:
     """A REAL executable named ``psmux`` that does nothing, on a dir of its own.
 
@@ -200,7 +176,9 @@ class _World:
         self.proj.mkdir()
         shim_path = _install_psmux_shim(tmp_path / "shim")
         self.port = _free_port()
-        self.cfg = tmp_path / "magent.config.json"
+        # The uuid in the NAME is load-bearing: this path is in the argv of
+        # every process the test causes, so teardown can find them by it.
+        self.cfg = tmp_path / f"magent-{self.unique}.config.json"
         self.cfg.write_text(
             json.dumps(
                 {
@@ -263,6 +241,7 @@ class _World:
         # no HOME redirect contains: a test-spawned serve/daemon must never
         # re-prioritise the developer's real psmux fleet.
         env["MAGENT_PSMUX_BOOST"] = "0"
+        env["MAGENT_NODE_SYNC"] = "0"
         # ...and the Session-0 hand-off must never fire from a test: a runner
         # (or an ssh-driven leg) is legitimately non-interactive, and the
         # default policy would create a REAL scheduled task on somebody's
@@ -282,25 +261,40 @@ class _World:
     def diagnostics(self) -> str:
         """Everything the redirected home knows, for a failure message."""
         lines = [f"port={self.port} home={self.home}"]
-        for name in ("att-d.err",):
+        for name in ("att-d.out", "att-d.err"):
             path = self.workdir / name
             if path.is_file():
                 lines.append(f"--- {name} ---\n{path.read_text(errors='replace')}")
-        log = self.md / "logs" / "attention.log"
-        if log.is_file():
-            lines.append(f"--- attention.log ---\n{log.read_text(errors='replace')}")
+        # upload.log carries each serve's "listening ... pid N" line: the only
+        # place two servers answering one port show up as two pids.
+        for name in ("attention.log", "upload.log"):
+            log = self.md / "logs" / name
+            if log.is_file():
+                lines.append(f"--- {name} ---\n{log.read_text(errors='replace')}")
         return "\n".join(lines)
+
+    def spawns(self) -> int:
+        """How many serves the watchdog has logged starting so far."""
+        log = self.md / "logs" / "attention.log"
+        if not log.is_file():
+            return 0
+        return log.read_text(errors="replace").count("starting a new magent serve")
 
 
 def _start_attention(w: _World, budget: _Budget) -> int:
     """Spawn the detached ``attention -d --interval 1``; return its pid.
 
-    stdout -> DEVNULL so the detached grandchild can't SIGPIPE on a closed
-    pipe; stderr -> a file, because a launcher that refuses to start is the
-    first thing anyone debugging this test needs to read.
+    stdout and stderr -> files, never pipes, so the detached grandchild can't
+    SIGPIPE on a closed one. Both are kept because the launcher's verdict
+    ("attention daemon failed to start") goes to STDOUT: with stdout on
+    DEVNULL a failed launch showed only an incidental stderr warning.
     """
+    out_path = w.workdir / "att-d.out"
     err_path = w.workdir / "att-d.err"
-    with err_path.open("w", encoding="utf-8") as err:
+    with (
+        out_path.open("w", encoding="utf-8") as out,
+        err_path.open("w", encoding="utf-8") as err,
+    ):
         launcher = subprocess.run(
             [
                 sys.executable,
@@ -313,7 +307,7 @@ def _start_attention(w: _World, budget: _Budget) -> int:
                 "--interval",
                 "1",
             ],
-            stdout=subprocess.DEVNULL,
+            stdout=out,
             stderr=err,
             env=w.env,
             timeout=budget.allow(_DAEMON_UP_S),
@@ -377,6 +371,7 @@ class TestAttentionDaemonSupervisesTheUploadServer:
             # the supervisor is allowed to be faster than this test can look,
             # and demanding an observable gap would be asserting that the
             # repair is SLOW. What matters is the identity of who answers next.
+            spawned_before_kill = w.spawns()
             _kill_pid(first)
 
             # A DIFFERENT server takes its place.
@@ -385,16 +380,25 @@ class TestAttentionDaemonSupervisesTheUploadServer:
             assert second != first
             assert pid_alive(second)
             assert _health_ok(w.port)
+            # ...and it is a REVIVE, not a duplicate spawned beside a slow first
+            # serve before the kill. Without this, a run where the watchdog
+            # doubled the startup passed for the wrong reason (the survivor
+            # looked like the replacement) and the mirror-image run failed.
+            assert w.spawns() > spawned_before_kill, (
+                f"server {second} answered but the watchdog logged no respawn "
+                f"after the kill:\n{w.diagnostics()}"
+            )
         finally:
             # Only pids this test created: the daemon, plus every server it was
             # observed to spawn (including one that may have appeared after the
             # last assertion).
-            _kill_pid(daemon_pid)
+            _kill_pid(daemon_pid or _read_pid(w.daemon_pidfile))
             late = _read_pid(w.server_pidfile)
             if late is not None and late not in seen_servers:
                 seen_servers.append(late)
             for pid in seen_servers:
                 _kill_pid(pid)
+            kill_everything_carrying(str(w.cfg))
 
     def test_the_opt_out_leaves_the_server_dead(self, tmp_path):
         """MAGENT_UPLOAD_SUPERVISOR=0 is a promise, not a preference: a user who
@@ -414,5 +418,6 @@ class TestAttentionDaemonSupervisesTheUploadServer:
             assert not _health_ok(w.port), "an opted-out daemon started a server"
             assert not w.server_pidfile.exists()
         finally:
-            _kill_pid(daemon_pid)
+            _kill_pid(daemon_pid or _read_pid(w.daemon_pidfile))
             _kill_pid(_read_pid(w.server_pidfile))
+            kill_everything_carrying(str(w.cfg))
