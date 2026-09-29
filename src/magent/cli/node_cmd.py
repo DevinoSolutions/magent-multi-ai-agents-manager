@@ -66,7 +66,7 @@ def _stop_node_sync() -> tuple[NodeSyncStop, str]:
             return "stopped", ""
         if node_sync.daemon_running():
             # False is also "a daemon holds the lock and outlived the stop"
-            # (pid unknown, kill refused, or not dead within the settle).
+            # (no pid within the settle, kill refused, or not dead within it).
             return "stuck", ""
     except OSError as exc:
         log.get_logger(node_sync.LOG_NAME).warning(

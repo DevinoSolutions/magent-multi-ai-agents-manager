@@ -164,18 +164,26 @@ def stop_daemon(
 ) -> bool:
     """Stop the node sync daemon. True when no daemon is left running and
     there was something to stop or clear; False when there was nothing at all,
-    or when the kill did not land within ``STOP_SETTLE_S``.
+    when no pid appeared within ``STOP_SETTLE_S``, or when the kill did not
+    land within another ``STOP_SETTLE_S``.
 
     Only a daemon that holds the lock is killed (``daemon_running``). With the
     lock free there is no daemon, whatever the pid file says -- its number may
     belong to a stranger by now -- so the leftovers are cleared and nothing is
-    killed. A forced kill skips the daemon's own cleanup, so this owns the
+    killed. The daemon writes its pid just after taking the lock
+    (``run_sync_loop``): one caught in between is waited for, never called
+    stuck. A forced kill skips the daemon's own cleanup, so this owns the
     heartbeat removal that tells 'off' from 'crashed'."""
     if not daemon_running():
         had_pid = _PID_PATH.exists()
         _clear_leftovers()
         return had_pid
     pid = daemon_pid()
+    if pid is None:
+        deadline = now() + STOP_SETTLE_S
+        while pid is None and now() < deadline:
+            sleep(STOP_POLL_S)
+            pid = daemon_pid()
     if not pid or not _kill(pid):
         return False
     deadline = now() + STOP_SETTLE_S
@@ -253,8 +261,8 @@ def await_late_daemon(
     ``ensure_node_sync`` Popens a daemon that takes ``LOCK_NAME`` only once its
     interpreter is up, so right after a spawn the lock -- the only proof of a
     daemon -- still reads free. It writes its pid just after the lock, and
-    ``stop_daemon`` kills by pid: stopped in between, it would be called
-    stuck. At the deadline the lock's last answer stands. A probe that could
+    ``stop_daemon`` kills by pid, so the look waits for both. At the deadline
+    the lock's last answer stands. A probe that could
     not open the lock file answers nothing and the look goes on; the stop
     after it asks again."""
     deadline = now() + STOP_SETTLE_S if until is None else until
