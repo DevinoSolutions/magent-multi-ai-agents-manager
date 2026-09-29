@@ -190,8 +190,8 @@ capture() {
 # keeps its mode -- one that appears between the walk and the mkdir too:
 # another bring-up (one person's second PC) made it, as `mkdir -p` shrugged
 # off, and mkdir's "File exists" is dropped. A real failure keeps mkdir's
-# words (nodes.log's), and a caller that gets 1 says why in the script's,
-# last -- the line the row shows.
+# words -- the OS's words: nodes.log's, never the screen's -- and a caller
+# that gets 1 says why in the script's, last: the line the row shows.
 mkdir_private() {
   local dir=$1 why
   local -a made=()

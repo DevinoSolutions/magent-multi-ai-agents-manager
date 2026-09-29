@@ -87,8 +87,9 @@ said_why() {
 # whose private_dir made it: success, as mkdir -p had it, and not a word.
 # Any other failure -- no folder, or one made that the chmod could not
 # restrict -- is said in this script's words and returns 1; each caller
-# refuses with exit 5. mkdir's and chmod's own words never come through:
-# said_why tags the OS's reason in them for the log. chmod's -- comes before
+# refuses with exit 5. mkdir's and chmod's own words are the OS's words:
+# nodes.log's, never the screen's -- said_why tags their reason for the log,
+# and nothing else of them is printed. chmod's -- comes before
 # the mode: BSD chmod (macOS) stops reading options at the mode, so a --
 # after it is a file.
 private_dir() {
