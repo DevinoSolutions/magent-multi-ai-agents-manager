@@ -726,6 +726,52 @@ class TestARewrittenSettingsFileKeepsItsMode:
         assert stat.S_IMODE(settings.stat().st_mode) == 0o600
 
 
+_BOM = b"\xef\xbb\xbf"
+# The user's own keys, which an install must carry over untouched.
+_USER_KEYS = {"model": "keep-me", "env": {"EDITOR": "vim"}, "permissions": {}}
+
+
+class TestASettingsFileWithAByteOrderMark:
+    """Some Windows tools write UTF-8 with a BOM (Windows PowerShell 5.1's
+    `Set-Content -Encoding utf8` and `Out-File -Encoding utf8`), and
+    wt_keys and env already read utf-8-sig; hooks refused such a file as
+    "not valid JSON". It reads the BOM away and writes BOM-less UTF-8."""
+
+    def test_install_wires_it_and_writes_it_back_without_the_bom(
+        self, runner, tmp_path
+    ):
+        settings = tmp_path / "claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_bytes(_BOM + json.dumps(_USER_KEYS).encode())
+
+        result = _install(runner, settings)
+
+        assert result.exit_code == 0, result.output
+        assert f"Wired {', '.join(EVENTS)}" in result.stdout
+        written = settings.read_bytes()
+        assert not written.startswith(_BOM)
+        data = json.loads(written.decode("utf-8"))
+        assert {k: v for k, v in data.items() if k != "hooks"} == _USER_KEYS
+        for event in EVENTS:
+            assert hooks_cmd._event_wired(data["hooks"][event])
+        # No backup, no temp file: install never made one, BOM or not.
+        assert [p.name for p in settings.parent.iterdir()] == ["settings.json"]
+
+    def test_status_reads_it_as_wired(self, runner, tmp_path):
+        settings = tmp_path / "settings.json"
+        _write_module_form(settings)
+        settings.write_bytes(_BOM + settings.read_bytes())
+
+        result = runner.invoke(
+            cli.main, ["hooks", "status", "--settings-file", str(settings)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert result.stderr == ""
+        for event in EVENTS:
+            assert f"+ {event}\n" in result.stdout
+
+
 class TestStatus:
     def test_unwired_events_marked_and_empty_store_reported(self, runner, tmp_path):
         result = runner.invoke(
