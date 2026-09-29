@@ -160,10 +160,24 @@ if [verb, name] in rules["crash"]:
     raise RuntimeError("scripted crash: %s %s" % (verb, name))
 
 
+def issued():
+    # How many calls of this verb for this name, counting this one: its
+    # record is already published above.
+    d = os.path.join(BASE, "calls")
+    seen = 0
+    for f in os.listdir(d):
+        if f.endswith(".json"):
+            try:
+                record = read(os.path.join(d, f))
+            except FileNotFoundError:
+                continue  # listed, then gone: not a call to count
+            seen += record["argv"][:3] == ["-L", name, verb]
+    return seen
+
+
 def hangs():
     # A rule is [verb, name] (every such call hangs) or [verb, name, n] (the
-    # n-th such call and later ones hang, counting this one: its record is
-    # already published above).
+    # n-th such call and later ones hang).
     for rule in rules["hang"]:
         if rule[:2] != [verb, name]:
             continue
@@ -172,16 +186,7 @@ def hangs():
             # Nothing to count, so no scan: the scan is the one step that
             # opens records other clients are publishing right now.
             return True
-        d = os.path.join(BASE, "calls")
-        seen = 0
-        for f in os.listdir(d):
-            if f.endswith(".json"):
-                try:
-                    record = read(os.path.join(d, f))
-                except FileNotFoundError:
-                    continue  # listed, then gone: not a call to count
-                seen += record["argv"][:3] == ["-L", name, verb]
-        return seen >= nth
+        return issued() >= nth
     return False
 
 
@@ -229,6 +234,13 @@ if hangs():
     sys.exit(0)
 
 if verb == "has-session":
+    if name in rules["late"]:
+        # Born late: absent to the dedupe probe, which always runs before the
+        # create, and live to every probe after it. Not read off the marker:
+        # the create client that writes it was killed at its deadline, and
+        # under load its interpreter can still be booting when the verify
+        # probes -- the verify then read "absent" on a loaded desktop.
+        sys.exit(0 if issued() >= 2 else 1)
     sys.exit(0 if name in rules["live"] or os.path.exists(marker) else 1)
 if verb == "kill-server":
     # What psmux answers for a socket with no server: "no server running", rc 1.
@@ -830,10 +842,12 @@ class TestTheBringUpNeverWaitsForever:
         assert "new-session" in failed["web"]
         assert "answers now" in failed["web"]
         assert "magent up" in failed["web"]
+        # First: a create client killed while booting publishes its call only
+        # after the product answered, and this waits for its stall.
+        fake.assert_no_client_left_behind(expect=1)
         assert len(fake.issued("new-session", "web")) == 1
         assert fake.issued("send-keys", "web") == []
         assert fake.issued("send-keys", "api")
-        fake.assert_no_client_left_behind(expect=1)
 
     @staticmethod
     def _bare_panes_read_as_casualties(monkeypatch, windows):
