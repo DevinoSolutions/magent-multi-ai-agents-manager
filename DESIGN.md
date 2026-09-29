@@ -2004,6 +2004,31 @@ key's chmod runs on every run and is never done through a link, the rule
 symlink, so the user knows what to change. Pin: `TestSetupShUnderRealBash::
 test_a_symlinked_node_key_never_reaches_its_target`.
 
+**A failed `.pub` derive deletes a `.pub` link to a directory (2026-09-29):**
+the dangling-`.pub` refusal above leaves a `.pub` link that resolves alone,
+and a link to a directory does resolve, so it is not refused. `[ -f ]` is
+false for it, so with a private key present `user_node_key` takes the derive
+branch: `ssh-keygen -y ... > "$id.pub"` fails on the directory, and the
+cleanup `rm -f -- "$id.pub"` then removes the user's link (never the
+directory it points at) before the fail row. Pre-existing, the same at rc1,
+and left unpinned: the refusal's `[ ! -e ]` is what the spec asked for, and
+the mutant that would tell it from `[ ! -f ]` (R8) survives on exactly this
+case. The fix, if it matters, is to refuse any `.pub` link that is not a
+regular file, before the derive, the way the dangling one is.
+
+**`stop_daemon` can kill a stranger named by a stale pid file (2026-09-29):**
+`node_sync.stop_daemon` kills only while the daemon's lock is held, and kills
+the pid the pid file names if that pid is alive. A daemon that died without
+its own cleanup (a crash, a forced kill) leaves its pid file behind, and a new
+daemon that has taken the lock but not yet written its pid is paired with that
+file. If the OS has handed the old number to another process by then,
+`daemon_pid()` reads it as live and the stop kills that process. The window is the few
+instructions between `run_sync_loop`'s lock and its pid write. Pre-existing;
+the wait for a late pid (2026-09-29) reads the same file first and neither
+widens nor narrows it. The fix would be a pid written under the lock with
+something only the daemon knows (its lock-time stamp, or its start time
+checked against the process's), not a liveness check.
+
 **Typed text cannot be delivered through a nested ConPTY over `ssh -t`
 (2026-08-18):** `tests/e2e/test_ssh_real.py::test_typed_text_survives_a_real
 _reconnect` is a loud `::warning` skip on win32. The test drives the real
