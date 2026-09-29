@@ -216,6 +216,24 @@ To own the listener's lifetime yourself, set `MAGENT_HOTKEY_SUPERVISOR=0`; `stat
 
 ## Nodes
 
+### A project on a pool machine
+
+`settings.nodes` lists the pool machines a project can run on, keyed by nick:
+
+```json
+"settings": {
+  "nodes": {"second": {"host": "build-box", "user": "alice", "root": "~/magent"}}
+}
+```
+
+A nick is 1-6 characters of `a-z`, `0-9` and `-` (it is drawn in the status bar); `auto` and `cloud` are not nicks. `user` defaults to your local username at use time; `root` is where project clones live on the node.
+
+A project's `"node": "second"` runs its session on that machine. The node holds a git clone at your current branch, so `magent up` refuses a local tree the node could not reproduce: uncommitted or unpushed work (`--allow-dirty` lets it through, and the node gets origin's copy), no origin, a detached HEAD, or a branch with no commits. `node` is exclusive with `host`. The gitignored files a session needs (`.env*`, `.claude/settings.local.json`, `CLAUDE.local.md`, `.mcp.json`, plus a project's `push` list) are shipped at bring-up.
+
+- `magent node setup <nick> [--user U]... [--key F]` prepares a machine once. Root is used for this one hop only, to install packages, create a per-person user and authorize your key; the node's own GitHub key is generated there and never leaves it. It is idempotent: every step prints ok/did/skip. **The Claude login is yours:** run `ssh <user>@<host> claude` once.
+- `magent node doctor [<nick>]` checks a node: tmux/git/claude/gh on PATH, the Claude login, the node's GitHub key, locale, free disk, and the sync daemon's heartbeat and snapshot age.
+- `magent node sync -d [--once] [--stop]` is the daemon that pulls transcripts and agent states home and samples each node's load. `magent serve` normally keeps it alive; `MAGENT_NODE_SYNC=0` stops serve from doing so (a sync run by hand still runs).
+
 ### Placement, plan, push and recall
 
 `"node": "auto"` lets magent pick the machine. It reads each node's load over the last 30 minutes, which the sync daemon samples, never a single reading, so a box used in bursts is not mistaken for an idle one. It penalizes load spikes and low free memory, skips a node under 10% free memory while another is above it, and spreads your own sessions out. A node with fewer than five recent samples gets one live reading (none under `--dry-run`); a node that does not answer it is left out. The choice then sticks: a project stays on its node until that node leaves `settings.nodes`, and the choice is kept in `~/.magent/nodes/node-map.json`, never in your config. `magent --go` and `magent up` place the same way, all of one launch's `auto` projects together so they spread out; an `auto` project that cannot be placed is not launched and its row says why.
