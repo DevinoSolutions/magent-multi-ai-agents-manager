@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.20.0] - UNRELEASED
 
+## [3.20.0rc2] - 2026-09-29
+
 ### Added
 
 - **magent places `auto` node projects by their load history, and `magent node
@@ -1755,6 +1757,7 @@ tool, every screen.
   env-gated via `MAGENT_SENTRY_DSN`.
 
 [3.20.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.2...v3.20.0
+[3.20.0rc2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.20.0rc1...v3.20.0rc2
 [3.20.0rc1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.2...v3.20.0rc1
 [3.19.4]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.3...v3.19.4
 [3.19.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.2...v3.19.3
