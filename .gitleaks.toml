@@ -8,3 +8,8 @@ id = "tailscale-magdns-hostname"
 description = "Tailscale MagicDNS hostname (contains the tailnet name)"
 regex = '''[a-z0-9-]+\.tail[a-z0-9-]+\.ts\.net'''
 tags = ["tailscale", "infra"]
+
+# The synthetic sentinel test_hooks_cmd.py plants as a fake API key; a rename cannot help, the scan reads every commit's patch.
+[allowlist]
+description = "synthetic test sentinels"
+regexes = ['''sentinel-secret-9d2a''']

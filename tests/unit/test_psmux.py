@@ -17,13 +17,14 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from typing import ClassVar
 
 import pytest
 
-from magent import psmux
+from magent import log, psmux
 from magent.config import DEFAULT_TOOLS, MagentConfig, ProjectConfig, Settings
 from magent.sessions import AGENT_TOOLS
 from tests.unit._fake_panes import fake_panes, pane_tree
@@ -2020,6 +2021,42 @@ class TestDecorateSession:
     def test_fan_out_without_binary_is_a_noop(self, monkeypatch):
         monkeypatch.setattr(psmux, "find_psmux", lambda: None)
         assert psmux.decorate_sessions(["api"]) == []
+
+    def test_a_failing_fan_out_writes_each_warning_once(self, monkeypatch):
+        # Every decoration command fails, so each worker's failure path is where
+        # get_logger("launch") is FIRST asked for -- by all of them at once
+        # (conftest's log.reset_logging() hands every test an unconfigured
+        # logger). A handler stacked per worker writes every warning that many
+        # times into launch.log.
+        names = [f"s{i}" for i in range(8)]
+        together = threading.Barrier(len(names), timeout=10)
+        started: set[str] = set()
+        guard = threading.Lock()
+
+        def _fail(cmd, **kwargs):
+            with guard:
+                first = cmd[2] not in started
+                started.add(cmd[2])
+            if first:
+                together.wait()  # every worker reaches its first warning at once
+            raise OSError("no psmux")
+
+        real = log._SharedRotatingFileHandler
+
+        def slow(*a, **kw):
+            time.sleep(0.05)  # hold get_logger's first-use window open
+            return real(*a, **kw)
+
+        monkeypatch.setattr(subprocess, "run", _fail)
+        monkeypatch.setattr(log, "_SharedRotatingFileHandler", slow)
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        assert logging.getLogger("magent.launch").handlers == []
+        assert psmux.decorate_sessions(names, code_hint=True) == names
+        assert len(logging.getLogger("magent.launch").handlers) == 1
+        text = (log.LOG_DIR / "launch.log").read_text(encoding="utf-8")
+        per_session = len(psmux.decoration_argv("s0", "psmux", True))
+        for name in names:
+            assert text.count(f"session={name}: ") == per_session
 
 
 class _SpawnRecorder:

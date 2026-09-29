@@ -1,6 +1,9 @@
 import json
+import locale
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -50,6 +53,32 @@ class TestCliFlags:
         )
         assert result.returncode != 0
         assert "No config found" in result.stderr or "config" in result.stderr.lower()
+
+    def test_an_env_file_that_is_not_utf8_exits_one_with_exactly_our_words(self):
+        # conftest points the whole HOME family at tmp and the child inherits
+        # it, so the child's import-time env.ENV_FILE is THIS ~/.magent/.env.
+        # A real process, because CliRunner never prints a traceback at all:
+        # the raw stderr bytes are compared whole, so a traceback, the
+        # offending bytes or a decode position cannot hide in them.
+        env_file = Path.home() / ".magent" / ".env"
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_file.write_bytes(b"MAGENT_LOG_LEVEL=\xff\xfe\n")
+        expected = (
+            f"{env_file} is not valid UTF-8 (UnicodeDecodeError); re-save it as UTF-8\n"
+            f"Fix the environment variable(s) above (see .env.example; "
+            f"env file: {env_file}).\n"
+        )
+        # `docs` only prints: had the env gate let it through, it would have
+        # written markdown to stdout and touched nothing else.
+        result = subprocess.run(
+            [sys.executable, "-m", "magent", "docs"],
+            capture_output=True,
+        )
+        assert result.returncode == 1
+        assert result.stdout == b""
+        assert result.stderr == expected.replace("\n", os.linesep).encode(
+            locale.getpreferredencoding(False), "backslashreplace"
+        )
 
     def test_invalid_json_exits_nonzero(self, tmp_path):
         bad = tmp_path / "bad.json"

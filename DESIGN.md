@@ -1015,6 +1015,64 @@ when the upload server reads DEAD **and** the daemon is off **and** it would
 actually supervise (config on, env not opted out). Suggesting the daemon to
 someone who disabled it would be advice that does nothing.
 
+### One port, one server (2026-09-26)
+
+The watchdog above, `serve --ensure` and a hand-run `magent serve` can each
+start a server while another is still starting, and the design assumed the loser
+would fail its bind. On Windows it did not. `ThreadingHTTPServer` sets
+`SO_REUSEADDR`, and on Windows that option lets a second process bind a port
+that is already **listening**. Measured: two live servers on one port, both
+logging `listening ... :15505`, with the pid file naming only the later one. The
+watchdog then killed or revived the wrong server, and `/health` was answered by
+whichever one the kernel picked. Linux `SO_REUSEADDR` never allowed two live
+listeners on the same address, so only Windows ever showed it. (BSD/macOS let a
+specific address coexist with a listening wildcard; not addressed here.)
+
+`_NoFqdnHTTPServer` now owns its bind options (`_claim_port_options`), set
+before the bind. On Windows it sets `SO_EXCLUSIVEADDRUSE` and not
+`SO_REUSEADDR`, so a second serve is refused. Exclusivity is what refuses a
+`serve --host 0.0.0.0` against a held loopback port. It does not stop a foreign
+program from binding the wildcard over a loopback holder, and a same-address
+`SO_REUSEADDR` socket was refused on this Windows build even before. On POSIX
+it keeps `SO_REUSEADDR`, which on Linux only lets a restart rebind past the
+previous server's `TIME_WAIT` connections. Windows never held a port hostage to
+`TIME_WAIT` (measured with ~20 such connections on the port, and again with
+FIN_WAIT_2, a still-ESTABLISHED accepted connection, and a killed server
+process), so an upgrade still restarts serve at once. The branch is a
+`sys.platform` check, not a capability probe: it is socket semantics, not a
+feature.
+
+A bind refused because the port is held raises `PortInUse`, not the old generic
+error. `EADDRINUSE` always means held. Windows' `WSAEACCES` means one of two
+things. It can be an exclusive wildcard holder refusing a specific address, or
+a port Windows has reserved (a Hyper-V / WSL / Docker excluded range, measured
+at 127.0.0.1:17000). A 0.3s connect tells them apart (`_holder_answers`).
+
+- **Something answers:** a holder, so `PortInUse`.
+- **Nothing answers:** a reservation. There is no first server to defer to, so
+  it degrades like any unbindable address. If it was the only address, the fatal
+  "no bindable address" ERROR (what Sentry captures) names the reservation and
+  points at `netsh int ipv4 show excludedportrange protocol=tcp`.
+
+Held on **any** of serve's addresses counts: serving only the free ones would
+be two servers and one pid file again. Whatever was already bound is closed,
+and the pid file is untouched, because ours is only written after the bind. The
+trade-off is on record: a foreign program holding only the Tailscale address
+now keeps loopback down too, where it used to degrade, and the watchdog retries
+at its cooldown pace. `PortInUse` is logged at WARNING, not ERROR. A watchdog
+or `--ensure` spawn that loses the race is **supposed** to end here, so it is
+not a crash for Sentry. The CLI shell prints the reason and exits 1 instead of
+a traceback. An address that cannot be bound for any other reason (a Tailscale
+IP that went away) still degrades with a warning, as before.
+
+Pins:
+- `tests/unit/test_upload_server.py::TestOnePortOneServer` (real sockets,
+  current OS, including the set-before-bind order);
+- `TestClaimPortOptions` / `TestPortTaken` (both OSes, fake socket);
+- `TestHolderAnswers`;
+- `TestRunServerOnAHeldPort` (held, reserved, and reserved-secondary);
+- `tests/e2e/test_real_upload.py::test_a_second_serve_on_the_same_port_exits_and_leaves_the_first_alone`.
+
 ### One liveness enumeration, and a shutdown that verifies (2026-08-18)
 
 Reported twice on a live 46-session Windows host: after `magent down --all`, a
@@ -1344,13 +1402,16 @@ The price is one lock + one open/close per record: **13 µs → 235 µs** on thi
 box. These are lifecycle logs at a few records a second, not a request stream,
 so the cost is unobservable and the correctness is not.
 
-Two loudness rules ride along, both stricter than the stdlib's. A rotation that
+Three loudness rules ride along, all stricter than the stdlib's. A rotation that
 still fails **writes the record anyway** and reports the rotation failure through
 `handleError` (the stdlib drops the record instead). A lock that cannot be taken
 within `_LOCK_TIMEOUT_S` degrades to an unlocked write — keeping the record,
 which is the whole point — and says so once per process **in the log file
 itself**, because that is the only channel a detached daemon has and reaching for
-`get_logger` from inside a handler would recurse.
+`get_logger` from inside a handler would recurse. And a record that cannot be
+encoded — a filename carrying a lone surrogate — **lands escaped, never
+dropped**: the stream is opened with `errors="backslashreplace"`, where the
+stdlib's strict default prints `--- Logging error ---` and loses the record.
 
 The public seam is unchanged (`get_logger(name)`, one handler, still a
 `RotatingFileHandler`, still `<name>.log` + `<name>.log.N`), so no consumer
@@ -1913,6 +1974,73 @@ Pins: `tests/unit/test_psmux.py::TestReviveNeverTypesIntoALiveAgent`,
 private socket (CI's Windows platform leg only),
 `tests/platform/test_real_psmux.py::
 test_real_pane_reads_idle_only_while_nothing_it_launched_runs`.
+### A slow child is not a failed child (2026-09-25)
+
+Both detaching launchers, `attention -d` and the Alt+V listener start
+(`launch.start_hotkey_listener`), learn their child's pid only from the pid
+file the child writes once it is up. Both used to wait a fixed 2 seconds for
+it. On a loaded desktop the daemon took 4.7-11.45s to register (about 1.5s
+idle; the pre-routing build flaked the same way), so `attention -d` printed
+"failed to start" and exited 1 over a daemon that then came up and kept
+running. The serve-watchdog e2e tier went red on it, and its teardown, which
+killed only pids it had learned, left that daemon and the server it supervised
+running.
+
+**One wait, one owner.** `procs.await_registration(child, read_pid, ...)` is the
+launcher-side wait for both callers. It lives in `procs.py` because that stdlib
+leaf is already imported by `launch.py` and by `cli/`: both directions are
+legal, and a src module never imports the cli package (LS-A-001). The window is
+`REGISTRATION_TIMEOUT_S` (20s, about 1.75x the slowest measured start). The
+idle path pays nothing, because the loop returns on the first poll that sees a
+pid. The listener start keeps `not_pid=existing`, so a restart whose kill did
+not take cannot read the old pid back as the new listener.
+
+**An exit ends the wait at once.** A child that exits, for any code including
+the 0 that `magent hotkey` returns when another listener already runs, is
+reported immediately rather than waited out. That check is meaningful on
+Windows because `spawn_detached` Popens `sys.executable`: under a venv that is
+the launcher `python.exe`, which waits for the base interpreter and passes its
+exit code through. The direct child's `poll()` therefore tracks the real
+process.
+
+**The wait never kills the child.** A timeout means "not registered yet", not
+"dead". On the machine this was measured on, the child was usually a few
+seconds from coming up. The launcher still reports failure (rc 1) so a script
+can react, but it leaves the child alone. Killing it would turn a slow start
+into a real failure, which is the bug this fixes.
+
+**The window is a bound.** It is not a knob: there is no env var, because the
+right answer is "long enough for a loaded box, and finite". A child that hangs
+alive without registering must not stall serve's supervisor thread or a `--go`
+launch before tiling. Pins:
+- `tests/unit/test_procs.py::TestAwaitRegistration`
+- `::TestTheWaitNeverEndsTheChild`
+- `::TestTheDefaultWindowIsBounded`
+- the wiring tests in `test_attention_cmd.py::TestTheLauncherWaitsForASlowDaemon`
+  and `test_hotkey.py::TestMaybeStartHotkey`
+
+**The upload watchdog applies the same rule.** `launch.UploadServerSupervisor`
+respawns a dead port at the cooldown rate, and the cooldown used to be the only
+thing between a slow serve and a second one. A serve measured 4.7s to bind
+against the e2e tier's 3s cooldown, the watchdog started another beside it, and
+on Windows the second bind succeeded (`SO_REUSEADDR`, before "One port, one
+server"): two live servers on one port, a pid file naming only the later one.
+Now a serve the supervisor spawned
+that is still alive inside `REGISTRATION_TIMEOUT_S` counts as starting, not
+failed. Once it exits, or the window runs out, the cooldown decides alone as
+before. The supervisor never ends that child either. At the default 60s cooldown
+this guard never engages, because the cooldown check returns first; it matters
+only when the cooldown is both below the 20s window and shorter than a serve's
+startup (the e2e tier's 3s override is one). It is
+not a cure either: a serve measured 28.65s to bind on a loaded desktop, past the
+window, and was doubled all the same. The structural fix is the exclusive bind
+("One port, one server" above): a duplicate now exits with `PortInUse`, and an
+exited child never holds back a respawn. Pins:
+`test_launch.py::TestUploadServerSupervisor`.
+
+The detaching e2e tiers carry the other half of the lesson. A failed launch
+must not leak what it started, so the tiers find it by a uuid argv marker, not
+by learned pid (see CLAUDE.md, serve-watchdog tier).
 
 ### The bring-up never waits forever, and a probe with no answer is not an absent session (2026-09-29)
 

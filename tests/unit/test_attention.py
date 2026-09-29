@@ -15,7 +15,7 @@ import urllib.error
 
 import pytest
 
-from magent import agent_state, attention
+from magent import agent_state, attention, log
 from magent.attention import AttentionEngine, name_map_from_projects
 
 
@@ -193,6 +193,32 @@ class TestCorruptRecordWarning:
             assert agent_state.all_states() == []
 
         assert any("arr.json" in r.getMessage() for r in caplog.records)
+
+    def test_a_file_whose_name_is_not_unicode_is_still_logged(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # The name is the disk's: a byte that is not UTF-8 decodes to a lone
+        # surrogate on Linux, NTFS keeps unpaired UTF-16 halves as they are.
+        # Strict UTF-8 cannot write one; the WARNING naming the file must still
+        # reach attention.log, through the REAL handler, with nothing on stderr.
+        assert log.LOG_DIR.is_relative_to(tmp_path)
+        d = tmp_path / "state"
+        d.mkdir()
+        monkeypatch.setattr(agent_state, "STATE_DIR", d)
+        monkeypatch.setattr(agent_state, "_swept_this_process", True)
+        monkeypatch.setattr(agent_state, "_warned_files", set())
+        try:
+            (d / "caf\udce9.json").write_text("{not json", encoding="utf-8")
+        except (OSError, UnicodeError):
+            pytest.skip("this filesystem refuses a name that is not Unicode")
+
+        assert agent_state.all_states() == []
+
+        path = log.LOG_DIR / "attention.log"
+        logged = path.read_text(encoding="utf-8") if path.exists() else ""
+        assert "skipping unusable agent-state record caf\\udce9.json: " in logged
+        assert "WARNING" in logged
+        assert "Logging error" not in capsys.readouterr().err
 
 
 class TestNormCwd:

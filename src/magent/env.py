@@ -27,6 +27,7 @@ from pydantic import (
     ValidationError,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings
 
 # magent's own dotenv file — module attribute (not baked into model_config)
@@ -48,7 +49,14 @@ class MagentEnv(BaseSettings):
     correct there, because that file belongs to magent alone.
     """
 
-    model_config = {"env_prefix": "MAGENT_", "extra": "forbid"}
+    # utf-8-sig: Notepad and PowerShell's utf8BOM write a byte-order mark, and
+    # read as plain utf-8 it became part of the first key -- a valid setting
+    # refused as an unknown variable. A file without the mark reads the same.
+    model_config = {
+        "env_prefix": "MAGENT_",
+        "extra": "forbid",
+        "env_file_encoding": "utf-8-sig",
+    }
 
     sentry_dsn: HttpUrl | None = None
     ntfy_topic: HttpUrl | None = None
@@ -156,8 +164,57 @@ def get_env() -> MagentEnv:
     """Return the validated env singleton (instantiated on first call)."""
     global _cached_env  # noqa: PLW0603  # reason: module-level cache singleton pattern
     if _cached_env is None:
-        _cached_env = MagentEnv(_env_file=ENV_FILE)
+        try:
+            _cached_env = MagentEnv(_env_file=ENV_FILE)
+        except UnicodeDecodeError as exc:
+            problem = f"is not valid UTF-8 ({type(exc).__name__}); re-save it as UTF-8"
+        except OSError as exc:
+            problem = (
+                f"could not be read ({type(exc).__name__}); close any program "
+                "holding it open and check you can read it"
+            )
+        else:
+            return _cached_env
+        # Raised here, past the except blocks, and from None: a decode error
+        # carries the whole file in ``.object`` and its frames hold it as
+        # locals, so chaining it -- or raising while it is still being handled,
+        # which chains it as __context__ -- would hand every secret in the file
+        # to Sentry's exception serializer.
+        raise _env_file_unusable(problem) from None
     return _cached_env
+
+
+def _env_file_unusable(problem: str) -> ValidationError:
+    """ENV_FILE could not be used, as a ValidationError naming the file.
+
+    The dotenv read raises UnicodeDecodeError for a file that is not UTF-8 and
+    an OSError (PermissionError) for one it cannot read. Neither is a
+    ValidationError, so each walked straight past every caller and killed the
+    command with a traceback. Both ARE an invalid environment, and every
+    get_env() caller already handles ValidationError: the CLI refuses in one
+    line, doctor FAILs its env check, and the daemons' readers fall back to
+    their defaults. A new exception type would be a new traceback at each
+    caller that missed it. (A directory never gets here: pydantic-settings
+    reads the file only when it ``is_file()``.)
+
+    Our words and the exception's class only -- never the offending bytes or
+    the decode position, which is why this takes the words and not the
+    exception. The empty ``loc`` makes ``validation_error_items`` show the
+    message as-is, and the one ``{message}`` key keeps a brace in the path
+    literal.
+    """
+    message = f"{ENV_FILE} {problem}"
+    return ValidationError.from_exception_data(
+        MagentEnv.__name__,
+        [
+            {
+                "type": PydanticCustomError(
+                    "env_file_unusable", "{message}", {"message": message}
+                ),
+                "input": str(ENV_FILE),
+            }
+        ],
+    )
 
 
 def validation_error_items(exc: ValidationError) -> list[tuple[str, str]]:
