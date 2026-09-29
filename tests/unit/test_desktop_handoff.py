@@ -386,6 +386,15 @@ def _calls(bin_dir: Path) -> list[list[str]]:
     return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
 
 
+def _ansi_code_page_holds(char: str) -> bool:
+    """Whether this box's ANSI code page -- what the desktop copy's redirected
+    stdout is written in -- has ``char``."""
+    import ctypes
+
+    acp = f"cp{ctypes.windll.kernel32.GetACP()}"
+    return char.encode(acp, "ignore") != b""
+
+
 @pytestmark_win
 class TestRunOnDesktopOnWindows:
     def _plat(self):
@@ -450,6 +459,8 @@ class TestRunOnDesktopOnWindows:
         # accented letter in a project name or path as U+FFFD. The accent is a
         # Python escape so the child's ARGV stays ASCII: this pins the output
         # leg alone.
+        if not _ansi_code_page_holds("é"):
+            pytest.skip("the ANSI code page has no é, so a plain print of it raises")
         result = self._plat().run_on_desktop(
             [sys.executable, "-c", "print('caf\\u00e9')"], timeout_s=60
         )
@@ -470,6 +481,12 @@ class TestRunOnDesktopOnWindows:
         # that sets either of these would hand it a UTF-8 stdout that holds
         # every character: the test would print no escape and fail, and the
         # code page it is about would never be exercised.
+        #
+        # The expectation is a cp1252-class code page's: é held, 中 escaped.
+        # Elsewhere (cp1251, cp932, a UTF-8 code page) the right output is
+        # different, so the pin skips rather than fail on a correct copy.
+        if not _ansi_code_page_holds("é") or _ansi_code_page_holds("中"):
+            pytest.skip("the ANSI code page is not one that has é but lacks 中")
         monkeypatch.delenv("PYTHONIOENCODING", raising=False)
         monkeypatch.delenv("PYTHONUTF8", raising=False)
         cfg = tmp_path / "magent.config.json"
