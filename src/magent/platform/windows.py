@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import ctypes.wintypes
+import re
 import shutil
 import subprocess
 import tempfile
@@ -138,6 +139,14 @@ _TR_MAX_CHARS = 261
 # Task Scheduler inside the logged-on user's session, against the user's own
 # PATH, not against the possibly-hostile PATH of an ssh login.
 _HANDOFF_SHELL = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File"
+# The script that shell runs is written WITH a BOM. Windows PowerShell 5.1
+# decodes a `-File` script that has none in the ANSI code page, which turns
+# every non-ASCII character of a path or an argument into mojibake -- and can
+# end a literal early: the UTF-8 bytes of U+00D1 (C3 91) and U+0442 (D1 82)
+# each hold one that cp1252 reads as a typographic single quote. One constant,
+# because the tests that run a launcher script stage it with this too; a copy
+# written any other way is not the file production runs.
+_HANDOFF_SCRIPT_ENCODING = "utf-8-sig"
 
 
 def _schtasks_exe() -> str | None:
@@ -171,9 +180,11 @@ def _ps_quote(value: str) -> str:
     Single-quoted, so nothing inside is expanded: these are paths and a whole
     Windows command line, and a ``$`` or a backtick in either must arrive at
     the child exactly as written. Doubling is the only escape a single-quoted
-    PowerShell string has.
+    PowerShell string has, and PowerShell ends such a string on FIVE code
+    points, not one: U+0027 and the typographic U+2018, U+2019, U+201A and
+    U+201B. Every one of them is doubled, or a value holding one breaks out.
     """
-    return "'" + value.replace("'", "''") + "'"
+    return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", value) + "'"
 
 
 def _handoff_script(
@@ -1176,9 +1187,10 @@ class WindowsPlatform(Platform):
         pid_file, rc_file = work / "pid.txt", work / "rc.txt"
         try:
             work.mkdir(parents=True, exist_ok=True)
+            # WITH a BOM -- see _HANDOFF_SCRIPT_ENCODING.
             script.write_text(
                 _handoff_script(argv, str(Path.cwd()), out, err, pid_file, rc_file),
-                encoding="utf-8",
+                encoding=_HANDOFF_SCRIPT_ENCODING,
             )
         except OSError as exc:
             return HandoffResult(
