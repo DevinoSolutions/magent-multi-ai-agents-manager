@@ -208,10 +208,15 @@ if hangs():
         k32.WaitForSingleObject.restype = ctypes.c_uint32
         k32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
         launcher = k32.OpenProcess(0x00100000, 0, os.getppid())  # SYNCHRONIZE
+        # 87 (invalid parameter): no such process. The launcher was killed
+        # before this client even reached its hang, so there is nothing left
+        # to follow; any other failure is left loud, as a client left running.
+        gone = not launcher and ctypes.get_last_error() == 87
 
         def follow():
             if launcher:
                 k32.WaitForSingleObject(launcher, 0xFFFFFFFF)
+            if launcher or gone:
                 put("ends", me, {{"how": "launcher-killed"}})
                 os._exit(3)
 
@@ -370,8 +375,8 @@ class _Fake:
         crashes = self.take_crashes()
         assert not crashes, "the fake psmux crashed:\n" + "\n".join(crashes)
 
-    def assert_no_client_left_behind(self) -> None:
-        """Every client that hung was killed AND is gone -- not merely abandoned.
+    def assert_no_client_left_behind(self, *, expect: int) -> None:
+        """All ``expect`` clients that hung were killed AND are gone.
 
         Checked through the hung fakes' own pids, and on Windows through the
         launcher they followed down: a stall that ended because its launcher
@@ -383,9 +388,11 @@ class _Fake:
         running (killing the .cmd leaves the interpreter), so it can publish
         its stall AND its end after a first read. Counting one snapshot
         against a later one failed 5 of 150 loaded runs (6 ends, 5 stalls).
-        For the same reason no stall yet, or a live client still on its way to
-        its stall, is not settled: killed while booting, every client can
-        reach its hang only after the product has answered.
+        For the same reason too few stalls, or a live client still on its way
+        to its stall, is not settled: killed while booting, every client can
+        reach its hang only after the product has answered. ``expect`` is what
+        makes a client that has not published anything yet count: without it
+        such a client is invisible, and the check passes without it.
         """
         deadline = time.monotonic() + _GONE_GRACE_S
         while True:
@@ -406,11 +413,20 @@ class _Fake:
                 for stem, c in calls.items()
                 if stem not in stalls and pid_alive(int(c["pid"]))
             ]
-            settled = stalls and not running and not unended and not booting
+            settled = (
+                len(stalls) >= expect and not running and not unended and not booting
+            )
             if settled or time.monotonic() >= deadline:
                 break
             time.sleep(0.1)
-        assert stalls, "the pin never reached its hanging client"
+        assert not booting, "a client never reached its hang: " + "; ".join(
+            f"{calls[stem]['argv']} (launcher "
+            f"{'ALIVE' if pid_alive(int(calls[stem]['ppid'])) else 'killed'})"
+            for stem in booting
+        )
+        assert len(stalls) == expect, (
+            f"{expect} hung client(s) expected, {len(stalls)} reached the hang"
+        )
         assert not running, (
             "a timed-out psmux client was left running: "
             f"{[s['argv'] for s in running.values()]}"
@@ -526,7 +542,7 @@ class TestTheDedupeProbeHasThreeAnswers:
             ),
         )
         assert states == {"api": "live", "web": "unknown", "db": "absent"}
-        fake.assert_no_client_left_behind()
+        fake.assert_no_client_left_behind(expect=1)
 
     def test_a_probe_that_cannot_even_start_is_unknown_not_absent(self, tmp_path):
         states = psmux.probe_sessions(
@@ -558,7 +574,7 @@ class TestOneDeadlinePerFanOut:
         assert set(states.values()) == {"unknown"}
         # A timeout per client, waited in turn, would be 10 x the budget.
         assert elapsed < 5 * _SHRUNK_S, elapsed
-        fake.assert_no_client_left_behind()
+        fake.assert_no_client_left_behind(expect=10)
 
     def test_a_client_that_answered_keeps_its_answer_past_the_deadline(
         self, fake_psmux
@@ -616,7 +632,7 @@ class TestClearingAStaleServer:
             ),
         )
         assert stuck == ["web"]
-        fake.assert_no_client_left_behind()
+        fake.assert_no_client_left_behind(expect=1)
 
     def test_no_server_running_is_an_answer_not_a_failure(self, fake_psmux):
         # kill-server against a socket with no server exits 1 -- the normal
@@ -738,7 +754,7 @@ class TestTheBringUpNeverWaitsForever:
         for name in ("api", "db"):
             assert fake.issued("new-session", name), name
             assert fake.issued("send-keys", name), name
-        fake.assert_no_client_left_behind()
+        fake.assert_no_client_left_behind(expect=1)
 
     def test_an_unanswered_kill_server_is_never_created_on_top_of(
         self, fake_psmux, shrunk
@@ -750,7 +766,7 @@ class TestTheBringUpNeverWaitsForever:
         assert "kill-server" in refused["web"]
         assert fake.issued("new-session", "web") == []
         assert fake.issued("send-keys", "api")
-        fake.assert_no_client_left_behind()
+        fake.assert_no_client_left_behind(expect=1)
 
     def test_a_stuck_new_session_costs_only_its_own_window(
         self, fake_psmux, shrunk, monkeypatch
@@ -767,7 +783,7 @@ class TestTheBringUpNeverWaitsForever:
         for name in ("api", "db"):
             assert fake.issued("send-keys", name), name
             assert fake.issued("set", name), name  # decorated too
-        fake.assert_no_client_left_behind()
+        fake.assert_no_client_left_behind(expect=1)
 
     def test_the_verified_bring_up_reports_the_unknown_name_with_its_reason(
         self, fake_psmux, shrunk
@@ -789,7 +805,9 @@ class TestTheBringUpNeverWaitsForever:
         assert fake.issued("kill-server", "web") == []
         assert fake.issued("new-session", "web") == []
         assert fake.issued("send-keys", "api")
-        fake.assert_no_client_left_behind()
+        # Two: the dedupe probe, then the creation verify's probe of the name
+        # it could not read.
+        fake.assert_no_client_left_behind(expect=2)
 
     def test_a_session_created_after_its_wait_gave_up_stays_failed(
         self, fake_psmux, shrunk
@@ -815,7 +833,7 @@ class TestTheBringUpNeverWaitsForever:
         assert len(fake.issued("new-session", "web")) == 1
         assert fake.issued("send-keys", "web") == []
         assert fake.issued("send-keys", "api")
-        fake.assert_no_client_left_behind()
+        fake.assert_no_client_left_behind(expect=1)
 
     @staticmethod
     def _bare_panes_read_as_casualties(monkeypatch, windows):
@@ -844,7 +862,7 @@ class TestTheBringUpNeverWaitsForever:
         assert len(fake.issued("send-keys", "web")) == 1
         # ...and the rest of the batch carried on to its decorations.
         assert fake.issued("set", "api")
-        fake.assert_no_client_left_behind()
+        fake.assert_no_client_left_behind(expect=1)
 
     def test_a_re_send_that_never_answers_is_the_last_send(
         self, fake_psmux, shrunk, monkeypatch
@@ -859,7 +877,7 @@ class TestTheBringUpNeverWaitsForever:
         assert refused == {}
         assert shrunk._SEND_MAX_ATTEMPTS == 3
         assert len(fake.issued("send-keys", "web")) == 2
-        fake.assert_no_client_left_behind()
+        fake.assert_no_client_left_behind(expect=1)
 
     def test_a_decoration_that_never_answers_is_killed(self, fake_psmux, shrunk):
         # Purely cosmetic, so it may cost a budget but never the bring-up.
@@ -868,7 +886,7 @@ class TestTheBringUpNeverWaitsForever:
 
         assert refused == {}
         assert fake.issued("set", "web")
-        fake.assert_no_client_left_behind()
+        fake.assert_no_client_left_behind(expect=1)
 
 
 # --- the reason reaches the report: all OSes -----------------------------------
