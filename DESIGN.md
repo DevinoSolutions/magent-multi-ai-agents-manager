@@ -1924,6 +1924,31 @@ test_real_pane_reads_idle_only_while_nothing_it_launched_runs`.
 
 Ordered roughly by how likely a future change is to collide with it.
 
+**Two Session-0 hand-off failures the launcher cannot describe (2026-09-29):**
+both sit before or outside the Python launcher, so its fast, worded answers
+cannot cover them.
+
+- *A missing interpreter reads as "never started".* If the `sys.executable`
+  that `run.ps1` names is gone by the time the task runs (a venv deleted or an
+  upgrade that swapped the interpreter between staging and `/Run`), its `&`
+  fails under `$ErrorActionPreference = 'Stop'` and PowerShell exits before
+  any launcher exists. That leaves no `pid.txt`, no `rc.txt`, and a task that
+  is not running, so after `_HANDOFF_START_GRACE_S` (30s) the caller hears
+  "Task Scheduler never started the hand-off (is anyone logged on?)". The
+  outcome, nothing brought up and `rc=None`, is right. The wording and the 30s
+  wait are not, because only the launcher writes the immediate rc 1 with a
+  reason, and here it never runs. Closing this would need a `catch` in
+  `run.ps1` that writes `err.txt` and `rc.txt` itself, which makes PowerShell a
+  writer again.
+- *A crash of `launch.py` itself leaves no trace in the scratch dir.* The
+  launcher handles a command that cannot start. Anything else it raises (an
+  `rc.txt` still held after the record retries, say) goes to the task's
+  hidden console as a traceback, and that console is gone when the task
+  ends. The caller hears "exited without an exit code", or "never started",
+  and the scratch directory it names holds nothing about why. Closing this
+  would mean wrapping `main()` in a `try/except BaseException` that writes the
+  traceback into a scratch file.
+
 **Typed text cannot be delivered through a nested ConPTY over `ssh -t`
 (2026-08-18):** `tests/e2e/test_ssh_real.py::test_typed_text_survives_a_real
 _reconnect` is a loud `::warning` skip on win32. The test drives the real
