@@ -54,9 +54,14 @@ _STALL_S = 90.0
 # which blows through any number.
 _BUDGET_S = 45.0
 
-# What each shrunk wait gets. Small enough to keep the file fast, large enough
-# that a healthy fake client (one cold interpreter start) answers well inside it.
-_SHRUNK_S = 5.0
+# What each shrunk wait gets. Every hung client costs exactly this, and nine
+# waits in this file run to it, so it is what keeps the file fast (the Windows
+# e2e job has no minutes to spare). A healthy fake client shares the hung one's
+# deadline and must still answer inside it: one `python -I -S` start behind a
+# .cmd, measured at ~80ms a fan-out, on a fake the fixture has already run once
+# so a first-exec scan cannot land on the timed part. The production values
+# are pinned separately (TestTheProductionBudgets).
+_SHRUNK_S = 0.5
 
 # How long a killed client gets to be gone before the pin calls it left behind.
 _GONE_GRACE_S = 10.0
@@ -182,12 +187,12 @@ class _Fake:
         if sys.platform == "win32":
             launcher = self.bin_dir / "psmux.cmd"
             launcher.write_text(
-                f'@"{_interpreter()}" "{script}" %*\r\n', encoding="utf-8"
+                f'@"{_interpreter()}" -I -S "{script}" %*\r\n', encoding="utf-8"
             )
         else:
             launcher = self.bin_dir / "psmux"
             launcher.write_text(
-                f'#!/bin/sh\nexec "{_interpreter()}" "{script}" "$@"\n',
+                f'#!/bin/sh\nexec "{_interpreter()}" -I -S "{script}" "$@"\n',
                 encoding="utf-8",
             )
             launcher.chmod(0o755)
@@ -274,6 +279,15 @@ def fake_psmux(
         )
         psmux.find_psmux.cache_clear()
         assert os.path.normcase(str(psmux.find_psmux())) == os.path.normcase(fake.path)
+        # Run it once untimed: the first exec of a freshly written script is the
+        # one an on-access scanner may hold, and no pin's deadline should pay it.
+        subprocess.run(
+            [fake.path, "-V"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_BUDGET_S,
+            check=False,
+        )
         return fake
 
     yield make
@@ -349,7 +363,7 @@ class TestTheDedupeProbeHasThreeAnswers:
 
 class TestOneDeadlinePerFanOut:
     def test_n_hung_clients_cost_one_budget_not_n(self, fake_psmux):
-        names = ["a", "b", "c", "d"]
+        names = [f"s{i}" for i in range(10)]
         fake = fake_psmux(hang=tuple(("has-session", n) for n in names))
         started = time.monotonic()
         states = _within(
@@ -359,8 +373,8 @@ class TestOneDeadlinePerFanOut:
         )
         elapsed = time.monotonic() - started
         assert set(states.values()) == {"unknown"}
-        # A timeout per client, waited in turn, would be 4 x the budget.
-        assert elapsed < 2 * _SHRUNK_S + 2.0, elapsed
+        # A timeout per client, waited in turn, would be 10 x the budget.
+        assert elapsed < 5 * _SHRUNK_S, elapsed
         fake.assert_no_client_left_behind()
 
     def test_a_client_that_answered_keeps_its_answer_past_the_deadline(
@@ -398,6 +412,27 @@ class TestClearingAStaleServer:
 # --- the bring-up: WindowsPlatform ---------------------------------------------
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+)
+class TestTheProductionBudgets:
+    """The pins below run every budget shrunk to _SHRUNK_S; these are the real
+    ones, each justified by a measurement in platform/windows.py."""
+
+    def test_the_budgets_are_the_measured_ones(self):
+        from magent import upload_server
+        from magent.platform import windows
+
+        # 1.5x the ~19s measured for a 46-socket has-session fan-out.
+        assert windows._DEDUPE_TIMEOUT_S == 30.0
+        assert windows._CLEAR_TIMEOUT_S == windows._DEDUPE_TIMEOUT_S
+        # One delivery attempt, never retried: the paste's own cap.
+        assert windows._CREATE_TIMEOUT_S == upload_server.INJECT_TIMEOUT_S == 60.0
+        assert windows._SEND_TIMEOUT_S == upload_server.INJECT_TIMEOUT_S
+        # The decorations take the plain send-keys budget, not a copy of it.
+        assert windows.SEND_KEYS_TIMEOUT_S == psmux.SEND_KEYS_TIMEOUT_S == 20.0
+
+
 def _windows(names: list[str]) -> list[psmux.PsmuxWindowOpts]:
     return [
         psmux.PsmuxWindowOpts(window_name=n, cwd=".", command="claude") for n in names
@@ -419,6 +454,7 @@ def shrunk(monkeypatch):
         "_CLEAR_TIMEOUT_S",
         "_CREATE_TIMEOUT_S",
         "_SEND_TIMEOUT_S",
+        "SEND_KEYS_TIMEOUT_S",
     ):
         monkeypatch.setattr(windows, name, _SHRUNK_S, raising=False)
     monkeypatch.setattr(windows, "_BRING_UP_BATCH_PAUSE_S", 0.0)
@@ -427,6 +463,21 @@ def shrunk(monkeypatch):
     monkeypatch.setattr(psmux, "_CREATE_PROBE_TIMEOUT_S", _SHRUNK_S)
     # Pinned, never probed: the runner's PATH is not what is under test.
     monkeypatch.setattr(windows, "code_on_path", lambda: False)
+    # The two advisory reads between create and send are not these pins'
+    # subject either, and they are the bring-up's only SERIAL client calls: a
+    # capture-pane per window, then a pane verdict before the send verifier
+    # would re-type anything. Answered as a healthy pane would ("rendered", "no
+    # casualty"), so the pins pay only for the waits they are about.
+    monkeypatch.setattr(windows, "_wait_for_panes_ready", lambda *_a, **_k: None)
+    monkeypatch.setattr(windows, "idle_sessions", lambda *_a, **_k: set())
+    # One real decoration per window instead of nine: the fan-out and its
+    # budget are still exercised, at a ninth of the spawns.
+    real_decorations = windows.decoration_argv
+    monkeypatch.setattr(
+        windows,
+        "decoration_argv",
+        lambda *a: [c for c in real_decorations(*a) if c[3] == "set"][:1],
+    )
     # The one spawn that inherits the caller's console (new-session) would
     # open a real terminal window per fake client on a console-less test
     # process; which console it gets is not what these pins are about.
