@@ -1458,6 +1458,178 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
         assert self._modes(home) == _LANDED_OWNER_ONLY
 
 
+# A payload item's chmod refused, by the test its last path passes: the
+# folders' find -exec, or the files'. private_dir's own chmods are on paths
+# outside the temp dir, and run as the real one.
+_PAYLOAD_CHMOD_REFUSED = {"folders": "-d", "files": "-f"}
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="node scripts run under a Linux node's bash"
+)
+class TestEveryInstallRefusalIsSaidInTheScriptsWords:
+    """G-S12: tar's words (exit 3) and a set -e death's (mktemp, the payload
+    chmod, mv) used to reach the --to row as the tool said them. Each is a
+    named refusal now, said in the script's own words, with the tool's
+    reason on one tagged line that remote_mux logs and never shows. The
+    WHOLE stderr is pinned, so no tool's line can hide above it."""
+
+    @pytest.fixture
+    def home(self, tmp_path) -> Path:
+        home = tmp_path / "nodehome"
+        home.mkdir()
+        return home
+
+    @staticmethod
+    def _call(monkeypatch, tmp_path, payload: bytes | None = b"<pulled>"):
+        if payload == b"<pulled>":
+            payload = remote_mux._tar_dir(_pulled(tmp_path))
+        return _node_call(monkeypatch, "install_transcripts", [_ENCODED], payload)
+
+    @staticmethod
+    def _files(home: Path) -> list[str]:
+        return sorted(
+            p.relative_to(home).as_posix() for p in home.rglob("*") if not p.is_dir()
+        )
+
+    def test_a_missing_payload_is_refused_with_the_reason_tagged(
+        self, monkeypatch, tmp_path, home
+    ):
+        done = _node_run(self._call(monkeypatch, tmp_path, None), home)
+
+        assert done.returncode == 3
+        assert (
+            done.stderr
+            == (
+                "install_transcripts.sh: the payload is missing or broken;"
+                " nothing installed\n"
+                f"{remote_mux.INSTALL_REASON_TAG}no __MAGENT_PAYLOAD__ line on stdin\n"
+            ).encode()
+        )
+
+    def test_tars_words_on_a_broken_payload_are_one_tagged_line(
+        self, monkeypatch, tmp_path, home
+    ):
+        # GNU and BSD tar word it differently, so the reason is read off the
+        # same tar given the same bytes: its FIRST line, the cause. GNU's
+        # last is a summary ("Exiting with failure status due to previous
+        # errors") that would tell the log nothing.
+        whole = remote_mux._tar_dir(_pulled(tmp_path))
+        broken = whole[: 512 + 10]
+        (tmp_path / "bare").mkdir()
+        bare = subprocess.run(
+            ["tar", "-xf", "-", "-C", str(tmp_path / "bare")],
+            input=broken,
+            capture_output=True,
+            check=False,
+        )
+        cause = bare.stderr.decode().splitlines()[0].rsplit(": ", 1)[-1]
+
+        done = _node_run(self._call(monkeypatch, tmp_path, broken), home)
+
+        assert done.returncode == 3
+        assert done.stderr.decode() == (
+            "install_transcripts.sh: the payload is missing or broken;"
+            " nothing installed\n"
+            f"{remote_mux.INSTALL_REASON_TAG}{cause}\n"
+        )
+        assert "tar" not in cause
+        assert self._files(home) == []
+
+    def test_a_temp_folder_that_cannot_be_made_is_a_folder_refusal(
+        self, monkeypatch, tmp_path, home
+    ):
+        _path_shim(
+            tmp_path,
+            monkeypatch,
+            "mktemp",
+            "echo \"mktemp: failed to create directory via template '$last':"
+            ' Permission denied" >&2\nexit 1\n',
+        )
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert done.returncode == 5
+        assert (
+            done.stderr
+            == (
+                "install_transcripts.sh: cannot make a temp folder in"
+                f" {home}/.claude/projects; no file installed\n"
+                f"{remote_mux.INSTALL_REASON_TAG}Permission denied\n"
+            ).encode()
+        )
+        assert self._files(home) == []
+
+    @pytest.mark.parametrize("which", sorted(_PAYLOAD_CHMOD_REFUSED))
+    def test_a_payload_that_cannot_be_restricted_is_a_folder_refusal(
+        self, monkeypatch, tmp_path, home, which
+    ):
+        _path_shim(
+            tmp_path,
+            monkeypatch,
+            "chmod",
+            'case "$last" in */.magent-install.*)\n'
+            f'  if [ {_PAYLOAD_CHMOD_REFUSED[which]} "$last" ]; then\n'
+            f'    echo "{_CHMOD_REFUSED}" >&2\n'
+            "    exit 1\n"
+            "  fi ;;\n"
+            "esac\n"
+            'exec "$real" "$@"\n',
+        )
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert done.returncode == 5
+        assert (
+            done.stderr
+            == (
+                "install_transcripts.sh: cannot restrict the payload to its owner;"
+                " no file installed\n"
+                f"{remote_mux.INSTALL_REASON_TAG}Operation not permitted\n"
+            ).encode()
+        )
+        # Nothing placed, and the EXIT trap took the temp dir with it.
+        assert self._files(home) == []
+        assert list((home / ".claude" / "projects").iterdir()) == []
+
+    @pytest.mark.parametrize("seed", [None, _PULLED_JSONL[:7]])
+    def test_a_file_that_will_not_move_is_refused_by_name(
+        self, monkeypatch, tmp_path, home, seed
+    ):
+        # Both moves: a file the node lacks (mv), and one whose copy there
+        # is a strict prefix (mv -f).
+        dest = home / ".claude" / "projects" / _ENCODED
+        target = dest / f"{SESSION_ID}.jsonl"
+        if seed is not None:
+            dest.mkdir(parents=True)
+            target.write_text(seed, encoding="utf-8")
+        _path_shim(
+            tmp_path,
+            monkeypatch,
+            "mv",
+            _refuses(
+                str(target), "mv: cannot move to '$last': No space left on device"
+            ),
+        )
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert done.returncode == 6
+        assert (
+            done.stderr
+            == (
+                f"install_transcripts.sh: cannot move {SESSION_ID}.jsonl into place;"
+                " the files placed before it stay\n"
+                f"{remote_mux.INSTALL_REASON_TAG}No space left on device\n"
+            ).encode()
+        )
+        # The node's copy is as it was.
+        if seed is None:
+            assert not target.exists()
+        else:
+            assert target.read_text(encoding="utf-8") == seed
+
+
 class TestAnAbsoluteRootIsInstalledThroughTheEncoder:
     def test_an_absolute_root_travels_through_realpath_and_the_encoder(
         self, monkeypatch, tmp_path
@@ -1598,6 +1770,14 @@ class TestTheInstallResultAndRefusals:
             "the node could not make a folder the conversation goes in, or could"
             " not restrict one it made to its owner, so no file was installed;"
             " check that the node user has a home it owns and can write to"
+        )
+
+    def test_a_file_that_would_not_move_is_a_refusal_of_its_own(self):
+        # G-S12: exit 6 is a placement cut short, not a folder: what was
+        # placed before it stays, and it says so.
+        assert remote_mux.INSTALL_REFUSALS[6] == (
+            "the node could not move a file of the conversation into place; the"
+            " files placed before it stay, and a new recall places the rest"
         )
 
     # A refusal as install_transcripts.sh says it (G-S1): its own line, then
@@ -4493,6 +4673,70 @@ class TestRecallTo:
         ) in result.stderr
         assert "Permission denied" not in result.output
         assert any("Permission denied" in m for m in _node_logs(caplog))
+
+    @pytest.mark.parametrize(
+        ("rc", "refused", "reason"),
+        [
+            (
+                3,
+                (
+                    "install_transcripts.sh: the payload is missing or broken;"
+                    " nothing installed"
+                ),
+                "Unexpected EOF in archive",
+            ),
+            (
+                6,
+                (
+                    f"install_transcripts.sh: cannot move {SESSION_ID}.jsonl into"
+                    " place; the files placed before it stay"
+                ),
+                "No space left on device",
+            ),
+        ],
+    )
+    def test_tar_and_mv_words_are_the_logs_and_the_row_is_the_scripts(
+        self,
+        runner,
+        placed_api,
+        node_answers,
+        moving,
+        monkeypatch,
+        caplog,
+        rc,
+        refused,
+        reason,
+    ):
+        # G-S12: the payload's refusal (tar's words) and a file that would
+        # not move (mv's) are said as every other refusal is: magent's
+        # class, the script's line, and the tool's reason in nodes.log only.
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+
+        def _run_script(node, script, args, *, timeout_s, stdin=None, **_k):
+            if script == "node_realpath":
+                return subprocess.CompletedProcess(
+                    [], 0, b"/home/demo/magent/api\n", b""
+                )
+            raise remote_mux.RemoteError(
+                rc,
+                f"{refused}\n{remote_mux.INSTALL_REASON_TAG}{reason}",
+                ("ssh", "devino-third"),
+            )
+
+        monkeypatch.setattr(remote_mux, "install_transcripts", _REAL_INSTALL)
+        monkeypatch.setattr(remote_mux, "run_script", _run_script)
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 3
+        assert (
+            f"could not install the conversation on @third"
+            f" ({remote_mux.INSTALL_REFUSALS[rc]}; {refused});"
+            " api stays placed on @second -- `magent up api` resumes it there"
+        ) in result.stderr
+        assert reason not in result.output
+        assert any(reason in m for m in _node_logs(caplog))
+        assert nodes.read_node_map()["api"].nick == "second"
 
     def test_a_failed_bring_up_exits_3_saying_the_conversation_is_installed(
         self, runner, placed_api, node_answers, moving, monkeypatch

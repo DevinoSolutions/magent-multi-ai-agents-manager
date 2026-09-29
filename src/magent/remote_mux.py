@@ -3073,6 +3073,10 @@ INSTALL_REFUSALS = {
         " not restrict one it made to its owner, so no file was installed;"
         " check that the node user has a home it owns and can write to"
     ),
+    6: (
+        "the node could not move a file of the conversation into place; the"
+        " files placed before it stay, and a new recall places the rest"
+    ),
 }
 # What starts each line of a refusal that carries the OS's reason
 # (install_transcripts.sh's said_why). Those are the OS's words: nodes.log's,

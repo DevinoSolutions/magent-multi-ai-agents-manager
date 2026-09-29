@@ -162,4 +162,4 @@ class TestNoTerminatorFollowsAnOperand:
         calls = _calls(_shipped()["install_transcripts.sh"])
         assert ("chmod", ["--", "700", '"$1"', "2>"]) in calls
         assert ("mkdir", ["-m", "700", "--", '"$1"', "2>"]) in calls
-        assert ("mv", ['"$src"', '"$target"']) in calls
+        assert ("mv", ['"$src"', '"$target"', "2>"]) in calls
