@@ -16,8 +16,11 @@ on:
         type: boolean
         default: true
 
-# Least privilege at the top; only the publish and release jobs elevate, each
-# narrowly and only on a real tag push.
+# `id-token: write` is granted here, at the WORKFLOW level, so every job can
+# mint an OIDC token. PyPI accepts one only from a job in the `pypi`
+# environment (the Trusted Publisher's environment constraint), i.e. publish.
+# `contents: write` is elevated in github-release alone. Scoping id-token to
+# the publish job is a follow-up.
 permissions:
   id-token: write
   contents: read
@@ -34,19 +37,94 @@ jobs:
     name: "Build (sdist + wheel)"
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      # "true" for a PEP 440 pre-release tag (v3.20.0rc1, v3.20.0a1, v3.20.0b2,
+      # v3.20.0.dev1), "false" for a final one. Empty unless the run's ref is
+      # a v* tag; a run without a tag ref never reaches github-release.
+      prerelease: ${{ steps.classify.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.13"
-      # `build` + `twine` are ad-hoc release tooling, deliberately NOT pyproject
-      # extras (same stance as tests/dist and dependency-audit, which install
-      # their tooling per-job).
-      - run: python -m pip install --upgrade build twine
+      # `build` + `twine` + `packaging` are ad-hoc release tooling, deliberately
+      # NOT pyproject extras (same stance as tests/dist and dependency-audit,
+      # which install their tooling per-job).
+      - run: python -m pip install --upgrade build twine packaging
+      # A pre-release must never become the repo's "Latest" GitHub release, so
+      # github-release needs to know which kind of tag this is. PEP 440 decides
+      # (packaging), not a regex; a tag it cannot parse fails the build here,
+      # before anything is published under a guess.
+      - name: Classify the tag (PEP 440 pre-release?)
+        id: classify
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          from packaging.version import Version
+
+          tag = os.environ["TAG"]
+          prerelease = Version(tag.removeprefix("v")).is_prerelease
+          print(f"{tag}: prerelease={prerelease}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"prerelease={str(prerelease).lower()}\n")
+          PY
       - name: Build sdist + wheel
         run: python -m build
       - name: Validate distribution metadata
         run: twine check --strict dist/*
+      # PyPI gets the version in the BUILT artifacts (pyproject's), never the
+      # tag's, and an upload cannot be taken back. So v3.20.0rc1 over a 3.20.0
+      # build fails here, before publish. The tag must be exactly "v" + the
+      # canonical PEP 440 form of the built version: v3.20.0rc1, never
+      # v3.20.0-rc1, so the GitHub tag, the Release and the CHANGELOG links
+      # all spell the version the way PyPI does. The built side is normalized
+      # because hatchling writes pyproject's spelling into METADATA verbatim.
+      # Skipped unless the run's ref is a v* tag; a workflow_dispatch on a tag
+      # ref runs it too, which is harmless (publish needs a push event).
+      - name: Check the tag matches the built version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import glob
+          import os
+          import sys
+          import tarfile
+          import zipfile
+          from email.parser import BytesHeaderParser
+          from packaging.version import Version
+
+          def version_of(raw):
+              return BytesHeaderParser().parsebytes(raw)["Version"]
+
+          wheels = sorted(glob.glob("dist/*.whl"))
+          sdists = sorted(glob.glob("dist/*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              print(f"::error::expected exactly one wheel and one sdist in dist/, found {wheels + sdists}")
+              sys.exit(1)
+          (wheel,), (sdist,) = wheels, sdists
+          with zipfile.ZipFile(wheel) as zf:
+              (meta,) = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
+              wheel_version = version_of(zf.read(meta))
+          with tarfile.open(sdist) as tf:
+              # The sdist's own PKG-INFO sits at <name>-<version>/PKG-INFO.
+              (info,) = [m for m in tf.getmembers() if m.name.count("/") == 1 and m.name.endswith("/PKG-INFO")]
+              sdist_version = version_of(tf.extractfile(info).read())
+
+          tag = os.environ["TAG"]
+          built = Version(wheel_version)
+          if built != Version(sdist_version):
+              print(f"::error::wheel is {wheel_version} but sdist is {sdist_version}; they must match")
+              sys.exit(1)
+          if tag != f"v{built}":
+              print(f"::error::tag {tag} does not match the built version {built} (expected tag v{built}); bump pyproject.toml or retag")
+              sys.exit(1)
+          print(f"tag {tag} matches the built version {built} (wheel and sdist)")
+          PY
       - uses: DevinoSolutions/artifact/upload@v1
         with:
           name: dist
@@ -163,13 +241,27 @@ jobs:
         with:
           name: dist
           path: dist
+      # A final release runs exactly the command it always has. A pre-release
+      # adds `--prerelease --latest=false`, so an rc never becomes "Latest".
+      # Anything but true/false fails rather than defaulting to a final release.
+      # The tag reaches the script through env, never `${{ }}` inside `run:`:
+      # git accepts tag names like v1$(cmd), and a template expansion would
+      # run that in a job holding contents: write.
       - name: Create GitHub Release with generated notes
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${{ github.ref_name }}"
-          dist/*
-          --repo "${{ github.repository }}"
-          --title "${{ github.ref_name }}"
-          --generate-notes
-          --verify-tag
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          case "$PRERELEASE" in
+            true) kind=(--prerelease --latest=false) ;;
+            false) kind=() ;;
+            *) echo "::error::build.outputs.prerelease is '$PRERELEASE', expected true or false"; exit 1 ;;
+          esac
+          gh release create "$TAG" \
+            dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes \
+            --verify-tag \
+            "${kind[@]}"

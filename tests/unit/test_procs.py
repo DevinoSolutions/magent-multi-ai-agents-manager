@@ -18,7 +18,9 @@ from magent.procs import (
     ABOVE_NORMAL_PRIORITY_CLASS,
     CREATE_BREAKAWAY_FROM_JOB,
     NO_CONSOLE_SESSION,
+    REGISTRATION_TIMEOUT_S,
     active_console_session_id,
+    await_registration,
     count_processes,
     current_session_id,
     pid_alive,
@@ -467,3 +469,151 @@ class TestActiveConsoleSession:
         # 0 is the services session; 0xFFFFFFFF is "nothing attached". Both are
         # "no desktop", and neither may be mistaken for a session id.
         assert NO_CONSOLE_SESSION == (0, 0xFFFFFFFF)
+
+
+class _Child:
+    """A detached child that records every attempt to end it."""
+
+    def __init__(self, returncode: int | None = None) -> None:
+        self.returncode = returncode
+        self.ended: list[str] = []
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.ended.append("kill")
+
+    def terminate(self) -> None:
+        self.ended.append("terminate")
+
+    def send_signal(self, sig: int) -> None:
+        self.ended.append(f"signal {sig}")
+
+
+class _Clock:
+    """A fake clock whose ``sleep`` advances it; nothing really sleeps. A wait
+    that never closes FAILS here instead of hanging the suite."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        assert self.now < 120.0, "the registration wait never closed"
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class TestAwaitRegistration:
+    """The launcher-side wait for a detached child's pid file. The old fixed 2s
+    window reported "failed to start" over children that registered at
+    4.7-11s on a loaded desktop and then kept running."""
+
+    def test_a_child_that_registers_after_five_seconds_is_accepted(self):
+        clock = _Clock()
+
+        def read_pid() -> int | None:
+            return 4242 if clock.now >= 5.0 else None
+
+        pid = await_registration(_Child(), read_pid, sleep=clock.sleep, clock=clock)
+
+        assert pid == 4242
+
+    def test_the_default_window_outlasts_the_slowest_measured_start(self):
+        assert REGISTRATION_TIMEOUT_S >= 11.5  # slowest measured: 11.45s
+
+    def test_a_child_that_exited_is_not_waited_out(self):
+        clock = _Clock()
+
+        pid = await_registration(
+            _Child(returncode=1), lambda: None, sleep=clock.sleep, clock=clock
+        )
+
+        assert pid is None
+        assert clock.now < 1.0
+
+    def test_the_wait_is_bounded(self):
+        clock = _Clock()
+
+        pid = await_registration(
+            _Child(), lambda: None, 20.0, sleep=clock.sleep, clock=clock
+        )
+
+        assert pid is None
+        assert 20.0 <= clock.now < 20.5
+
+    def test_the_old_pid_never_counts_as_the_new_registration(self):
+        # A restart whose kill did not take leaves the old pid in the file.
+        clock = _Clock()
+
+        pid = await_registration(
+            _Child(), lambda: 1234, 3.0, not_pid=1234, sleep=clock.sleep, clock=clock
+        )
+
+        assert pid is None
+
+    def test_a_pid_already_there_is_returned_after_one_poll(self):
+        clock = _Clock()
+
+        pid = await_registration(_Child(), lambda: 99, sleep=clock.sleep, clock=clock)
+
+        assert pid == 99
+        assert clock.now == pytest.approx(0.1)
+
+    def test_a_child_that_exited_zero_is_not_waited_out(self):
+        # `magent hotkey` exits 0 when another listener already runs: a clean
+        # exit is still an exit, not 20 seconds of waiting on a corpse.
+        clock = _Clock()
+
+        pid = await_registration(
+            _Child(returncode=0), lambda: None, sleep=clock.sleep, clock=clock
+        )
+
+        assert pid is None
+        assert clock.now < 1.0
+
+
+class TestTheWaitNeverEndsTheChild:
+    """A timeout means "not registered YET", never "dead": on a loaded box the
+    child may be a second from coming up, so the wait must not end it."""
+
+    def test_a_child_that_never_registers_is_left_running(self):
+        clock = _Clock()
+        child = _Child()
+
+        pid = await_registration(
+            child, lambda: None, 3.0, sleep=clock.sleep, clock=clock
+        )
+
+        assert pid is None
+        assert child.ended == []
+
+    def test_a_restart_whose_kill_did_not_take_leaves_the_new_child_alone(self):
+        clock = _Clock()
+        child = _Child()
+
+        pid = await_registration(
+            child, lambda: 1234, 3.0, not_pid=1234, sleep=clock.sleep, clock=clock
+        )
+
+        assert pid is None
+        assert child.ended == []
+
+
+class TestTheDefaultWindowIsBounded:
+    """Long enough for the slowest measured start, and still a bound: a child
+    that hangs alive without registering must not stall serve's supervisor
+    thread or a `--go` launch forever."""
+
+    def test_the_default_window_is_a_bound_not_a_hang(self):
+        assert REGISTRATION_TIMEOUT_S <= 30.0
+
+    def test_the_default_window_is_what_a_caller_without_one_gets(self):
+        clock = _Clock()
+
+        pid = await_registration(_Child(), lambda: None, sleep=clock.sleep, clock=clock)
+
+        assert pid is None
+        assert REGISTRATION_TIMEOUT_S <= clock.now < REGISTRATION_TIMEOUT_S + 0.5

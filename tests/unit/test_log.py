@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -36,6 +37,101 @@ class TestGetLogger:
         log_file = log.LOG_DIR / "upload.log"
         assert log_file.exists()
         assert "hello from test" in log_file.read_text(encoding="utf-8")
+
+    def test_first_use_from_many_threads_attaches_one_handler(self, monkeypatch):
+        # A first call for a name can come from a thread pool (the status-line
+        # decoration fan-out, psmux.decorate_sessions); a check-then-set race
+        # would stack a handler per thread and write every record that many
+        # times.
+        real = log._SharedRotatingFileHandler
+
+        def slow(*a, **kw):
+            time.sleep(0.05)  # hold the race window open for every thread
+            return real(*a, **kw)
+
+        monkeypatch.setattr(log, "_SharedRotatingFileHandler", slow)
+        barrier = threading.Barrier(8, timeout=10)
+
+        def first_use() -> None:
+            barrier.wait()
+            log.get_logger("race")
+
+        threads = [threading.Thread(target=first_use) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert not any(t.is_alive() for t in threads)
+        assert len(logging.getLogger("magent.race").handlers) == 1
+
+    def test_a_thread_that_asks_mid_configuration_waits_for_the_handler(
+        self, monkeypatch
+    ):
+        # The unlocked fast path trusts the configured sentinel, so it must be
+        # set after the handler is attached: a thread that asks while the first
+        # caller is still attaching has to wait for the lock, not take a
+        # handler-less logger whose records miss the file.
+        real_lock = log._CONFIGURE_LOCK
+        reached = threading.Event()  # the asker is at the lock, or already done
+        askers: list[threading.Thread] = []
+
+        class _Lock:
+            def __enter__(self) -> None:
+                if threading.current_thread() in askers:
+                    reached.set()
+                real_lock.acquire()
+
+            def __exit__(self, *exc: object) -> None:
+                real_lock.release()
+
+        def ask() -> None:
+            log.get_logger("midway").warning("from the asker")
+            reached.set()
+
+        real_add = logging.Logger.addHandler
+
+        def add_handler(self: logging.Logger, handler: logging.Handler) -> None:
+            if self.name == "magent.midway" and not askers:
+                askers.append(threading.Thread(target=ask))
+                askers[0].start()
+                assert reached.wait(10)
+            real_add(self, handler)
+
+        monkeypatch.setattr(log, "_CONFIGURE_LOCK", _Lock())
+        monkeypatch.setattr(logging.Logger, "addHandler", add_handler)
+        log.get_logger("midway").warning("from the first caller")
+        askers[0].join(timeout=10)
+        assert not askers[0].is_alive()
+        text = (log.LOG_DIR / "midway.log").read_text(encoding="utf-8")
+        assert "from the first caller" in text
+        assert "from the asker" in text
+
+    def test_a_thread_that_asks_as_the_lock_is_released_attaches_nothing(
+        self, monkeypatch
+    ):
+        # ...and set inside the lock: a caller that arrives the instant the
+        # first one lets go must find the logger configured, not configure it
+        # a second time and write every record twice.
+        real_lock = log._CONFIGURE_LOCK
+        askers: list[threading.Thread] = []
+
+        class _Lock:
+            def __enter__(self) -> None:
+                real_lock.acquire()
+
+            def __exit__(self, *exc: object) -> None:
+                real_lock.release()
+                if not askers:
+                    askers.append(
+                        threading.Thread(target=log.get_logger, args=("released",))
+                    )
+                    askers[0].start()
+                    askers[0].join(timeout=10)
+
+        monkeypatch.setattr(log, "_CONFIGURE_LOCK", _Lock())
+        log.get_logger("released")
+        assert not askers[0].is_alive()
+        assert len(logging.getLogger("magent.released").handlers) == 1
 
     def test_mkdir_failure_falls_back_to_null_handler(self, monkeypatch):
         def _raise(*a, **k):
@@ -136,6 +232,32 @@ class TestSharedRotatingHandler:
         assert "degraded two" in text
         assert text.count("log interlock unavailable") == 1  # once per process
         assert "WARNING" in text
+
+    def test_a_lone_surrogate_is_escaped_never_lost(self, capsys):
+        """A name read off the disk can hold a lone surrogate -- a POSIX byte
+        that is not UTF-8 (surrogateescape), an unpaired UTF-16 half on NTFS.
+        Strict UTF-8 cannot encode one: the stdlib prints "--- Logging error
+        ---" and DROPS the record. Whatever a call site passes, the record
+        lands, with the character escaped -- and the file stays UTF-8."""
+        log.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        handler = log._SharedRotatingFileHandler(
+            log.LOG_DIR / "shared.log", max_bytes=0, backup_count=0, encoding="utf-8"
+        )
+        try:
+            for name in ("caf\udce9", "after"):
+                handler.handle(
+                    logging.makeLogRecord(
+                        {"msg": "skills/%s: skipped", "args": (name,)}
+                    )
+                )
+        finally:
+            handler.close()
+
+        data = (log.LOG_DIR / "shared.log").read_bytes()
+        assert b"skills/caf\\udce9: skipped" in data
+        assert b"skills/after: skipped" in data
+        assert data.decode("utf-8").count("\n") == 2
+        assert "Logging error" not in capsys.readouterr().err
 
 
 class TestLogLevelFromEnv:

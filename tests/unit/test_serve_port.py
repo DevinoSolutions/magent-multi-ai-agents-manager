@@ -138,6 +138,62 @@ class TestServeBlockingPathUsesConfiguredPort:
         ]
 
 
+class TestServeOnAHeldPortExitsByName:
+    """A serve that never bound says why in one line and exits 1 -- no
+    traceback. A crash of the running loop is NOT swallowed by the same catch."""
+
+    def _raise(self, monkeypatch, exc):
+        def _run_server(**kwargs):
+            raise exc
+
+        monkeypatch.setattr("magent.upload_server.run_server", _run_server)
+        monkeypatch.setattr("magent.tailnet.ip4", lambda: None)
+
+    def test_port_in_use_is_a_sentence_and_exit_1(self, runner, tmp_path, monkeypatch):
+        from magent.upload_server import PortInUse
+
+        detail = "upload server: port 8034 is already in use (x)"
+        self._raise(monkeypatch, PortInUse(detail))
+        cfg = _write_config(tmp_path / "magent.config.json", port=8034)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "serve"])
+
+        assert result.exit_code == 1
+        # SystemExit, not the PortInUse itself: the shell turned it into a
+        # sentence and an exit code (CliRunner never prints a traceback).
+        assert isinstance(result.exception, SystemExit)
+        assert detail in result.stderr
+
+    def test_no_bindable_address_is_reported_the_same_way(
+        self, runner, tmp_path, monkeypatch
+    ):
+        from magent.upload_server import BindFailed
+
+        detail = (
+            "upload server: no bindable address on port 8034: port 8034 is "
+            "reserved or not permitted on 127.0.0.1 (x); see 'netsh ...'"
+        )
+        self._raise(monkeypatch, BindFailed(detail))
+        cfg = _write_config(tmp_path / "magent.config.json", port=8034)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "serve"])
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert detail in result.stderr
+
+    def test_a_crash_of_the_serve_loop_still_propagates(
+        self, runner, tmp_path, monkeypatch
+    ):
+        self._raise(monkeypatch, RuntimeError("accept loop exploded"))
+        cfg = _write_config(tmp_path / "magent.config.json", port=8034)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "serve"])
+
+        assert isinstance(result.exception, RuntimeError)
+        assert not isinstance(result.exception, SystemExit)
+
+
 class TestMobileFallsBackToConfiguredPort:
     def test_no_running_server_uses_the_configs_upload_port(
         self, runner, tmp_path, monkeypatch

@@ -27,12 +27,9 @@ import logging
 import logging.handlers
 import os
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import threading
 
 # The shared-log interlock's primitive, bound ONCE at import: msvcrt on Windows,
 # flock elsewhere -- the same per-OS locking-API split lockfile.py makes.
@@ -90,6 +87,8 @@ _LOCK_TIMEOUT_S = 5.0
 _LOCK_POLL_S = 0.002
 
 _CONFIGURED_ATTR = "_magent_log_configured"
+# Serializes a logger's FIRST configuration across threads (get_logger).
+_CONFIGURE_LOCK = threading.Lock()
 
 
 def _configured_level() -> int:
@@ -165,6 +164,13 @@ class _SharedRotatingFileHandler(logging.handlers.RotatingFileHandler):
             maxBytes=max_bytes,
             backupCount=backup_count,
             encoding=encoding,
+            # Load-bearing: a record can carry a name read off the disk, and
+            # one holding a lone surrogate (a non-UTF-8 byte on POSIX, an
+            # unpaired UTF-16 half on NTFS) cannot be encoded strictly -- the
+            # stdlib then prints "--- Logging error ---" and DROPS the record.
+            # Escaped, it lands; whatever a call site passes, no record is lost
+            # to its encoding.
+            errors="backslashreplace",
             # Load-bearing: the stream must be opened per record inside the
             # lock, never left open across records, or the rename this class
             # exists to protect is blocked again.
@@ -294,28 +300,35 @@ def get_logger(name: str) -> logging.Logger:
     NullHandler and stays otherwise usable.
 
     Safe to call for the same ``name`` from several magent processes at once --
-    see ``_SharedRotatingFileHandler``.
+    see ``_SharedRotatingFileHandler`` -- and from several threads at once: the
+    first use is configured under ``_CONFIGURE_LOCK``, so a thread pool's
+    racing first calls attach one handler, not one each. A configured logger
+    is returned without taking the lock, and records never touch it.
     """
     logger = logging.getLogger(f"magent.{name}")
     if getattr(logger, _CONFIGURED_ATTR, False):
         return logger
 
-    handler: logging.Handler
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        handler = _SharedRotatingFileHandler(
-            LOG_DIR / f"{name}.log",
-            max_bytes=_MAX_BYTES,
-            backup_count=_BACKUP_COUNT,
-            encoding="utf-8",
-        )
-        handler.setFormatter(logging.Formatter(_FORMAT))
-    except OSError:
-        handler = logging.NullHandler()
+    with _CONFIGURE_LOCK:
+        if getattr(logger, _CONFIGURED_ATTR, False):
+            return logger
+        handler: logging.Handler
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            handler = _SharedRotatingFileHandler(
+                LOG_DIR / f"{name}.log",
+                max_bytes=_MAX_BYTES,
+                backup_count=_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            handler.setFormatter(logging.Formatter(_FORMAT))
+        except OSError:
+            handler = logging.NullHandler()
 
-    logger.addHandler(handler)
-    logger.setLevel(_configured_level())
-    setattr(logger, _CONFIGURED_ATTR, True)
+        logger.addHandler(handler)
+        logger.setLevel(_configured_level())
+        # Last, and inside the lock: the unlocked fast path above trusts it.
+        setattr(logger, _CONFIGURED_ATTR, True)
     return logger
 
 
