@@ -282,11 +282,14 @@ elif mode == "/run":
         # `subprocess.run(capture_output=True)` blocks until the task finishes
         # and /run stops being the fire-and-forget real schtasks is. And a cwd
         # of our own, because a real task starts in system32, never in the
-        # caller's directory: a launcher that dropped -WorkingDirectory must
-        # not pass by inheriting the right one.
+        # caller's directory: a launcher that dropped the caller's cwd must
+        # not pass by inheriting the right one. And no console window: the
+        # task's console is not ours to flash at the desktop, and a child that
+        # merely inherited it (instead of getting a hidden one of its own)
+        # then has no window at all, which the console pin can see.
         late = os.environ.get("MDTEST_HANDOFF_STARTS_LATE_S")
         if late:
-            # Started, but slow to reach Start-Process (a loaded box): the
+            # Started, but slow to reach the launcher (a loaded box): the
             # launcher is alive, so /Query says Running, and no pid.txt yet.
             spec = f'"{sys.executable}" -c "import time; time.sleep({late})" && {spec}'
         # A job.txt sidecar names a job object the TEST created: the task is
@@ -300,7 +303,8 @@ elif mode == "/run":
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=0x00000004 if job_file.exists() else 0,  # CREATE_SUSPENDED
+            # CREATE_NO_WINDOW, plus CREATE_SUSPENDED when a job is named
+            creationflags=0x08000000 | (0x00000004 if job_file.exists() else 0),
         )
         if job_file.exists():
             import ctypes
@@ -382,7 +386,7 @@ def fake_schtasks(tmp_path, monkeypatch):
     a real child must never run in the checkout, where anything it writes
     relative to its cwd lands in the repository.
     """
-    bin_dir = tmp_path / "fake bin Ñ т"
+    bin_dir = tmp_path / "fake bin \u00d1 \u0442"
     bin_dir.mkdir()
     (bin_dir / "schtasks_helper.py").write_text(_FAKE_SCHTASKS, encoding="utf-8")
     fake = bin_dir / "schtasks.cmd"
@@ -526,6 +530,104 @@ class TestRunOnDesktopOnWindows:
         # after its resume -- or a green rc proves nothing about the race.
         assert (hook.killed, hook.kill_ok) == (1, 1)
         assert result.rc == 7, result.detail
+
+    def test_a_command_that_cannot_start_says_so_at_once(self, fake_schtasks, tmp_path):
+        # Not "Task Scheduler never started the hand-off" 30s later: the task
+        # did start, and the launcher knows exactly what went wrong.
+        started = time.monotonic()
+
+        result = self._plat().run_on_desktop(
+            [str(tmp_path / "no such magent.exe"), "up"], timeout_s=60
+        )
+
+        assert result.rc == 1, result.detail
+        assert "hand-off launcher: could not start the command" in result.stderr
+        assert time.monotonic() - started < 15
+
+    def test_an_ntstatus_exit_code_arrives_signed(self, fake_schtasks):
+        # 0xC000013A is what a console closed under a command exits with. The
+        # launcher reads it as a DWORD; everything Windows prints says
+        # -1073741510, and so does the old launcher's Int32 ExitCode.
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-c", "import os; os._exit(-1073741510)"], timeout_s=60
+        )
+
+        assert result.rc == -1073741510, result.detail
+
+    def test_a_weird_argv_and_cwd_arrive_exactly(
+        self, fake_schtasks, tmp_path, monkeypatch
+    ):
+        # Everything a quoting layer ever ate, lone surrogates included (legal
+        # in a Windows file name and argument; json escapes them into ASCII).
+        # The child answers in json on stdout, so its console encoding cannot
+        # blur what it received.
+        weird = [
+            "O\u2019Brien \u00d1 \u0442",
+            "a & b | c",
+            "100% %PATH%",
+            'say "hi" \\"there\\"',
+            "trailing\\",
+            "",
+            "lone \udcff and \ud800",
+        ]
+        where = tmp_path / "caller \u2019 \u00d1 \udcff"
+        where.mkdir()
+        monkeypatch.chdir(where)
+        code = (
+            "import json, os, sys; "
+            "print(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd()}))"
+        )
+
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-c", code, *weird], timeout_s=60
+        )
+
+        assert result.rc == 0, result.detail
+        assert json.loads(result.stdout) == {"argv": weird, "cwd": str(where)}
+
+    def test_the_launcher_ignores_a_pythonpath_that_shadows_its_imports(
+        self, fake_schtasks, tmp_path, monkeypatch
+    ):
+        # The user's environment reaches the desktop copy whole, PYTHONPATH
+        # included. -I keeps it off the launcher's sys.path: a json.py there
+        # must not be what the launcher imports.
+        shadow = tmp_path / "shadow"
+        shadow.mkdir()
+        marker = tmp_path / "shadow-imported"
+        (shadow / "json.py").write_text(
+            f"open({str(marker)!r}, 'w').close()\nraise SystemExit(99)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("PYTHONPATH", str(shadow))
+        # A red launcher dies before pid.txt; do not wait the default 30s.
+        monkeypatch.setattr("magent.platform.windows._HANDOFF_START_GRACE_S", 5.0)
+
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-I", "-c", "pass"], timeout_s=60
+        )
+
+        assert not marker.exists()
+        assert result.rc == 0, result.detail
+
+    def test_the_command_gets_a_console_of_its_own_and_it_is_hidden(
+        self, fake_schtasks
+    ):
+        # What `Start-Process -WindowStyle Hidden` gave it: a console (a
+        # console program with none behaves differently) whose window nobody
+        # sees. The fake starts the task with no console window, so a command
+        # that merely inherited the launcher's console reports no window.
+        code = (
+            "import ctypes; k = ctypes.windll.kernel32; "
+            "k.GetConsoleWindow.restype = ctypes.c_void_p; "
+            "h = k.GetConsoleWindow(); "
+            "print(bool(h), bool(h) and bool("
+            "ctypes.windll.user32.IsWindowVisible(ctypes.c_void_p(h))))"
+        )
+
+        result = self._plat().run_on_desktop([sys.executable, "-c", code], timeout_s=60)
+
+        assert result.rc == 0, result.detail
+        assert result.stdout.split() == ["True", "False"]
 
     def test_the_child_can_never_hand_off_again(self, fake_schtasks):
         # A hand-off that landed in Session 0 again and handed off in turn
@@ -854,7 +956,7 @@ class TestTheLauncherReallyRuns:
     ):
         from magent.platform.windows import _HANDOFF_SHELL, _stage_handoff
 
-        work = tmp_path / "a b Ñ т"
+        work = tmp_path / "a b \u00d1 \u0442"
         caller = tmp_path / "caller"
         caller.mkdir()
         monkeypatch.chdir(caller)
