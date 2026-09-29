@@ -7,8 +7,8 @@ hands a FILE to ``::ParseFile``, which decodes it exactly as
 ``powershell.exe -File`` does (a BOM picks the encoding; without one, Windows
 PowerShell 5.1 reads the ANSI code page). Either way the parser builds the
 syntax tree and executes nothing, and every command in the tree comes back
-with its elements: parameters by name, string constants with their parsed
-VALUE and quote kind. Windows only; the output is ASCII (base64 for every
+with its invocation operator and its elements: parameters by name, string
+constants with their parsed VALUE and quote kind. So does every assignment. Windows only; the output is ASCII (base64 for every
 value), so no console code page can bend it.
 
 Windows PowerShell 5.1 and nothing else, because it is the production host
@@ -49,7 +49,7 @@ function b64([string]$s) { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBy
 foreach ($e in $errors) { [Console]::Out.WriteLine("error`t" + (b64 $e.Message)) }
 $isCommand = { param($n) $n -is [System.Management.Automation.Language.CommandAst] }
 foreach ($c in $ast.FindAll($isCommand, $true)) {
-  [Console]::Out.WriteLine("command")
+  [Console]::Out.WriteLine("command`t" + (b64 $c.InvocationOperator))
   foreach ($el in $c.CommandElements) {
     if ($el -is [System.Management.Automation.Language.CommandParameterAst]) {
       [Console]::Out.WriteLine("param`t" + (b64 $el.ParameterName))
@@ -60,6 +60,16 @@ foreach ($c in $ast.FindAll($isCommand, $true)) {
     }
   }
 }
+$isAssignment = { param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }
+foreach ($a in $ast.FindAll($isAssignment, $true)) {
+  $right = $a.Right.Expression
+  if ($right -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+    $value = $right.Value
+  } else {
+    $value = $a.Right.Extent.Text
+  }
+  [Console]::Out.WriteLine("assign`t" + (b64 $a.Left.Extent.Text) + "`t" + (b64 $value))
+}
 """
 
 
@@ -68,6 +78,12 @@ class Parsed(NamedTuple):
     # one list per command, in tree order; each element is
     # ("param", name) | ("const", quote kind, value) | ("other", type, text)
     commands: list[list[tuple[str, ...]]]
+    # each command's invocation operator, same order: "Ampersand" for `& x`,
+    # "Dot" for `. x`, "Unknown" for a bare command
+    operators: list[str]
+    # every assignment statement, in tree order: (left side as written,
+    # the right side's string value, or its text when it is not a constant)
+    assignments: list[tuple[str, str]]
 
     def named(self, name: str) -> list[list[tuple[str, ...]]]:
         """The commands whose first element is the bare word ``name``."""
@@ -122,6 +138,8 @@ def _run(reader: str, src: Path, tmp_path: Path) -> Parsed:
     assert proc.returncode == 0, proc.stderr
     errors: list[str] = []
     commands: list[list[tuple[str, ...]]] = []
+    operators: list[str] = []
+    assignments: list[tuple[str, str]] = []
     for line in proc.stdout.splitlines():
         kind, *fields = line.split("\t")
         values = tuple(base64.b64decode(f).decode("utf-8") for f in fields)
@@ -129,9 +147,12 @@ def _run(reader: str, src: Path, tmp_path: Path) -> Parsed:
             errors.append(values[0])
         elif kind == "command":
             commands.append([])
+            operators.append(values[0])
         elif kind in {"param", "const", "other"}:
             commands[-1].append((kind, *values))
-    return Parsed(errors, commands)
+        elif kind == "assign":
+            assignments.append((values[0], values[1]))
+    return Parsed(errors, commands, operators, assignments)
 
 
 def argument_of(command: list[tuple[str, ...]], parameter: str) -> tuple[str, ...]:

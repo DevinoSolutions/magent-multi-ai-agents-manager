@@ -6,6 +6,7 @@ import ctypes.wintypes
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -23,6 +24,7 @@ from magent.platform import (
     TerminalLaunchOpts,
     TerminalNotFoundError,
     VSCodeLaunchOpts,
+    _handoff_launcher,
     find_psmux,
 )
 from magent.procs import (
@@ -131,12 +133,12 @@ _HANDOFF_POLL_S = 0.25
 # abandoning a 900s budget for. Generous because the signal comes from a COLD
 # powershell.exe: ~1.6s measured on an idle desktop, but a loaded box (CI
 # proved it -- 5s was not enough on 2 of 5 windows-latest runners) can take
-# well over 5s just to reach `Start-Process`. A false "never started" here
+# well over 5s just to reach the launcher. A false "never started" here
 # abandons a bring-up that is in fact under way, so the grace errs long; a
 # task that truly never ran is still reported, only 30s later.
 _HANDOFF_START_GRACE_S = 30.0
 # How long a child that is GONE gets to still have its exit code written. The
-# launcher writes rc.txt only after its WaitForExit returns, so between the
+# launcher writes rc.txt only after its wait() returns, so between the
 # child's last breath and rc.txt landing there is a window in which "pid dead,
 # no rc.txt" is the ordinary success path mid-flight, not a lost child. CI
 # proved the window is real: on 3 of 5 windows-latest runners a `-c "exit 7"`
@@ -145,29 +147,30 @@ _HANDOFF_START_GRACE_S = 30.0
 # after this grace, not before.
 _HANDOFF_EXIT_GRACE_S = 15.0
 # How long a PRESENT rc.txt gets to become an integer. rc.txt existing is not
-# the exit code being written: `Set-Content` creates the file, then writes, and
-# refuses readers until it closes (measured: 298 of 300 first reads after the
-# file appeared were a sharing violation, a sub-millisecond window on an idle
-# box and an unbounded one on a loaded runner). Treating that read as final
-# reported "unreadable exit code ''" for commands that had succeeded, on five
-# windows-latest CI runs. Only a complete (newline-terminated) integer ends the
-# wait; this bounds the wait on an rc.txt that never becomes one (a launcher
-# that wrote no value, a file something keeps locked). It errs long because a
-# false answer here is a succeeded bring-up reported as failed, while the cost
-# of a long one falls only on an rc.txt that is broken anyway.
+# the exit code being readable: the launcher renames a finished file into
+# place, but a scanner can hold a file it has just seen written, and the
+# PowerShell launcher before it created the file first and refused readers
+# until it closed (measured: 298 of 300 first reads after the file appeared
+# were a sharing violation). Treating that read as final reported "unreadable
+# exit code ''" for commands that had succeeded, on five windows-latest CI
+# runs. Only a complete (newline-terminated) integer ends the wait; this bounds
+# the wait on an rc.txt that never becomes one (a file something keeps locked,
+# a value that is not a number). It errs long because a false answer here is a
+# succeeded bring-up reported as failed, while the cost of a long one falls
+# only on an rc.txt that is broken anyway.
 _HANDOFF_RC_GRACE_S = 10.0
 # How long to keep retrying the scratch-directory delete after success. The
-# launcher (powershell.exe) still holds the two redirect files open for the few
-# milliseconds between writing rc.txt and exiting, and on Windows an open file
-# makes rmtree fail -- silently, with ignore_errors, which is how CI grew a
-# scratch directory per successful hand-off.
+# launcher and the powershell.exe running it are still exiting for the few
+# milliseconds after rc.txt lands, and on Windows a file still open makes rmtree
+# fail -- silently, with ignore_errors, which is how CI grew a scratch directory
+# per successful hand-off.
 _HANDOFF_CLEANUP_GRACE_S = 5.0
 # Every schtasks call itself is bounded -- Create/Run/Query/Delete are local and
 # instant, so a hang is a wedge, not work.
 _SCHTASKS_TIMEOUT_S = 15.0
 # schtasks truncates /TR at ~261 characters -- silently, so past it the task
 # runs a DIFFERENT command. That is why /TR carries only a fixed-length launcher
-# and the real argv lives in the script file.
+# and the real argv lives in a file next to it (argv.json).
 _TR_MAX_CHARS = 261
 # Bare `powershell.exe`, not an absolute path, and not `pwsh`: Windows PowerShell
 # ships on every Windows box while PowerShell 7 does not, and /TR's length budget
@@ -178,7 +181,7 @@ _TR_MAX_CHARS = 261
 _HANDOFF_SHELL = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File"
 # The script that shell runs is written WITH a BOM. Windows PowerShell 5.1
 # decodes a `-File` script that has none in the ANSI code page, which turns
-# every non-ASCII character of a path or an argument into mojibake -- and can
+# every non-ASCII character of the two paths it holds into mojibake -- and can
 # end a literal early: the UTF-8 bytes of U+00D1 (C3 91) and U+0442 (D1 82)
 # each hold one that cp1252 reads as a typographic single quote. One constant,
 # because the tests that run a launcher script stage it with this too; a copy
@@ -214,87 +217,82 @@ def _schtasks_exe() -> str | None:
 def _ps_quote(value: str) -> str:
     """Wrap ``value`` as ONE PowerShell single-quoted literal.
 
-    Single-quoted, so nothing inside is expanded: these are paths and a whole
-    Windows command line, and a ``$`` or a backtick in either must arrive at
-    the child exactly as written. Doubling is the only escape a single-quoted
-    PowerShell string has, and PowerShell ends such a string on FIVE code
-    points, not one: U+0027 and the typographic U+2018, U+2019, U+201A and
-    U+201B. Every one of them is doubled, or a value holding one breaks out.
+    Single-quoted, so nothing inside is expanded: these are paths, and a
+    ``$`` or a backtick in one must arrive exactly as written. Doubling is the
+    only escape a single-quoted PowerShell string has, and PowerShell ends
+    such a string on FIVE code points, not one: U+0027 and the typographic
+    U+2018, U+2019, U+201A and U+201B. Every one of them is doubled, or a
+    value holding one breaks out.
     """
     return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", value) + "'"
 
 
-def _handoff_script(
-    argv: list[str], cwd: str, out: Path, err: Path, pid: Path, rc: Path
-) -> str:
+def _handoff_script(python: str, launcher: Path) -> str:
     """The PowerShell the scheduled task runs in the user's own session.
 
-    PowerShell rather than a ``.cmd`` shim, for three reasons that are all
-    defects in the batch version: ``-WindowStyle Hidden`` means the desktop
-    does not get a console window flashed at it by a command the user did not
-    type; ``$p.ExitCode`` is the real exit status rather than a parsed
-    ``%ERRORLEVEL%``; and cmd would interpret an ``&`` in an unquoted argument
-    as a command separator, which ``list2cmdline`` does not protect against
-    (it only quotes for whitespace and quotes).
+    Three lines, and none of them is the command. PowerShell cannot be the
+    launcher: 5.1's ``Start-Process`` with redirection drops the handle
+    CreateProcess returned, and ``$p.Handle`` then re-opens the child by pid,
+    after the fact -- so a child that has already exited leaves ``ExitCode``
+    at ``$null`` and rc.txt empty (the measured "hand-off failed" for a
+    bring-up that worked). The launcher is ``launch.py`` (a copy of
+    ``_handoff_launcher``), run by the interpreter magent itself is running
+    under; it holds the handle, and the argv reaches it through
+    ``argv.json``, never through a quoted command line.
 
-    TWO QUOTING LAYERS, both load-bearing. ``subprocess.list2cmdline`` builds
-    the command line by the MS C-runtime rules the child's own argv parser
-    uses, so a path with spaces survives; ``_ps_quote`` then makes that whole
-    string ONE PowerShell literal. Passing a LIST to ``-ArgumentList`` would
-    skip the first layer entirely -- PowerShell joins array elements with bare
-    spaces and does not re-quote them, so ``--config C:\\A B\\magent.json``
-    would arrive at magent as two arguments.
-
-    Three other things it must do, all load-bearing:
-
-    * ``-WorkingDirectory`` the CALLER's directory. ``find_config`` walks up
-      from the working directory and a scheduled task starts in ``system32``,
-      so a hand-off without this could bring up a different config's projects
-      than the command the user actually typed.
     * export ``MAGENT_SESSION0_POLICY=refuse`` for the child, so a hand-off
       that somehow landed in Session 0 again refuses instead of handing off in
       turn -- a recursion whose every level writes a scheduled task.
-    * write ``pid.txt`` as soon as the process exists and ``rc.txt`` LAST.
-      pid.txt is the "it really started" signal the start-grace check reads;
-      rc.txt is the completion signal, and the redirections are closed by the
-      time it is written, so a reader that sees it can never read a
-      half-written out.txt. "Sees it" means reads a complete INTEGER from it
-      (see ``_recorded_int``): ``Set-Content`` creates each file before it
-      writes the value.
+    * ``-I``: PYTHONPATH, PYTHONHOME and the script's directory stay off
+      ``sys.path``, so nothing in the user's environment or the scratch
+      directory can put a different module under the launcher's imports.
+    * ``&`` with both paths as single-quoted literals: nothing in either is
+      expanded, and PowerShell hands each to CreateProcess as ONE argument.
     """
-    command_line = subprocess.list2cmdline(argv[1:])
     return "\n".join(
         (
             "$ErrorActionPreference = 'Stop'",
             "$env:MAGENT_SESSION0_POLICY = 'refuse'",
-            "$p = Start-Process -PassThru -WindowStyle Hidden"
-            f" -FilePath {_ps_quote(argv[0])}"
-            + (f" -ArgumentList {_ps_quote(command_line)}" if command_line else "")
-            + f" -WorkingDirectory {_ps_quote(cwd)}"
-            f" -RedirectStandardOutput {_ps_quote(str(out))}"
-            f" -RedirectStandardError {_ps_quote(str(err))}",
-            # Touching .Handle is not decoration -- it is the documented
-            # workaround for a `Start-Process -PassThru` object whose
-            # `.ExitCode` is $null forever. PowerShell does not cache the
-            # process handle, so once the child exits the OS has nothing left
-            # to ask and the exit code is lost. Measured here first: rc.txt
-            # came back EMPTY on every run until this line existed.
-            "$null = $p.Handle",
-            f"Set-Content -LiteralPath {_ps_quote(str(pid))} -Value $p.Id",
-            "$p.WaitForExit()",
-            f"Set-Content -LiteralPath {_ps_quote(str(rc))} -Value $p.ExitCode",
+            f"& {_ps_quote(python)} -I {_ps_quote(str(launcher))}",
             "",
         )
     )
 
 
+def _stage_handoff(work: Path, argv: list[str]) -> Path:
+    """Write one hand-off's three files into ``work`` and return ``run.ps1``.
+
+    ``argv.json`` carries the command and the CALLER's working directory:
+    ``find_config`` walks up from the working directory and a scheduled task
+    starts in ``system32``, so without it a hand-off could bring up a
+    different config's projects than the command the user actually typed.
+    ``launch.py`` is ``_handoff_launcher``'s own source, byte for byte.
+    ``run.ps1`` is written WITH a BOM -- see _HANDOFF_SCRIPT_ENCODING.
+
+    Raises OSError, or UnicodeEncodeError for a path that has no UTF-8 form
+    (a lone surrogate in the scratch or interpreter path).
+    """
+    work.mkdir(parents=True, exist_ok=True)
+    _handoff_launcher.write_spec(work, argv, str(Path.cwd()))
+    launcher = work / _handoff_launcher.LAUNCHER
+    launcher.write_bytes(Path(_handoff_launcher.__file__).read_bytes())
+    script = work / "run.ps1"
+    script.write_text(
+        _handoff_script(sys.executable, launcher), encoding=_HANDOFF_SCRIPT_ENCODING
+    )
+    return script
+
+
 def _remove_scratch(work: Path) -> None:
     """Delete a finished hand-off's scratch directory, retrying briefly.
 
-    The launcher still holds the redirect files open for the few milliseconds
-    between writing rc.txt and exiting, and an open file makes rmtree fail on
-    Windows. Bounded by ``_HANDOFF_CLEANUP_GRACE_S``; a directory that outlives
-    it is left behind rather than fought over (the next call uses a new one).
+    A file in it can still be open for a moment after rc.txt lands. The
+    launcher closed its own copies of the redirect files right after starting
+    the command, but it and the powershell.exe running it are still exiting,
+    and a scanner may be reading a file it has just seen written. An open file
+    makes rmtree fail on Windows. Bounded by ``_HANDOFF_CLEANUP_GRACE_S``; a
+    directory that outlives it is left behind rather than fought over (the
+    next call uses a new one).
     """
     deadline = time.monotonic() + _HANDOFF_CLEANUP_GRACE_S
     while True:
@@ -302,6 +300,14 @@ def _remove_scratch(work: Path) -> None:
         if not work.exists() or time.monotonic() >= deadline:
             return
         time.sleep(0.1)
+
+
+def _printable(text: str) -> str:
+    """``text`` with every lone surrogate written as an escape. The argv and
+    the paths a hand-off names may hold one (Windows allows it), and the log
+    file is UTF-8: a record that cannot be encoded is not written at all --
+    logging prints a traceback on stderr instead."""
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def _one_line(text: str, limit: int = 200) -> str:
@@ -315,10 +321,11 @@ def _recorded_int(raw: str) -> int | None:
     """What the launcher recorded, as an integer -- or None if it is not one
     YET.
 
-    Complete means newline-terminated: ``Set-Content`` ends every value with
-    one (``7`` lands as ``7\\r\\n``), so a value without it may be a prefix --
-    the ``1`` of ``12`` -- and a prefix must never be final. The one rule
-    every read of pid.txt and rc.txt goes through.
+    Complete means newline-terminated. The launcher writes ``<n>\\n`` to a
+    temporary name and renames it into place, so it never shows a prefix; the
+    rule stays because a prefix -- the ``1`` of ``12`` -- must never be
+    final, whoever wrote the file. The one rule every read of pid.txt and
+    rc.txt goes through.
     """
     if not raw.endswith("\n"):
         return None
@@ -333,11 +340,10 @@ def _read_recorded_int(path: Path) -> int | None:
     or None until it has written one.
 
     None covers every "not yet": the file is absent, present but empty,
-    present but still held by the writer (``Set-Content`` creates the file
-    before it writes the value and refuses readers until it closes, and this
-    poll reads every 250ms), or present with a value that is not complete. All
-    of them mean "no answer yet", never "it failed"; only a complete integer
-    (see ``_recorded_int``) is an answer.
+    present but held by something else (a scanner that has just seen it
+    written, and this poll reads every 250ms), or present with a value that is
+    not complete. All of them mean "no answer yet", never "it failed"; only a
+    complete integer (see ``_recorded_int``) is an answer.
     """
     return _recorded_int(_read_handoff_text(path))
 
@@ -359,8 +365,8 @@ def _settle_exit_code(
     the poll's last look is the answer, like any other. Otherwise this is the
     fourth answer, distinct from the other three: not "never started" and not
     "lost its child" (the launcher got as far as its exit code), and not "may
-    still be running" (rc.txt is written after WaitForExit, so the command is
-    done). The command FINISHED and we cannot say how, so no exit code is
+    still be running" (the launcher writes rc.txt after ``wait()`` returns, so
+    the command is done). The command FINISHED and we cannot say how, so no exit code is
     fabricated -- but its output, complete by now, is relayed.
 
     ``detail`` names what that read saw, in our words: a file that refused the
@@ -377,8 +383,8 @@ def _settle_exit_code(
             waited_s,
             exc,
         )
-        # Say only what is known: errno 13 is usually Set-Content's share
-        # lock, but an ACL denial and a delete-pending file raise it too.
+        # Say only what is known: errno 13 is usually a share lock (a
+        # scanner's), but an ACL denial and a delete-pending file raise it too.
         why = (
             "was locked or refused"
             if isinstance(exc, PermissionError)
@@ -404,7 +410,8 @@ def _settle_exit_code(
 
 
 def _read_handoff_text(path: Path) -> str:
-    """Read one of the shim's output files; absent or unreadable reads empty.
+    """Read the command's out.txt or err.txt, which the launcher hands it as
+    its stdout and stderr; absent or unreadable reads empty.
 
     UTF-8 first, then the ANSI code page. The child's stdout is a FILE, so a
     default Python child writes it in the ANSI code page, not UTF-8, and reading
@@ -1296,19 +1303,19 @@ class WindowsPlatform(Platform):
         nonce = uuid.uuid4().hex[:12]
         task = f"{_HANDOFF_TASK_PREFIX}{nonce}"
         work = Path(tempfile.gettempdir()) / _HANDOFF_DIR_NAME / nonce
-        script = work / "run.ps1"
-        out, err = work / "out.txt", work / "err.txt"
-        pid_file, rc_file = work / "pid.txt", work / "rc.txt"
+        out = work / _handoff_launcher.OUT
+        err = work / _handoff_launcher.ERR
+        pid_file = work / _handoff_launcher.PID
+        rc_file = work / _handoff_launcher.RC
         try:
-            work.mkdir(parents=True, exist_ok=True)
-            # WITH a BOM -- see _HANDOFF_SCRIPT_ENCODING.
-            script.write_text(
-                _handoff_script(argv, str(Path.cwd()), out, err, pid_file, rc_file),
-                encoding=_HANDOFF_SCRIPT_ENCODING,
-            )
-        except OSError as exc:
+            script = _stage_handoff(work, argv)
+        except (OSError, UnicodeEncodeError) as exc:
+            # A lone surrogate lands here: legal in a Windows path, but run.ps1
+            # is UTF-8 and cannot hold one. Refused before anything runs, in
+            # words that can themselves be printed and logged.
             return HandoffResult(
-                rc=None, detail=f"could not stage the hand-off in {work}: {exc}"
+                rc=None,
+                detail=_printable(f"could not stage the hand-off in {work}: {exc}"),
             )
 
         run_spec = f'{_HANDOFF_SHELL} "{script}"'
@@ -1321,7 +1328,11 @@ class WindowsPlatform(Platform):
                 ),
             )
 
-        log.info("session-0 hand-off %s: %s", task, subprocess.list2cmdline(argv)[:500])
+        log.info(
+            "session-0 hand-off %s: %s",
+            task,
+            _printable(subprocess.list2cmdline(argv))[:500],
+        )
         # `/sc once` demands a trigger, and `/run` fires the task now, so the
         # trigger time exists only to satisfy schtasks. `/st 00:00` is TODAY at
         # midnight -- already in the past, so the trigger can never fire on its
@@ -1382,15 +1393,17 @@ class WindowsPlatform(Platform):
         never started or a child that died without writing one.
 
         ``pid.txt`` is the "it really started" signal -- the launcher writes it
-        the moment ``Start-Process`` returns, before the command has produced a
+        the moment its CreateProcess returns, before the command has produced a
         byte. Two different failures hide behind "no rc.txt yet", and both
         deserve a precise answer instead of the caller's whole budget spent in
-        silence: no pid.txt after the start grace means TASK SCHEDULER never
-        ran the task (nobody logged on, a policy refusal), while a pid that is
-        gone with no rc.txt means the LAUNCHER died mid-flight and nothing will
-        ever write one.
+        silence. No pid.txt after the start grace, from a task that is not
+        running, means TASK SCHEDULER never ran it (nobody logged on, a policy
+        refusal); a launcher that merely could not record its pid is still
+        running, and its rc.txt still answers. A pid that is gone with no
+        rc.txt means the LAUNCHER died mid-flight and nothing will ever write
+        one.
 
-        rc.txt existing is not the exit code being written (see
+        rc.txt existing is not the exit code being read (see
         ``_HANDOFF_RC_GRACE_S``): only a complete integer ends the wait, and
         an rc.txt that stays anything else past that grace -- or past the
         budget -- is a fourth answer of its own (``_settle_exit_code``).
@@ -1410,12 +1423,12 @@ class WindowsPlatform(Platform):
             if time.monotonic() >= deadline:
                 break
             if rc_file.exists():
-                # The launcher is mid-Set-Content: the file is there and the
-                # value is not yet. Not a lost child either -- the launcher got
-                # as far as its exit code -- so the pid checks below are moot,
-                # and running them would be wrong: a child gone longer than the
-                # exit grace whose launcher is only now writing rc.txt is the
-                # loaded-runner success path, not a lost child.
+                # The file is there and a readable value is not yet. Not a
+                # lost child either -- the launcher got as far as its exit
+                # code -- so the pid checks below are moot, and running them
+                # would be wrong: a child gone longer than the exit grace whose
+                # rc.txt is only now becoming readable is the loaded-runner
+                # success path, not a lost child.
                 if rc_seen_since is None:
                     rc_seen_since = time.monotonic()
                 waited = time.monotonic() - rc_seen_since
@@ -1460,9 +1473,10 @@ class WindowsPlatform(Platform):
                     )
             time.sleep(_HANDOFF_POLL_S)
         if rc_file.exists():
-            # The budget ran out mid-write: the command is done (rc.txt lands
-            # after WaitForExit), so this is not "may still be running" -- and
-            # the settling read may yet find the code complete.
+            # The budget ran out before rc.txt read as a number: the command
+            # is done (rc.txt lands after wait() returns), so this is not "may
+            # still be running" -- and the settling read may yet find the code
+            # complete.
             waited = 0.0 if rc_seen_since is None else time.monotonic() - rc_seen_since
             return _settle_exit_code(files, task, work, waited)
         # Deliberately NO kill. A bring-up still running on the desktop past
