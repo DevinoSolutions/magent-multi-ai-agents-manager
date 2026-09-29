@@ -23,7 +23,9 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -836,6 +838,30 @@ class TestRunOnDesktopOnWindows:
         assert result.rc == 0, result.detail
         modes = [c[0] for c in _calls(fake_schtasks)]
         assert modes == ["/Create", "/Run", "/Query", "/Delete"]
+
+    def test_a_pid_that_cannot_be_recorded_is_not_a_task_that_never_started(
+        self, fake_schtasks, monkeypatch
+    ):
+        # An antivirus scanner holding pid.txt, or a full disk: a launcher that
+        # died on it would leave the command running and the caller hearing
+        # "never started" about a bring-up under way. A directory squatting on
+        # pid.txt in the scratch dir this call will use makes every rename onto
+        # it fail. The command outlives the start grace, so the start check
+        # runs while no pid exists -- and must see a task still running.
+        fixed = uuid.UUID(int=0x5E55_10)
+        monkeypatch.setattr(
+            "magent.platform.windows.uuid", SimpleNamespace(uuid4=lambda: fixed)
+        )
+        (_scratch_root(fake_schtasks) / fixed.hex[:12] / "pid.txt").mkdir(parents=True)
+        monkeypatch.setattr("magent.platform.windows._HANDOFF_START_GRACE_S", 3.0)
+
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-c", "import time; time.sleep(5); raise SystemExit(7)"],
+            timeout_s=60,
+        )
+
+        assert result.rc == 7, result.detail
+        assert "/Query" in [c[0] for c in _calls(fake_schtasks)]
 
     def test_no_schtasks_is_a_named_failure_not_a_crash(self, monkeypatch):
         monkeypatch.setattr("magent.platform.windows._schtasks_exe", lambda: None)

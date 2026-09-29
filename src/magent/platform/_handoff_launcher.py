@@ -22,17 +22,21 @@ the launcher's environment (``run.ps1`` has exported
 The file contract with the poll in ``WindowsPlatform._await_handoff``:
 ``pid.txt`` once the child exists, ``rc.txt`` last. Each is one decimal
 integer and a newline, written to a temporary name and renamed into place, so
-a reader never sees a half-written one. A command that cannot be started gets
-its reason appended to ``err.txt`` and ``rc.txt`` = 1, with no ``pid.txt``:
-the answer comes at once instead of after the start grace.
+a reader never sees a half-written one. A ``pid.txt`` that cannot be written
+is skipped, never fatal: the exit code is what the caller is waiting for. A
+command that cannot be started gets its reason appended to ``err.txt`` and
+``rc.txt`` = 1, with no ``pid.txt``: the answer comes at once instead of after
+the start grace.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import BinaryIO
 
@@ -42,6 +46,11 @@ OUT = "out.txt"
 ERR = "err.txt"
 PID = "pid.txt"
 RC = "rc.txt"
+
+# How often, and how far apart, a record whose file is held gets retried:
+# 0.4s in all, well inside the poll's graces.
+_RECORD_TRIES = 5
+_RECORD_RETRY_S = 0.1
 
 
 def write_spec(work: Path, argv: list[str], cwd: str) -> None:
@@ -66,10 +75,23 @@ def read_spec(work: Path) -> tuple[list[str], str]:
 
 def record(path: Path, value: int) -> None:
     """Write ``value`` to ``path`` atomically: the poll reads these files every
-    250ms, and must see either no file or the whole number."""
+    250ms, and must see either no file or the whole number.
+
+    A PermissionError is retried a few times, briefly: an antivirus scanner or
+    the search indexer can hold a file it has just seen being written, and the
+    rename then fails for a moment. Anything else, or a file still held after
+    the last try, raises."""
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(f"{value}\n".encode("ascii"))
-    os.replace(tmp, path)
+    for attempt in range(_RECORD_TRIES):
+        try:
+            tmp.write_bytes(f"{value}\n".encode("ascii"))
+            os.replace(tmp, path)
+        except PermissionError:
+            if attempt == _RECORD_TRIES - 1:
+                raise
+            time.sleep(_RECORD_RETRY_S)
+        else:
+            return
 
 
 def signed_exit_code(code: int) -> int:
@@ -118,7 +140,11 @@ def run(work: Path) -> int:
             err.write(reason.encode("utf-8", errors="backslashreplace"))
         record(work / RC, 1)
         return 1
-    record(work / PID, child.pid)
+    # The pid is only the poll's "it started" signal, and failing to record it
+    # must not cost the exit code. The task stays Running while we wait, so
+    # the poll's start check waits too, and rc.txt still answers.
+    with contextlib.suppress(OSError):
+        record(work / PID, child.pid)
     code = signed_exit_code(child.wait())
     record(work / RC, code)
     return code

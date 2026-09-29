@@ -10,6 +10,7 @@ records the poll reads, and the failure that must answer at once.
 from __future__ import annotations
 
 import ast
+import errno
 import json
 import os
 import subprocess
@@ -101,6 +102,59 @@ class TestTheRecords:
         assert seen == [(False, b"7\n")]
         assert target.read_bytes() == b"7\n"
 
+    def test_a_briefly_held_file_is_retried(self, tmp_path, monkeypatch):
+        # An antivirus scanner or the search indexer holds a file it has just
+        # seen being written, and the rename fails for a moment. One such
+        # moment must not cost the record.
+        target = tmp_path / "rc.txt"
+        held = [PermissionError(13, "held by a scanner")] * 2
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if held:
+                raise held.pop()
+            real_replace(src, dst)
+
+        monkeypatch.setattr(launcher.os, "replace", replace)
+
+        launcher.record(target, 7)
+
+        assert held == []
+        assert target.read_bytes() == b"7\n"
+
+    def test_a_file_that_stays_held_raises_well_inside_a_second(
+        self, tmp_path, monkeypatch
+    ):
+        tries = []
+
+        def replace(src, dst):
+            tries.append(dst)
+            raise PermissionError(13, "held by a scanner")
+
+        monkeypatch.setattr(launcher.os, "replace", replace)
+        started = time.monotonic()
+
+        with pytest.raises(PermissionError):
+            launcher.record(tmp_path / "rc.txt", 7)
+
+        assert time.monotonic() - started < 1
+        assert len(tries) > 1
+
+    def test_only_a_held_file_is_retried(self, tmp_path, monkeypatch):
+        # A full disk does not clear in a fraction of a second.
+        tries = []
+
+        def replace(src, dst):
+            tries.append(dst)
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(launcher.os, "replace", replace)
+
+        with pytest.raises(OSError, match="No space"):
+            launcher.record(tmp_path / "rc.txt", 7)
+
+        assert len(tries) == 1
+
     @pytest.mark.parametrize(
         ("raw", "signed"),
         [
@@ -166,6 +220,36 @@ class TestItRunsTheCommand:
         launcher.run(work)
 
         assert _text(work / launcher.OUT).split() == ["True", "False"]
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            PermissionError(13, "held by a scanner"),
+            OSError(errno.ENOSPC, "No space left on device"),
+        ],
+    )
+    def test_a_pid_that_cannot_be_recorded_still_gets_the_exit_code(
+        self, tmp_path, monkeypatch, failure
+    ):
+        # pid.txt is only the poll's "it started". A launcher that dies on it
+        # leaves the child running and the caller hearing that the task never
+        # started, about a bring-up that is under way.
+        real_record = launcher.record
+
+        def record(path, value):
+            if path.name == launcher.PID:
+                raise failure
+            real_record(path, value)
+
+        monkeypatch.setattr(launcher, "record", record)
+        work = _stage(
+            tmp_path / "w", [sys.executable, "-c", "raise SystemExit(7)"], tmp_path
+        )
+
+        assert launcher.run(work) == 7
+
+        assert _text(work / launcher.RC) == "7\n"
+        assert not (work / launcher.PID).exists()
 
     def test_the_child_reads_eof_not_the_launchers_stdin(self, tmp_path):
         # Nobody is at the desktop to type, and an inherited stdin is the
@@ -247,6 +331,30 @@ class TestItRunsAsALooseScript:
         )
 
         assert _text(work / launcher.RC) == "5\n"
+
+    def test_a_pid_file_that_cannot_be_written_is_not_fatal(self, tmp_path):
+        # A real failure, not a patched one: a directory squats on pid.txt, so
+        # every rename onto it fails (access denied on Windows, "is a
+        # directory" on POSIX). The launcher still records the exit code, and
+        # exits cleanly: no traceback on the task's console.
+        work = _stage(
+            tmp_path / "w", [sys.executable, "-c", "raise SystemExit(7)"], tmp_path
+        )
+        (work / launcher.PID).mkdir()
+        script = work / launcher.LAUNCHER
+        script.write_bytes(Path(launcher.__file__).read_bytes())
+
+        proc = subprocess.run(
+            [sys.executable, "-I", str(script)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=tmp_path,
+            stdin=subprocess.DEVNULL,
+        )
+
+        assert (proc.returncode, proc.stderr) == (0, "")
+        assert _text(work / launcher.RC) == "7\n"
 
     def test_main_runs_the_directory_it_was_copied_into(self, tmp_path, monkeypatch):
         work = _stage(tmp_path / "w", [sys.executable, "-c", "pass"], tmp_path)
