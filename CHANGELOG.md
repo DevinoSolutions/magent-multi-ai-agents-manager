@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes anything (exit 1, or 3 while the sync daemon holds the node), so
   running it again loses no work.
 
+### Fixed
+
+- **Stopping the node sync daemon while it is starting stops it.** The daemon
+  takes its lock and then writes its pid; a stop that landed between the two
+  found no pid, killed nothing and said "Could not stop the node sync daemon".
+  It now waits up to two seconds for the pid, and stops the daemon once it
+  appears.
+
 ## [3.20.0rc1] - 2026-09-28
 
 ### Added
