@@ -675,10 +675,17 @@ class TestARewrittenSettingsFileKeepsItsMode:
         assert stat.S_IMODE(settings.stat().st_mode) == mode
 
     @_POSIX_MODES
-    def test_a_first_install_keeps_the_umask_default(self, runner, tmp_path):
+    @pytest.mark.parametrize("leftover", [False, True], ids=["fresh", "leftover"])
+    def test_a_first_install_keeps_the_umask_default(self, runner, tmp_path, leftover):
         born = tmp_path / "born.json"
         born.write_text("{}", encoding="utf-8")  # the umask default, measured
         settings = tmp_path / "settings.json"
+        if leftover:
+            # Written into, a stale temp file would hand the new settings.json
+            # its own mode: it has to go first.
+            stale = tmp_path / "settings.tmp"
+            stale.write_bytes(b"{}")
+            stale.chmod(0o666)
 
         result = _install(runner, settings)
 
