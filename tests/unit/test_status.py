@@ -2136,7 +2136,12 @@ def _once_down_looks_for_a_late_daemon(monkeypatch) -> threading.Event:
     stop -- its first wait between looks. A ``_FakeDaemon`` let in by it
     locks after every read of the lock before that look, and after that
     look's own first read: late by construction, not by a delay a slow
-    runner outruns."""
+    runner outruns.
+
+    Not down's literal first ``daemon_running()`` (``before_pulls``' probe):
+    the first stop reads the lock twice more after it (``stop_daemon``'s own
+    look and ``_stop_node_sync``'s recheck), so a lock taken right after that
+    probe still lands inside the first stop."""
     from magent import node_sync
 
     looked = threading.Event()
