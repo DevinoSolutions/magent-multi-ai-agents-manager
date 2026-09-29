@@ -845,6 +845,9 @@ class TestTheBringUpNeverWaitsForever:
         # First: a create client killed while booting publishes its call only
         # after the product answered, and this waits for its stall.
         fake.assert_no_client_left_behind(expect=1)
+        # What proves the product created web: the fake's late rule answers
+        # live to any 2nd probe, so without this a bring-up that never issued
+        # new-session would pass.
         assert len(fake.issued("new-session", "web")) == 1
         assert fake.issued("send-keys", "web") == []
         assert fake.issued("send-keys", "api")
