@@ -37,6 +37,7 @@ from magent.env import get_env
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger, heartbeat_age, heartbeat_fresh, write_heartbeat
 from magent.nodes import LoadSample, NodeMapEntry, encoded_project_dir
+from tests.unit._fake_ssh import FLOOD_CAP
 from tests.unit._pull_reply import SAMPLE, pull_meta, pull_reply
 
 if TYPE_CHECKING:
@@ -3477,6 +3478,7 @@ class TestWhatCountsAsUnreachable:
     def test_only_a_transport_failure_or_a_timeout_is_unreachable(self, err, outcome):
         assert node_sync._classify(err)[0] == outcome
 
+    @pytest.mark.usefixtures("stepped_clock")
     def test_an_over_cap_reply_is_reported_by_its_cap_not_the_childs_last_words(
         self, fake_ssh
     ):
@@ -3488,11 +3490,11 @@ class TestWhatCountsAsUnreachable:
         fake_ssh.set_mode("flood")
         node = nodes.Node(nick="second", host="devino-second", user="demo", root="~")
         with pytest.raises(remote_mux.RemoteError) as info:
-            remote_mux.run(node, ["flood"], timeout_s=60, max_stdout_bytes=1024)
+            remote_mux.run(node, ["flood"], timeout_s=60, max_stdout_bytes=FLOOD_CAP)
         assert "boom: disk full" in info.value.stderr_tail.splitlines()[1:]
         assert node_sync._classify(info.value) == (
             node_sync.FAILED,
-            "reply exceeded 1024 bytes",
+            f"reply exceeded {FLOOD_CAP} bytes",
         )
 
     def test_only_the_flag_marks_an_over_cap_reply_never_the_text(self):

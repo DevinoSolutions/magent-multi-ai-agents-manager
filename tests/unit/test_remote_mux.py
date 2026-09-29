@@ -21,7 +21,6 @@ import struct
 import subprocess
 import sys
 import tarfile
-import threading
 import time
 import types
 from importlib import resources
@@ -663,8 +662,23 @@ class TestTheReplyIsBoundedInMemory:
         (call,) = fake_ssh.calls()
         assert call.stdin == payload
 
+    @pytest.mark.usefixtures("stepped_clock")
     def test_the_over_cap_error_keeps_what_the_child_said_on_stderr(self, fake_ssh):
         # The likely cause of a flood is the child's last words before it.
+        # The stepped clock orders them before the cap on every platform.
+        fake_ssh.set_reply("flood", stderr="boom: disk full\n")
+        fake_ssh.set_mode("flood")
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["flood"], timeout_s=60, max_stdout_bytes=CAP)
+        lines = exc.value.stderr_tail.splitlines()
+        assert lines[0] == f"reply exceeded {CAP} bytes"
+        assert "boom: disk full" in lines[1:]
+
+    def test_the_fakes_pause_puts_its_last_words_before_the_flood(self, fake_ssh):
+        # On the real clock this time: the fake's pause after its words
+        # (0722571) is what orders them before the cap. Without it, Windows'
+        # clock before Python 3.13 (15.6 ms ticks) stamps the words' read and
+        # the cap alike, and a tie is after -- the words would be lost.
         fake_ssh.set_reply("flood", stderr="boom: disk full\n")
         fake_ssh.set_mode("flood")
         with pytest.raises(RemoteError) as exc:
@@ -841,23 +855,13 @@ class TestTheReplyIsBoundedInMemory:
     @pytest.mark.parametrize(
         "ending", ["killed", "dies-at-the-pipe", "complains-at-the-pipe"]
     )
-    def test_a_stderr_whose_end_ties_the_cap_is_trimmed(self, monkeypatch, ending):
+    @pytest.mark.usefixtures("stepped_clock")
+    def test_a_stderr_whose_end_ties_the_cap_is_trimmed(self, ending):
         # A coarse clock (Windows' before Python 3.13 ticks every 15.6 ms)
         # stamps the cap and the stream's end alike. Which came first is then
-        # unknown, and a tie trims. Each thread's first reading here is 0.0
-        # and every later one 1000.0: on any clock, the words read first come
-        # before the cap, and the end -- or a complaint at the pipe -- ties it.
-        first: set[int] = set()
-
-        def monotonic() -> float:
-            if threading.get_ident() in first:
-                return 1000.0
-            first.add(threading.get_ident())
-            return 0.0
-
-        monkeypatch.setattr(
-            remote_mux, "time", types.SimpleNamespace(monotonic=monotonic)
-        )
+        # unknown, and a tie trims. Under the stepped clock the words read
+        # first come before the cap, and the end -- or a complaint at the
+        # pipe -- ties it.
         error = self._flood_past_a_plain_stderr("boom: disk full\nwriting blo", ending)
         assert error.stderr_tail.splitlines()[0] == f"reply exceeded {CAP} bytes"
         assert "boom: disk full" in error.stderr_tail.splitlines()[1:]

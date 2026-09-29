@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -182,6 +183,41 @@ class FakeSsh:
                 )
             )
         return out
+
+
+# A flood pin's cap under SteppedClock: over one read of a pipe
+# (remote_mux._READ_CHUNK_BYTES), so the read that passes it is never the
+# stdout drain's first.
+FLOOD_CAP = 256 * 1024
+
+
+class SteppedClock:
+    """remote_mux's monotonic clock for a flood pin, ordering by thread, not
+    by time: each thread's first reading is 0.0 and every later one 1000.0.
+    A drain stamps each read, so what a child said first -- stderr's first
+    read -- comes before the cap, and what a drain reads later (the stream's
+    end, a complaint at the pipe the cap closed) ties it, which counts as
+    after. No clock's tick, however coarse, and no scheduling can reorder
+    that -- nor can the fake's pause, so a pin of the pause needs the real
+    clock.
+
+    Keyed on the thread OBJECT, held for the clock's life: an ident is reused
+    once its thread ends, and a tick's executor worker and the drains its
+    call starts come and go. The cap must exceed one read (``FLOOD_CAP``): a
+    cap the stdout drain's FIRST read passed is stamped 0.0 too, and ties the
+    words."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._seen: set[threading.Thread] = set()
+
+    def monotonic(self) -> float:
+        me = threading.current_thread()
+        with self._lock:
+            if me in self._seen:
+                return 1000.0
+            self._seen.add(me)
+            return 0.0
 
 
 def make_fake_ssh(tmp_path: Path, *, name: str = "ssh") -> FakeSsh:
