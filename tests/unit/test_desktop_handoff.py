@@ -433,13 +433,20 @@ class TestRunOnDesktopOnWindows:
         assert result.stdout.strip() == "café"
 
     def test_a_character_the_code_page_lacks_never_crashes_the_copy(
-        self, fake_schtasks, tmp_path
+        self, fake_schtasks, tmp_path, monkeypatch
     ):
         # The REAL entry point as the desktop copy. It used to die on
         # UnicodeEncodeError partway through its output, and for `up` that
         # was after the sessions existed: rc 1 and a traceback over a
         # bring-up that had worked. The accent the code page holds comes back
         # as itself, the character it lacks as an escape.
+        #
+        # The desktop copy inherits this process's environment, so a dev box
+        # that sets either of these would hand it a UTF-8 stdout that holds
+        # every character: the test would print no escape and fail, and the
+        # code page it is about would never be exercised.
+        monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+        monkeypatch.delenv("PYTHONUTF8", raising=False)
         cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps({"projects": [{"path": str(tmp_path / "café 中")}]}),
