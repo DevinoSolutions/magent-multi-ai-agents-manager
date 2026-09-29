@@ -2054,9 +2054,10 @@ by cell, and the test itself runs for real on ubuntu and macOS. Worth trying
 next: pywinpty's WinPTY back end (`PtyProcess.spawn(backend=Backend.WinPTY)`),
 which predates win32-input-mode and may pass the CR through unencoded.
 
-**What the bounded bring-up still leaves open (2026-09-29):** there are four
-residuals of "The bring-up never waits forever" in §2. Items 1-3 were found by
-reading the code, and none has been seen on the fleet. Item 4 was reproduced.
+**What the bounded bring-up still leaves open (2026-09-29):** there are five
+residuals of "The bring-up never waits forever" in §2. Items 1-3 and 5 were
+found by reading the code, and none has been seen on the fleet. Item 4 was
+reproduced.
 (A fifth, "a timed-out new-session may still produce its session and be
 counted created", is closed: a refusal is now final, see §2.)
 
@@ -2106,6 +2107,18 @@ counted created", is closed: a refusal is now final, see §2.)
    another code page. Either write the `.cmd` in the OEM code page, or keep
    every path in it ASCII by passing the script path through the environment.
    This belongs with the 3.19.4 shim-encoding item.
+5. *A killed send-keys leaves a bare shell counted "Brought up".* A first
+   send-keys (or a re-send) that gives no answer within `_SEND_TIMEOUT_S` is
+   killed and never sent again, because it may still have landed. Its window
+   is then left out of `_verify_sends_landed`, and nothing reaches
+   `launch_psmux_session`'s refusals: the only trace is a WARNING in
+   `launch.log`. `launch_verified` finds the session live, so it is counted
+   created, possibly with no agent running. That is the shape the late-created
+   session had before a refusal became final. `magent up`'s revive finds such
+   a pane; `--go` does not. Refusing it would be wrong too, since the command
+   may be running. The fix is a third outcome: return the unsure names beside
+   the refusals, and have `report_bring_up_casualties` name them on their own
+   line ("may not have its agent") without counting them as failed.
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
