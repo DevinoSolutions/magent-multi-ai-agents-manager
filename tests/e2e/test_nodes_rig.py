@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -78,16 +78,23 @@ class TestEveryStageIsUnderTheBudget:
 
     def test_the_journey_budget_leaves_the_job_clock_its_margin(self) -> None:
         # Setup, the bash pins, teardown and the post-deadline floors ride on
-        # top of the budget: worst case about 1069 s of 1500 s at 300 s -- the
-        # 999 s it was, plus a stalled create's snapshot (10 s) and discard
-        # (60 s); its retry runs inside the budget. The abandoned attempt's
-        # second delete at teardown (60 s) and the create-hop pins (25 s)
-        # bound it at 1154 s. A budget past a third of timeout-minutes is a
-        # cancel waiting to happen.
+        # top of the budget: worst case 1154 s of 1500 s at 300 s. That is the
+        # 999 s it was, plus the create-hop pins every run pays (25 s), plus
+        # what a rescued stall adds: its snapshot (10 s), its discard (60 s)
+        # and its second delete at teardown (60 s); its retry runs inside the
+        # budget. A budget past a third of timeout-minutes is a cancel
+        # waiting to happen.
         found = re.search(r"timeout-minutes: (\d+)", _WORKFLOW.read_text("utf-8"))
         assert found, _WORKFLOW
         timeout_s, budget_s = int(found.group(1)) * 60, rig.NODES_BUDGET_S
         assert budget_s * 3 <= timeout_s, (budget_s, timeout_s)
+
+    def test_a_stalled_create_and_its_retry_leave_the_journey_its_time(
+        self,
+    ) -> None:
+        # Two full create attempts plus the healthy D path (at most 92 s on
+        # record) fit the budget: a rescued stall must not starve the journey.
+        assert 2 * rig.USERADD_WANT_S + 92 <= rig.NODES_BUDGET_S
 
     def test_a_daemon_start_wait_ends_before_serves_second_check(self) -> None:
         # D15's serve stage must pass on the supervisor's FIRST check: a wait
@@ -362,6 +369,8 @@ class _Call:
     target: str
     script: str  # "run", "create", "bootstrap", "delete" or "snapshot"
     args: tuple[str, ...]
+    # The budget share a script hop asked for; not part of a call's identity.
+    want: float | None = field(default=None, compare=False)
 
 
 _MADE = _run(0, "4242 /home/mgnabcde\n")
@@ -422,9 +431,9 @@ class _FakeHop:
             want: float = 60.0,
             timeout: float = 0,
         ) -> rig.Run:
-            del tag, want, timeout
+            del tag, timeout
             name = names[text]
-            self.calls.append(_Call(remote.target, name, args))
+            self.calls.append(_Call(remote.target, name, args, want))
             got = answer(name)
             if isinstance(got, BaseException):
                 raise got
@@ -456,7 +465,7 @@ class TestTheRootHopDeletesOnlyTheUserThisRunMade:
         # An existing mgn<5hex> user is someone else's: a concurrent journey,
         # or a leftover on a reused host.
         hop = _FakeHop(monkeypatch, create=_run(rc))
-        with pytest.raises(pytest.fail.Exception, match="nothing is deleted"):
+        with pytest.raises(pytest.fail.Exception, match="so it is not deleted"):
             _create(tmp_path)
         assert hop.scripts() == ["create"]
 
@@ -594,6 +603,32 @@ class TestAStalledCreateIsRetriedOnceAndOnlyThen:
         assert first[0] in said and _SNAPSHOT in said, said
         assert "ssh-useradd: timed out after 60s" in said, said
         assert "phase useradd" in said, said
+        # Each attempt keeps the create's own bound, under the budget clamp.
+        wants = [c.want for c in hop.calls if c.script == "create"]
+        assert wants == [rig.USERADD_WANT_S] * 2, wants
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            pytest.fail.Exception("ssh-stall-snapshot: timed out after 10s"),
+            FileNotFoundError("ssh"),
+        ],
+        ids=["timed-out", "no-ssh"],
+    )
+    def test_a_snapshot_that_fails_still_lets_the_retry_run(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure: BaseException,
+    ) -> None:
+        # The snapshot is diagnosis: its failure is its text, never the report.
+        hop = _FakeHop(monkeypatch, create=[_stall(), _MADE], snapshot=failure)
+        with pytest.warns(rig.StallRescued) as seen:
+            _create(tmp_path)
+        assert hop.scripts() == ["create", "snapshot", "delete", "create", "bootstrap"]
+        (warned,) = [w for w in seen if issubclass(w.category, rig.StallRescued)]
+        said = str(warned.message)
+        assert "stall snapshot unavailable" in said and str(failure) in said, said
 
     def test_the_snapshot_is_bounded_whatever_the_budget_has_left(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -630,14 +665,15 @@ class TestAStalledCreateIsRetriedOnceAndOnlyThen:
         assert hop.scripts() == [
             *("create", "snapshot", "delete"),
             *("create", "snapshot", "delete"),
-            "delete",
+            *("delete", "delete"),
         ]
         creates = [c.args for c in hop.calls if c.script == "create"]
         deletes = [c.args for c in hop.calls if c.script == "delete"]
-        # Each attempt by its own stamp, then the abandoned first once more:
-        # no rig is built, so no teardown will.
+        # Each attempt by its own stamp, then both once more: a useradd killed
+        # only on our side may finish on the node's, and no rig is built, so
+        # no teardown will sweep them.
         first, second = [(args[0], args[2]) for args in creates]
-        assert deletes == [first, second, first]
+        assert deletes == [first, second, first, second]
         said = str(raised.value)
         assert "snap-one" in said and "snap-two" in said, said
         assert said.count("ssh-useradd: timed out after 60s") == 2, said
@@ -848,12 +884,14 @@ class TestTheStallSnapshotIsSafeToPrint:
         assert not words & {"env", "printenv", "environ", "export", "declare"}
         assert "/proc" not in text
 
-    def test_the_journal_is_sshd_and_logind_only_and_bounded(self) -> None:
+    def test_the_journal_is_sshd_logind_and_pid1_only_and_bounded(self) -> None:
         (line,) = [s for s in rig._STALL_SNAPSHOT.splitlines() if "journalctl" in s]
+        # PID 1 ("systemd") logs the session scope and root's user@ manager.
         assert set(re.findall(r" -t (\S+)", line)) == {
             "sshd",
             "sshd-session",
             "systemd-logind",
+            "systemd",
         }, line
         assert re.search(r"\| tail -n \d+$", line), line
         # Every read is bounded on its own, inside the hop's DIAG_READ_S.

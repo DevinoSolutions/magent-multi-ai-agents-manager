@@ -664,8 +664,8 @@ class NodeUser:
         if made.rc in (_BAD_NAME, _EXISTS):
             _discard_all(root, created.abandoned)
             pytest.fail(
-                f"the root hop refused to create {name}; nothing was created, "
-                f"so nothing is deleted\n{made.show()}"
+                f"the root hop refused to create {name}; nothing was created "
+                f"under that name, so it is not deleted\n{made.show()}"
             )
         # From here a user carrying this run's stamp may exist: any way out
         # (a failure, a timeout, an answer that does not parse) deletes it.
@@ -749,16 +749,16 @@ class StallRescued(UserWarning):
 # What a stalled create hop leaves on the node, read at once over the same
 # root hop: the processes a stuck useradd or sshd session is (and the kernel
 # wait channel each sleeps in), systemd's queued jobs (a login's session
-# scope waits there), and sshd's and logind's own journal lines. The job log
-# is public: no read here prints an environment, and each is bounded in time
-# and in lines.
+# scope waits there), and the journal lines of sshd, logind and PID 1 (which
+# logs the session scope and root's user@ manager). The job log is public: no
+# read here prints an environment, and each is bounded in time and in lines.
 _STALL_SNAPSHOT = """set -u
 echo '--- processes: sshd, useradd, getent, logind ---'
 timeout 3 ps -eo pid,ppid,etimes,stat,wchan:32,args 2>&1 | awk 'NR == 1 || /[s]shd|[u]ser(add|mod)|[g]etent|[l]ogind/' | head -n 60
 echo '--- systemd jobs ---'
 timeout 3 systemctl list-jobs --no-pager 2>&1 | head -n 30
-echo '--- journal: sshd, systemd-logind (last 120 s) ---'
-timeout 3 journalctl -t sshd -t sshd-session -t systemd-logind --since=-120s --no-pager -o short-precise 2>&1 | tail -n 60
+echo '--- journal: sshd, systemd-logind, systemd (last 120 s) ---'
+timeout 3 journalctl -t sshd -t sshd-session -t systemd-logind -t systemd --since=-120s --no-pager -o short-precise 2>&1 | tail -n 60
 """
 
 
@@ -830,11 +830,13 @@ def _useradd(root: Remote, pub: str) -> _Created:
                         f"{said}\n"
                     )
                     raise
+                # Gone now, but a useradd killed only on our side may still
+                # finish on the node's: every way out deletes it once more.
+                abandoned.append((name, owner))
                 if len(stalls) > USERADD_RETRIES:
                     pytest.fail(
                         f"the create hop stalled on all {len(stalls)} attempts\n{said}"
                     )
-                abandoned.append((name, owner))
                 warnings.warn(
                     StallRescued(
                         f"the create hop for {name} stalled; its user is gone, "
