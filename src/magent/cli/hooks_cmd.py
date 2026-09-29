@@ -94,7 +94,9 @@ def _load_settings(path: Path) -> dict[str, object] | str:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig: Windows editors save a BOM, which json.loads refuses.
+        # The write back is BOM-less UTF-8.
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except UnicodeDecodeError as exc:
         problem = f"not valid UTF-8 ({type(exc).__name__})"
     except ValueError as exc:
