@@ -653,7 +653,7 @@ class TestMenuUpReportsCasualties:
         )
         monkeypatch.setattr(
             "magent.launch.bring_up_psmux",
-            lambda cfg, only=None, group=None: (list(created), list(failed)),
+            lambda cfg, only=None, group=None: (list(created), dict(failed)),
         )
         monkeypatch.setattr(status_mod.click, "prompt", lambda *a, **k: "a")
         monkeypatch.setattr(status_mod.click, "pause", lambda *a, **k: None)
@@ -661,16 +661,42 @@ class TestMenuUpReportsCasualties:
         status_mod._menu_up(Path(cfgpath))
 
     def test_failed_sessions_are_named_in_red(self, monkeypatch, tmp_config, capsys):
-        self._drive(monkeypatch, tmp_config, created=["web"], failed=["api"])
+        self._drive(monkeypatch, tmp_config, created=["web"], failed={"api": ""})
         out = capsys.readouterr().out
         assert "Brought up 1 session(s)" in out
         assert "1 session(s) failed to come up" in out
         assert "api" in out
 
+    def test_a_refused_session_says_why(self, monkeypatch, tmp_config, capsys):
+        # "Could not tell whether it is running" is not "dead", and the menu
+        # has to say which one it is. The Session-0 note still follows.
+        why = "could not tell whether api is running (has-session gave no answer)"
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+        self._drive(monkeypatch, tmp_config, created=[], failed={"api": why})
+        out = capsys.readouterr().out
+        assert "1 session(s) failed to come up" in out
+        assert why in out
+        assert "S0-NOTE" in out
+
+    def test_the_casualty_block_is_byte_for_byte(self, monkeypatch, tmp_config, capsys):
+        # Characterization: the whole block, in order -- the count and names
+        # with the local log hint, one dimmed line per KNOWN reason (none for
+        # an empty one), then the Session-0 note.
+        why = "could not tell whether web is running (has-session gave no answer)"
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+        self._drive(monkeypatch, tmp_config, created=[], failed={"api": "", "web": why})
+        out = capsys.readouterr().out
+        assert (
+            "  x 2 session(s) failed to come up: api, web"
+            " (see ~/.magent/logs/launch.log)\n"
+            f"    {why}\n"
+            "  S0-NOTE\n"
+        ) in out
+
     def test_a_clean_wave_says_nothing_about_failures(
         self, monkeypatch, tmp_config, capsys
     ):
-        self._drive(monkeypatch, tmp_config, created=["api", "web"], failed=[])
+        self._drive(monkeypatch, tmp_config, created=["api", "web"], failed={})
         out = capsys.readouterr().out
         assert "Brought up 2 session(s)" in out
         assert "failed to come up" not in out

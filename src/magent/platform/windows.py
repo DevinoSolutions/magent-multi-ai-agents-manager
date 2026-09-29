@@ -33,11 +33,15 @@ from magent.procs import (
     spawn_unjobbed,
 )
 from magent.psmux import (
+    SEND_KEYS_TIMEOUT_S,
+    await_clients,
     capture_pane,
     child_env,
+    clear_stale_servers,
     code_on_path,
     decoration_argv,
     idle_sessions,
+    probe_sessions,
 )
 
 user32 = windll.user32
@@ -63,6 +67,39 @@ _SEND_VERIFY_SETTLE_S = 2.0
 # pane still bare after that is a real fault to report, not one to keep
 # hammering: each attempt costs the batch another settle.
 _SEND_MAX_ATTEMPTS = 3
+
+# Budgets for every psmux client the bring-up waits on. Each of these was a
+# bare `wait()`, so one socket that stopped answering held `magent up` -- and
+# the `magent attach` driving it over ssh -- forever; in the 2026-08-18 wedge
+# every control command hung from any console. Each fan-out gets ONE deadline
+# for the whole set (`psmux.await_clients`: the clients run concurrently, so a
+# budget per client would cost N budgets), and a client still running at it is
+# killed and reaped, never left behind.
+#
+# Every number errs long: erring short costs a session, erring long costs only
+# time, and the bound exists for "never", not for "slow".
+#
+# The dedupe probe and the stale-server kill are one cheap round-trip per
+# socket fanned out across the whole fleet, and the measured worst case for
+# exactly that shape is ~19 s for a 46-socket has-session fan-out on a loaded
+# host (see psmux.live_sessions): 30 s is that with half again on top. A probe
+# that outruns it is UNKNOWN and its session is left alone -- never killed,
+# never re-created -- so a false timeout costs a report line, not an agent.
+_DEDUPE_TIMEOUT_S = 30.0
+_CLEAR_TIMEOUT_S = _DEDUPE_TIMEOUT_S
+# One wave's new-session clients. Healthy creation measured under a second
+# (892 ms, right after the wedge cleared -- during it, forever), but it is the
+# heaviest call here: it forks a server and a ConPTY in the middle of a spawn
+# storm. A false timeout leaves a session without its agent command, so it gets
+# the product's ceiling for one delivery attempt (upload_server.INJECT_TIMEOUT_S).
+_CREATE_TIMEOUT_S = 60.0
+# One wave's send-keys, and each round of re-sends. A control command against a
+# busy socket has been measured from 3 s to past 70 s (DESIGN.md, "The upload
+# reply is not hostage to the paste"), and a send that is killed may still have
+# landed, so it is never re-sent -- the paste's one-attempt law, with the same
+# 60 s cap. The status-line decorations are cosmetic and get the plain
+# SEND_KEYS_TIMEOUT_S.
+_SEND_TIMEOUT_S = 60.0
 
 # Geometry-reclaim nudge (see Platform.nudge_windows). The delta must be large
 # enough to change the terminal's character grid -- a sub-cell nudge resizes
@@ -781,42 +818,64 @@ class WindowsPlatform(Platform):
         # Same monarch caveat as `wt` -- `code` forwards to a running instance.
         subprocess.Popen(args, env=spawn_child_env())
 
-    def launch_psmux_session(self, windows: list[PsmuxWindowOpts]) -> None:
+    def launch_psmux_session(self, windows: list[PsmuxWindowOpts]) -> dict[str, str]:
         psmux = find_psmux()
         if not psmux:
             raise FileNotFoundError("psmux not found on PATH")
         if not windows:
-            return
+            return {}
+        log = get_logger("platform")
+        # Windows deliberately NOT created, each with the reason the report
+        # prints (psmux.launch_verified carries it to every bring-up printer).
+        refused: dict[str, str] = {}
 
-        checks = [
-            (
-                w,
-                subprocess.Popen(
-                    # `-t <name>`: a bare has-session exits 0 even for a socket
-                    # with no server, which made this dedupe skip creating every
-                    # session on a cold machine. See psmux.has_session.
-                    [psmux, "-L", w.window_name, "has-session", "-t", w.window_name],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                ),
+        # The dedupe has THREE answers (psmux.probe_sessions), and only a
+        # positive "no such session" may lead to kill-server + new-session. A
+        # probe that never answered says nothing about the session -- in the
+        # 2026-08-18 wedge the sockets that stopped answering were FROZEN LIVE
+        # agents, and killing and re-creating them is the mass restart that
+        # would have thrown every one of them away.
+        states = probe_sessions(
+            [w.window_name for w in windows], psmux, timeout=_DEDUPE_TIMEOUT_S
+        )
+        for w in windows:
+            if states[w.window_name] == "unknown":
+                refused[w.window_name] = (
+                    f"could not tell whether {w.window_name} is running"
+                    f" (has-session gave no answer within {_DEDUPE_TIMEOUT_S:g}s);"
+                    " left it alone -- not killed, not re-created"
+                )
+        if refused:
+            log.error(
+                "has-session gave no answer for %s; leaving them alone rather"
+                " than killing or re-creating a session whose state is unknown",
+                ", ".join(refused),
             )
-            for w in windows
-        ]
-        to_create = [w for w, p in checks if p.wait() != 0]
-
+        to_create = [w for w in windows if states[w.window_name] == "absent"]
         if not to_create:
-            return
+            return refused
 
-        kills = [
-            subprocess.Popen(
-                [psmux, "-L", w.window_name, "kill-server"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+        uncleared = set(
+            clear_stale_servers(
+                [w.window_name for w in to_create], psmux, timeout=_CLEAR_TIMEOUT_S
             )
-            for w in to_create
-        ]
-        for p in kills:
-            p.wait()
+        )
+        for w in to_create:
+            if w.window_name in uncleared:
+                refused[w.window_name] = (
+                    f"could not clear {w.window_name}'s old psmux server"
+                    f" (kill-server gave no answer within {_CLEAR_TIMEOUT_S:g}s),"
+                    " so it was not re-created on top of it"
+                )
+        if uncleared:
+            log.error(
+                "kill-server gave no answer for %s; not creating a session on"
+                " top of a server that could not be cleared",
+                ", ".join(sorted(uncleared)),
+            )
+        to_create = [w for w in to_create if w.window_name not in uncleared]
+        if not to_create:
+            return refused
 
         # One probe for the whole bring-up: the launching machine IS the one
         # whose windows these are, and `code` is not going to appear on PATH
@@ -896,16 +955,33 @@ class WindowsPlatform(Platform):
             # name right after this returns, respawns what is missing, and
             # reports what stayed down -- that is the component that owns the
             # "did it come up?" answer, and it can only do its job if it runs.
+            #
+            # A client that outruns the wave's one deadline is killed and its
+            # window refused -- contained exactly like a refusal: the rest of
+            # the wave, and every later wave, carry on.
             batch = []
-            for w, p in zip(wave, creates, strict=True):
-                if p.wait() == 0:
+            codes = await_clients(creates, _CREATE_TIMEOUT_S)
+            for w, rc in zip(wave, codes, strict=True):
+                if rc == 0:
                     batch.append(w)
+                elif rc is None:
+                    refused[w.window_name] = (
+                        f"psmux new-session for {w.window_name} gave no answer"
+                        f" within {_CREATE_TIMEOUT_S:g}s"
+                    )
+                    log.error(
+                        "psmux new-session for %s gave no answer within %gs;"
+                        " killed it, skipping the window and continuing the"
+                        " bring-up",
+                        w.window_name,
+                        _CREATE_TIMEOUT_S,
+                    )
                 else:
-                    get_logger("platform").error(
+                    log.error(
                         "psmux new-session for %s exited %s; skipping it and"
                         " continuing the bring-up",
                         w.window_name,
-                        p.returncode,
+                        rc,
                     )
             if not batch:
                 continue
@@ -924,15 +1000,30 @@ class WindowsPlatform(Platform):
             # host side of attach), sshd kills the whole process tree the
             # moment the CLI exits, and fire-and-forget senders die before
             # the keystrokes land -- every session then sits at a bare shell
-            # with no agent running.
-            for p in senders:
-                p.wait()
+            # with no agent running. Bounded like everything else here, and a
+            # send that is killed is NEVER re-sent: it may still have landed,
+            # and a second copy types the command into a running agent.
+            sent = await_clients(senders, _SEND_TIMEOUT_S)
+            unsure = {
+                w.window_name for w, rc in zip(batch, sent, strict=True) if rc is None
+            }
+            if unsure:
+                log.warning(
+                    "send-keys gave no answer within %gs for %s; killed it and"
+                    " not re-sending -- it may still have landed",
+                    _SEND_TIMEOUT_S,
+                    ", ".join(sorted(unsure)),
+                )
 
             # A send-keys that *exits 0* still proves nothing: the keystrokes
             # reached psmux, not necessarily the shell reading its console.
-            self._verify_sends_landed(psmux, batch)
+            self._verify_sends_landed(
+                psmux, [w for w in batch if w.window_name not in unsure]
+            )
 
             self._decorate_batch(psmux, batch, code_hint)
+
+        return refused
 
     @staticmethod
     def _verify_sends_landed(psmux: str, batch: list[PsmuxWindowOpts]) -> None:
@@ -982,6 +1073,7 @@ class WindowsPlatform(Platform):
                 sends,
                 _SEND_MAX_ATTEMPTS,
             )
+            retry = list(pending.values())
             try:
                 resends = [
                     subprocess.Popen(
@@ -989,7 +1081,7 @@ class WindowsPlatform(Platform):
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
-                    for w in pending.values()
+                    for w in retry
                 ]
             except OSError:
                 # Spawning the retry itself failed -- same outcome as a pane
@@ -997,8 +1089,24 @@ class WindowsPlatform(Platform):
                 # level, with the traceback since this one is a host fault.
                 log.exception("could not spawn a send-keys re-send for %s", names)
                 return
-            for p in resends:
-                p.wait()
+            # A re-send that is killed may still land, so it is never followed
+            # by another: that pane leaves the retry set.
+            answered = await_clients(resends, _SEND_TIMEOUT_S)
+            unsure = [
+                w.window_name
+                for w, rc in zip(retry, answered, strict=True)
+                if rc is None
+            ]
+            if unsure:
+                log.warning(
+                    "send-keys re-send gave no answer within %gs for %s; not"
+                    " sending to them again",
+                    _SEND_TIMEOUT_S,
+                    ", ".join(unsure),
+                )
+                pending = {n: w for n, w in pending.items() if n not in unsure}
+                if not pending:
+                    return
 
     @staticmethod
     def _decorate_batch(
@@ -1024,8 +1132,14 @@ class WindowsPlatform(Platform):
         except OSError as exc:
             get_logger("platform").warning("status-line decoration failed: %s", exc)
             return
-        for p in decorations:
-            p.wait()
+        unanswered = await_clients(decorations, SEND_KEYS_TIMEOUT_S).count(None)
+        if unanswered:
+            get_logger("platform").warning(
+                "%d status-line decoration command(s) gave no answer within %gs;"
+                " killed them",
+                unanswered,
+                SEND_KEYS_TIMEOUT_S,
+            )
 
     def attach_psmux(
         self,

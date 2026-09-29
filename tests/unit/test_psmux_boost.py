@@ -335,7 +335,7 @@ class TestTheThreeOwnersAllCallTheOneSeam:
 
         calls: list[int] = []
         monkeypatch.setattr(psmux, "boost_priority", lambda: calls.append(1) or 1)
-        monkeypatch.setattr(psmux, "launch_verified", lambda _p, _w: [])
+        monkeypatch.setattr(psmux, "launch_verified", lambda _p, _w: {})
 
         class _Plat:
             def attach_psmux(self, *_a, **_k) -> None:
@@ -370,7 +370,7 @@ class TestTheThreeOwnersAllCallTheOneSeam:
             raise OSError("kernel32 said no")
 
         monkeypatch.setattr(psmux, "boost_priority", boom)
-        monkeypatch.setattr(psmux, "launch_verified", lambda _p, _w: [])
+        monkeypatch.setattr(psmux, "launch_verified", lambda _p, _w: {})
 
         class _Plat:
             def attach_psmux(self, *_a, **_k) -> None:

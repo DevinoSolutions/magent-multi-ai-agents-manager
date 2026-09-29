@@ -272,8 +272,11 @@ def _drive_bring_up(
     class _Proc:
         returncode = 0
 
-        def wait(self):
+        def wait(self, timeout=None):
             return 0
+
+        def kill(self):
+            pass
 
     def _popen(cmd, **kwargs):
         calls.append(list(cmd))
@@ -285,13 +288,13 @@ def _drive_bring_up(
         if "has-session" in cmd:
             proc = _Proc()
             proc.returncode = 1
-            proc.wait = lambda: 1
+            proc.wait = lambda timeout=None: 1
             return proc
         # A session psmux refuses to create ("failed to create session 'X'").
         if "new-session" in cmd and cmd[2] in (create_failures or set()):
             proc = _Proc()
             proc.returncode = 1
-            proc.wait = lambda: 1
+            proc.wait = lambda timeout=None: 1
             return proc
         if popen_error is not None and "bind" in cmd:
             raise popen_error
