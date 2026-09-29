@@ -129,7 +129,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cap. Fixed in the next release candidate.
 - `"node": "auto"` is accepted but not placed yet: a fresh `auto` project's
   bring-up refuses it ("needs a placement"), so pin the project to a nick in
-  this release.
+  this release. The next release candidate places it by each node's load
+  history.
 - `"node": "cloud"` is reserved, and in this release it runs as an ordinary
   local session.
 

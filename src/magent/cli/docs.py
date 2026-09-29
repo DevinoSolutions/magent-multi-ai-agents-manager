@@ -40,10 +40,12 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         (
             "Run this project's session on a pool machine: a nick from "
             "`settings.nodes`. A node holds a git clone at your current branch. "
-            'Exclusive with `host`. `"auto"` and `"cloud"` are reserved in this '
-            'release: `"auto"` is accepted but not placed yet, so its bring-up '
-            'refuses it ("needs a placement"); `"cloud"` runs as an ordinary '
-            "local session."
+            'Exclusive with `host`. `"auto"` lets magent choose: the node with '
+            "the lowest load score over the sync daemon's last 30 minutes of "
+            "samples (a node under 10% free memory is skipped while another is "
+            "above it), and the project stays there until that node leaves "
+            '`settings.nodes`; `magent node plan` shows the choice. `"cloud"` is '
+            "reserved in this release and runs as an ordinary local session."
         ),
     ),
     (
@@ -201,7 +203,8 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             'Pool machines a project can run on, keyed by nick: `{"second": {"host": '
             '"build-box", "user": "alice", "root": "~/magent"}}`. A nick is 1-6 '
             "characters of `a-z`, `0-9` and `-` (it is drawn in the status bar); "
-            "`auto` and `cloud` are reserved. `user` defaults to your local username at use time; "
+            "`auto` and `cloud` are not nicks: they are a project's `node` "
+            "placements. `user` defaults to your local username at use time; "
             "`root` is where project clones live on the node."
         ),
     ),
@@ -219,7 +222,7 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "nodeSync.sampleIntervalS",
         "int",
         "`60`",
-        'Seconds between node load samples; `"node": "auto"` placement will read this history.',
+        'Seconds between node load samples; `"node": "auto"` placement reads this history.',
     ),
     (
         "nodeSync.historyH",
