@@ -137,8 +137,11 @@ class TestTheRecords:
         with pytest.raises(PermissionError):
             launcher.record(tmp_path / "rc.txt", 7)
 
-        assert time.monotonic() - started < 1
-        assert len(tries) > 1
+        # Bounded, and spaced: the tries wait between them (four 0.1s sleeps),
+        # or a scanner that needs a moment never gets one.
+        elapsed = time.monotonic() - started
+        assert 0.3 <= elapsed < 1
+        assert len(tries) == launcher._RECORD_TRIES
 
     def test_only_a_held_file_is_retried(self, tmp_path, monkeypatch):
         # A full disk does not clear in a fraction of a second.
