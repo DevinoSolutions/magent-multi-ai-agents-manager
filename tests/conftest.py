@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
 )
 from magent.titles import get_leaf_name
-from tests.unit._fake_ssh import make_fake_ssh
+from tests.unit._fake_ssh import SteppedClock, make_fake_ssh
 
 # --- Real-home isolation ------------------------------------------------------
 # Captured at conftest IMPORT time, i.e. before any fixture has had the chance
@@ -273,6 +274,25 @@ def fake_gh(tmp_path, monkeypatch):
     monkeypatch.setattr("magent.remote_mux.find_gh", lambda: fake.path)
     monkeypatch.setattr("magent.remote_mux.GH_TIMEOUT_S", FAKE_GH_TIMEOUT_S)
     return fake
+
+
+@pytest.fixture
+def stepped_clock(monkeypatch):
+    """remote_mux's clock replaced by a ``SteppedClock`` (tests/unit/
+    _fake_ssh.py): a flood pin's first words come before the cap on any
+    platform's clock. remote_mux reads ``time.monotonic`` alone, so the
+    stand-in carries only that -- any other ``time`` use there would fail
+    loudly, never read the real clock.
+
+    Flood pins only: ``_finish``'s deadline reads this same clock, so a call
+    that does NOT pass the cap finds its whole bound spent at the next read
+    (``deadline - 1000.0`` is below zero) and stops waiting on its drains
+    and the child at once -- a false timeout, not the reply."""
+    clock = SteppedClock()
+    monkeypatch.setattr(
+        "magent.remote_mux.time", types.SimpleNamespace(monotonic=clock.monotonic)
+    )
+    return clock
 
 
 # --- The tripwire -------------------------------------------------------------

@@ -37,6 +37,7 @@ from magent.env import get_env
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger, heartbeat_age, heartbeat_fresh, write_heartbeat
 from magent.nodes import LoadSample, NodeMapEntry, encoded_project_dir
+from tests.unit._fake_ssh import FLOOD_CAP
 from tests.unit._pull_reply import SAMPLE, pull_meta, pull_reply
 
 if TYPE_CHECKING:
@@ -3629,6 +3630,7 @@ class TestWhatCountsAsUnreachable:
     def test_only_a_transport_failure_or_a_timeout_is_unreachable(self, err, outcome):
         assert node_sync._classify(err)[0] == outcome
 
+    @pytest.mark.usefixtures("stepped_clock")
     def test_an_over_cap_reply_is_reported_by_its_cap_not_the_childs_last_words(
         self, fake_ssh
     ):
@@ -3640,12 +3642,58 @@ class TestWhatCountsAsUnreachable:
         fake_ssh.set_mode("flood")
         node = nodes.Node(nick="second", host="devino-second", user="demo", root="~")
         with pytest.raises(remote_mux.RemoteError) as info:
-            remote_mux.run(node, ["flood"], timeout_s=60, max_stdout_bytes=1024)
+            remote_mux.run(node, ["flood"], timeout_s=60, max_stdout_bytes=FLOOD_CAP)
         assert "boom: disk full" in info.value.stderr_tail.splitlines()[1:]
         assert node_sync._classify(info.value) == (
             node_sync.FAILED,
-            "reply exceeded 1024 bytes",
+            f"reply exceeded {FLOOD_CAP} bytes",
         )
+
+    @pytest.mark.usefixtures("stepped_clock")
+    def test_an_over_cap_pull_logs_the_words_the_row_leaves_out(
+        self, placed, fake_ssh, monkeypatch
+    ):
+        # The row is the cap. nodes.log has the rest, escaped on the one
+        # line: the child's last words before the flood, and the half line
+        # the cap cut (after_cap).
+        monkeypatch.setattr(remote_mux, "PULL_MAX_REPLY_BYTES", FLOOD_CAP)
+        fake_ssh.set_reply("devino-second", stderr="boom: disk full\nwriting \x1bblo")
+        fake_ssh.set_mode("flood")
+        cap = f"reply exceeded {FLOOD_CAP} bytes"
+        syncer = node_sync.NodeSyncer(_second_only())
+        try:
+            assert syncer.tick() == {"second": (node_sync.FAILED, cap)}
+        finally:
+            syncer.close()
+        (line,) = [
+            line
+            for line in (log.LOG_DIR / "nodes.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if "node second: failed" in line
+        ]
+        assert f"({cap}): {cap}\\nboom: disk full" in line
+        assert "after the cap: writing \\x1bblo" in line
+
+    def test_a_failure_logs_the_tail_its_one_line_left_out(self, placed, caplog):
+        _capture_nodes_log(caplog)
+        err = remote_mux.RemoteError(1, "cannot write\nboom", ("ssh",))
+        node_sync.NodeSyncer(_config(), pull=_pull_raising({"second": err})).tick()
+        assert _node_warnings(caplog, "second") == [
+            "node second: failed (boom): cannot write\\nboom"
+        ]
+
+    def test_an_unreachable_node_logs_its_last_line_alone(self, placed, caplog):
+        # The tail is a FAILED node's extra: an ssh banner ahead of the real
+        # refusal stays out of an unreachable node's line.
+        _capture_nodes_log(caplog)
+        err = remote_mux.RemoteError(
+            255, "banner\nPermission denied (publickey).", ("ssh",)
+        )
+        node_sync.NodeSyncer(_config(), pull=_pull_raising({"second": err})).tick()
+        assert _node_warnings(caplog, "second") == [
+            "node second: unreachable (Permission denied (publickey).)"
+        ]
 
     def test_only_the_flag_marks_an_over_cap_reply_never_the_text(self):
         """A node whose stderr merely STARTS with the cap's wording is not an
@@ -3665,6 +3713,31 @@ class TestWhatCountsAsUnreachable:
         assert results["second"] == (node_sync.FAILED, "?]0;pwned??[2Jboom?\tend?")
         (line,) = _node_warnings(caplog, "second")
         assert not re.search(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]", line)
+
+
+class TestAnEscapedLineIsWhatTheNodeSaid:
+    def test_a_literal_escape_and_the_byte_it_names_log_differently(self):
+        # A node that printed the four characters \x1b did not send ESC: a
+        # backslash is escaped too, so the log tells the two apart.
+        assert node_sync.escaped(r"\x1b") == r"\\x1b"
+        assert node_sync.escaped("\x1b") == r"\x1b"
+
+    @pytest.mark.parametrize(
+        "said",
+        [
+            pytest.param(r"\x1b", id="literal-escape"),
+            pytest.param("\x1b]0;x\x07boom", id="real-esc"),
+            pytest.param(r"C:\Users\demo\a.jsonl", id="windows-path"),
+            pytest.param("bad \ufffd byte", id="u-fffd"),
+            # A lone surrogate is its \ud800 escape, which decodes back to it.
+            pytest.param("hi\ud800", id="lone-surrogate"),
+            pytest.param("first\n\tsecond", id="newline-and-tab"),
+        ],
+    )
+    def test_an_escaped_line_decodes_back_to_what_the_node_said(self, said):
+        line = node_sync.escaped(said)
+        assert all(" " <= c <= "~" for c in line)
+        assert line.encode("ascii").decode("unicode_escape") == said
 
 
 class TestABadWatermarkIsNoWatermark:

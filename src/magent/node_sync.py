@@ -643,10 +643,15 @@ def escaped(text: str) -> str:
     """``text`` as one line for the log, where ``printable`` would drop
     characters: each one outside printable ASCII becomes its escape -- a
     newline ``\\n``, ESC ``\\x1b``, U+FFFD (what a byte that was not UTF-8
-    decoded to) ``\\ufffd``. A node's words in nodes.log must neither split a
-    record nor write to a terminal tailing it."""
+    decoded to) ``\\ufffd`` -- and so does a backslash, ``\\\\``, or a node
+    that printed the four characters ``\\x1b`` would log as one that sent
+    ESC. A node's words in nodes.log must neither split a record nor write to
+    a terminal tailing it, and ``unicode_escape`` decodes the line back to
+    them."""
     return "".join(
-        c if " " <= c <= "~" else c.encode("unicode_escape").decode("ascii")
+        c
+        if " " <= c <= "~" and c != "\\"
+        else c.encode("unicode_escape").decode("ascii")
         for c in text
     )
 
@@ -663,6 +668,21 @@ def _classify(e: remote_mux.RemoteError) -> tuple[str, str]:
     if e.timed_out or e.rc == SSH_TRANSPORT_RC:
         return UNREACHABLE, detail
     return FAILED, detail
+
+
+def _said(e: remote_mux.RemoteError, detail: str) -> str:
+    """What a node's WARNING adds to its row ``detail``, for nodes.log: the
+    node's stderr tail, escaped, when the row's one line leaves something out
+    (more lines, a control character, the child's words over the cap); what
+    stderr said after the cap; and the OS's words behind a local ssh that
+    would not start (``remote_mux.os_detail``; never the client's path). The
+    node's parts are ``remote_mux``'s tails: at most 20 lines each."""
+    parts = [
+        escaped(e.stderr_tail) if e.stderr_tail.strip() != detail else "",
+        f"after the cap: {escaped(e.after_cap)}" if e.after_cap else "",
+        remote_mux.os_detail(e),
+    ]
+    return "; ".join(part for part in parts if part)
 
 
 def _pull_node(
@@ -713,9 +733,8 @@ class NodeSyncer:
         # write the same key.
         self._errors: dict[str, Exception] = {}
         # What _note's WARNING adds to a FAILED node's line, from its worker
-        # the same way. The outcome names a class only: this carries a local
-        # OSError's words, or the OS's words behind a local ssh that would not
-        # start (remote_mux.os_detail; never the client's path).
+        # the same way. The outcome is one line: this carries a local
+        # OSError's words, or what a RemoteError's row leaves out (_said).
         self._words: dict[str, str] = {}
         # The class of what last refused the node map, while it stays unread.
         self._map_error: str | None = None
@@ -878,12 +897,13 @@ class NodeSyncer:
             # the pull does takes one, which makes it a bug, not contention.
             return self._internal_error(nick, e)
         except remote_mux.RemoteError as e:
-            # pull_node's call is quiet: a local ssh that would not start is
-            # its class alone, so this node's WARNING carries the OS's words.
-            words = remote_mux.os_detail(e)
+            # pull_node's call is quiet, so this node's WARNING carries what
+            # the row's one line leaves out (_said).
+            outcome, detail = _classify(e)
+            words = _said(e, detail)
             if words:
                 self._words[nick] = words
-            return _classify(e)
+            return outcome, detail
         except OSError as e:
             # `node sync --once` prints the detail, and this one can name a
             # path on this PC: the class there, the words in nodes.log.
