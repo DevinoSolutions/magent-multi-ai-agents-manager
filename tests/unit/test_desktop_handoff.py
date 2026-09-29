@@ -549,7 +549,8 @@ class TestRunOnDesktopOnWindows:
     def test_an_ntstatus_exit_code_arrives_signed(self, fake_schtasks):
         # 0xC000013A is what a console closed under a command exits with. The
         # launcher reads it as a DWORD; everything Windows prints says
-        # -1073741510, and so does the old launcher's Int32 ExitCode.
+        # -1073741510, as the Int32 ExitCode of the PowerShell launcher before
+        # it did.
         result = self._plat().run_on_desktop(
             [sys.executable, "-c", "import os; os._exit(-1073741510)"], timeout_s=60
         )
@@ -1051,7 +1052,8 @@ class TestTheLauncherReallyRuns:
             work, [sys.executable, "-c", "import os; print(ascii(os.getcwd()))"]
         )
 
-        # Never the checkout as the cwd: PowerShell writes relative to it.
+        # Never the checkout as the cwd: nothing this run leaves behind may
+        # land in the repository.
         subprocess.run(
             [*_HANDOFF_SHELL.split(), str(script)],
             check=True,

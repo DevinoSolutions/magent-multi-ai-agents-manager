@@ -1741,9 +1741,11 @@ newline written to a temporary name and renamed into place, so the 250ms poll
 never reads a half-written one (the exit code is the signed Int32 Windows
 tools print, so an NTSTATUS arrives as `-1073741510`, not `3221225786`). That
 order is what lets the poll tell three failures apart: no pid after the start
-grace means Task Scheduler never ran the task, a pid that is gone with no rc
-means the launcher lost its child and nothing is coming, and neither is the
-caller's budget simply running out. On that last one the delegated child is
+grace, from a task that is not running, means Task Scheduler never ran it (a
+launcher that merely could not record its pid -- a scanner holding the file,
+a full disk -- carries on, and its rc.txt still answers), a pid that is gone
+with no rc means the launcher lost its child and nothing is coming, and neither
+is the caller's budget simply running out. On that last one the delegated child is
 deliberately NOT killed: a bring-up still running on the desktop is doing the
 work that was asked for, and the pid is a number Windows recycles freely. A
 command that cannot be started at all -- a missing executable, a working
