@@ -31,6 +31,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It now waits up to two seconds for the pid, and stops the daemon once it
   appears.
 
+- **A node reply cut at the output cap shows the cap as its reason.** When a
+  node's reply ran past magent's output cap, the bring-up, `down` or sync row
+  showed the last stderr line from before the cap. That could be half a line,
+  or the node's complaint at the pipe the cap closed. The row now reads `reply
+  exceeded N bytes`, and the node's own words go to
+  `~/.magent/logs/nodes.log`, escaped onto one line per record.
+
+- **A node session's agent state no longer freezes on a record it cannot
+  read.** A state record on the node nested too deeply for python to parse made
+  the node's state hook fail on every tool call, so `magent attention` and
+  `magent watch` showed that session's state unchanged until the file was
+  removed. The next tool call now overwrites the record.
+
+- **`magent node setup` refuses a dangling `id_ed25519.pub` link.** A `.pub`
+  link whose target is missing read as no `.pub` at all, so setup wrote the
+  public key, and ssh-keygen its own, through the link to wherever it pointed.
+  Setup now stops on that key with a `fail` row and exit 1 before writing
+  anything. A `.pub` link to a real file is still only read.
+
+### Known issues
+
+- rc1's two known issues, the output-cap reason and `"node": "auto"` not being
+  placed, are fixed in this release candidate.
+- `"node": "cloud"` is reserved, and in this release it runs as an ordinary
+  local session.
+
 ## [3.20.0rc1] - 2026-09-28
 
 ### Added
