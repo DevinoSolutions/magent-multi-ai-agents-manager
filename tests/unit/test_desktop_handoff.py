@@ -458,6 +458,15 @@ def _calls(bin_dir: Path) -> list[list[str]]:
     return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
 
 
+def _ansi_code_page_holds(char: str) -> bool:
+    """Whether this box's ANSI code page -- what the desktop copy's redirected
+    stdout is written in -- has ``char``."""
+    import ctypes
+
+    acp = f"cp{ctypes.windll.kernel32.GetACP()}"
+    return char.encode(acp, "ignore") != b""
+
+
 @pytestmark_win
 class TestRunOnDesktopOnWindows:
     def _plat(self):
@@ -688,6 +697,56 @@ class TestRunOnDesktopOnWindows:
 
         assert result.rc == 0, result.detail
         assert result.stdout.split() == ["True", "False"]
+
+    def test_an_accent_the_child_wrote_comes_back_intact(self, fake_schtasks):
+        # The desktop copy's stdout is a FILE, so Python writes it in the ANSI
+        # code page, not UTF-8 -- and reading it back as UTF-8 relayed every
+        # accented letter in a project name or path as U+FFFD. The accent is a
+        # Python escape so the child's ARGV stays ASCII: this pins the output
+        # leg alone.
+        if not _ansi_code_page_holds("é"):
+            pytest.skip("the ANSI code page has no é, so a plain print of it raises")
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-c", "print('caf\\u00e9')"], timeout_s=60
+        )
+
+        assert result.rc == 0, result.detail
+        assert result.stdout.strip() == "café"
+
+    def test_a_character_the_code_page_lacks_never_crashes_the_copy(
+        self, fake_schtasks, tmp_path, monkeypatch
+    ):
+        # The REAL entry point as the desktop copy. It used to die on
+        # UnicodeEncodeError partway through its output, and for `up` that
+        # was after the sessions existed: rc 1 and a traceback over a
+        # bring-up that had worked. The accent the code page holds comes back
+        # as itself, the character it lacks as an escape.
+        #
+        # The desktop copy inherits this process's environment, so a dev box
+        # that sets either of these would hand it a UTF-8 stdout that holds
+        # every character: the test would print no escape and fail, and the
+        # code page it is about would never be exercised.
+        #
+        # The expectation is a cp1252-class code page's: é held, 中 escaped.
+        # Elsewhere (cp1251, cp932, a UTF-8 code page) the right output is
+        # different, so the pin skips rather than fail on a correct copy.
+        if not _ansi_code_page_holds("é") or _ansi_code_page_holds("中"):
+            pytest.skip("the ANSI code page is not one that has é but lacks 中")
+        monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+        monkeypatch.delenv("PYTHONUTF8", raising=False)
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps({"projects": [{"path": str(tmp_path / "café 中")}]}),
+            encoding="utf-8",
+        )
+
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-m", "magent", "--config", str(cfg), "config", "show"],
+            timeout_s=60,
+        )
+
+        assert result.rc == 0, result.stderr
+        assert "café \\u4e2d" in result.stdout
 
     def test_the_child_can_never_hand_off_again(self, fake_schtasks):
         # A hand-off that landed in Session 0 again and handed off in turn
@@ -1302,6 +1361,37 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
         assert "hello err" in result.stderr
         assert work.exists()
         assert f"scratch left at {work}" in result.detail
+
+
+@pytestmark_win
+class TestTheRelayedTextDecodes:
+    """out.txt and err.txt hold whatever encoding the CHILD chose, and the
+    reader has to take both answers a Python child can give."""
+
+    def test_utf8_is_read_as_utf8(self, tmp_path):
+        from magent.platform.windows import _read_handoff_text
+
+        out = tmp_path / "out.txt"
+        # A child in Python's UTF-8 mode writes this. Tried first, so the
+        # ANSI fallback can never turn it into mojibake.
+        out.write_bytes("café 中\r\n".encode())
+
+        assert _read_handoff_text(out) == "café 中\n"
+
+    def test_the_ansi_code_page_is_the_fallback(self, tmp_path):
+        from magent.platform.windows import _read_handoff_text
+
+        out = tmp_path / "out.txt"
+        # What a default child writes into a redirected stdout: the ANSI code
+        # page (mbcs), which is not valid UTF-8 as soon as it holds an accent.
+        out.write_bytes("café\r\n".encode("mbcs"))
+
+        assert _read_handoff_text(out) == "café\n"
+
+    def test_an_absent_file_still_reads_empty(self, tmp_path):
+        from magent.platform.windows import _read_handoff_text
+
+        assert _read_handoff_text(tmp_path / "out.txt") == ""
 
 
 @pytestmark_win
