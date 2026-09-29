@@ -20,10 +20,10 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from magent.config import MagentConfig
     from magent.platform import Platform
@@ -347,6 +347,91 @@ def live_sessions(
     return [n for n in names if n in live]
 
 
+# What the bring-up's dedupe learns about one session. "live" and "absent" are
+# ANSWERS -- has-session exited 0, or exited non-zero -- and mean exactly what
+# ``has_session`` means by True and False. "unknown" is the third state that
+# ``has_session``/``live_sessions`` fold into "not live": the client never
+# answered (or could not even be started). For a status table that fold is the
+# right call; for a bring-up it is not, because "not live" leads to kill-server
+# and a fresh new-session, and in the 2026-08-18 wedge the sessions that stopped
+# answering were FROZEN live agents, not dead ones.
+SessionState = Literal["live", "absent", "unknown"]
+
+# How long a killed client gets to be collected. A kill cannot be refused
+# (TerminateProcess / SIGKILL), so this is only the OS's own teardown -- bounded
+# anyway, so the reap can never become the unbounded wait it exists to end.
+_REAP_TIMEOUT_S = 5.0
+
+
+def _kill_and_reap(proc: subprocess.Popen[bytes]) -> None:
+    """Kill a client that outran its budget, and collect it. Never raises."""
+    with contextlib.suppress(OSError):
+        proc.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=_REAP_TIMEOUT_S)
+
+
+def await_clients(
+    procs: Sequence[subprocess.Popen[bytes] | None], timeout: float
+) -> list[int | None]:
+    """Wait on a fan-out of psmux clients under ONE deadline.
+
+    Returns each client's exit code in order, or None for one that never
+    answered (killed and reaped here, never left running) or was never spawned
+    (a None slot). One deadline for the whole set, not one per client: the
+    clients run concurrently, so a fresh timeout per ``wait`` would make N hung
+    clients cost N budgets -- the ``_display_fan_out`` lesson. Past the deadline
+    a client that already exited still hands over its code (a zero-length wait
+    reads it); only one still running counts as unanswered.
+
+    Output is not read here, and callers spawn with DEVNULL on purpose: a piped
+    client that is killed can leave a grandchild holding the pipe, and draining
+    it is exactly the unbounded wait ``probe_control_plane`` documents.
+    """
+    deadline = time.monotonic() + timeout
+    codes: list[int | None] = []
+    for proc in procs:
+        if proc is None:
+            codes.append(None)
+            continue
+        try:
+            codes.append(proc.wait(timeout=max(0.0, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            _kill_and_reap(proc)
+            codes.append(None)
+    return codes
+
+
+def probe_sessions(
+    names: list[str], psmux: str, *, timeout: float
+) -> dict[str, SessionState]:
+    """The bring-up's dedupe: live, absent or UNKNOWN for each of ``names``.
+
+    The same ``has-session -t`` probe as ``has_session`` -- ``-t`` is
+    load-bearing, see there -- fanned out and bounded by ``await_clients``. A
+    probe that times out, or that could not be spawned, is "unknown", never
+    "absent": only a positive answer that the session is not there may lead to
+    killing its socket and creating it afresh.
+    """
+    procs: list[subprocess.Popen[bytes] | None] = []
+    for name in names:
+        try:
+            procs.append(
+                subprocess.Popen(
+                    [psmux, "-L", name, "has-session", "-t", name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=_SPAWN_FLAGS,
+                )
+            )
+        except OSError:
+            procs.append(None)
+    states: dict[str, SessionState] = {}
+    for name, rc in zip(names, await_clients(procs, timeout), strict=True):
+        states[name] = "unknown" if rc is None else ("live" if rc == 0 else "absent")
+    return states
+
+
 # How long the control plane gets to answer one cheap command before `magent
 # doctor` calls it wedged. Deliberately short: this is a diagnostic, and the
 # failure it looks for is not "slow" but "never" -- a wedged psmux answers
@@ -488,6 +573,40 @@ def kill_servers(names: list[str]) -> list[str]:
         return []
     _kill_batch(names, binary)
     return list(names)
+
+
+def clear_stale_servers(names: list[str], psmux: str, *, timeout: float) -> list[str]:
+    """``kill-server`` every name concurrently; return the ones with no answer.
+
+    The bring-up's step between "has-session said absent" and ``new-session``:
+    a socket can hold a dead server that answers "no session" while still
+    squatting the name. The exit code is deliberately ignored -- "no server
+    running" (rc 1) is the normal answer for an absent name, and psmux 3.3.6
+    exits 0 for kills that do not take -- so the only failure is SILENCE: a
+    client that never answered within ``timeout`` (one deadline for the whole
+    fan-out, killed and reaped by ``await_clients``), or one that could not be
+    spawned. Those names are returned so the caller can refuse to create a
+    session on top of a server it could not clear.
+
+    Not ``kill_server``/``_kill_batch``: those answer "did rc == 0", which folds
+    "no server running" into the same False as "never answered", and their
+    captured pipes are not a real bound on Windows.
+    """
+    procs: list[subprocess.Popen[bytes] | None] = []
+    for name in names:
+        try:
+            procs.append(
+                subprocess.Popen(
+                    [psmux, "-L", name, "kill-server"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=_SPAWN_FLAGS,
+                )
+            )
+        except OSError:
+            procs.append(None)
+    codes = await_clients(procs, timeout)
+    return [n for n, rc in zip(names, codes, strict=True) if rc is None]
 
 
 def stop_sessions(
@@ -1538,14 +1657,15 @@ def bring_up(
     config: MagentConfig,
     only: list[str] | None = None,
     group: str | None = None,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], dict[str, str]]:
     """Create detached psmux sessions for eligible projects.
 
     ``only`` restricts creation to the given session names; ``group``
     restricts to a single project group.
 
     Returns ``(created, failed)``: the sessions the creation verify PROVED are
-    up, and the ones still missing after ``launch_verified``'s one respawn.
+    up, and the ones still missing after ``launch_verified``'s one respawn --
+    each mapped to the reason it is down (see ``launch_verified``).
     The casualties used to be discarded here -- ``launch_verified`` logged
     "session never came up after respawn" while this function answered with
     every name it had attempted, so both callers printed "Brought up N
@@ -1570,7 +1690,7 @@ def bring_up(
         )
     names = [w.window_name for w in windows]
     if not windows:
-        return [], []
+        return [], {}
     failed = launch_verified(plat, windows)
     stuck = set(failed)
     return [n for n in names if n not in stuck], failed
@@ -1611,7 +1731,16 @@ def _missing_sessions(names: list[str], binary: str) -> list[str]:
     return [n for n, ok in zip(names, flags, strict=True) if not ok]
 
 
-def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]:
+# Appended to a refusal whose session the verify then found live: the refused
+# client did its job after all, too late for this bring-up to start the agent.
+# `magent up` revives a live session that rests at its shell.
+_LATE_LIVE = (
+    "; it answers now, but this bring-up typed no agent command into it"
+    " -- run `magent up` to revive it"
+)
+
+
+def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str, str]:
     """Create ``windows`` through the platform, then prove each session exists.
 
     ``launch_psmux_session`` reports success the moment its ``new-session``
@@ -1628,8 +1757,23 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]
     agent. Here the remedy is ``new-session``, which ``launch_psmux_session``
     already skips for any session that answers ``has-session`` -- so re-running
     it is safe, and an unknown state (including a probe that TIMED OUT against
-    a wedged server) counts as MISSING and is retried. Unknown is safe to
-    re-create; it is not safe to inject into.
+    a wedged server) counts as MISSING and is handed back for the respawn.
+    That is safe only because the respawn goes through ``launch_psmux_session``
+    again, whose own dedupe is tri-state: a name IT cannot read is never
+    killed and never re-created (psmux.probe_sessions). "Unknown" is safe to
+    re-ask about; it is not safe to kill, re-create, or inject into.
+
+    A name the platform REFUSED (its dedupe or its kill-server got no answer,
+    or its new-session outran the budget) is not respawned when the verify
+    also misses it: the respawn would only repeat the wait that failed, and on
+    a wedged socket double it. It is reported with the platform's reason.
+
+    A refusal is final even when the verify finds that session LIVE. A
+    new-session killed at its deadline can still have created the session
+    late, and then nothing ever typed the agent command into it: counted as
+    brought up, it is a bare shell under a success line (``--go`` never
+    revives). So it stays in the report, its reason extended by what the
+    verify saw (``_LATE_LIVE``).
 
     Never raises out of the verify -- and, since v3.10.10, never raises out of
     the CREATION either: one stuck session must not cost the wave its remaining
@@ -1641,10 +1785,13 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]
     below, which is the component that already knows how to respawn what is
     missing and report what stayed down.
 
-    Returns the names still missing after the one retry.
+    Returns the sessions still missing after the one retry, plus every name
+    the platform refused, in input order, each mapped to why: the platform's
+    refusal reason, or ``""`` when the log is the only account (the Session-0
+    refusal is named by the printers via ``launch.session0_note``).
     """
     if not windows:
-        return []
+        return {}
     names = [w.window_name for w in windows]
     log = get_logger("launch")
 
@@ -1664,10 +1811,11 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]
         log.error(
             "%s (would have created: %s)", session0_refusal(plat), ", ".join(names)
         )
-        return names
+        return dict.fromkeys(names, "")
 
+    refused: dict[str, str] = {}
     try:
-        plat.launch_psmux_session(windows)
+        refused.update(plat.launch_psmux_session(windows))
     except (OSError, subprocess.SubprocessError):
         # Same handling the respawn below has always had. Deliberately NOT a
         # re-raise: the probe decides what actually came up, and a partial
@@ -1679,36 +1827,55 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]
         # Nothing can be probed, so nothing can be claimed. Every name is
         # reported missing rather than silently passed off as created -- with
         # no psmux binary the creation above cannot have succeeded either.
-        return names
+        return dict.fromkeys(names, "")
+
+    def _report(down: list[str]) -> dict[str, str]:
+        gone = set(down)
+        late = [n for n in names if n in refused and n not in gone]
+        if late:
+            log.warning(
+                "refused %s, which answers now: left without its agent command",
+                ", ".join(late),
+            )
+        return {
+            n: refused[n] + _LATE_LIVE
+            if n in refused and n not in gone
+            # ...and the missing ones, refused or not, as the platform left them.
+            else refused.get(n, "")
+            for n in names
+            if n in gone or n in refused
+        }
 
     # Settle first: the storm's timeouts were transient churn, and probing at
     # t=0 would misclassify slow-but-fine servers on a loaded host.
     time.sleep(_CREATE_VERIFY_SETTLE_S)
     missing = _missing_sessions(names, binary)
-    if not missing:
-        return []
-
+    respawn = [n for n in missing if n not in refused]
+    if not respawn:
+        return _report(missing)
     log.warning(
-        "session did not come up after bring-up; respawning: %s", ", ".join(missing)
+        "session did not come up after bring-up; respawning: %s", ", ".join(respawn)
     )
-    stuck = set(missing)
+    stuck = set(respawn)
     try:
         # Back through the full launch path on purpose -- a hand-rolled
         # ``new-session`` here would diverge from the original recipe (batch
         # pacing, send-keys verification, status-line decoration).
-        plat.launch_psmux_session([w for w in windows if w.window_name in stuck])
+        refused.update(
+            plat.launch_psmux_session([w for w in windows if w.window_name in stuck])
+        )
     except (OSError, subprocess.SubprocessError):
-        log.exception("respawn failed for %s", ", ".join(missing))
-        return missing
+        log.exception("respawn failed for %s", ", ".join(respawn))
+        return _report(missing)
 
     time.sleep(_CREATE_VERIFY_SETTLE_S)
-    still_missing = _missing_sessions(missing, binary)
+    still_missing = set(_missing_sessions(respawn, binary))
     if still_missing:
         log.error(
             "session never came up after respawn; left down: %s",
-            ", ".join(still_missing),
+            ", ".join(n for n in respawn if n in still_missing),
         )
-    return still_missing
+    return _report([n for n in missing if n in still_missing or n not in stuck])
 
 
 def revive_sessions(

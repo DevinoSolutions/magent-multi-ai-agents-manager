@@ -101,7 +101,15 @@ class Platform(ABC):
         """Return {title: handle} for all visible windows in a single pass."""
         return {}
 
-    def launch_psmux_session(self, windows: list[PsmuxWindowOpts]) -> None:
+    def launch_psmux_session(self, windows: list[PsmuxWindowOpts]) -> dict[str, str]:
+        """Create ``windows``; return the ones REFUSED, each with its reason.
+
+        A refusal is a window deliberately not created because psmux gave no
+        answer the bring-up could act on safely -- see
+        ``WindowsPlatform.launch_psmux_session``. Windows psmux merely failed
+        to create are not refused: ``psmux.launch_verified`` finds and
+        respawns those.
+        """
         raise NotImplementedError("psmux is only supported on Windows")
 
     def attach_psmux(
