@@ -52,10 +52,12 @@ class HandoffResult:
     Frozen because it is a REPORT: the caller relays it to a user and exits
     with it, and a value anyone downstream can edit is a report that can lie.
 
-    ``rc`` is the command's own exit code, or None when the command never ran
-    (no Task Scheduler, the task refused to start, ...). ``timed_out`` is the
-    third case: it started, we stopped waiting, and it may still be running --
-    which is why it is a separate flag rather than a fabricated exit code.
+    ``rc`` is the command's own exit code, or None when none came back: the
+    command never ran (no Task Scheduler, the task refused to start, ...), or
+    it ran and its exit code was lost (the launcher lost its child, or the
+    exit code never became readable). ``timed_out`` is the separate case where
+    it started, we stopped waiting, and it may still be running -- which is why
+    it is a flag rather than a fabricated exit code.
     ``detail`` names the phase that failed and, on failure, where the scratch
     directory was left, so a bug report can be read without a repro.
     """

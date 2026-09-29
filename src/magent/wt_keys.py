@@ -301,14 +301,30 @@ class SettingsParseError(RuntimeError):
     round-tripping it through ``json.dump`` would silently delete the user's
     comments, and guessing at a repair could corrupt a working terminal. The
     caller prints the manual snippet instead.
+
+    ``maybe_jsonc`` is True only for a JSON syntax error -- the one refusal
+    JSONC can explain -- and the callers print the comments-and-trailing-commas
+    hint only then.
     """
+
+    def __init__(self, reason: str, *, maybe_jsonc: bool = False) -> None:
+        super().__init__(reason)
+        self.maybe_jsonc = maybe_jsonc
 
 
 def load_settings(path: Path) -> dict[str, object]:
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except ValueError as exc:
-        raise SettingsParseError(str(exc)) from exc
+        # A file that is not UTF-8 lands here too (UnicodeDecodeError is a
+        # ValueError), and no comment or trailing comma explains that.
+        raise SettingsParseError(
+            str(exc), maybe_jsonc=isinstance(exc, json.JSONDecodeError)
+        ) from exc
+    except RecursionError as exc:
+        # JSON nested past the parser's depth. Not a ValueError, but a file we
+        # cannot parse all the same, and every caller refuses those by name.
+        raise SettingsParseError("settings.json is nested too deeply to parse") from exc
     if not isinstance(data, dict):
         raise SettingsParseError("settings.json is not a JSON object")
     return data

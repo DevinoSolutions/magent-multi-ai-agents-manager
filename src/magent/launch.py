@@ -22,7 +22,12 @@ from magent.platform import (
     VSCodeLaunchOpts,
     get_platform,
 )
-from magent.procs import pid_alive, spawn_unjobbed
+from magent.procs import (
+    REGISTRATION_TIMEOUT_S,
+    await_registration,
+    pid_alive,
+    spawn_unjobbed,
+)
 from magent.sessions import (
     AGENT_TOOLS,
     build_resume_command,
@@ -185,9 +190,11 @@ def relay_handoff(plat: Platform, argv: list[str], *, timeout_s: float) -> int:
         )
         return 1
     if result.rc is None:
+        # "failed", not "could not run": some of these answers are about a
+        # command that DID run (it lost its child, or finished with an
+        # unreadable exit code), and `detail` says which.
         click.echo(
-            f"  {style('x', fg='red')} hand-off could not run on the desktop: "
-            f"{result.detail} "
+            f"  {style('x', fg='red')} hand-off failed: {result.detail} "
             "(see ~/.magent/logs/launch.log on this host)",
             err=True,
         )
@@ -271,17 +278,11 @@ def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int |
     args = [sys.executable, "-m", "magent", "hotkey", "-s", server_url]
     if ssh_host:
         args += ["--ssh-host", ssh_host]
-    spawn_detached(args)
-    # The child writes its pid only after the keyboard hook installs; give it a
-    # short window to come up so we can report (and so a hook failure surfaces).
-    # `pid != existing` guards the restart path: a kill that didn't take must
+    # The child writes its pid only after the keyboard hook installs, so the
+    # wait both reports the pid and surfaces a hook failure (the child exits).
+    # `not_pid=existing` guards the restart path: a kill that didn't take must
     # not read back as "the new listener came up".
-    for _ in range(20):
-        time.sleep(0.1)
-        pid = listener_pid()
-        if pid and pid != existing:
-            return pid
-    return None
+    return await_registration(spawn_detached(args), listener_pid, not_pid=existing)
 
 
 def supervised_hotkey_target(
@@ -486,6 +487,7 @@ class UploadServerSupervisor:
         )
         self._now = now
         self._last_spawn: float | None = None
+        self._child: subprocess.Popen[bytes] | None = None
 
     @property
     def cooldown_s(self) -> float:
@@ -504,6 +506,22 @@ class UploadServerSupervisor:
             return "no pid file"
         return f"recorded pid {pid} is {'alive' if pid_alive(pid) else 'gone'}"
 
+    def _still_starting(self, now: float) -> bool:
+        """The serve this supervisor last spawned is alive and still inside the
+        shared registration window: slow, not failed (DESIGN.md section 2, "A
+        slow child is not a failed child"). Measured on a loaded desktop, a serve
+        took ~4.7s to bind, so a short cooldown respawned beside it. Before the
+        exclusive bind, that second bind SUCCEEDED on Windows (``SO_REUSEADDR``):
+        two live servers on one port. Now it exits with ``PortInUse``, but a
+        spawn that can only fail is still a wasted one. Past the
+        window, or once the child has exited, the cooldown alone decides, as it
+        always did. The child is never ended here."""
+        if self._child is None or self._last_spawn is None:
+            return False
+        if now - self._last_spawn >= REGISTRATION_TIMEOUT_S:
+            return False
+        return self._child.poll() is None
+
     def tick(self) -> bool:
         """One liveness check. True when a respawn was issued."""
         if _probe_upload_port(self._port):
@@ -517,6 +535,14 @@ class UploadServerSupervisor:
                 self._cooldown,
             )
             return False
+        if self._still_starting(now):
+            log.debug(
+                "upload supervisor: port %d not answering yet; the serve spawned "
+                "%.1fs ago is still starting",
+                self._port,
+                now - (self._last_spawn or now),
+            )
+            return False
         self._last_spawn = now
         # ASCII only: this line goes to a rotating logfile that gets read back
         # through whatever the host console's code page happens to be.
@@ -526,7 +552,10 @@ class UploadServerSupervisor:
             self._port,
             self._pid_note(),
         )
-        spawn_detached(upload_server_argv(self._port, self._config_path))
+        # Forget the previous child first: if this spawn raises, that child must
+        # not be timed against this attempt's stamp as though it were the new one.
+        self._child = None
+        self._child = spawn_detached(upload_server_argv(self._port, self._config_path))
         return True
 
 

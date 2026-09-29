@@ -26,6 +26,7 @@ import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -215,6 +216,24 @@ class TestTheRelay:
 
         assert rc == 1
         assert "schtasks not found" in capsys.readouterr().err
+
+    def test_a_command_that_ran_is_never_reported_as_unrun(self, capsys):
+        # The fourth answer is about a command that DID run on the desktop, so
+        # the caller's own words must stay true for it -- exactly this line.
+        detail = (
+            "the desktop command finished but its exit code never became "
+            "readable within 10.0s -- rc.txt was empty; task T, scratch left at S"
+        )
+        plat = FakePlatform(
+            supports_handoff=True, handoff_result=HandoffResult(rc=None, detail=detail)
+        )
+
+        rc = relay_handoff(plat, ["x"], timeout_s=5)
+
+        assert rc == 1
+        assert capsys.readouterr().err.splitlines() == [
+            f"  x hand-off failed: {detail} (see ~/.magent/logs/launch.log on this host)"
+        ]
 
 
 class TestThePlatformDefaults:
@@ -882,7 +901,14 @@ class TestRunOnDesktopOnWindows:
         # One directory per call, deleted on success -- so a machine that hands
         # off all day does not accumulate a launcher script per bring-up.
         for _ in range(3):
-            self._plat().run_on_desktop([sys.executable, "-c", "pass"], timeout_s=60)
+            result = self._plat().run_on_desktop(
+                [sys.executable, "-c", "pass"], timeout_s=60
+            )
+            # Every call must have SUCCEEDED for "no growth" to mean anything:
+            # a failed hand-off keeps its directory on purpose, so a harness
+            # stall (the fake schtasks timing out under load) fails here, as
+            # the failure it is, instead of below as "the root grew".
+            assert result.rc == 0, result.detail
 
         assert list(_scratch_root(fake_schtasks).iterdir()) == []
 
@@ -909,7 +935,11 @@ class TestRunOnDesktopOnWindows:
         # and nothing is ever going to write one. Reporting that now beats
         # spending the caller's whole 900s budget proving it.
         started = time.monotonic()
-        monkeypatch.setattr("magent.platform.windows._read_pid", lambda _p: 4)
+        # pid.txt and rc.txt share one reader; only the pid is faked.
+        monkeypatch.setattr(
+            "magent.platform.windows._read_recorded_int",
+            lambda p: 4 if p.name == "pid.txt" else None,
+        )
         monkeypatch.setattr("magent.platform.windows.pid_alive", lambda _p: False)
         # A gone pid is given a grace to still have its exit code written (the
         # launcher writes rc.txt after its wait() returns); shrink it so this
@@ -929,6 +959,344 @@ class TestRunOnDesktopOnWindows:
         assert result.timed_out is False
         assert "without an exit code" in result.detail
         assert time.monotonic() - started < 30
+
+
+# CreateFileW arguments `_winapi` has no names for.
+_CREATE_ALWAYS = 2
+_FILE_SHARE_READ_WRITE = 0x1 | 0x2
+
+
+class _PollClock:
+    """The hand-off poll's ``time``, advanced only by the poll's own sleeps.
+
+    Swapped in for ``magent.platform.windows.time`` so a scenario is keyed to
+    POLL TICKS rather than to how loaded the machine is: every step the fake
+    launcher takes lands between the same two reads on every run. Only the
+    clock is fake -- the files the poll reads are real, and so is the lock.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.ticks = 0
+        self.on_tick = lambda _tick: None
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        self.ticks += 1
+        self.on_tick(self.ticks)
+
+
+class _HeldExitCode:
+    """rc.txt the way the launcher's ``Set-Content`` writes it: CREATED first,
+    empty, and held open while the value goes in.
+
+    ``locked`` holds it with no sharing, so a reader gets a sharing violation --
+    which is what Windows PowerShell measurably does (298 of 300 first reads
+    after the file appeared). ``shared`` holds a zero-byte file a reader CAN
+    open, and reads as empty: the other half of the same window. ``partial``
+    is ``shared`` with the first digit of a longer value already written and
+    no line end yet. ``_winapi`` and not ``open()``, because Python's own open
+    always shares.
+    """
+
+    def __init__(self, path: Path, mode: str) -> None:
+        import _winapi
+
+        self._winapi = _winapi
+        share = 0 if mode == "locked" else _FILE_SHARE_READ_WRITE
+        self._handle: int | None = _winapi.CreateFile(
+            str(path), _winapi.GENERIC_WRITE, share, _winapi.NULL, _CREATE_ALWAYS, 0, 0
+        )
+        if mode == "partial":
+            self.write("1")
+
+    def write(self, text: str) -> None:
+        """Write without closing -- the writer is still mid-value."""
+        if self._handle is not None:
+            self._winapi.WriteFile(self._handle, text.encode("ascii"))
+
+    def finish(self, text: str) -> None:
+        """Write the rest and close -- the moment Set-Content returns."""
+        self.write(text)
+        self.close()
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._winapi.CloseHandle(self._handle)
+            self._handle = None
+
+
+@pytestmark_win
+class TestTheExitCodeIsFinalOnlyAsAnInteger:
+    """rc.txt EXISTING is not the exit code being WRITTEN.
+
+    The launcher's ``Set-Content`` creates rc.txt before it writes the value
+    and holds it while it does, so a poll can see the file and read nothing.
+    That read used to be terminal -- ``rc=None``, "unreadable exit code ''" --
+    for a command that had succeeded: ``assert None == 7`` in
+    ``test_the_command_really_runs_and_its_streams_come_back``, on five CI runs
+    of unrelated PRs. The pid.txt read already knew that "present but not an
+    integer" means "not yet"; both now also require the line end Set-Content
+    writes after the value, so a prefix is never final either.
+
+    Driven through the poll directly, against real files, with no scheduler at
+    all: the window is opened on purpose and held for a known number of poll
+    ticks, not hoped for.
+    """
+
+    @pytest.fixture
+    def handoff(self, tmp_path, monkeypatch):
+        work = tmp_path / "scratch"
+        work.mkdir()
+        files = (
+            work / "out.txt",
+            work / "err.txt",
+            work / "pid.txt",
+            work / "rc.txt",
+        )
+        files[0].write_text("hello out\n", encoding="utf-8")
+        files[1].write_text("hello err\n", encoding="utf-8")
+        files[2].write_text("4242\n", encoding="utf-8")
+        # The child is gone -- the launcher writes rc.txt only after
+        # WaitForExit -- which is exactly the state a poll meets mid-write.
+        monkeypatch.setattr("magent.platform.windows.pid_alive", lambda _p: False)
+        clock = _PollClock()
+        monkeypatch.setattr("magent.platform.windows.time", clock)
+        return work, files, clock
+
+    @pytest.fixture
+    def hold(self, request):
+        def _hold(path: Path, mode: str) -> _HeldExitCode:
+            held = _HeldExitCode(path, mode)
+            request.addfinalizer(held.close)
+            return held
+
+        return _hold
+
+    def _await(self, work, files, timeout_s):
+        from magent.platform.windows import WindowsPlatform
+
+        # pid.txt is present, so the start check -- the only schtasks call the
+        # poll makes -- is never reached.
+        return WindowsPlatform()._await_handoff(
+            "schtasks-is-never-asked", "magent-handoff-test", work, files, timeout_s
+        )
+
+    @pytest.mark.parametrize("mode", ["locked", "shared"])
+    def test_an_exit_code_still_being_written_is_waited_for(self, handoff, hold, mode):
+        work, files, clock = handoff
+        rc_file = files[3]
+        held = hold(rc_file, mode)
+        # The window is real before the poll starts: the file is there, and it
+        # does not read as an exit code.
+        assert rc_file.exists()
+        if mode == "locked":
+            with pytest.raises(PermissionError):
+                rc_file.read_text(encoding="utf-8")
+        else:
+            assert rc_file.read_text(encoding="utf-8") == ""
+
+        def launcher(tick: int) -> None:
+            # Set-Content returns three poll ticks after it created the file.
+            if tick == 3:
+                held.finish("7\r\n")
+
+        clock.on_tick = launcher
+
+        result = self._await(work, files, timeout_s=60)
+
+        assert result.rc == 7
+        assert result.timed_out is False
+        assert result.detail == ""
+        assert "hello out" in result.stdout
+        assert "hello err" in result.stderr
+        # It really sat through the window: three reads met the held file.
+        assert clock.ticks >= 3
+
+    def test_an_exit_code_that_lands_as_the_budget_ends_still_counts(
+        self, handoff, hold
+    ):
+        work, files, clock = handoff
+        held = hold(files[3], "locked")
+
+        def launcher(tick: int) -> None:
+            # Set-Content returns during the poll's LAST sleep.
+            if tick == 2:
+                held.finish("7\r\n")
+
+        clock.on_tick = launcher
+
+        result = self._await(work, files, timeout_s=0.5)
+
+        assert clock.now >= 0.5
+        assert result.rc == 7
+        assert result.detail == ""
+
+    def test_an_exit_code_that_lands_after_the_last_read_still_counts(
+        self, handoff, hold, monkeypatch
+    ):
+        # The budget runs out with rc.txt still held at the poll's final read,
+        # and Set-Content returns an instant later. The read the poll gives up
+        # with is decisive: a code complete by then is the answer, not
+        # something to print in `detail` and throw away.
+        from magent.platform import windows
+
+        work, files, clock = handoff
+        held = hold(files[3], "locked")
+        real_read = windows._read_recorded_int
+
+        def poll_read(path: Path) -> int | None:
+            value = real_read(path)
+            if path == files[3] and clock.now >= 0.5:
+                held.finish("7\r\n")
+            return value
+
+        monkeypatch.setattr("magent.platform.windows._read_recorded_int", poll_read)
+
+        result = self._await(work, files, timeout_s=0.5)
+
+        assert result.rc == 7, result.detail
+        assert result.detail == ""
+        # A full success, not a success-shaped report: the scratch directory
+        # goes, like on any hand-off that got its exit code back.
+        assert not work.exists()
+
+    def test_a_partial_exit_code_is_not_yet_an_answer(self, handoff, hold):
+        # The "1" of "12": a value without the line end Set-Content writes
+        # after it may be a prefix, and a prefix must never be final.
+        work, files, clock = handoff
+        rc_file = files[3]
+        held = hold(rc_file, "partial")
+        assert rc_file.read_text(encoding="utf-8") == "1"
+
+        def launcher(tick: int) -> None:
+            if tick == 3:
+                held.finish("2\r\n")
+
+        clock.on_tick = launcher
+
+        result = self._await(work, files, timeout_s=60)
+
+        assert result.rc == 12, result.detail
+        assert clock.ticks >= 3
+
+    def test_a_present_exit_code_is_never_mistaken_for_a_lost_child(
+        self, handoff, hold
+    ):
+        from magent.platform.windows import _HANDOFF_EXIT_GRACE_S, _HANDOFF_POLL_S
+
+        work, files, clock = handoff
+        # The child died at t=0. rc.txt appears just inside the exit grace and
+        # Set-Content returns just after it -- the loaded-runner shape that
+        # grace exists for. A poll that ran the pid checks while the file was
+        # there would call this a lost child at the grace, mid-write.
+        created = round((_HANDOFF_EXIT_GRACE_S - 0.5) / _HANDOFF_POLL_S)
+        held: list[_HeldExitCode] = []
+
+        def launcher(tick: int) -> None:
+            if tick == created:
+                held.append(hold(files[3], "locked"))
+            if tick == created + 4:
+                held[0].finish("7\r\n")
+
+        clock.on_tick = launcher
+
+        result = self._await(work, files, timeout_s=60)
+
+        assert result.rc == 7, result.detail
+        assert clock.now > _HANDOFF_EXIT_GRACE_S
+
+    # What the last read saw, in our words: a refused read, a launcher that
+    # wrote no value, and a value cut short are different bugs. "Refused", not
+    # "held by the writer": errno 13 is also an ACL denial or a delete-pending
+    # file, so the words claim no more than the error does.
+    _SEEN: ClassVar[dict[str, str]] = {
+        "locked": "rc.txt was locked or refused (PermissionError)",
+        "shared": "rc.txt was empty",
+        "partial": "rc.txt held '1', not a complete exit code",
+    }
+
+    @pytest.mark.parametrize("mode", ["locked", "shared", "partial"])
+    def test_an_exit_code_that_never_becomes_readable_is_its_own_answer(
+        self, handoff, hold, mode
+    ):
+        from magent.platform.windows import _HANDOFF_RC_GRACE_S
+
+        work, files, clock = handoff
+        hold(files[3], mode)  # ...and never finishes.
+
+        result = self._await(work, files, timeout_s=60)
+
+        self._assert_unreadable_answer(result, work, mode, _HANDOFF_RC_GRACE_S)
+        # A short grace, not the caller's whole budget.
+        assert clock.now < 60
+
+    @pytest.mark.parametrize("mode", ["locked", "shared", "partial"])
+    def test_a_budget_that_runs_out_mid_write_gets_the_same_answer(
+        self, handoff, hold, mode
+    ):
+        work, files, clock = handoff
+        hold(files[3], mode)
+
+        result = self._await(work, files, timeout_s=0.5)
+
+        self._assert_unreadable_answer(result, work, mode, 0.5)
+        assert clock.now >= 0.5
+
+    def test_the_os_words_go_to_the_log_never_the_screen(
+        self, handoff, hold, caplog, capsys
+    ):
+        # What the OS said about the refused read is worth keeping -- in
+        # launch.log, where a bug report can quote it. The screen gets our
+        # words and the exception class: in `detail`, and in the line the
+        # relay prints from it.
+        work, files, _ = handoff
+        hold(files[3], "locked")
+        with pytest.raises(PermissionError) as refused:
+            files[3].read_text(encoding="utf-8")
+        os_words = refused.value.strerror
+        assert os_words
+
+        with caplog.at_level("WARNING", logger="magent.launch"):
+            result = self._await(work, files, timeout_s=60)
+
+        logged = [r for r in caplog.records if r.name == "magent.launch"]
+        assert [r.levelname for r in logged] == ["WARNING"]
+        assert "rc.txt unreadable" in logged[0].getMessage()
+        assert os_words in logged[0].getMessage()
+        assert os_words not in result.detail
+
+        relay_handoff(
+            FakePlatform(supports_handoff=True, handoff_result=result),
+            ["x"],
+            timeout_s=5,
+        )
+        screen = capsys.readouterr()
+        assert result.detail in screen.err
+        assert os_words not in screen.out + screen.err
+
+    def _assert_unreadable_answer(self, result, work, mode, waited):
+        assert result.rc is None
+        # rc.txt exists only after WaitForExit, so the command FINISHED: not
+        # "may still be running", and no fabricated exit code either.
+        assert result.timed_out is False
+        assert f"never became readable within {waited:.1f}s -- " in result.detail
+        assert self._SEEN[mode] in result.detail
+        # Our words on screen; the OS's own text goes to the log.
+        assert "Permission denied" not in result.detail
+        # ...and none of the other three answers.
+        assert "never started" not in result.detail
+        assert "without an exit code" not in result.detail
+        assert "may still be running" not in result.detail
+        # Its output is complete by now, so it is relayed with the failure,
+        # and the scratch directory is kept and named as the evidence.
+        assert "hello out" in result.stdout
+        assert "hello err" in result.stderr
+        assert work.exists()
+        assert f"scratch left at {work}" in result.detail
 
 
 @pytestmark_win
