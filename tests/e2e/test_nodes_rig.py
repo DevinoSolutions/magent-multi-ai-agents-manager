@@ -94,7 +94,10 @@ class TestEveryStageIsUnderTheBudget:
     ) -> None:
         # Two full create attempts plus the healthy D path (at most 92 s on
         # record) fit the budget: a rescued stall must not starve the journey.
-        assert 2 * rig.USERADD_WANT_S + 92 <= rig.NODES_BUDGET_S
+        # The stalled attempt's snapshot and discard are not clamped, but
+        # they still run on the journey's clock, so they count here too.
+        stall = rig.DIAG_READ_S + rig.CLEANUP_TIMEOUT_S
+        assert 2 * rig.USERADD_WANT_S + stall + 92 <= rig.NODES_BUDGET_S
 
     def test_a_daemon_start_wait_ends_before_serves_second_check(self) -> None:
         # D15's serve stage must pass on the supervisor's FIRST check: a wait
