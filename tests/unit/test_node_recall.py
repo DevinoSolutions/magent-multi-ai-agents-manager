@@ -46,6 +46,13 @@ from tests.unit._node_fixtures import (
     seed_history,
     write_transcript,
 )
+from tests.unit._path_shims import (
+    CHMOD_REFUSED,
+    LOSES_THE_RACE,
+    MKDIR_REFUSED,
+    path_shim,
+    refuses,
+)
 
 
 class TestTheEncodedDirIsClaudeCodesOwnRule:
@@ -1192,48 +1199,6 @@ _DEFAULT_ACL_RWX_FOR_ALL = struct.pack("<I", 2) + b"".join(
 )
 
 
-def _path_shim(tmp_path: Path, monkeypatch, program: str, body: str) -> None:
-    """A ``program`` ahead of the real one on PATH. ``body`` runs with its
-    last argument -- the folder private_dir asked for -- in $last and the
-    real program in $real."""
-    real = shutil.which(program)
-    assert real is not None
-    shim_dir = tmp_path / "shim"
-    shim_dir.mkdir()
-    shim = shim_dir / program
-    shim.write_text(
-        f"#!/bin/sh\nreal={shlex.quote(real)}\nfor last; do :; done\n{body}",
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
-
-
-# Another install makes the folder first -- 0700, as its private_dir would
-# -- so this one's mkdir finds it there and fails: the race mkdir -p hid.
-_LOSES_THE_RACE = (
-    '"$real" -m 700 -- "$last" || exit 2\n'
-    "echo \"mkdir: cannot create directory '$last': File exists\" >&2\n"
-    "exit 1\n"
-)
-
-
-_MKDIR_REFUSED = "mkdir: cannot create directory '$last': Permission denied"
-_CHMOD_REFUSED = "chmod: changing permissions of '$last': Operation not permitted"
-
-
-def _refuses(folder: str, said: str) -> str:
-    """A program that fails on ``folder``, saying ``said`` and changing
-    nothing there, and is the real one for every other path."""
-    return (
-        f'case "$last" in {shlex.quote(folder)})\n'
-        f'  echo "{said}" >&2\n'
-        "  exit 1 ;;\n"
-        "esac\n"
-        'exec "$real" "$@"\n'
-    )
-
-
 # Each place private_dir runs: the two parents before the payload is read,
 # the destination, and a folder inside it.
 _PRIVATE_DIR_SITES = (
@@ -1354,7 +1319,7 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
         # moment earlier. mkdir -p shrugged that off; private_dir must too.
         home = tmp_path / "nodehome"
         home.mkdir()
-        _path_shim(tmp_path, monkeypatch, "mkdir", _LOSES_THE_RACE)
+        path_shim(tmp_path, monkeypatch, "mkdir", LOSES_THE_RACE)
 
         done = _node_run(self._call(monkeypatch), home)
 
@@ -1379,7 +1344,7 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
         home = tmp_path / "nodehome"
         home.mkdir()
         refused = f"{home}/{rel}"
-        _path_shim(tmp_path, monkeypatch, "mkdir", _refuses(refused, _MKDIR_REFUSED))
+        path_shim(tmp_path, monkeypatch, "mkdir", refuses(refused, MKDIR_REFUSED))
 
         done = _node_run(self._call(monkeypatch), home)
 
@@ -1406,7 +1371,7 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
         home = tmp_path / "nodehome"
         home.mkdir()
         refused = f"{home}/{rel}"
-        _path_shim(tmp_path, monkeypatch, "chmod", _refuses(refused, _CHMOD_REFUSED))
+        path_shim(tmp_path, monkeypatch, "chmod", refuses(refused, CHMOD_REFUSED))
 
         done = _node_run(self._call(monkeypatch), home)
 
@@ -1539,7 +1504,7 @@ class TestEveryInstallRefusalIsSaidInTheScriptsWords:
     def test_a_temp_folder_that_cannot_be_made_is_a_folder_refusal(
         self, monkeypatch, tmp_path, home
     ):
-        _path_shim(
+        path_shim(
             tmp_path,
             monkeypatch,
             "mktemp",
@@ -1564,13 +1529,13 @@ class TestEveryInstallRefusalIsSaidInTheScriptsWords:
     def test_a_payload_that_cannot_be_restricted_is_a_folder_refusal(
         self, monkeypatch, tmp_path, home, which
     ):
-        _path_shim(
+        path_shim(
             tmp_path,
             monkeypatch,
             "chmod",
             'case "$last" in */.magent-install.*)\n'
             f'  if [ {_PAYLOAD_CHMOD_REFUSED[which]} "$last" ]; then\n'
-            f'    echo "{_CHMOD_REFUSED}" >&2\n'
+            f'    echo "{CHMOD_REFUSED}" >&2\n'
             "    exit 1\n"
             "  fi ;;\n"
             "esac\n"
@@ -1603,13 +1568,11 @@ class TestEveryInstallRefusalIsSaidInTheScriptsWords:
         if seed is not None:
             dest.mkdir(parents=True)
             target.write_text(seed, encoding="utf-8")
-        _path_shim(
+        path_shim(
             tmp_path,
             monkeypatch,
             "mv",
-            _refuses(
-                str(target), "mv: cannot move to '$last': No space left on device"
-            ),
+            refuses(str(target), "mv: cannot move to '$last': No space left on device"),
         )
 
         done = _node_run(self._call(monkeypatch, tmp_path), home)

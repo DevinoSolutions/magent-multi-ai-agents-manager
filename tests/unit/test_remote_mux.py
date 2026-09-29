@@ -42,6 +42,7 @@ from magent.sessions import build_resume_command
 from tests.unit._deny_stat import deny_scandir, deny_stat
 from tests.unit._fake_ssh import make_fake_ssh
 from tests.unit._git_repos import commit, git, make_origin_and_clone, needs_git
+from tests.unit._path_shims import LOSES_THE_RACE, MKDIR_REFUSED, path_shim, refuses
 
 NODE = Node(nick="second", host="devino-second", user="demo", root="~/magent")
 
@@ -3477,47 +3478,9 @@ def _no_real_acl(reason: str) -> NoReturn:
 _UMASK_000 = "umask() { builtin umask 000; }\nbuiltin umask 000\n"
 
 
-# The mkdir shims of test_node_recall.py (integ-G, fa44f46), same shapes.
-def _mkdir_shim(tmp_path: Path, monkeypatch, body: str) -> None:
-    """A ``mkdir`` ahead of the real one on PATH. ``body`` runs with the
-    folder private_dir asked for in $last and the real mkdir in $real."""
-    real = shutil.which("mkdir")
-    assert real is not None
-    shim_dir = tmp_path / "shim"
-    shim_dir.mkdir()
-    shim = shim_dir / "mkdir"
-    shim.write_text(
-        f"#!/bin/sh\nreal={shlex.quote(real)}\nfor last; do :; done\n{body}",
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
-
-
-# Another install makes the folder first -- 0700, as its private_dir would
-# -- so this one's mkdir finds it there and fails: the race mkdir -p hid.
-_LOSES_THE_RACE = (
-    '"$real" -m 700 -- "$last" || exit 2\n'
-    "echo \"mkdir: cannot create directory '$last': File exists\" >&2\n"
-    "exit 1\n"
-)
-
-
-def _refuses(folder: str) -> str:
-    """A mkdir that fails on ``folder`` and leaves nothing there, and is the
-    real one for every other folder."""
-    return (
-        f'case "$last" in {shlex.quote(folder)})\n'
-        "  echo \"mkdir: cannot create directory '$last': Permission denied\" >&2\n"
-        "  exit 1 ;;\n"
-        "esac\n"
-        'exec "$real" "$@"\n'
-    )
-
-
 def _refuses_in_raw_bytes(folder: str) -> str:
-    """``_refuses``, with a reason that carries a terminal-title sequence and
-    two bytes that are not UTF-8."""
+    """``refuses(folder, MKDIR_REFUSED)``, with a reason that carries a
+    terminal-title sequence and two bytes that are not UTF-8."""
     return (
         f'case "$last" in {shlex.quote(folder)})\n'
         "  printf 'mkdir: \\033]0;x\\007denied \\377\\376\\n' >&2\n"
@@ -4289,7 +4252,7 @@ class TestBringUpShOnARealShell:
         # mkdir's "File exists" never reaches the screen.
         root = rig["root"]
         root.mkdir(parents=True)
-        _mkdir_shim(tmp_path, monkeypatch, _ONLY_MKDIR_PRIVATE + _LOSES_THE_RACE)
+        path_shim(tmp_path, monkeypatch, "mkdir", _ONLY_MKDIR_PRIVATE + LOSES_THE_RACE)
         result = self._push_raw(
             rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n"))
         )
@@ -4311,7 +4274,7 @@ class TestBringUpShOnARealShell:
     ):
         # The seed's walk, from a home with no ~/.claude yet, loses the same
         # race on every folder: the bring-up goes on and the seed lands.
-        _mkdir_shim(tmp_path, monkeypatch, _ONLY_MKDIR_PRIVATE + _LOSES_THE_RACE)
+        path_shim(tmp_path, monkeypatch, "mkdir", _ONLY_MKDIR_PRIVATE + LOSES_THE_RACE)
         remote_mux.bring_up(rig["node"], rig["recipe"])
         claude = Path.home() / ".claude"
         memory = claude / "projects" / rig["enc"] / "memory"
@@ -4330,7 +4293,7 @@ class TestBringUpShOnARealShell:
         # nodes.log's, never the row's -- and nothing written.
         root = rig["root"]
         root.mkdir(parents=True)
-        _mkdir_shim(tmp_path, monkeypatch, _refuses(f"{root}/sub"))
+        path_shim(tmp_path, monkeypatch, "mkdir", refuses(f"{root}/sub", MKDIR_REFUSED))
         with pytest.raises(RemoteError) as info:
             self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
         assert info.value.rc == 5
@@ -4353,7 +4316,7 @@ class TestBringUpShOnARealShell:
         # the script's own line.
         root = rig["root"]
         root.mkdir(parents=True)
-        _mkdir_shim(tmp_path, monkeypatch, _refuses_in_raw_bytes(f"{root}/sub"))
+        path_shim(tmp_path, monkeypatch, "mkdir", _refuses_in_raw_bytes(f"{root}/sub"))
         with pytest.raises(RemoteError) as info:
             self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
         lines = info.value.stderr_tail.splitlines()
@@ -4371,7 +4334,7 @@ class TestBringUpShOnARealShell:
         # script's own line last with mkdir's reason above it, and no memory
         # written.
         dest = Path.home() / ".claude" / "projects" / rig["enc"] / "memory"
-        _mkdir_shim(tmp_path, monkeypatch, _refuses(str(dest)))
+        path_shim(tmp_path, monkeypatch, "mkdir", refuses(str(dest), MKDIR_REFUSED))
         with pytest.raises(RemoteError) as info:
             remote_mux.bring_up(rig["node"], rig["recipe"])
         assert info.value.rc == 5
