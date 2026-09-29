@@ -66,11 +66,16 @@ _SHRUNK_S = 0.5
 # How long a killed client gets to be gone before the pin calls it left behind.
 _GONE_GRACE_S = 10.0
 
+# The ``#{pane_pid}`` every fake pane reports. Never a real process: the pins
+# that read it patch the process snapshot to hold exactly this pid.
+_PANE_PID = 4242
+
 _FAKE = r"""
 import json, os, sys, time
 
 BASE = {base!r}
 STALL_S = {stall!r}
+PANE_PID = {pane_pid!r}
 argv = sys.argv[1:]
 # Every psmux command magent issues is `-L <socket> <verb> ...`.
 name = argv[1] if len(argv) > 2 and argv[0] == "-L" else ""
@@ -94,7 +99,26 @@ put("calls", me, {{"pid": os.getpid(), "ppid": os.getppid(), "argv": argv}})
 with open(os.path.join(BASE, "rules.json"), encoding="utf-8") as fh:
     rules = json.load(fh)
 
-if [verb, name] in rules["hang"]:
+
+def hangs():
+    # A rule is [verb, name] (every such call hangs) or [verb, name, n] (the
+    # n-th such call and later ones hang, counting this one: its record is
+    # already published above).
+    for rule in rules["hang"]:
+        if rule[:2] != [verb, name]:
+            continue
+        nth = rule[2] if len(rule) > 2 else 1
+        d = os.path.join(BASE, "calls")
+        seen = 0
+        for f in os.listdir(d):
+            if f.endswith(".json"):
+                with open(os.path.join(d, f), encoding="utf-8") as fh:
+                    seen += json.load(fh)["argv"][:3] == ["-L", name, verb]
+        return seen >= nth
+    return False
+
+
+if hangs():
     put("stalls", me, {{"pid": os.getpid(), "ppid": os.getppid(), "argv": argv}})
     if sys.platform == "win32":
         # The launcher is a .cmd, so the client the product holds is cmd.exe
@@ -142,9 +166,16 @@ if verb == "capture-pane":
     sys.stdout.write("PS> \n")
     sys.exit(0)
 if verb == "display-message":
-    # A running agent in the foreground: no pane reads as a bare shell, so the
-    # send verifier never re-types anything.
-    sys.stdout.write("claude\n")
+    fmt = argv[-1]
+    if "pane_pid" in fmt:
+        sys.stdout.write("%d\n" % PANE_PID)
+    elif name in rules["bare"]:
+        # A pane resting at its shell: the send verifier's casualty, once the
+        # process snapshot (patched by the pin) agrees.
+        sys.stdout.write("pwsh\n")
+    else:
+        # A running agent in the foreground: never re-typed into.
+        sys.stdout.write("claude\n")
     sys.exit(0)
 sys.exit(0)
 """
@@ -170,19 +201,27 @@ class _Fake:
         self,
         base: Path,
         *,
-        hang: tuple[tuple[str, str], ...] = (),
+        hang: tuple[tuple[str, str] | tuple[str, str, int], ...] = (),
         live: tuple[str, ...] = (),
+        bare: tuple[str, ...] = (),
     ) -> None:
         self.base = base
         self.bin_dir = base / "bin"
         self.bin_dir.mkdir(parents=True)
         (base / "rules.json").write_text(
-            json.dumps({"hang": [list(h) for h in hang], "live": list(live)}),
+            json.dumps(
+                {
+                    "hang": [list(h) for h in hang],
+                    "live": list(live),
+                    "bare": list(bare),
+                }
+            ),
             encoding="utf-8",
         )
         script = base / "fake_psmux.py"
         script.write_text(
-            _FAKE.format(base=str(base), stall=_STALL_S), encoding="utf-8"
+            _FAKE.format(base=str(base), stall=_STALL_S, pane_pid=_PANE_PID),
+            encoding="utf-8",
         )
         if sys.platform == "win32":
             launcher = self.bin_dir / "psmux.cmd"
@@ -574,6 +613,59 @@ class TestTheBringUpNeverWaitsForever:
         assert fake.issued("send-keys", "api")
         fake.assert_no_client_left_behind()
 
+    @staticmethod
+    def _bare_panes_read_as_casualties(monkeypatch, windows):
+        # The send verifier's REAL verdict over the fake's panes, not the
+        # fixture's "no casualty" stub: a `bare` name reads `pwsh` in the
+        # foreground, its pane process is a pwsh with nothing under it, and
+        # so it is exactly the pane the verifier would re-type into.
+        from magent import procs
+
+        monkeypatch.setattr(windows, "idle_sessions", psmux.idle_sessions)
+        monkeypatch.setattr(
+            procs, "snapshot_processes", lambda: [("pwsh.exe", _PANE_PID, 1)]
+        )
+
+    def test_a_send_that_never_answers_is_killed_and_never_re_sent(
+        self, fake_psmux, shrunk, monkeypatch
+    ):
+        # `web` rests at a bare shell, so the verifier WOULD re-type into it --
+        # but its one send was killed unanswered and may still land, and a
+        # second copy types the command into a running agent.
+        self._bare_panes_read_as_casualties(monkeypatch, shrunk)
+        fake = fake_psmux(hang=(("send-keys", "web"),), bare=("web",))
+        refused = self._launch(fake, ["api", "web"])
+
+        assert refused == {}
+        assert len(fake.issued("send-keys", "web")) == 1
+        # ...and the rest of the batch carried on to its decorations.
+        assert fake.issued("set", "api")
+        fake.assert_no_client_left_behind()
+
+    def test_a_re_send_that_never_answers_is_the_last_send(
+        self, fake_psmux, shrunk, monkeypatch
+    ):
+        # The first send answers and the pane stays bare, so it is re-sent;
+        # that re-send is killed unanswered, so it is never followed by a
+        # third -- though the attempt cap alone would allow one.
+        self._bare_panes_read_as_casualties(monkeypatch, shrunk)
+        fake = fake_psmux(hang=(("send-keys", "web", 2),), bare=("web",))
+        refused = self._launch(fake, ["web"])
+
+        assert refused == {}
+        assert shrunk._SEND_MAX_ATTEMPTS == 3
+        assert len(fake.issued("send-keys", "web")) == 2
+        fake.assert_no_client_left_behind()
+
+    def test_a_decoration_that_never_answers_is_killed(self, fake_psmux, shrunk):
+        # Purely cosmetic, so it may cost a budget but never the bring-up.
+        fake = fake_psmux(hang=(("set", "api"),))
+        refused = self._launch(fake, ["api", "web"])
+
+        assert refused == {}
+        assert fake.issued("set", "web")
+        fake.assert_no_client_left_behind()
+
 
 # --- the reason reaches the report: all OSes -----------------------------------
 
@@ -613,6 +705,24 @@ class TestTheReasonReachesTheReport:
         # Refused is final for this bring-up: the respawn would only repeat the
         # probe that could not answer, and double the wait on a wedged socket.
         assert launches == [["api", "web"]]
+
+    def test_a_refused_name_survives_the_respawn_of_another(self, plat, monkeypatch):
+        # `web` is refused; `api` is merely missing and stays missing through
+        # its respawn. Both are reported, each with what is known about it.
+        why = "could not tell whether web is running (has-session gave no answer)"
+        launches: list[list[str]] = []
+
+        def _launch(windows):
+            names = [w.window_name for w in windows]
+            launches.append(names)
+            return {"web": why} if "web" in names else {}
+
+        monkeypatch.setattr(plat, "launch_psmux_session", _launch)
+        failed = psmux.launch_verified(plat, _windows(["api", "web"]))
+
+        assert failed == {"api": "", "web": why}
+        assert list(failed) == ["api", "web"]
+        assert launches == [["api", "web"], ["api"]]
 
     def test_a_merely_missing_name_is_still_respawned_and_carries_no_reason(self, plat):
         plat._psmux_launch_failures = {"web"}
