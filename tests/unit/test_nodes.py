@@ -27,6 +27,7 @@ from magent.config import (
     ProjectConfig,
     Settings,
 )
+from magent.json_depth import MAX_JSON_DEPTH, TOO_DEEP
 from magent.lockfile import LockHeld, lock_path
 from magent.nodes import (
     LoadSample,
@@ -275,6 +276,52 @@ class TestTheNodeMap:
         # enough stack would read it whole.
         node_map.parent.mkdir(parents=True)
         node_map.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+        assert nodes.read_node_map() == {}
+
+    # Both depth answers survive the G merge. Past MAX_JSON_DEPTH the WHOLE
+    # file is refused by the scan, before json walks it -- a good sibling
+    # entry does not save it; at the bound the file parses and the one deep
+    # entry is dropped alone, with its WARNING.
+    def test_one_entry_past_the_bound_refuses_the_file_before_json_reads_it(
+        self, node_map, nodes_warnings, monkeypatch
+    ):
+        # The outer object is one level: 64 lists inside it make 65.
+        _map_with_db(node_map, "[" * MAX_JSON_DEPTH + "]" * MAX_JSON_DEPTH)
+
+        def not_reached(text: str) -> object:
+            raise AssertionError("json.loads read a file the scan refuses")
+
+        monkeypatch.setattr(nodes.json, "loads", not_reached)
+        with pytest.raises(ValueError, match=TOO_DEEP) as caught:
+            nodes.load_node_map_strict()
+        assert type(caught.value) is ValueError
+        assert nodes.malformed_entry(caught.value) is None
+        assert nodes.read_node_map() == {}
+        assert nodes_warnings() == []
+
+    def test_an_entry_nested_to_the_bound_is_dropped_alone_and_logged(
+        self, node_map, nodes_warnings
+    ):
+        deep = MAX_JSON_DEPTH - 1
+        _map_with_db(node_map, "[" * deep + "]" * deep)
+        assert nodes.read_node_map() == {"api": ENTRY}
+        (line,) = nodes_warnings()
+        assert "'db'" in line
+        assert "not a JSON object" in line
+
+    def test_a_recursion_error_the_scan_let_through_is_the_bad_file_error(
+        self, node_map, monkeypatch
+    ):
+        # The backstop: whatever nesting the scan passes, json's own
+        # RecursionError still reads as the ValueError every caller catches.
+        _map_with_db(node_map, "[]")
+
+        def recursing(text: str) -> object:
+            raise RecursionError
+
+        monkeypatch.setattr(nodes.json, "loads", recursing)
+        with pytest.raises(ValueError, match=TOO_DEEP):
+            nodes.load_node_map_strict()
         assert nodes.read_node_map() == {}
 
     @pytest.mark.parametrize(("bad", "why"), _MALFORMED, ids=_MALFORMED_IDS)
