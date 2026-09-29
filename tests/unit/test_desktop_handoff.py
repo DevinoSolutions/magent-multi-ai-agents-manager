@@ -508,10 +508,6 @@ class TestRunOnDesktopOnWindows:
         assert "hello out" in result.stdout
         assert "hello err" in result.stderr
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="run.ps1 re-opens the child by pid after Start-Process; fixed next",
-    )
     def test_a_child_gone_before_the_launcher_looks_still_reports_its_code(
         self, fake_schtasks, rcprobe
     ):
@@ -555,18 +551,25 @@ class TestRunOnDesktopOnWindows:
 
         assert Path(result.stdout.strip()) == Path.cwd()
 
-    def test_a_non_ascii_working_directory_survives_the_script_file(
+    def test_a_non_ascii_working_directory_and_scratch_root_survive(
         self, fake_schtasks, tmp_path, monkeypatch
     ):
         # Windows PowerShell 5.1 reads a `-File` script with no BOM in the ANSI
-        # code page, so a UTF-8 run.ps1 turned this directory into mojibake and
-        # the desktop copy never started. The child prints ascii() of its cwd,
-        # so its own console encoding cannot blur the comparison.
+        # code page, so a UTF-8 run.ps1 turned a non-ASCII path in it into
+        # mojibake and the desktop copy never started. The launcher path is
+        # under the scratch root, so that root is non-ASCII here; the cwd
+        # travels in argv.json and must survive too. The child prints ascii()
+        # of its cwd, so its own console encoding cannot blur the comparison.
+        root = tmp_path / "T\u00ebmp \u0442"
+        root.mkdir()
+        monkeypatch.setattr(
+            "magent.platform.windows.tempfile.gettempdir", lambda: str(root)
+        )
         where = tmp_path / "caf\u00e9 \u4e2d"
         where.mkdir()
         monkeypatch.chdir(where)
-        # A launcher that never reaches Start-Process never writes pid.txt, so
-        # a red run waits out the start grace: seconds, not the default 30.
+        # A launcher that never starts never writes pid.txt, so a red run
+        # waits out the start grace: seconds, not the default 30.
         # Safe for a green one on a slow box, because the fake's /Query says
         # Running for as long as the launcher is alive.
         monkeypatch.setattr("magent.platform.windows._HANDOFF_START_GRACE_S", 5.0)
@@ -720,7 +723,7 @@ class TestRunOnDesktopOnWindows:
         monkeypatch.setattr("magent.platform.windows._read_pid", lambda _p: 4)
         monkeypatch.setattr("magent.platform.windows.pid_alive", lambda _p: False)
         # A gone pid is given a grace to still have its exit code written (the
-        # launcher writes rc.txt after WaitForExit returns); shrink it so this
+        # launcher writes rc.txt after its wait() returns); shrink it so this
         # test proves the failure path, not the grace.
         monkeypatch.setattr("magent.platform.windows._HANDOFF_EXIT_GRACE_S", 0.5)
         # ...and the real launcher must not win the race by writing rc.txt: a
@@ -770,17 +773,17 @@ class TestTheSchtasksResolver:
 
 @pytestmark_win
 class TestThePowerShellQuoting:
-    """Two quoting layers stand between an argv and the desktop's child
-    process, and a mistake in either splits an argument silently. Pure string
-    assertions -- but they live in ``platform/windows.py``, which imports
-    ``ctypes.WINFUNCTYPE`` at module level and so cannot be imported anywhere
-    else (CI proved it: 5 ImportErrors on every macOS/Linux leg)."""
+    """run.ps1 holds two paths as PowerShell literals, and a quote character in
+    either would end one early. Pure string and parser assertions -- but they
+    live in ``platform/windows.py``, which imports ``ctypes.WINFUNCTYPE`` at
+    module level and so cannot be imported anywhere else (CI proved it: 5
+    ImportErrors on every macOS/Linux leg)."""
 
     def test_a_literal_is_single_quoted_and_doubled(self):
         from magent.platform.windows import _ps_quote
 
-        # Single quotes so nothing inside is expanded: these are paths and a
-        # whole command line, and a `$` or a backtick must arrive verbatim.
+        # Single quotes so nothing inside is expanded: these are paths, and a
+        # `$` or a backtick in one must arrive verbatim.
         assert _ps_quote(r"C:\a $b `c") == r"'C:\a $b `c'"
         assert _ps_quote("it's") == "'it''s'"
 
@@ -793,112 +796,71 @@ class TestThePowerShellQuoting:
         assert _ps_quote(f"a{quote}b") == f"'a{quote}{quote}b'"
 
     @pytest.mark.parametrize("quote", _PS_SINGLE_QUOTES)
-    def test_a_cwd_holding_a_single_quote_stays_one_literal(self, tmp_path, quote):
-        # PowerShell's own parser, never a run: the whole cwd must come back as
-        # the ONE single-quoted -WorkingDirectory value, and no fragment of it
-        # may parse as a command of its own.
+    def test_a_path_holding_a_single_quote_stays_one_literal(self, tmp_path, quote):
+        # PowerShell's own parser, never a run: each path must come back as ONE
+        # single-quoted literal, and no fragment of it may parse as a command.
         # Tokenizer layer only (parse() over text we decoded ourselves); the
-        # file-decoding layer is ParseFile's every-single-quote/cwd-non-ascii-quote.
+        # file-decoding layer is ParseFile's every-single-quote case below.
         from magent.platform.windows import _handoff_script
 
-        cwd = rf"C:\work{quote}; Get-Date; {quote}x"
-        script = _handoff_script(
-            ["py.exe", "up"], cwd, Path("o"), Path("e"), Path("p"), Path("r")
-        )
-        parsed = parse_powershell(script, tmp_path)
+        python = rf"C:\py{quote}; Get-Date; {quote}x\python.exe"
+        launcher = Path(rf"C:\work{quote}; Get-Process; {quote}y\launch.py")
+
+        parsed = parse_powershell(_handoff_script(python, launcher), tmp_path)
+
         assert parsed.errors == []
-        assert parsed.named("Get-Date") == []
-        (start,) = parsed.named("Start-Process")
-        assert argument_of(start, "WorkingDirectory") == ("const", "SingleQuoted", cwd)
+        assert parsed.named("Get-Date") == parsed.named("Get-Process") == []
+        assert parsed.commands == [
+            [
+                ("const", "SingleQuoted", python),
+                ("param", "I"),
+                ("const", "SingleQuoted", str(launcher)),
+            ]
+        ]
 
-    def test_the_argv_becomes_one_argument_list_string(self):
+    def test_the_script_carries_no_command_line(self, tmp_path):
+        # The whole script is three statements: the error preference, the
+        # no-recursion export, and ONE call of the interpreter on the launcher.
+        # Nothing of the command is in it -- no Start-Process, no argument
+        # list, no working directory -- because the command reaches the
+        # launcher through argv.json.
         from magent.platform.windows import _handoff_script
 
-        script = _handoff_script(
-            ["py.exe", "--config", r"C:\A B\magent.json", "up"],
-            r"C:\work",
-            Path("o"),
-            Path("e"),
-            Path("p"),
-            Path("r"),
+        parsed = parse_powershell(
+            _handoff_script(r"C:\Python\python.exe", Path(r"C:\w\launch.py")), tmp_path
         )
 
-        # list2cmdline quoted the space-bearing path, and _ps_quote then made
-        # the WHOLE command line one PowerShell literal. Passing a list to
-        # -ArgumentList instead would join with bare spaces and split that
-        # path into two arguments.
-        assert "-ArgumentList '--config \"C:\\A B\\magent.json\" up'" in script
-        assert "-FilePath 'py.exe'" in script
+        assert parsed.errors == []
+        assert parsed.operators == ["Ampersand"]
+        assert parsed.assignments == [
+            ("$ErrorActionPreference", "Stop"),
+            # No recursion: a hand-off that landed in Session 0 again refuses.
+            ("$env:MAGENT_SESSION0_POLICY", "refuse"),
+        ]
 
-    def test_it_carries_the_three_load_bearing_instructions(self):
-        from magent.platform.windows import _handoff_script
 
-        script = _handoff_script(
-            ["py.exe"], r"C:\work", Path("o"), Path("e"), Path("p"), Path("r")
-        )
-
-        # No recursion: a hand-off that landed in Session 0 again refuses.
-        assert "$env:MAGENT_SESSION0_POLICY = 'refuse'" in script
-        # The caller's directory, because find_config walks up from the cwd and
-        # a scheduled task starts in system32.
-        assert "-WorkingDirectory 'C:\\work'" in script
-        # No console flashed at the desktop by a command nobody typed.
-        assert "-WindowStyle Hidden" in script
-
-    def test_the_exit_code_is_written_last(self):
-        from magent.platform.windows import _handoff_script
-
-        script = _handoff_script(
-            ["py.exe"], r"C:\work", Path("o"), Path("e"), Path("pid"), Path("rc")
-        )
-
-        # pid.txt is the "it really started" signal and must land first; rc.txt
-        # is the completion signal and must land after WaitForExit, so a reader
-        # that sees it can never read a half-written out.txt.
-        assert script.index("'pid'") < script.index("WaitForExit")
-        assert script.index("WaitForExit") < script.index("'rc'")
-
-    def test_the_process_handle_is_cached_before_the_wait(self):
-        from magent.platform.windows import _handoff_script
-
-        script = _handoff_script(
-            ["py.exe"], r"C:\work", Path("o"), Path("e"), Path("p"), Path("r")
-        )
-
-        # A `Start-Process -PassThru` object's .ExitCode is $null FOREVER
-        # unless the handle is cached while the process is alive: PowerShell
-        # does not hold it, so once the child exits there is nothing left to
-        # ask. Measured, not theorised -- rc.txt came back empty on every run
-        # until this line existed, and the whole hand-off then reported an
-        # "unreadable exit code" for commands that had succeeded.
-        assert "$null = $p.Handle" in script
-        assert script.index("$p.Handle") < script.index("WaitForExit")
+def _staged_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
 
 
 @pytestmark_win
 class TestTheLauncherReallyRuns:
-    """The generated PowerShell, executed for real, from a directory whose name
-    has spaces and non-ASCII in it -- so a script staged in any encoding but
-    production's cannot pass."""
+    """The staged run.ps1, executed for real by the shell /TR names, from a
+    scratch directory whose name has spaces and non-ASCII in it -- so a script
+    staged in any encoding but production's cannot pass."""
 
-    def test_a_path_with_spaces_survives_both_layers(self, tmp_path):
-        from magent.platform.windows import (
-            _HANDOFF_SCRIPT_ENCODING,
-            _HANDOFF_SHELL,
-            _handoff_script,
-        )
+    def test_the_staged_files_run_from_a_non_ascii_path_with_spaces(
+        self, tmp_path, monkeypatch
+    ):
+        from magent.platform.windows import _HANDOFF_SHELL, _stage_handoff
 
         work = tmp_path / "a b Ñ т"
-        work.mkdir()
-        script = work / "run.ps1"
-        out, err = work / "out.txt", work / "err.txt"
-        pid, rc = work / "pid.txt", work / "rc.txt"
+        caller = tmp_path / "caller"
+        caller.mkdir()
+        monkeypatch.chdir(caller)
         # Staged exactly as run_on_desktop stages it, encoding included.
-        script.write_text(
-            _handoff_script(
-                [sys.executable, "-c", "print('ok')"], str(work), out, err, pid, rc
-            ),
-            encoding=_HANDOFF_SCRIPT_ENCODING,
+        script = _stage_handoff(
+            work, [sys.executable, "-c", "import os; print(ascii(os.getcwd()))"]
         )
 
         # Never the checkout as the cwd: PowerShell writes relative to it.
@@ -909,40 +871,52 @@ class TestTheLauncherReallyRuns:
             cwd=tmp_path,
         )
 
-        assert out.read_text(encoding="utf-8").strip() == "ok"
-        assert rc.read_text(encoding="utf-8").strip() == "0"
-        assert pid.read_text(encoding="utf-8").strip().isdigit()
+        assert _staged_text(work / "out.txt").strip() == ascii(str(caller))
+        assert _staged_text(work / "rc.txt") == "0\n"
+        assert _staged_text(work / "pid.txt").strip().isdigit()
 
 
 _PY = r"C:\Python\python.exe"
 
-# (argv, name of the caller's directory). Every case carries U+0442 or U+4E2D,
-# which a cp1252 writer cannot encode at all and which a script without a BOM
-# turns into mojibake under -File -- so each one is red against both writers.
+# (argv, name of the caller's directory, interpreter path). The scratch root
+# every case stages under carries U+0442, which a cp1252 writer cannot encode
+# at all and which a script without a BOM turns into mojibake under -File --
+# so the launcher path alone makes each case red against both writers; the
+# interpreter paths add their own.
 _STAGED_CASES = {
     "non-ascii-argv": (
         ["C:\\Caf\u00e9\\python.exe", "-m", "magent", "up", "caf\u00e9 \u00d1 \u0442"],
         "work",
+        _PY,
     ),
     "every-single-quote": (
         [_PY, "-m", "magent", "up", "a'b\u2018c\u2019d\u201ae\u201bf \u0442"],
         "work",
+        "C:\\a'b\u2018c\u2019d\u201ae\u201bf \u0442\\python.exe",
     ),
     "config-typographic-quote": (
         [_PY, "-m", "magent", "--config", "C:\\A\u2019B\\\u4e2d\\magent.json", "up"],
         "work",
+        "C:\\A\u2019B\\\u4e2d\\python.exe",
     ),
     "config-non-ascii-space": (
         [_PY, "-m", "magent", "--config", "C:\\\u00d1 \u0442\\magent.json", "up"],
         "work",
+        "C:\\Caf\u00e9\\python.exe",
     ),
-    "cwd-non-ascii-quote": ([_PY, "-m", "magent", "up"], "\u00d1\u2019s \u0442"),
+    "cwd-non-ascii-quote": (
+        [_PY, "-m", "magent", "up", 'say "hi" & 100% done'],
+        "\u00d1\u2019s \u0442",
+        _PY,
+    ),
 }
 
 
 @pytestmark_win
-class TestTheStagedScriptParsesBackToTheArgv:
-    """The run.ps1 ``run_on_desktop`` REALLY stages, read the way -File reads it.
+class TestTheStagedFilesReadBackExactly:
+    """The three files ``run_on_desktop`` REALLY stages, read back the way
+    their readers read them: ``run.ps1`` the way ``-File`` reads it, and
+    ``argv.json`` the way the launcher reads it.
 
     ``ParseFile`` decodes a file exactly as ``powershell.exe -File`` does and
     executes nothing, so this parses the bytes production wrote rather than
@@ -950,7 +924,7 @@ class TestTheStagedScriptParsesBackToTheArgv:
     kept as evidence and nothing runs. Windows PowerShell 5.1 reads a script
     with no BOM in the ANSI code page, where the UTF-8 bytes of U+00D1 and
     U+0442 each hold a typographic single quote -- and that parses with NO
-    error and different values, which is why every literal is compared, not
+    error and different values, which is why both literals are compared, not
     just the error count.
 
     Blind spot: a machine whose ANSI code page is 65001 (UTF-8) reads a script
@@ -982,16 +956,19 @@ class TestTheStagedScriptParsesBackToTheArgv:
         assert seen == {"utf-8": ansi, "utf-8-sig": value}
 
     @pytest.mark.parametrize(
-        ("argv", "cwd_name"), list(_STAGED_CASES.values()), ids=list(_STAGED_CASES)
+        ("argv", "cwd_name", "python"),
+        list(_STAGED_CASES.values()),
+        ids=list(_STAGED_CASES),
     )
-    def test_every_literal_is_what_was_asked_for(
-        self, fake_schtasks, tmp_path, monkeypatch, argv, cwd_name
+    def test_every_value_is_what_was_asked_for(
+        self, fake_schtasks, tmp_path, monkeypatch, argv, cwd_name, python
     ):
+        from magent.platform import _handoff_launcher
         from magent.platform.windows import WindowsPlatform
 
         monkeypatch.setenv("MDTEST_HANDOFF_CREATE_FAILS", "1")
-        # The redirects and both Set-Content targets live under the scratch
-        # root, so a non-ASCII root puts them through the same encoding.
+        # The launcher path lives under the scratch root, so a non-ASCII root
+        # puts it through the script file's encoding.
         root = tmp_path / "T\u00ebmp \u00d1 \u0442"
         root.mkdir()
         monkeypatch.setattr(
@@ -1001,7 +978,10 @@ class TestTheStagedScriptParsesBackToTheArgv:
         cwd.mkdir()
         monkeypatch.chdir(cwd)
 
-        result = WindowsPlatform().run_on_desktop(argv, timeout_s=60)
+        # Only for the hand-off itself: the staged interpreter is sys.executable.
+        with monkeypatch.context() as m:
+            m.setattr(sys, "executable", python)
+            result = WindowsPlatform().run_on_desktop(argv, timeout_s=60)
 
         # Staged, then refused: the task was never run, only cleaned up.
         assert result.rc is None
@@ -1010,29 +990,24 @@ class TestTheStagedScriptParsesBackToTheArgv:
         (work,) = (root / "magent-handoff").iterdir()
         assert str(work) in result.detail
 
+        # The command and the caller's directory, exactly, from argv.json.
+        assert _handoff_launcher.read_spec(work) == (argv, str(cwd))
+        # The launcher is the module's own source, byte for byte.
+        assert (work / "launch.py").read_bytes() == Path(
+            _handoff_launcher.__file__
+        ).read_bytes()
+
         parsed = parse_file(work / "run.ps1", tmp_path)
 
         assert parsed.errors == []
-        # No fragment of any value parsed as a command of its own.
-        assert [c[0][-1] for c in parsed.commands] == [
-            "Start-Process",
-            "Set-Content",
-            "Set-Content",
+        # ONE command, the & call: no fragment of either path parsed as a
+        # command of its own, and nothing else runs.
+        assert parsed.operators == ["Ampersand"]
+        assert parsed.commands == [
+            [
+                ("const", "SingleQuoted", python),
+                ("param", "I"),
+                ("const", "SingleQuoted", str(work / "launch.py")),
+            ]
         ]
-        (start,) = parsed.named("Start-Process")
-        expected = {
-            "FilePath": argv[0],
-            # ONE literal holding the whole command line, not a list.
-            "ArgumentList": subprocess.list2cmdline(argv[1:]),
-            "WorkingDirectory": str(cwd),
-            "RedirectStandardOutput": str(work / "out.txt"),
-            "RedirectStandardError": str(work / "err.txt"),
-        }
-        assert {name: argument_of(start, name) for name in expected} == {
-            name: ("const", "SingleQuoted", value) for name, value in expected.items()
-        }
-        # pid.txt first, rc.txt last.
-        assert [argument_of(c, "LiteralPath") for c in parsed.named("Set-Content")] == [
-            ("const", "SingleQuoted", str(work / "pid.txt")),
-            ("const", "SingleQuoted", str(work / "rc.txt")),
-        ]
+        assert ("$env:MAGENT_SESSION0_POLICY", "refuse") in parsed.assignments

@@ -6,6 +6,7 @@ import ctypes.wintypes
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -23,6 +24,7 @@ from magent.platform import (
     TerminalLaunchOpts,
     TerminalNotFoundError,
     VSCodeLaunchOpts,
+    _handoff_launcher,
     find_psmux,
 )
 from magent.procs import (
@@ -94,12 +96,12 @@ _HANDOFF_POLL_S = 0.25
 # abandoning a 900s budget for. Generous because the signal comes from a COLD
 # powershell.exe: ~1.6s measured on an idle desktop, but a loaded box (CI
 # proved it -- 5s was not enough on 2 of 5 windows-latest runners) can take
-# well over 5s just to reach `Start-Process`. A false "never started" here
+# well over 5s just to reach the launcher. A false "never started" here
 # abandons a bring-up that is in fact under way, so the grace errs long; a
 # task that truly never ran is still reported, only 30s later.
 _HANDOFF_START_GRACE_S = 30.0
 # How long a child that is GONE gets to still have its exit code written. The
-# launcher writes rc.txt only after its WaitForExit returns, so between the
+# launcher writes rc.txt only after its wait() returns, so between the
 # child's last breath and rc.txt landing there is a window in which "pid dead,
 # no rc.txt" is the ordinary success path mid-flight, not a lost child. CI
 # proved the window is real: on 3 of 5 windows-latest runners a `-c "exit 7"`
@@ -108,17 +110,17 @@ _HANDOFF_START_GRACE_S = 30.0
 # after this grace, not before.
 _HANDOFF_EXIT_GRACE_S = 15.0
 # How long to keep retrying the scratch-directory delete after success. The
-# launcher (powershell.exe) still holds the two redirect files open for the few
-# milliseconds between writing rc.txt and exiting, and on Windows an open file
-# makes rmtree fail -- silently, with ignore_errors, which is how CI grew a
-# scratch directory per successful hand-off.
+# launcher and the powershell.exe running it are still exiting for the few
+# milliseconds after rc.txt lands, and on Windows a file still open makes rmtree
+# fail -- silently, with ignore_errors, which is how CI grew a scratch directory
+# per successful hand-off.
 _HANDOFF_CLEANUP_GRACE_S = 5.0
 # Every schtasks call itself is bounded -- Create/Run/Query/Delete are local and
 # instant, so a hang is a wedge, not work.
 _SCHTASKS_TIMEOUT_S = 15.0
 # schtasks truncates /TR at ~261 characters -- silently, so past it the task
 # runs a DIFFERENT command. That is why /TR carries only a fixed-length launcher
-# and the real argv lives in the script file.
+# and the real argv lives in a file next to it (argv.json).
 _TR_MAX_CHARS = 261
 # Bare `powershell.exe`, not an absolute path, and not `pwsh`: Windows PowerShell
 # ships on every Windows box while PowerShell 7 does not, and /TR's length budget
@@ -129,7 +131,7 @@ _TR_MAX_CHARS = 261
 _HANDOFF_SHELL = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File"
 # The script that shell runs is written WITH a BOM. Windows PowerShell 5.1
 # decodes a `-File` script that has none in the ANSI code page, which turns
-# every non-ASCII character of a path or an argument into mojibake -- and can
+# every non-ASCII character of the two paths it holds into mojibake -- and can
 # end a literal early: the UTF-8 bytes of U+00D1 (C3 91) and U+0442 (D1 82)
 # each hold one that cp1252 reads as a typographic single quote. One constant,
 # because the tests that run a launcher script stage it with this too; a copy
@@ -165,9 +167,8 @@ def _schtasks_exe() -> str | None:
 def _ps_quote(value: str) -> str:
     """Wrap ``value`` as ONE PowerShell single-quoted literal.
 
-    Single-quoted, so nothing inside is expanded: these are paths and a whole
-    Windows command line, and a ``$`` or a backtick in either must arrive at
-    the child exactly as written. Doubling is the only escape a single-quoted
+    Single-quoted, so nothing inside is expanded: these are paths, and a
+    ``$`` or a backtick in one must arrive exactly as written. Doubling is the only escape a single-quoted
     PowerShell string has, and PowerShell ends such a string on FIVE code
     points, not one: U+0027 and the typographic U+2018, U+2019, U+201A and
     U+201B. Every one of them is doubled, or a value holding one breaks out.
@@ -175,66 +176,60 @@ def _ps_quote(value: str) -> str:
     return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", value) + "'"
 
 
-def _handoff_script(
-    argv: list[str], cwd: str, out: Path, err: Path, pid: Path, rc: Path
-) -> str:
+def _handoff_script(python: str, launcher: Path) -> str:
     """The PowerShell the scheduled task runs in the user's own session.
 
-    PowerShell rather than a ``.cmd`` shim, for three reasons that are all
-    defects in the batch version: ``-WindowStyle Hidden`` means the desktop
-    does not get a console window flashed at it by a command the user did not
-    type; ``$p.ExitCode`` is the real exit status rather than a parsed
-    ``%ERRORLEVEL%``; and cmd would interpret an ``&`` in an unquoted argument
-    as a command separator, which ``list2cmdline`` does not protect against
-    (it only quotes for whitespace and quotes).
+    Three lines, and none of them is the command. PowerShell cannot be the
+    launcher: 5.1's ``Start-Process`` with redirection drops the handle
+    CreateProcess returned, and ``$p.Handle`` then re-opens the child by pid,
+    after the fact -- so a child that has already exited leaves ``ExitCode``
+    at ``$null`` and rc.txt empty (the measured "hand-off failed" for a
+    bring-up that worked). The launcher is ``launch.py`` (a copy of
+    ``_handoff_launcher``), run by the interpreter magent itself is running
+    under; it holds the handle, and the argv reaches it through
+    ``argv.json``, never through a quoted command line.
 
-    TWO QUOTING LAYERS, both load-bearing. ``subprocess.list2cmdline`` builds
-    the command line by the MS C-runtime rules the child's own argv parser
-    uses, so a path with spaces survives; ``_ps_quote`` then makes that whole
-    string ONE PowerShell literal. Passing a LIST to ``-ArgumentList`` would
-    skip the first layer entirely -- PowerShell joins array elements with bare
-    spaces and does not re-quote them, so ``--config C:\\A B\\magent.json``
-    would arrive at magent as two arguments.
-
-    Three other things it must do, all load-bearing:
-
-    * ``-WorkingDirectory`` the CALLER's directory. ``find_config`` walks up
-      from the working directory and a scheduled task starts in ``system32``,
-      so a hand-off without this could bring up a different config's projects
-      than the command the user actually typed.
     * export ``MAGENT_SESSION0_POLICY=refuse`` for the child, so a hand-off
       that somehow landed in Session 0 again refuses instead of handing off in
       turn -- a recursion whose every level writes a scheduled task.
-    * write ``pid.txt`` as soon as the process exists and ``rc.txt`` LAST.
-      pid.txt is the "it really started" signal the start-grace check reads;
-      rc.txt is the completion signal, and the redirections are closed by the
-      time it is written, so a reader that sees it can never read a
-      half-written out.txt.
+    * ``-I``: PYTHONPATH, PYTHONHOME and the script's directory stay off
+      ``sys.path``, so nothing in the user's environment or the scratch
+      directory can put a different module under the launcher's imports.
+    * ``&`` with both paths as single-quoted literals: nothing in either is
+      expanded, and PowerShell hands each to CreateProcess as ONE argument.
     """
-    command_line = subprocess.list2cmdline(argv[1:])
     return "\n".join(
         (
             "$ErrorActionPreference = 'Stop'",
             "$env:MAGENT_SESSION0_POLICY = 'refuse'",
-            "$p = Start-Process -PassThru -WindowStyle Hidden"
-            f" -FilePath {_ps_quote(argv[0])}"
-            + (f" -ArgumentList {_ps_quote(command_line)}" if command_line else "")
-            + f" -WorkingDirectory {_ps_quote(cwd)}"
-            f" -RedirectStandardOutput {_ps_quote(str(out))}"
-            f" -RedirectStandardError {_ps_quote(str(err))}",
-            # Touching .Handle is not decoration -- it is the documented
-            # workaround for a `Start-Process -PassThru` object whose
-            # `.ExitCode` is $null forever. PowerShell does not cache the
-            # process handle, so once the child exits the OS has nothing left
-            # to ask and the exit code is lost. Measured here first: rc.txt
-            # came back EMPTY on every run until this line existed.
-            "$null = $p.Handle",
-            f"Set-Content -LiteralPath {_ps_quote(str(pid))} -Value $p.Id",
-            "$p.WaitForExit()",
-            f"Set-Content -LiteralPath {_ps_quote(str(rc))} -Value $p.ExitCode",
+            f"& {_ps_quote(python)} -I {_ps_quote(str(launcher))}",
             "",
         )
     )
+
+
+def _stage_handoff(work: Path, argv: list[str]) -> Path:
+    """Write one hand-off's three files into ``work`` and return ``run.ps1``.
+
+    ``argv.json`` carries the command and the CALLER's working directory:
+    ``find_config`` walks up from the working directory and a scheduled task
+    starts in ``system32``, so without it a hand-off could bring up a
+    different config's projects than the command the user actually typed.
+    ``launch.py`` is ``_handoff_launcher``'s own source, byte for byte.
+    ``run.ps1`` is written WITH a BOM -- see _HANDOFF_SCRIPT_ENCODING.
+
+    Raises OSError, or UnicodeEncodeError for a path that has no UTF-8 form
+    (a lone surrogate in the scratch or interpreter path).
+    """
+    work.mkdir(parents=True, exist_ok=True)
+    _handoff_launcher.write_spec(work, argv, str(Path.cwd()))
+    launcher = work / _handoff_launcher.LAUNCHER
+    launcher.write_bytes(Path(_handoff_launcher.__file__).read_bytes())
+    script = work / "run.ps1"
+    script.write_text(
+        _handoff_script(sys.executable, launcher), encoding=_HANDOFF_SCRIPT_ENCODING
+    )
+    return script
 
 
 def _remove_scratch(work: Path) -> None:
@@ -263,9 +258,8 @@ def _one_line(text: str, limit: int = 200) -> str:
 def _read_pid(path: Path) -> int | None:
     """The pid the launcher recorded, or None until it has written one.
 
-    None covers every "not yet": the file is absent, or it is present but
-    half-written (``Set-Content`` is not atomic, and this poll reads every
-    250ms). Both mean "no answer yet", never "it failed".
+    None covers every "not yet": the file is absent, or it does not hold a
+    number. Both mean "no answer yet", never "it failed".
     """
     raw = _read_handoff_text(path).strip()
     try:
@@ -1072,17 +1066,13 @@ class WindowsPlatform(Platform):
         nonce = uuid.uuid4().hex[:12]
         task = f"{_HANDOFF_TASK_PREFIX}{nonce}"
         work = Path(tempfile.gettempdir()) / _HANDOFF_DIR_NAME / nonce
-        script = work / "run.ps1"
-        out, err = work / "out.txt", work / "err.txt"
-        pid_file, rc_file = work / "pid.txt", work / "rc.txt"
+        out = work / _handoff_launcher.OUT
+        err = work / _handoff_launcher.ERR
+        pid_file = work / _handoff_launcher.PID
+        rc_file = work / _handoff_launcher.RC
         try:
-            work.mkdir(parents=True, exist_ok=True)
-            # WITH a BOM -- see _HANDOFF_SCRIPT_ENCODING.
-            script.write_text(
-                _handoff_script(argv, str(Path.cwd()), out, err, pid_file, rc_file),
-                encoding=_HANDOFF_SCRIPT_ENCODING,
-            )
-        except OSError as exc:
+            script = _stage_handoff(work, argv)
+        except (OSError, UnicodeEncodeError) as exc:
             return HandoffResult(
                 rc=None, detail=f"could not stage the hand-off in {work}: {exc}"
             )
@@ -1158,7 +1148,7 @@ class WindowsPlatform(Platform):
         never started or a child that died without writing one.
 
         ``pid.txt`` is the "it really started" signal -- the launcher writes it
-        the moment ``Start-Process`` returns, before the command has produced a
+        the moment its CreateProcess returns, before the command has produced a
         byte. Two different failures hide behind "no rc.txt yet", and both
         deserve a precise answer instead of the caller's whole budget spent in
         silence: no pid.txt after the start grace means TASK SCHEDULER never
