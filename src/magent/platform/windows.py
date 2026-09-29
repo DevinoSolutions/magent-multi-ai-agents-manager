@@ -248,6 +248,14 @@ def _remove_scratch(work: Path) -> None:
         time.sleep(0.1)
 
 
+def _printable(text: str) -> str:
+    """``text`` with every lone surrogate written as an escape. The argv and
+    the paths a hand-off names may hold one (Windows allows it), and the log
+    file is UTF-8: a record that cannot be encoded is not written at all --
+    logging prints a traceback on stderr instead."""
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _one_line(text: str, limit: int = 200) -> str:
     """The last non-empty line of a tool's output, clipped -- diagnostics go in
     a single ``detail`` string, and schtasks answers in a multi-line table."""
@@ -1073,8 +1081,12 @@ class WindowsPlatform(Platform):
         try:
             script = _stage_handoff(work, argv)
         except (OSError, UnicodeEncodeError) as exc:
+            # A lone surrogate lands here: legal in a Windows path, but run.ps1
+            # is UTF-8 and cannot hold one. Refused before anything runs, in
+            # words that can themselves be printed and logged.
             return HandoffResult(
-                rc=None, detail=f"could not stage the hand-off in {work}: {exc}"
+                rc=None,
+                detail=_printable(f"could not stage the hand-off in {work}: {exc}"),
             )
 
         run_spec = f'{_HANDOFF_SHELL} "{script}"'
@@ -1087,7 +1099,11 @@ class WindowsPlatform(Platform):
                 ),
             )
 
-        log.info("session-0 hand-off %s: %s", task, subprocess.list2cmdline(argv)[:500])
+        log.info(
+            "session-0 hand-off %s: %s",
+            task,
+            _printable(subprocess.list2cmdline(argv))[:500],
+        )
         # `/sc once` demands a trigger, and `/run` fires the task now, so the
         # trigger time exists only to satisfy schtasks. `/st 00:00` is TODAY at
         # midnight -- already in the past, so the trigger can never fire on its

@@ -555,7 +555,7 @@ class TestRunOnDesktopOnWindows:
         assert result.rc == -1073741510, result.detail
 
     def test_a_weird_argv_and_cwd_arrive_exactly(
-        self, fake_schtasks, tmp_path, monkeypatch
+        self, fake_schtasks, tmp_path, monkeypatch, capsys
     ):
         # Everything a quoting layer ever ate, lone surrogates included (legal
         # in a Windows file name and argument; json escapes them into ASCII).
@@ -584,6 +584,44 @@ class TestRunOnDesktopOnWindows:
 
         assert result.rc == 0, result.detail
         assert json.loads(result.stdout) == {"argv": weird, "cwd": str(where)}
+        # The hand-off logs its argv, and a UTF-8 log cannot hold a lone
+        # surrogate: the record is written escaped, not dropped for a traceback.
+        assert "Logging error" not in capsys.readouterr().err
+
+    def test_a_lone_surrogate_in_the_scratch_root_is_refused_before_anything_runs(
+        self, fake_schtasks, tmp_path, monkeypatch, capsys
+    ):
+        # Windows allows a lone surrogate in a directory name, and run.ps1 --
+        # UTF-8, BOM and all -- cannot hold one: its launcher path would not
+        # encode. That is a refusal with a reason, not a traceback, and no task
+        # is created for a script that was never written.
+        root = tmp_path / "T\udcffmp"
+        root.mkdir()
+        monkeypatch.setattr(
+            "magent.platform.windows.tempfile.gettempdir", lambda: str(root)
+        )
+
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-c", "pass"], timeout_s=60
+        )
+
+        assert result.rc is None
+        assert result.detail.startswith("could not stage the hand-off in ")
+        # ...in words that can themselves be printed and logged.
+        result.detail.encode("utf-8")
+        assert _calls(fake_schtasks) == []
+        assert "Logging error" not in capsys.readouterr().err
+
+    def test_a_lone_surrogate_in_the_interpreter_path_is_refused_too(
+        self, fake_schtasks, monkeypatch
+    ):
+        monkeypatch.setattr(sys, "executable", "C:\\Py\udcff\\python.exe")
+
+        result = self._plat().run_on_desktop(["x"], timeout_s=60)
+
+        assert result.rc is None
+        assert "could not stage the hand-off" in result.detail
+        assert _calls(fake_schtasks) == []
 
     def test_the_launcher_ignores_a_pythonpath_that_shadows_its_imports(
         self, fake_schtasks, tmp_path, monkeypatch
