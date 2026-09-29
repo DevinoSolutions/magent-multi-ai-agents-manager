@@ -2379,6 +2379,15 @@ class TestTheRepoRecordFileIsCheckedOnTheWayInAndOut:
         with pytest.raises(ValueError):
             nodes.read_repo_record("second", "api")
 
+    def test_a_torn_body_is_refused_by_the_file_it_came_from(self):
+        # The one line recall logs must say WHICH record to look at.
+        _raw_record('{"ts": 5, "sour')
+
+        with pytest.raises(ValueError) as info:
+            nodes.read_repo_record("second", "api")
+        assert str(nodes.repo_record_path("second", "api")) in str(info.value)
+        assert isinstance(info.value.__cause__, json.JSONDecodeError)
+
     def test_a_body_past_the_depth_bound_is_refused_before_json_reads_it(
         self, monkeypatch
     ):
