@@ -990,11 +990,14 @@ class TestMaybeStartHotkey:
         """The starter now reads a manifest and can taskkill a pid, so both
         are stubbed for every test here -- an unstubbed run would read (and
         kill) the developer's own live listener."""
-        from magent import hotkey, launch
+        from magent import hotkey
 
         monkeypatch.setattr(hotkey, "listener_manifest", lambda: None)
         monkeypatch.setattr(hotkey, "stop_listener", lambda: True)
-        monkeypatch.setattr(launch.time, "sleep", lambda _s: None)
+        # The registration wait runs on procs' own clock (never the global time
+        # module): nothing here really sleeps, and a wait that never closes
+        # fails instead of hanging. A test that schedules events swaps its own.
+        monkeypatch.setattr("magent.procs.time", _FakeTime())
 
     @staticmethod
     def _manifest(server_url="http://x:8034", ssh_host=None, version=None):
@@ -1120,8 +1123,104 @@ class TestMaybeStartHotkey:
         monkeypatch.setattr(hotkey, "listener_pid", lambda: 1234)
         monkeypatch.setattr(hotkey, "listener_manifest", lambda: None)
         monkeypatch.setattr(hotkey, "stop_listener", lambda: False)
-        monkeypatch.setattr("magent.launch.spawn_detached", lambda *a, **k: None)
+        child = _StillStarting()
+        monkeypatch.setattr("magent.launch.spawn_detached", lambda *a, **k: child)
         assert cli._maybe_start_hotkey("http://x:8034") is None
+        # ...and the new child, which may yet come up, is left alone.
+        assert child.ended == []
+
+    def test_the_listener_start_is_bounded_by_the_same_window(self, monkeypatch):
+        # A child that hangs alive without registering must not stall serve's
+        # supervisor thread or a `--go` launch past the shared window.
+        from magent import hotkey, launch
+        from magent.procs import REGISTRATION_TIMEOUT_S
+
+        monkeypatch.setattr(hotkey, "listener_pid", lambda: None)
+        child = _StillStarting()
+        monkeypatch.setattr("magent.launch.spawn_detached", lambda *a, **k: child)
+        clock = _FakeTime()
+        monkeypatch.setattr("magent.procs.time", clock)
+
+        assert launch.start_hotkey_listener("http://x:8034") is None
+        assert REGISTRATION_TIMEOUT_S <= clock.now < REGISTRATION_TIMEOUT_S + 0.5
+        assert child.ended == []
+
+    def test_a_listener_that_registers_after_five_seconds_is_returned(
+        self, monkeypatch
+    ):
+        # The old 2s window returned None here -- and every caller read that as
+        # "no listener" -- while the listener came up behind it on a busy box.
+        from magent import cli, hotkey
+
+        state = {"pid": None}
+        monkeypatch.setattr(hotkey, "listener_pid", lambda: state["pid"])
+        monkeypatch.setattr(
+            "magent.launch.spawn_detached", lambda *a, **k: _StillStarting()
+        )
+        clock = _FakeTime()
+        clock.at(5.0, lambda: state.update(pid=5678))  # the measured slow start
+        monkeypatch.setattr("magent.procs.time", clock)
+        assert cli._maybe_start_hotkey("http://x:8034") == 5678
+
+    def test_a_listener_that_dies_starting_is_reported_at_once(self, monkeypatch):
+        # A keyboard hook that fails to install exits the child: the launcher
+        # must say so now, not after the whole window.
+        from magent import cli, hotkey
+
+        monkeypatch.setattr(hotkey, "listener_pid", lambda: None)
+        monkeypatch.setattr(
+            "magent.launch.spawn_detached", lambda *a, **k: _StillStarting(rc=1)
+        )
+        clock = _FakeTime()
+        monkeypatch.setattr("magent.procs.time", clock)
+        assert cli._maybe_start_hotkey("http://x:8034") is None
+        assert clock.now < 1.0
+
+
+class _StillStarting:
+    """The spawned detached child: alive (``rc=None``) or already exited.
+    Records every attempt to end it -- the launcher must never make one."""
+
+    def __init__(self, rc: int | None = None) -> None:
+        self.rc = rc
+        self.ended: list[str] = []
+
+    def poll(self) -> int | None:
+        return self.rc
+
+    def kill(self) -> None:
+        self.ended.append("kill")
+
+    def terminate(self) -> None:
+        self.ended.append("terminate")
+
+    def send_signal(self, sig: int) -> None:
+        self.ended.append(f"signal {sig}")
+
+
+class _FakeTime:
+    """Stands in for ``procs.time``: ``sleep`` advances ``monotonic`` instead of
+    sleeping, and fires anything scheduled with ``at`` once its time comes.
+    Patched onto the procs module only, never onto the global time module. A
+    wait that never closes FAILS here instead of hanging the suite."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self._due: list[tuple[float, object]] = []
+
+    def at(self, when: float, action) -> None:
+        self._due.append((when, action))
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        assert self.now < 120.0, "the registration wait never closed"
+        for when, action in list(self._due):
+            if self.now >= when:
+                self._due.remove((when, action))
+                action()
 
 
 class TestHookStructsAndConstants:
