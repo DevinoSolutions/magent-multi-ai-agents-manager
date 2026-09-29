@@ -7,10 +7,12 @@ store is.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
+import stat
 import time
 from pathlib import Path
 
@@ -73,13 +75,44 @@ def _codex_recipe() -> str:
     return f'notify = [{json.dumps(_hook_exe())}, "--source", "codex"]'
 
 
-def _load_settings(path: Path) -> dict[str, object]:
+def _load_settings(path: Path) -> dict[str, object] | str:
+    """The parsed settings.json ({} when there is none), or what is wrong with it.
+
+    The string, in our words plus the error's class, is for a file magent
+    cannot safely understand: unreadable, not UTF-8, not JSON, nested past the
+    parser's depth, or not the shape Claude Code writes -- ``hooks`` an
+    object, each of our events' values an array. install refuses such a file
+    untouched (the wt_keys law: a file magent cannot read is never rewritten;
+    before this, a wrong-shaped ``hooks`` was silently replaced), and status
+    says so instead of reporting every event unwired.
+
+    Returned, never raised: settings.json can hold API keys in its "env"
+    block, and an exception keeps alive both a parser error (a
+    JSONDecodeError's ``.doc`` is the whole file) and the frame that parsed
+    it, whose locals hold the file.
+    """
     if not path.exists():
         return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise TypeError("settings.json is not a JSON object")
-    return data
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as exc:
+        problem = f"not valid UTF-8 ({type(exc).__name__})"
+    except ValueError as exc:
+        problem = f"not valid JSON ({type(exc).__name__})"
+    except RecursionError as exc:
+        problem = f"nested too deeply to parse ({type(exc).__name__})"
+    except OSError as exc:
+        problem = f"could not be read ({type(exc).__name__})"
+    else:
+        if not isinstance(data, dict):
+            return "not a JSON object"
+        if not isinstance(hooks := data.get("hooks", {}), dict):
+            return '"hooks" is not a JSON object'
+        wrong = [e for e in _EVENTS if not isinstance(hooks.get(e, []), list)]
+        if wrong:
+            return f'"hooks.{wrong[0]}" is not a JSON array'
+        return data
+    return problem
 
 
 def _event_wired(entries: object) -> bool:
@@ -120,32 +153,21 @@ def _repair_entries(entries: list[object], cmd: str) -> bool:
     return changed
 
 
-@main.group("hooks")
-def hooks_group() -> None:
-    """Wire agent lifecycle hooks that feed the session-state store."""
+def _wire_settings(path: Path) -> tuple[list[str], list[str]] | str:
+    """Merge one magent-state-hook entry per event into the settings.json at
+    ``path`` and write it back: the events (added, repaired), or why the file
+    cannot be edited.
 
-
-@hooks_group.command("install")
-@click.option(
-    "--settings-file",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Claude Code settings.json to edit (default: ~/.claude/settings.json).",
-)
-def hooks_install_cmd(settings_file: Path | None) -> None:
-    """Add magent's state hook to Claude Code so session states stay accurate.
-
-    Merges one magent-state-hook entry per lifecycle event into settings.json
-    (idempotent; existing hooks are preserved). Prints the Codex notify recipe
-    -- ~/.codex/config.toml is TOML, edited by hand.
+    Returned, never raised, for _load_settings's reason: the command raises
+    SystemExit, and the traceback keeps that frame's locals alive -- so the
+    parsed file, API keys and all, lives only in this one.
     """
-    path = settings_file or _default_settings_file()
-    try:
-        data = _load_settings(path)
-    except (ValueError, TypeError) as exc:
-        click.echo(f"  {style('x', fg='red')} Cannot edit {path}: {exc}", err=True)
-        raise SystemExit(1) from exc
+    data = _load_settings(path)
+    if isinstance(data, str):
+        return data
 
+    # _load_settings refused any other shape: these defaults only fill in what
+    # is absent.
     hooks_raw = data.get("hooks")
     hooks: dict[str, object] = hooks_raw if isinstance(hooks_raw, dict) else {}
     data["hooks"] = hooks
@@ -168,11 +190,81 @@ def hooks_install_cmd(settings_file: Path | None) -> None:
         entries.append(entry)
         added.append(event)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    problem = _write_settings(path, data)
+    return (added, repaired) if problem is None else problem
 
+
+def _write_settings(path: Path, data: dict[str, object]) -> str | None:
+    """Replace the settings.json at ``path`` with ``data``: None, or what
+    stopped the write in our words plus the error's class. A failed write
+    removes its temp file (best effort), leaving nothing beside the file.
+
+    The file itself is opened for writing first: POSIX renames over a
+    read-only file as freely as over any other (a rename is the directory's
+    business), so the replace alone would overwrite a settings.json the user
+    made read-only -- and hand it back writable.
+
+    The replacement keeps the old file's mode. A new file is born with the
+    umask's, so a 0600 settings.json -- keys in its "env" block -- would come
+    back 0644; the temp file is born owner-only instead, so the keys are never
+    in a file anyone else can open, and given the old mode just before the
+    replace. A first install keeps the umask default.
+
+    A failed write removes only the temp file this call made: a settings.tmp
+    already there is removed once the write begins (it would bring its own
+    mode), but a refusal before that -- the probe's -- leaves it alone.
+    """
+    tmp = path.with_suffix(".tmp")
+    ours = False
+    try:
+        existing = path.stat() if path.exists() else None
+        if existing is not None:
+            with path.open("r+b"):
+                pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Born here: a leftover temp file would bring its own mode.
+        tmp.unlink(missing_ok=True)
+        ours = True
+        if existing is not None:
+            tmp.touch(mode=0o600)
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        if existing is not None:
+            os.chmod(tmp, stat.S_IMODE(existing.st_mode))
+        os.replace(tmp, path)
+    except OSError as exc:
+        if ours:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+        return f"could not be written ({type(exc).__name__})"
+    return None
+
+
+@main.group("hooks")
+def hooks_group() -> None:
+    """Wire agent lifecycle hooks that feed the session-state store."""
+
+
+@hooks_group.command("install")
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Claude Code settings.json to edit (default: ~/.claude/settings.json).",
+)
+def hooks_install_cmd(settings_file: Path | None) -> None:
+    """Add magent's state hook to Claude Code so session states stay accurate.
+
+    Merges one magent-state-hook entry per lifecycle event into settings.json
+    (idempotent; existing hooks are preserved). Prints the Codex notify recipe
+    -- ~/.codex/config.toml is TOML, edited by hand.
+    """
+    path = settings_file or _default_settings_file()
+    wired = _wire_settings(path)
+    if isinstance(wired, str):
+        click.echo(f"  {style('x', fg='red')} Cannot edit {path}: {wired}", err=True)
+        raise SystemExit(1)
+
+    added, repaired = wired
     if added:
         click.echo(
             f"  {style('+', fg='green', bold=True)} Wired {', '.join(added)} in {style(str(path), dim=True)}"
@@ -207,18 +299,31 @@ def hooks_status_cmd(settings_file: Path | None) -> None:
     from magent import agent_state  # heavy subsystem: in-body per policy
 
     path = settings_file or _default_settings_file()
-    try:
-        data = _load_settings(path)
-    except (ValueError, TypeError):
-        data = {}
-    hooks = data.get("hooks")
-    hooks_map = hooks if isinstance(hooks, dict) else {}
-    for event in _EVENTS:
-        wired = _event_wired(hooks_map.get(event))
-        mark = style("+", fg="green", bold=True) if wired else style("x", fg="red")
-        click.echo(f"  {mark} {event}")
+    data = _load_settings(path)
+    if isinstance(data, str):
+        # Never per-event rows here: "x" would claim every event is unwired,
+        # which a file magent cannot read says nothing about.
+        click.echo(
+            f"  {style('x', fg='red')} {path}: {data}; cannot tell which hooks "
+            "are wired",
+            err=True,
+        )
+    else:
+        hooks = data.get("hooks")
+        hooks_map = hooks if isinstance(hooks, dict) else {}
+        for event in _EVENTS:
+            wired = _event_wired(hooks_map.get(event))
+            mark = style("+", fg="green", bold=True) if wired else style("x", fg="red")
+            click.echo(f"  {mark} {event}")
     click.echo()
-    records = agent_state.all_states()
+    _echo_store_freshness(agent_state.all_states())
+    if isinstance(data, str):
+        # Unknown is not success: a script must not read "cannot tell" as
+        # "all wired". The store report above still ran.
+        raise SystemExit(1)
+
+
+def _echo_store_freshness(records: list[dict[str, object]]) -> None:
     if not records:
         click.echo(
             f"  {style('State store is empty', fg='yellow')} "
