@@ -3497,6 +3497,40 @@ class TestWhatCountsAsUnreachable:
             f"reply exceeded {FLOOD_CAP} bytes",
         )
 
+    @pytest.mark.usefixtures("stepped_clock")
+    def test_an_over_cap_pull_logs_the_words_the_row_leaves_out(
+        self, placed, fake_ssh, monkeypatch
+    ):
+        # The row is the cap. nodes.log has the rest, escaped on the one
+        # line: the child's last words before the flood, and the half line
+        # the cap cut (after_cap).
+        monkeypatch.setattr(remote_mux, "PULL_MAX_REPLY_BYTES", FLOOD_CAP)
+        fake_ssh.set_reply("devino-second", stderr="boom: disk full\nwriting \x1bblo")
+        fake_ssh.set_mode("flood")
+        cap = f"reply exceeded {FLOOD_CAP} bytes"
+        syncer = node_sync.NodeSyncer(_second_only())
+        try:
+            assert syncer.tick() == {"second": (node_sync.FAILED, cap)}
+        finally:
+            syncer.close()
+        (line,) = [
+            line
+            for line in (log.LOG_DIR / "nodes.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if "node second: failed" in line
+        ]
+        assert f"({cap}): {cap}\\nboom: disk full" in line
+        assert "after the cap: writing \\x1bblo" in line
+
+    def test_a_failure_logs_the_tail_its_one_line_left_out(self, placed, caplog):
+        _capture_nodes_log(caplog)
+        err = remote_mux.RemoteError(1, "cannot write\nboom", ("ssh",))
+        node_sync.NodeSyncer(_config(), pull=_pull_raising({"second": err})).tick()
+        assert _node_warnings(caplog, "second") == [
+            "node second: failed (boom): cannot write\\nboom"
+        ]
+
     def test_only_the_flag_marks_an_over_cap_reply_never_the_text(self):
         """A node whose stderr merely STARTS with the cap's wording is not an
         over-cap reply: the detail stays its last line."""
