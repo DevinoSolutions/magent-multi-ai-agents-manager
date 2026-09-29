@@ -2094,7 +2094,10 @@ cannot cover them.
   `rc.txt` still held after the record retries, say) goes to the task's
   hidden console as a traceback, and that console is gone when the task
   ends. The caller hears "exited without an exit code", or "never started",
-  and the scratch directory it names holds nothing about why. Closing this
+  and the scratch directory it names holds nothing about why. After a pid
+  record that failed (skipped by design) there is no pid to watch, so a crash
+  past the one start check reads as the budget running out -- "may still be
+  running" -- instead. Closing this
   would mean wrapping `main()` in a `try/except BaseException` that writes the
   traceback into a scratch file.
 

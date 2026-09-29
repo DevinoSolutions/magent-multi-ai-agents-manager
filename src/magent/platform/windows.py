@@ -305,9 +305,8 @@ def _read_recorded_int(path: Path) -> int | None:
     None covers every "not yet": the file is absent, present but empty,
     present but held by something else (a scanner that has just seen it
     written, and this poll reads every 250ms), or present with a value that is
-    not complete. All
-    of them mean "no answer yet", never "it failed"; only a complete integer
-    (see ``_recorded_int``) is an answer.
+    not complete. All of them mean "no answer yet", never "it failed"; only a
+    complete integer (see ``_recorded_int``) is an answer.
     """
     return _recorded_int(_read_handoff_text(path))
 
