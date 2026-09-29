@@ -308,6 +308,29 @@ class TestTheNodeHookNeverFailsATurn:
         _run_hook(tmp_path, node_home, event)
         assert json.loads(path.read_text(encoding="utf-8"))["ts"] == first
 
+    def test_a_record_nested_too_deeply_to_parse_is_overwritten_not_frozen(
+        self, tmp_path
+    ):
+        # Deeper than a node python before 3.14 recurses through:
+        # RecursionError, not a ValueError (3.14 reads to the end, a
+        # ValueError). Only a tool call reads the record (the refresh
+        # throttle). The error must not reach the program's catch-all, or
+        # every tool call leaves the record as it is: the state freezes.
+        node_home = tmp_path / "node"
+        store = node_home / ".magent" / "state"
+        store.mkdir(parents=True)
+        path = store / f"{agent_state._key('/w/api')}.json"
+        path.write_text("[" * 65_000, encoding="utf-8")
+        event = {"hook_event_name": "PostToolUse", "cwd": "/w/api", "session_id": "s"}
+        done = _run_hook(tmp_path, node_home, json.dumps(event))
+        assert done.returncode == 0, done.stderr.decode()
+        text = path.read_text(encoding="utf-8")
+        assert not text.startswith("["), "the deep record froze the session's state"
+        assert list(store.iterdir()) == [path]
+        rec = json.loads(text)
+        assert rec["state"] == agent_state.WORKING
+        assert rec["session_id"] == "s"
+
     def test_a_codex_source_writes_nothing(self, tmp_path):
         node_home = tmp_path / "node"
         done = _run_hook(tmp_path, node_home, json.dumps(CASES[0]), "--source", "codex")

@@ -4,8 +4,9 @@
 # writes ~/.magent/state/<key>.json in agent_state's record schema, which the
 # PC's node sync daemon pulls home. Installed by provision as
 # ~/.magent/bin/state-hook.sh. It must never fail the agent's turn: every fault
-# exits 0. The Python below mirrors state_hook.handle_claude line for line;
-# tests/unit/test_state_hook_sh.py runs both on the same events.
+# exits 0. The Python below mirrors state_hook.handle_claude line for line,
+# with one deliberate difference: read_state also treats a RecursionError as
+# no record. tests/unit/test_state_hook_sh.py runs both on the same events.
 set -euo pipefail
 
 IFS= read -r -d '' MAGENT_STATE_HOOK_PY <<'MAGENT_STATE_HOOK_PY' || true
@@ -62,7 +63,10 @@ def read_state(cwd):
     try:
         with open(record_path(cwd), encoding="utf-8") as fh:
             rec = json.load(fh)
-    except (OSError, ValueError):
+    # RecursionError: a record nested past what json recurses through reads
+    # as no record, so this tool call overwrites it. Raised, the catch-all at
+    # the end would swallow it on every tool call: the state would freeze.
+    except (OSError, ValueError, RecursionError):
         return None
     return rec if isinstance(rec, dict) else None
 

@@ -1272,10 +1272,11 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     it was reached. And nothing in ``~/.claude`` outside the skills folder
     is read either -- the session transcripts, the history, the login. Both
     sides of every comparison are resolved first, so a
-    ``~/.ssh`` or ``~/.claude`` that is itself a junction elsewhere (OneDrive
-    setups) is still recognised. A skills folder that is itself such a link
-    ships nothing -- one resolving elsewhere in ~/.claude (a ``skills-v2``)
-    with a note of its own; the path is in the log only.
+    ``~/.ssh`` or ``~/.claude`` that is itself a junction elsewhere
+    (cloud-synced profile setups) is still recognised. A skills folder that
+    is itself such a link ships nothing -- one resolving elsewhere in
+    ~/.claude (a ``skills-v2``) with a note of its own; the path is in the
+    log only.
 
     That is defence in depth, NOT containment: a link to any other folder
     (``~/private-notes``) ships what it holds, deliberately -- the user put
