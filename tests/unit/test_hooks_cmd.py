@@ -732,7 +732,8 @@ _USER_KEYS = {"model": "keep-me", "env": {"EDITOR": "vim"}, "permissions": {}}
 
 
 class TestASettingsFileWithAByteOrderMark:
-    """Windows editors (Notepad among them) save UTF-8 with a BOM, and
+    """Some Windows tools write UTF-8 with a BOM (Windows PowerShell 5.1's
+    `Set-Content -Encoding utf8` and `Out-File -Encoding utf8`), and
     wt_keys and env already read utf-8-sig; hooks refused such a file as
     "not valid JSON". It reads the BOM away and writes BOM-less UTF-8."""
 
