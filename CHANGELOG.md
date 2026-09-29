@@ -50,6 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Setup now stops on that key with a `fail` row and exit 1 before writing
   anything. A `.pub` link to a real file is still only read.
 
+- **`magent node recall` reports a commit record nested too deeply instead of
+  crashing.** When the node was unreachable and its saved commit record was
+  nested past magent's depth limit, recall stopped with a Python traceback. It
+  now prints the usual "the commit record ... is unreadable" note, as for any
+  other damaged record.
+
 ### Known issues
 
 - rc1's two known issues, the output-cap reason and `"node": "auto"` not being

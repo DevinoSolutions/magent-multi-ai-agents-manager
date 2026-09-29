@@ -32,6 +32,7 @@ import pytest
 from magent import attach_client, cli, launch, log, node_sync, nodes, remote_mux
 from magent.cli import node_cmd
 from magent.config import NODE_AUTO, ProjectConfig, load_config
+from magent.json_depth import MAX_JSON_DEPTH, TOO_DEEP
 from magent.lockfile import LockHeld
 from magent.nodes import LocalGitState
 from magent.sessions import claude as claude_sessions
@@ -2377,6 +2378,36 @@ class TestTheRepoRecordFileIsCheckedOnTheWayInAndOut:
 
         with pytest.raises(ValueError):
             nodes.read_repo_record("second", "api")
+
+    def test_a_body_past_the_depth_bound_is_refused_before_json_reads_it(
+        self, monkeypatch
+    ):
+        # _load_node_map's rule: refused the same on every C stack, as the
+        # ValueError every caller already catches for a bad file.
+        _raw_record("[" * (MAX_JSON_DEPTH + 1) + "]" * (MAX_JSON_DEPTH + 1))
+
+        def not_reached(_text):
+            raise AssertionError("json.loads walked a body the scan refuses")
+
+        monkeypatch.setattr(nodes.json, "loads", not_reached)
+
+        with pytest.raises(ValueError, match=TOO_DEEP) as info:
+            nodes.read_repo_record("second", "api")
+        assert type(info.value) is ValueError
+
+    def test_a_recursion_error_the_scan_let_through_is_the_bad_file_error(
+        self, monkeypatch
+    ):
+        _raw_record('{"ts": 5, "source": "recall", "repos": []}')
+
+        def overflow(_text):
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(nodes.json, "loads", overflow)
+
+        with pytest.raises(ValueError, match=TOO_DEEP) as info:
+            nodes.read_repo_record("second", "api")
+        assert isinstance(info.value.__cause__, RecursionError)
 
     def test_a_source_that_is_not_a_string_is_not_a_record(self):
         _raw_record('{"ts": 5, "source": 3, "repos": []}')
@@ -5339,7 +5370,7 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
         assert node_answers == []
 
     @pytest.mark.parametrize(
-        "damage", ["torn", "unopenable", "not-an-object", "not-a-record"]
+        "damage", ["torn", "unopenable", "not-an-object", "not-a-record", "too-deep"]
     )
     def test_an_unreadable_commit_record_is_not_never_recorded(
         self, runner, placed_api, node_is_gone, caplog, damage
@@ -5352,6 +5383,9 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
             "not-an-object": "[]",
             # Valid JSON, but a ts that is not a number: not a record either.
             "not-a-record": '{"ts": "5", "source": "recall", "repos": []}',
+            # Deep enough that json.loads itself raises RecursionError on a
+            # default stack: the scan must answer first, or recall tracebacks.
+            "too-deep": "[" * 200_000 + "]" * 200_000,
         }
         if damage == "unopenable":
             path.mkdir()  # there, and it cannot be read

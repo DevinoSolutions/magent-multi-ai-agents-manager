@@ -3157,6 +3157,10 @@ def parse_load_lines(lines: Iterable[str]) -> list[LoadSample]:
     take the whole placement pass down with it."""
     samples: list[LoadSample] = []
     for line in lines:
+        # Nested past the bound is no sample, skipped before json walks it --
+        # node_sync's reader of the same file (``_row_ts``) skips it too.
+        if nests_too_deep(line):
+            continue
         try:
             samples.append(_load_sample(json.loads(line)))
         # RecursionError: json.loads' answer to deep nesting, which is not a
@@ -3576,14 +3580,28 @@ def read_repo_record(
     its OSError; one that is torn or not UTF-8, is not a record -- not an
     object, a ``ts`` that is not a finite number (the node map's rule,
     ``_epoch``), a bad ``source`` or ``repos`` -- or an unsafe ``sid``
-    (NodeConfigError) raises a ValueError. Unknown is never read as "no
-    record was ever written". A malformed row is dropped on its own."""
+    (NodeConfigError) raises a ValueError, and so does a file nested deeper
+    than ``MAX_JSON_DEPTH``, refused by ``nests_too_deep`` before
+    ``json.loads`` walks it, with a ``RecursionError`` out of the parse as the
+    backstop (``_load_node_map``'s rule). Unknown is never read as "no record
+    was ever written". A malformed row is dropped on its own."""
     path = repo_record_path(nick, sid, nodes_dir=nodes_dir)
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    body = json.loads(text)
+    # Refused before json parses it, the same on every stack: the ValueError
+    # every caller already catches for a bad file.
+    if nests_too_deep(text):
+        raise ValueError(f"{path}: {TOO_DEEP}")
+    try:
+        body = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # Name the file, as the non-object branch does.
+        raise ValueError(f"{path}: {exc}") from exc
+    except RecursionError as e:
+        # The backstop for any nesting the scan did not refuse.
+        raise ValueError(f"{path}: {TOO_DEEP}") from e
     if not isinstance(body, dict):
         raise ValueError(f"{path}: not a JSON object")  # noqa: TRY004  # reason: corrupt DATA, the same family as a torn file's JSONDecodeError; callers catch one type for every bad file
     ts, source, rows = _epoch(body.get("ts")), body.get("source"), body.get("repos")

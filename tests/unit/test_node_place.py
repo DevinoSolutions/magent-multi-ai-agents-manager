@@ -34,6 +34,7 @@ from magent.config import (
     ProjectConfig,
     Settings,
 )
+from magent.json_depth import MAX_JSON_DEPTH
 from magent.launch import RunOpts
 from magent.nodes import LoadSample
 from tests.unit._node_fixtures import NOW, entry, pool, seed_history
@@ -144,6 +145,26 @@ class TestTheLoadHistory:
 
         assert len(history) == 2
         assert all(s.nproc == 4 and s.load1 == 1.6 for s in history)
+
+    def test_a_row_past_the_depth_bound_is_skipped_before_json_reads_it(
+        self, tmp_path, monkeypatch
+    ):
+        # node_sync's reader of this same file skips it the same way.
+        deep = "[" * (MAX_JSON_DEPTH + 1) + "]" * (MAX_JSON_DEPTH + 1)
+        path = nodes.load_path("n", nodes_dir=tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text(f"{_GOOD_ROW}\n{deep}\n{_GOOD_ROW}\n", encoding="utf-8")
+        real_loads = json.loads
+
+        def loads(text):
+            assert text != deep, "json.loads walked a row the scan refuses"
+            return real_loads(text)
+
+        monkeypatch.setattr(nodes.json, "loads", loads)
+
+        history = nodes.read_load_history("n", nodes_dir=tmp_path)
+
+        assert len(history) == 2
 
     def test_the_history_reader_and_the_pull_path_share_one_parse(self):
         from magent import remote_mux
