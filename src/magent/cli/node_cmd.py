@@ -233,7 +233,7 @@ def _table_row(cells: list[str], widths: list[int]) -> str:
 
 # What the user column shows when the D4 rule refuses the login a node's
 # sessions would run as: a node with no "user" whose local login is not a
-# usable node login (e.g. "Amin Dhouib") or is "root". An explicit empty
+# usable node login (e.g. "Alice Smith") or is "root". An explicit empty
 # "user" never gets here -- config load refuses it.
 _NO_LOGIN = "? (set user)"
 
@@ -1639,7 +1639,7 @@ def _kill_hint(target: str | None, sid: str) -> str:
 
     DECISION-26 iii: the target is single-quoted -- zsh reads a bare =sid as
     a command lookup. ``pullable_sid`` lets ``'``, ``$``, a backtick and ``!``
-    through (a title like "Amin's site"), so the quoting is real rather than
+    through (a title like "Demo's site"), so the quoting is real rather than
     pasted: a ``'`` is closed, escaped and reopened. Inside the ssh line's
     double quotes the LOCAL shell would still expand ``$(...)``, a backtick or
     ``!``, so only a plain sid gets the plan's one-liner; any other gets two

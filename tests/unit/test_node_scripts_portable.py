@@ -80,7 +80,7 @@ class TestNoTerminatorFollowsAnOperand:
         "line",
         [
             'chmod 700 -- "$1"',
-            "chown amin -- x",
+            "chown demo -- x",
             "mkdir -p x -- y",
             'mkdir -m 700 "$d" -- y',
             "rm -f x -- y",

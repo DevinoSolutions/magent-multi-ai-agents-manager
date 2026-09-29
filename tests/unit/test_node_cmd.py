@@ -1396,7 +1396,7 @@ class TestTheNodeTable:
         ]
         assert result.exit_code == 0
         assert [r[0] for r in rows] == ["third", "second"]
-        assert rows[1][:5] == ["second", "devino-second", "amin", "0.40", "(31)"]
+        assert rows[1][:5] == ["second", "devino-second", "demo", "0.40", "(31)"]
         assert "50%" in rows[1]
 
     def test_memory_and_sessions_come_from_the_newest_sample(self, runner, tmp_config):
@@ -1449,8 +1449,8 @@ class TestTheNodeTable:
     ):
         # The D4 rule's one home is nodes.node_for_nick: the LOWERCASED local
         # login, never the raw environment value.
-        monkeypatch.setenv("USERNAME", "Amin")
-        monkeypatch.setenv("USER", "Amin")
+        monkeypatch.setenv("USERNAME", "Demo")
+        monkeypatch.setenv("USER", "Demo")
         body = config_json(("second",), [])
         del body["settings"]["nodes"]["second"]["user"]
         cfg = tmp_config(body)
@@ -1458,14 +1458,14 @@ class TestTheNodeTable:
         result = runner.invoke(cli.main, ["--config", cfg, "node"])
 
         cfg_typed = cli.config_io._load_config_or_exit(Path(cfg))
-        expected = nodes.node_for_nick(cfg_typed, "second", local_user="Amin").user
-        assert expected == "amin"
+        expected = nodes.node_for_nick(cfg_typed, "second", local_user="Demo").user
+        assert expected == "demo"
         assert _row(result.stdout, "second").split()[2] == expected
 
     @pytest.mark.parametrize(
         "local",
         [
-            "Amin Dhouib",  # not a node login once lowercased
+            "Alice Smith",  # not a node login once lowercased
             "root",  # D4: running as root never silently means root on a node
         ],
         ids=["unusable-local-login", "local-root"],
@@ -1484,7 +1484,7 @@ class TestTheNodeTable:
         assert result.exit_code == 0
         row = _row(result.stdout, "second")
         assert "? (set user)" in row
-        # A substring, not a token: "amin dhouib" holds a space, so no token
+        # A substring, not a token: "alice smith" holds a space, so no token
         # of row.split() could ever equal it (cq-G11 r2).
         assert local.lower() not in row
 
@@ -1493,8 +1493,8 @@ class TestTheNodeTable:
     ):
         # The config refuses it at load (exit 1), so the table can never show
         # the local login for a node whose sessions could not run at all.
-        monkeypatch.setenv("USERNAME", "amin")
-        monkeypatch.setenv("USER", "amin")
+        monkeypatch.setenv("USERNAME", "demo")
+        monkeypatch.setenv("USER", "demo")
         body = config_json(("second",), [])
         body["settings"]["nodes"]["second"]["user"] = ""
         cfg = tmp_config(body)
@@ -1618,7 +1618,7 @@ def api_dir(tmp_path) -> Path:
 @pytest.fixture
 def _node_user(monkeypatch):
     # Not autouse: F16's classes share this module and must not inherit it.
-    monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+    monkeypatch.setattr("magent.env.local_username", lambda: "demo")
 
 
 @pytest.fixture
@@ -2007,7 +2007,7 @@ def one_repo(monkeypatch, api_dir):
     a project with none (a node clones the project from its origin)."""
     state = LocalGitState(
         path=api_dir,
-        url="git@github.com:amin/api.git",
+        url="git@github.com:demo/api.git",
         branch="main",
         dirty=False,
         unpushed=False,

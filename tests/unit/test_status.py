@@ -1835,7 +1835,7 @@ class TestStatusShowsNodeSessions:
                 sid=sid,
                 placed_ts=1.0,
                 attached_existing=False,
-                remote_root="/home/amin/magent/api",
+                remote_root="/home/demo/magent/api",
             ),
         )
         cfgpath = self._config(tmp_config, tmp_path)
@@ -2105,7 +2105,7 @@ _MAP_ENTRY = {
     "sid": "api",
     "placed_ts": 1.0,
     "attached_existing": False,
-    "remote_root": "/home/amin/magent/api",
+    "remote_root": "/home/demo/magent/api",
 }
 
 
@@ -2139,7 +2139,7 @@ class TestANodeMapTheSyncCannotReadIsShownAsSyncPaused:
                     {"path": str(tmp_path / "api"), "title": "api", "node": "auto"}
                 ],
                 "settings": {
-                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                    "nodes": {"second": {"host": "devino-second", "user": "demo"}}
                 },
             }
         )

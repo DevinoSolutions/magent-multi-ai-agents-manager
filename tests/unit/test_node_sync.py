@@ -3841,12 +3841,12 @@ class TestAFinalPullThatDidNotFinishIsNotASuccess:
         directory is already known, so each final pull is one call."""
         nodes.write_json_atomic(
             nodes.pull_marks_path("second"),
-            {"api": {"since": 10.0, "realpath": "/home/amin/magent/api"}},
+            {"api": {"since": 10.0, "realpath": "/home/demo/magent/api"}},
         )
 
         def load(**over):
             snap = _snapshot(
-                sessions=("api",), realpaths={"api": "/home/amin/magent/api"}, **over
+                sessions=("api",), realpaths={"api": "/home/demo/magent/api"}, **over
             )
             monkeypatch.setattr(node_sync, "_pull_node", lambda node, sids: snap)
 
@@ -3871,7 +3871,7 @@ class TestAFinalPullThatDidNotFinishIsNotASuccess:
         assert info.value.not_stored is True
         assert info.value.stuck is False
         # The watermark held, so the next pull asks for that file again.
-        assert _marks()["api"] == {"since": 10.0, "realpath": "/home/amin/magent/api"}
+        assert _marks()["api"] == {"since": 10.0, "realpath": "/home/demo/magent/api"}
 
     def test_files_the_reply_had_no_room_for_raise_naming_how_many(self, answers):
         answers(
@@ -3896,7 +3896,7 @@ class TestAFinalPullThatDidNotFinishIsNotASuccess:
         # watermark, and no later pull would ask for them.
         assert _marks()["api"] == {
             "since": math.nextafter(50.0, -math.inf),
-            "realpath": "/home/amin/magent/api",
+            "realpath": "/home/demo/magent/api",
         }
 
     @pytest.mark.parametrize(
@@ -3915,7 +3915,7 @@ class TestAFinalPullThatDidNotFinishIsNotASuccess:
     ):
         """cq-G14 m3 (N3a/N3b): a directory seen for the first time takes two
         calls, and what EITHER left behind makes the pull unfinished."""
-        real = "/home/amin/magent/api"
+        real = "/home/demo/magent/api"
         replies = iter(
             [
                 _snapshot(sessions=("api",), realpaths={"api": real}, **first),

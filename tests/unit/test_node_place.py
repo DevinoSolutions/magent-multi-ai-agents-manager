@@ -712,7 +712,7 @@ def remote_samples(monkeypatch):
         return _sample(NOW, load1=3.6)
 
     monkeypatch.setattr(remote_mux, "sample", _sample_node)
-    monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+    monkeypatch.setattr("magent.env.local_username", lambda: "demo")
     return calls
 
 
@@ -1266,7 +1266,7 @@ class TestAnUnreadableLoadHistoryIsSaidNotSilent:
             raise remote_mux.RemoteError(255, "ssh: connect timed out", ("ssh",))
 
         monkeypatch.setattr(remote_mux, "sample", _no_answer)
-        monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+        monkeypatch.setattr("magent.env.local_username", lambda: "demo")
         seed_history("second", "quiet")
         cls, _ = unreadable_history("third")
         config = pool("second", "third", projects=[_auto("api")])

@@ -53,18 +53,18 @@ class TestTheEncodedDirIsClaudeCodesOwnRule:
         ("path", "expected"),
         [
             (
-                r"C:\Users\amind\OneDrive\Desktop\Projects\CUSTOM MCPs & PRODUCTIVITY\magent-multi-ai-agents-manager",
-                "C--Users-amind-OneDrive-Desktop-Projects-CUSTOM-MCPs---PRODUCTIVITY-magent-multi-ai-agents-manager",
+                r"C:\Users\alice\Documents\Projects\CUSTOM MCPs & PRODUCTIVITY\magent-multi-ai-agents-manager",
+                "C--Users-alice-Documents-Projects-CUSTOM-MCPs---PRODUCTIVITY-magent-multi-ai-agents-manager",
             ),
             (
                 r"C:\p\stealth-chrome-devtools-mcp\.claude\worktrees\agent-a0ed696fa523ab8f6",
                 "C--p-stealth-chrome-devtools-mcp--claude-worktrees-agent-a0ed696fa523ab8f6",
             ),
             (
-                r"c:\Users\amind\OneDrive\Desktop\Projects\INTERNAL\devino-landing-page",
-                "c--Users-amind-OneDrive-Desktop-Projects-INTERNAL-devino-landing-page",
+                r"c:\Users\alice\Documents\Projects\INTERNAL\devino-landing-page",
+                "c--Users-alice-Documents-Projects-INTERNAL-devino-landing-page",
             ),
-            ("/home/amin/magent/my_repo.v2", "-home-amin-magent-my-repo-v2"),
+            ("/home/demo/magent/my_repo.v2", "-home-demo-magent-my-repo-v2"),
         ],
     )
     def test_every_ascii_character_outside_letters_and_digits_becomes_a_dash(
@@ -75,16 +75,16 @@ class TestTheEncodedDirIsClaudeCodesOwnRule:
     def test_a_non_ascii_character_costs_one_dash_per_utf16_unit(self):
         # é is one UTF-16 unit (one dash); the emoji is a surrogate pair (two).
         assert (
-            nodes.encoded_project_dir("/home/amin/café \U0001f600")
-            == "-home-amin-caf----"
+            nodes.encoded_project_dir("/home/demo/café \U0001f600")
+            == "-home-demo-caf----"
         )
 
     def test_a_name_over_200_units_is_cut_and_suffixed_with_the_paths_hash(self):
-        path = "/home/amin/magent/" + "a" * 250
+        path = "/home/demo/magent/" + "a" * 250
 
         encoded = nodes.encoded_project_dir(path)
 
-        assert encoded == "-home-amin-magent-" + "a" * 182 + "-d43su2"
+        assert encoded == "-home-demo-magent-" + "a" * 182 + "-cn8awk"
         assert len(encoded) == 207
 
     def test_a_name_of_exactly_200_units_is_left_whole(self):
@@ -255,7 +255,7 @@ class TestTheResumeId:
         assert nodes.latest_transcript_id("second", "api") == OLDER_SESSION_ID
 
 
-_NODE = nodes.Node(nick="second", host="devino-second", user="amin", root="~/magent")
+_NODE = nodes.Node(nick="second", host="devino-second", user="demo", root="~/magent")
 
 
 def _node_call(
@@ -380,7 +380,7 @@ class TestTheRepoRecord:
                 sid=recipe.sid,
                 attached_existing=True,
                 commits={"api": "a" * 40},
-                cwd="/home/amin/magent/api",
+                cwd="/home/demo/magent/api",
             )
 
         monkeypatch.setattr(remote_mux, "bring_up", _attached)
@@ -401,7 +401,7 @@ class TestTheRepoRecord:
                 sid=recipe.sid,
                 attached_existing=False,
                 commits={"api": "a" * 40},
-                cwd="/home/amin/magent/api",
+                cwd="/home/demo/magent/api",
                 dirty=reported,
             )
 
@@ -605,10 +605,10 @@ class TestInstallTranscripts:
             seen.append((script, args, stdin or b""))
             if script == "node_realpath":
                 return subprocess.CompletedProcess(
-                    [], 0, b"/home/amin/magent/my_api\n", b""
+                    [], 0, b"/home/demo/magent/my_api\n", b""
                 )
             return subprocess.CompletedProcess(
-                [], 0, b"/home/amin/.claude/projects/-home-amin-magent-my-api\n", b""
+                [], 0, b"/home/demo/.claude/projects/-home-demo-magent-my-api\n", b""
             )
 
         monkeypatch.setattr(remote_mux, "run_script", _run_script)
@@ -625,10 +625,10 @@ class TestInstallTranscripts:
             ("node_realpath", ["~/magent/my_api"]),
             (
                 "install_transcripts",
-                [nodes.encoded_project_dir("/home/amin/magent/my_api")],
+                [nodes.encoded_project_dir("/home/demo/magent/my_api")],
             ),
         ]
-        assert landed.landed == "/home/amin/.claude/projects/-home-amin-magent-my-api"
+        assert landed.landed == "/home/demo/.claude/projects/-home-demo-magent-my-api"
         assert landed.kept == ()
 
     def test_the_conversation_travels_as_a_tar_of_the_directory_contents(
@@ -702,13 +702,13 @@ class TestTheInstallScriptsOnANode:
         home = tmp_path / "nodehome"
         home.mkdir()
 
-        landed = self._install(monkeypatch, tmp_path, home, "-home-amin-magent-api")
+        landed = self._install(monkeypatch, tmp_path, home, "-home-demo-magent-api")
 
         expected = (
             Path(os.path.realpath(home))
             / ".claude"
             / "projects"
-            / "-home-amin-magent-api"
+            / "-home-demo-magent-api"
         )
         assert Path(landed) == expected
         assert (expected / f"{SESSION_ID}.jsonl").read_text(
@@ -718,11 +718,11 @@ class TestTheInstallScriptsOnANode:
 
     def test_it_never_deletes_what_is_already_there(self, monkeypatch, tmp_path):
         home = tmp_path / "nodehome"
-        existing = home / ".claude" / "projects" / "-home-amin-magent-api"
+        existing = home / ".claude" / "projects" / "-home-demo-magent-api"
         existing.mkdir(parents=True)
         (existing / "older.jsonl").write_text("{}\n", encoding="utf-8")
 
-        self._install(monkeypatch, tmp_path, home, "-home-amin-magent-api")
+        self._install(monkeypatch, tmp_path, home, "-home-demo-magent-api")
 
         assert (existing / "older.jsonl").exists()
 
@@ -759,7 +759,7 @@ class TestTheInstallScriptsOnANode:
 
 
 _PULLED_JSONL = '{"sessionId": "x"}\n'
-_ENCODED = "-home-amin-magent-api"
+_ENCODED = "-home-demo-magent-api"
 
 
 def _node_run(
@@ -1471,7 +1471,7 @@ class TestAnAbsoluteRootIsInstalledThroughTheEncoder:
                     [], 0, b"/data/srv/magent/api\n", b""
                 )
             return subprocess.CompletedProcess(
-                [], 0, b"/home/amin/.claude/projects/-data-srv-magent-api\n", b""
+                [], 0, b"/home/demo/.claude/projects/-data-srv-magent-api\n", b""
             )
 
         monkeypatch.setattr(remote_mux, "run_script", _run_script)
@@ -1488,7 +1488,7 @@ class TestAnAbsoluteRootIsInstalledThroughTheEncoder:
             ),
         ]
         assert seen[1][1] == ["-data-srv-magent-api"]
-        assert result.landed == "/home/amin/.claude/projects/-data-srv-magent-api"
+        assert result.landed == "/home/demo/.claude/projects/-data-srv-magent-api"
 
 
 class TestTheInstallResultAndRefusals:
@@ -1506,7 +1506,7 @@ class TestTheInstallResultAndRefusals:
             calls.append(script)
             if script == "node_realpath":
                 return subprocess.CompletedProcess(
-                    [], 0, b"/home/amin/magent/api\n", b""
+                    [], 0, b"/home/demo/magent/api\n", b""
                 )
             if rc:
                 raise remote_mux.RemoteError(rc, said, ("ssh", "devino-second"))
@@ -1521,7 +1521,7 @@ class TestTheInstallResultAndRefusals:
             stdout=(
                 b"KEPT\tmemory/MEMORY.md\nKEPT\t"
                 + SESSION_ID.encode()
-                + b".jsonl\n/home/amin/.claude/projects/-home-amin-magent-api\n"
+                + b".jsonl\n/home/demo/.claude/projects/-home-demo-magent-api\n"
             ),
         )
 
@@ -1529,7 +1529,7 @@ class TestTheInstallResultAndRefusals:
             _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
         )
 
-        assert result.landed == "/home/amin/.claude/projects/-home-amin-magent-api"
+        assert result.landed == "/home/demo/.claude/projects/-home-demo-magent-api"
         assert result.kept == ("memory/MEMORY.md", f"{SESSION_ID}.jsonl")
         assert "2 item(s)" in result.note
         assert "memory/MEMORY.md" in result.note
@@ -1538,7 +1538,7 @@ class TestTheInstallResultAndRefusals:
         # spec-G9's probe: the node has a FILE named memory where the payload
         # has a directory, so the directory and everything under it are kept.
         result = remote_mux._installed(
-            "KEPT\tmemory\nKEPT\tmemory/a.md\nKEPT\ts.jsonl\n/home/amin/.claude/projects/x\n"
+            "KEPT\tmemory\nKEPT\tmemory/a.md\nKEPT\ts.jsonl\n/home/demo/.claude/projects/x\n"
         )
 
         assert result.kept == ("memory", "memory/a.md", "s.jsonl")
@@ -1549,14 +1549,14 @@ class TestTheInstallResultAndRefusals:
         assert "file(s)" not in result.note
 
     def test_nothing_kept_has_no_note(self, monkeypatch, tmp_path):
-        self._fake(monkeypatch, stdout=b"/home/amin/.claude/projects/x\n")
+        self._fake(monkeypatch, stdout=b"/home/demo/.claude/projects/x\n")
 
         result = remote_mux.install_transcripts(
             _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
         )
 
         assert (result.landed, result.kept, result.note) == (
-            "/home/amin/.claude/projects/x",
+            "/home/demo/.claude/projects/x",
             (),
             "",
         )
@@ -1603,7 +1603,7 @@ class TestTheInstallResultAndRefusals:
     # A refusal as install_transcripts.sh says it (G-S1): its own line, then
     # the OS's reason on a line of its own under the tag.
     _REFUSED = (
-        "install_transcripts.sh: cannot make folder /home/amin/.claude;"
+        "install_transcripts.sh: cannot make folder /home/demo/.claude;"
         " no file installed"
     )
     _SAID = f"{_REFUSED}\n{remote_mux.INSTALL_REASON_TAG}Permission denied"
@@ -2370,7 +2370,7 @@ def memory_only(api_repo, tmp_config):
 def node_answers(monkeypatch):
     """A reachable @second: records each remote step in order."""
     events: list[tuple[object, ...]] = []
-    monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+    monkeypatch.setattr("magent.env.local_username", lambda: "demo")
 
     def _final_pull(config, name, *, wait_s=None, local_user=None):
         events.append(("pull", name, local_user))
@@ -2407,7 +2407,7 @@ def node_is_gone(monkeypatch, request):
             ("ssh", "devino-second"),
         )
 
-    monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+    monkeypatch.setattr("magent.env.local_username", lambda: "demo")
     monkeypatch.setattr(node_sync, "final_pull", _gone)
     monkeypatch.setattr(remote_mux, "repo_status", _gone)
     # kill_session never raises (D); an unreachable node is never asked anyway.
@@ -2492,7 +2492,7 @@ class TestRecallLocal:
         # node_sync.final_pull holds the daemon's per-node lock; the fixture
         # makes a bare remote_mux.pull fail the recall (DECISION-26 xi).
         assert result.exit_code == 0
-        assert node_answers[0] == ("pull", "api", "amin")
+        assert node_answers[0] == ("pull", "api", "demo")
 
     def test_a_daemon_holding_the_node_stops_the_recall_before_anything_is_touched(
         self, runner, placed_api, node_answers, monkeypatch
@@ -2864,7 +2864,7 @@ class TestTheLastPullMustFinish:
                     "now": NOW,
                     "sessions": ("api",),
                     "sample": None,
-                    "realpaths": {"api": "/home/amin/magent/api"},
+                    "realpaths": {"api": "/home/demo/magent/api"},
                     "state_files": {},
                     "files": (),
                     "failed_sids": frozenset(),
@@ -3004,7 +3004,7 @@ class TestTheLastPullMustFinish:
         owed file; the second, cut again without moving the mark, stops the
         recall; the rerun asks from that same point and finishes."""
         monkeypatch.setattr(node_sync, "final_pull", _REAL_FINAL_PULL)
-        real = "/home/amin/magent/api"
+        real = "/home/demo/magent/api"
         nodes.write_json_atomic(
             nodes.pull_marks_path("second"), {"api": {"since": 10.0, "realpath": real}}
         )
@@ -3137,7 +3137,7 @@ class TestTheLastPullMustFinish:
 
         def _refused(*a, **k):
             raise remote_mux.PullRefused(
-                "a refusal made on this PC", ("ssh", "amin@devino-second")
+                "a refusal made on this PC", ("ssh", "demo@devino-second")
             )
 
         monkeypatch.setattr(node_sync, "final_pull", _refused)
@@ -3437,7 +3437,7 @@ class TestRecallReadsTheNodeMapAsUntrusted:
         def _refused(node, root, *, timeout_s):
             raise nodes.NodeConfigError(f"session root {root!r} is not absolute")
 
-        monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+        monkeypatch.setattr("magent.env.local_username", lambda: "demo")
         monkeypatch.setattr(
             node_sync,
             "final_pull",
@@ -3771,13 +3771,13 @@ class TestTheResumeWorksInEveryShell:
     @pytest.mark.parametrize(
         ("target", "here", "hint"),
         [
-            ("D:/work/api", "C:/Users/amin", True),
-            ("C:/work/api", "c:/Users/amin", False),
+            ("D:/work/api", "C:/Users/demo", True),
+            ("C:/work/api", "c:/Users/demo", False),
             # cmd cannot sit in a UNC folder at all: `cd /d` would be untrue.
-            ("//server/share/api", "C:/Users/amin", False),
+            ("//server/share/api", "C:/Users/demo", False),
             ("D:/work/api", None, True),
-            ("/home/amin/api", "/tmp", False),
-            ("/home/amin/api", None, False),
+            ("/home/demo/api", "/tmp", False),
+            ("/home/demo/api", None, False),
         ],
         ids=[
             "other-drive",
@@ -3991,7 +3991,7 @@ class TestRecallLocalFailureBranches:
     ):
         result = _recall(runner, placed_api, "--local")
         assert "may still be running on @second" in result.stdout
-        assert "ssh amin@devino-second" not in result.stdout
+        assert "ssh demo@devino-second" not in result.stdout
 
     def test_k11_the_default_tool_counts_for_the_claude_only_rule(
         self, runner, api_repo, tmp_config, node_answers
@@ -4020,7 +4020,7 @@ class TestRecallLocalFailureBranches:
 
 
 # pullable_sid lets ', $, ` and ! through -- psmux.session_name turns a title
-# like "Amin's site" into Amin's-site -- so the printed stop command must never
+# like "Demo's site" into Demo's-site -- so the printed stop command must never
 # paste a sid raw inside a shell's quotes (spec-G14 P1).
 _UNQUOTABLE_SIDS = ["it's", "a$(id)b", "a`id`b", "a!b"]
 
@@ -4051,12 +4051,12 @@ class TestTheStopCommandIsSafeToPaste:
 
     @pytest.mark.parametrize("sid", _UNQUOTABLE_SIDS)
     def test_such_a_sid_is_never_put_inside_an_ssh_one_liner(self, sid):
-        hint = node_cmd._kill_hint("amin@devino-second", sid)
+        hint = node_cmd._kill_hint("demo@devino-second", sid)
 
         # Inside the ssh line's double quotes, the LOCAL shell would run $(id)
         # or `id` and a ' would leave the remote quote open: two steps instead.
         assert '"' not in hint
-        assert "ssh amin@devino-second" in hint
+        assert "ssh demo@devino-second" in hint
         assert shlex.split(_kill_command(hint)) == _kill_argv(sid)
 
     def test_a_plain_sid_keeps_the_plans_exact_lines(self):
@@ -4064,8 +4064,8 @@ class TestTheStopCommandIsSafeToPaste:
 
         assert node_cmd._kill_hint(None, "api") == f"stop it there with: {kill}"
         assert (
-            node_cmd._kill_hint("amin@devino-second", "api")
-            == f'stop it with: ssh amin@devino-second "{kill}"'
+            node_cmd._kill_hint("demo@devino-second", "api")
+            == f'stop it with: ssh demo@devino-second "{kill}"'
         )
 
     @pytest.mark.parametrize("sid", _UNQUOTABLE_SIDS)
@@ -4105,7 +4105,7 @@ class TestTheStopCommandIsSafeToPaste:
 
         assert result.exit_code == 0
         assert ' "tmux' not in result.stdout
-        assert "ssh amin@devino-second, then run on the node" in result.stdout
+        assert "ssh demo@devino-second, then run on the node" in result.stdout
         assert shlex.split(_kill_command(result.stdout)) == _kill_argv(sid)
 
 
@@ -4214,8 +4214,8 @@ class TestRecallShowsTheMapsSidAsPrintableAscii:
 
 
 def _landed() -> str:
-    encoded = nodes.encoded_project_dir("/home/amin/magent/api")
-    return f"/home/amin/.claude/projects/{encoded}"
+    encoded = nodes.encoded_project_dir("/home/demo/magent/api")
+    return f"/home/demo/.claude/projects/{encoded}"
 
 
 # The real one, for a test that puts it back under `moving`'s stub.
@@ -4242,7 +4242,7 @@ def moving(monkeypatch, api_repo, sync_starts):
     events: list[tuple[object, ...]] = []
     state = LocalGitState(
         path=api_repo,
-        url="git@github.com:amin/api.git",
+        url="git@github.com:demo/api.git",
         branch="main",
         dirty=False,
         unpushed=False,
@@ -4290,7 +4290,7 @@ class TestRecallTo:
         cfg = pool("second", "third")
         proj = ProjectConfig(path=str(state.path), title="api", node="third")
         remote_root = launch.node_recipe(
-            cfg, proj, nodes.node_for_nick(cfg, "third", local_user="amin"), [state]
+            cfg, proj, nodes.node_for_nick(cfg, "third", local_user="demo"), [state]
         ).remote_root
         assert result.exit_code == 0
         assert events == [
@@ -4465,14 +4465,14 @@ class TestRecallTo:
         # refusal and the script's line; the OS's reason is nodes.log's.
         caplog.set_level(logging.WARNING, logger="magent.nodes")
         refused = (
-            "install_transcripts.sh: cannot make folder /home/amin/.claude;"
+            "install_transcripts.sh: cannot make folder /home/demo/.claude;"
             " no file installed"
         )
 
         def _run_script(node, script, args, *, timeout_s, stdin=None, **_k):
             if script == "node_realpath":
                 return subprocess.CompletedProcess(
-                    [], 0, b"/home/amin/magent/api\n", b""
+                    [], 0, b"/home/demo/magent/api\n", b""
                 )
             raise remote_mux.RemoteError(
                 5,
@@ -4753,7 +4753,7 @@ class TestRecallTo:
         # The landed path and the kept names are the node's reply: ESC and
         # non-ASCII never reach this terminal (node_sync.printable).
         installed = remote_mux.InstalledTranscripts(
-            landed="/home/amin/.claude/projects/\x1b[31mapi",
+            landed="/home/demo/.claude/projects/\x1b[31mapi",
             kept=("\u00e9t\u00e9.jsonl",),
         )
         monkeypatch.setattr(
@@ -4766,7 +4766,7 @@ class TestRecallTo:
 
         assert result.exit_code == 0
         assert "\x1b" not in result.output
-        assert "in /home/amin/.claude/projects/?[31mapi" in result.stdout
+        assert "in /home/demo/.claude/projects/?[31mapi" in result.stdout
         assert "copy of 1 item(s): ?t?.jsonl" in result.stdout
 
     def test_a_failed_bring_up_shows_the_nodes_words_as_printable_ascii(
@@ -5197,7 +5197,7 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
 def _git_state(path: Path) -> LocalGitState:
     return LocalGitState(
         path=path,
-        url=f"git@github.com:amin/{path.name}.git",
+        url=f"git@github.com:demo/{path.name}.git",
         branch="main",
         dirty=False,
         unpushed=False,
@@ -5219,7 +5219,7 @@ def pipeline(monkeypatch, api_repo):
     monkeypatch.setattr(launch, "_provision_once", lambda node, config: None)
     monkeypatch.setattr(attach_client, "spawn_attach_window", lambda *a, **k: 4242)
     monkeypatch.setattr(launch, "ensure_node_sync", lambda *a, **k: True)
-    monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+    monkeypatch.setattr("magent.env.local_username", lambda: "demo")
 
     def _bring_up(node, recipe, *, resume_id=None, **_k):
         calls.append({"nick": node.nick, "sid": recipe.sid, "resume_id": resume_id})
@@ -5227,7 +5227,7 @@ def pipeline(monkeypatch, api_repo):
             sid=recipe.sid,
             attached_existing=False,
             commits={recipe.sid: "a" * 40},
-            cwd=f"/home/amin/magent/{recipe.sid}",
+            cwd=f"/home/demo/magent/{recipe.sid}",
             dirty={recipe.sid: False},
         )
 

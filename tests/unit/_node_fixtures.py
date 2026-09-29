@@ -62,7 +62,7 @@ def pool(*nicks: str, projects: list[ProjectConfig] | None = None) -> MagentConf
         projects=projects or [],
         settings=Settings(
             nodes={
-                n: NodeConfig(nick=n, host=f"devino-{n}", user="amin") for n in nicks
+                n: NodeConfig(nick=n, host=f"devino-{n}", user="demo") for n in nicks
             }
         ),
     )
@@ -75,7 +75,7 @@ def config_json(
     return {
         "version": SCHEMA_VERSION,
         "settings": {
-            "nodes": {n: {"host": f"devino-{n}", "user": "amin"} for n in nicks}
+            "nodes": {n: {"host": f"devino-{n}", "user": "demo"} for n in nicks}
         },
         "projects": projects,
     }
@@ -89,8 +89,8 @@ def entry(nick: str, sid: str = "api") -> nodes.NodeMapEntry:
         placed_ts=NOW,
         attached_existing=False,
         remote_root=f"~/magent/{sid}",
-        target=f"amin@devino-{nick}",
-        cwd=f"/home/amin/magent/{sid}",
+        target=f"demo@devino-{nick}",
+        cwd=f"/home/demo/magent/{sid}",
     )
 
 
@@ -103,7 +103,7 @@ def write_transcript(nick: str, sid: str, session_id: str, *, mtime: float) -> P
     record = {
         "type": "user",
         "sessionId": session_id,
-        "cwd": f"/home/amin/magent/{sid}",
+        "cwd": f"/home/demo/magent/{sid}",
     }
     path.write_text(json.dumps(record) + "\n", encoding="utf-8")
     os.utime(path, (mtime, mtime))
