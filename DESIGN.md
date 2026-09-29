@@ -1977,28 +1977,32 @@ folder and pick the conversation from the list; with no id it prints plain
 
 Ordered roughly by how likely a future change is to collide with it.
 
-**`node setup` keeps two node-key edges (2026-09-27):** `setup.sh`'s
-`user_node_key` refuses a symlinked `~/.ssh` or `~/.ssh/id_ed25519` and makes
-the key 0600 on every run (F-ACL-1: a default ACL overrides the umask, so
-ssh-keygen can leave a new key 0644). Two edges of that were left as they are on
-purpose.
+**`node setup` keeps one node-key edge (2026-09-27; a second, the dangling
+`.pub`, closed 2026-09-28):** `setup.sh`'s `user_node_key` refuses a symlinked
+`~/.ssh` or `~/.ssh/id_ed25519` and makes the key 0600 on every run (F-ACL-1: a
+default ACL overrides the umask, so ssh-keygen can leave a new key 0644). One
+edge of that is left as it is on purpose.
 
-*A dangling `.pub` link is still written through.* The refusal covers `~/.ssh`
-and the private key, not `id_ed25519.pub`. The derive branch's `> "$id.pub"` and
-ssh-keygen's own `.pub` write at generation run whenever no `.pub` resolves, so
-a dangling link there has its target created (a live one is only read). The
-content is a public key and the phase runs as the user, never root, so nothing
-crosses a privilege line, but the row's "magent does not write through it" does
-not hold for that one file. Closing it means adding `$id.pub` to the refusal,
-which would also turn a live symlinked `.pub` into a fail row: the same trade as
-the next item.
+*Closed: a dangling `.pub` link is refused, not written through.* The derive
+branch's `> "$id.pub"` and ssh-keygen's own `.pub` write at generation run
+whenever no `.pub` resolves, so a dangling link there used to have its target
+created. `user_node_key` now refuses a `.pub` that is a link and does not
+resolve (`[ -h "$id.pub" ] && [ ! -e "$id.pub" ]`) with its own fail row and
+rc 1, before either write. The key's chmod still runs first, and the row
+carries its repair note. Only the dangling case is refused, so the trade this
+entry first named (adding `$id.pub` to the symlink refusal would fail a live
+link too) was never forced: a live symlinked `.pub` is only read and stays
+`skip` + `key`. Pins: `tests/unit/test_node_provision.py::
+TestSetupShUnderRealBash::test_a_dangling_node_key_pub_is_never_written_through`
+and `::test_a_live_symlinked_node_key_pub_is_only_read`.
 
 *A dotfile-managed key now fails setup.* A node whose `~/.ssh/id_ed25519` is a
 symlink to a 0600 key (a dotfile manager's layout) went `skip` + `key` before
 F-ACL-1 and now fails every `node setup` with rc 1. That is deliberate: the
 key's chmod runs on every run and is never done through a link, the rule
 `user_authorized` already applies to `authorized_keys`. The fail row names the
-symlink, so the user knows what to change.
+symlink, so the user knows what to change. Pin: `TestSetupShUnderRealBash::
+test_a_symlinked_node_key_never_reaches_its_target`.
 
 **Typed text cannot be delivered through a nested ConPTY over `ssh -t`
 (2026-08-18):** `tests/e2e/test_ssh_real.py::test_typed_text_survives_a_real
