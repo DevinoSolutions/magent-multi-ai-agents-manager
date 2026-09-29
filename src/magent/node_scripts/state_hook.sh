@@ -4,8 +4,9 @@
 # writes ~/.magent/state/<key>.json in agent_state's record schema, which the
 # PC's node sync daemon pulls home. Installed by provision as
 # ~/.magent/bin/state-hook.sh. It must never fail the agent's turn: every fault
-# exits 0. The Python below mirrors state_hook.handle_claude line for line;
-# tests/unit/test_state_hook_sh.py runs both on the same events.
+# exits 0. The Python below mirrors state_hook.handle_claude line for line,
+# with one deliberate difference: read_state also treats a RecursionError as
+# no record. tests/unit/test_state_hook_sh.py runs both on the same events.
 set -euo pipefail
 
 IFS= read -r -d '' MAGENT_STATE_HOOK_PY <<'MAGENT_STATE_HOOK_PY' || true
