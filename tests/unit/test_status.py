@@ -590,6 +590,21 @@ class TestMenuUpReportsCasualties:
         assert why in out
         assert "S0-NOTE" in out
 
+    def test_the_casualty_block_is_byte_for_byte(self, monkeypatch, tmp_config, capsys):
+        # Characterization: the whole block, in order -- the count and names
+        # with the local log hint, one dimmed line per KNOWN reason (none for
+        # an empty one), then the Session-0 note.
+        why = "could not tell whether web is running (has-session gave no answer)"
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+        self._drive(monkeypatch, tmp_config, created=[], failed={"api": "", "web": why})
+        out = capsys.readouterr().out
+        assert (
+            "  x 2 session(s) failed to come up: api, web"
+            " (see ~/.magent/logs/launch.log)\n"
+            f"    {why}\n"
+            "  S0-NOTE\n"
+        ) in out
+
     def test_a_clean_wave_says_nothing_about_failures(
         self, monkeypatch, tmp_config, capsys
     ):

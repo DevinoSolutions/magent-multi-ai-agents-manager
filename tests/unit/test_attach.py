@@ -1096,6 +1096,23 @@ class TestUpReportsCasualties:
         assert why in result.output
         assert "S0-NOTE" in result.output
 
+    def test_the_casualty_block_is_byte_for_byte(self, runner, tmp_path, monkeypatch):
+        # Characterization: the whole block, in order -- the count and names
+        # with the host's log hint, one dimmed line per KNOWN reason (none for
+        # an empty one), then the Session-0 note.
+        why = "could not tell whether web is running (has-session gave no answer)"
+        self._patch(monkeypatch, created=[], failed={"api": "", "web": why})
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+        assert result.exit_code == 0
+        assert (
+            "  + Brought up 0 session(s): (none)\n"
+            "  x 2 session(s) failed to come up: api, web"
+            " (see ~/.magent/logs/launch.log on the host)\n"
+            f"    {why}\n"
+            "  S0-NOTE\n"
+        ) in result.output
+
     def test_a_clean_wave_says_nothing_about_failures(
         self, runner, tmp_path, monkeypatch
     ):

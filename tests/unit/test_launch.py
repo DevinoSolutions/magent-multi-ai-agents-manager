@@ -558,6 +558,28 @@ class TestGoPathCreationVerify:
         assert why in out
         assert "S0-NOTE" in out
 
+    def test_the_casualty_block_is_byte_for_byte(self, monkeypatch, capsys):
+        # Characterization: the whole block, in order -- a blank line, the
+        # count and names with the local log hint, one dimmed line per KNOWN
+        # reason (none for an empty one), then the Session-0 note.
+        why = "could not tell whether b is running (has-session gave no answer)"
+        plat = FakePlatform(supports_psmux=True)
+        monkeypatch.setattr(
+            "magent.psmux.launch_verified", lambda _p, _w: {"a": "", "b": why}
+        )
+        monkeypatch.setattr("magent.launch.session0_note", lambda: "S0-NOTE")
+
+        self._run(monkeypatch, missing=[], plat=plat)
+
+        out = capsys.readouterr().out
+        assert out.startswith(
+            "\n"
+            "  x 2 session(s) failed to come up: a, b"
+            " (see ~/.magent/logs/launch.log)\n"
+            f"    {why}\n"
+            "  S0-NOTE\n"
+        ), out
+
 
 class TestHotkeyRestartReason:
     """The keep-or-restart decision for an already-running Alt+V/F2 listener.
