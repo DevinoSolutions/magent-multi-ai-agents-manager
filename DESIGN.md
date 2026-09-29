@@ -1914,6 +1914,100 @@ private socket (CI's Windows platform leg only),
 `tests/platform/test_real_psmux.py::
 test_real_pane_reads_idle_only_while_nothing_it_launched_runs`.
 
+### The bring-up never waits forever, and a probe with no answer is not an absent session (2026-09-29)
+
+`WindowsPlatform.launch_psmux_session` is the one call that creates psmux
+sessions, and every path reaches it through `psmux.launch_verified`: `--go`,
+the menu's "u", and `magent up`, which is also the host side of `magent attach`.
+It ran six client fan-outs: the has-session dedupe, kill-server, new-session,
+send-keys, the send verifier's re-sends and the status-line decorations. Each
+ended in a bare `p.wait()`. The wedge described in "Doctor names the wedge"
+above makes every psmux control command hang forever. So one wedged socket held
+the whole bring-up forever. It held every later wave with it, and over ssh the
+attach's read of the host timed out with nothing to show for it.
+
+**One deadline per fan-out.** Every wait is now `psmux.await_clients`: one
+deadline for the whole set, not one per client. With a timeout per client, N
+hung clients cost N budgets, which is the `_display_fan_out` lesson. A client
+still running at the deadline is killed and reaped. The reap is itself bounded
+(`_REAP_TIMEOUT_S`), because a timeout must not leave its own unbounded wait
+behind. A client that exited before the deadline still hands over its code. The
+clients are spawned with `DEVNULL` stdio, because `capture_output` is not a
+bound on Windows (see the 90s answer to a 5s timeout above). Every budget is
+per fan-out and has a measurement behind it:
+
+- the dedupe and the kill-server get 30s each (`_DEDUPE_TIMEOUT_S` /
+  `_CLEAR_TIMEOUT_S`). That is 1.5x the ~19s measured for one 46-socket
+  has-session fan-out on a loaded host.
+- new-session and send-keys get 60s per wave (`_CREATE_TIMEOUT_S` /
+  `_SEND_TIMEOUT_S`). That is `upload_server.INJECT_TIMEOUT_S`, the
+  product's one-attempt ceiling. A healthy new-session was measured at 892ms,
+  and in the wedge it never finished. A send-keys against a busy socket was
+  measured from 3s to past 70s. A send that is killed is never re-sent, because
+  it may still have landed, and a second copy would type the command into a
+  running agent. This is the paste's double-delivery law.
+- the decorations get `SEND_KEYS_TIMEOUT_S` (20s). They are cosmetic.
+
+The total is bounded, not fast: about 30 + 30 s, plus per wave 60 + 10
+(panes-ready) + 60 s plus the verify.
+
+**The dedupe has three answers.** `psmux.probe_sessions` answers `live`,
+`absent` or `unknown`. `has_session` and `live_sessions` fold "never answered"
+into "not live". That is the right fold for a status table. It is the wrong
+fold for a bring-up, because there "not live" leads to kill-server and a fresh
+new-session. Only `absent` (has-session answered, non-zero) may lead to either.
+A probe that timed out, or could not even be spawned, is `unknown`. That window
+is refused with the reason "could not tell whether <name> is running". It gets
+no kill-server, no new-session and no send-keys.
+
+**Why unknown is never killed.** When the wedge was cleared, every session
+probed alive. The sockets that had stopped answering were frozen LIVE agents,
+not dead ones. A bring-up that reads silence as absence kills and re-creates
+each of them. That is the mass restart "Doctor names the wedge" exists to talk a
+human out of, done automatically, and it throws away every agent's running turn
+and context. The two errors have different costs. A false "unknown" costs one
+report line, and the next `up` asks again. A false "absent" destroys a live
+agent. This is the same asymmetry as the idle rule above: when the state cannot
+be proven, the bring-up does not act.
+
+The same rule covers the other two waits:
+
+- A kill-server that never answered means the old server may still hold the
+  name, so nothing is created on top of it.
+- A new-session that outran its wave is refused for that window alone. The rest
+  of the wave and every later wave carry on, exactly as a psmux refusal (rc 1)
+  already did.
+
+**The reason reaches the human.** `launch_psmux_session` returns
+`{name: reason}`. `launch_verified` merges it into its own report, and `bring_up`
+returns `(created, {name: reason})`. The three "N session(s) failed to come up"
+printers (`launch.py`, `cli/status.py`, `cli/attach.py`) print each reason under
+that line, dimmed. `launch.session0_note()` still follows on all three.
+
+`launch_verified` does not respawn a refused name that its verify also misses.
+The respawn would only repeat the wait that failed, and on a wedged socket it
+would double that wait. A name that is merely missing is still respawned. That
+stays safe because the respawn goes back through the tri-state dedupe:
+"unknown" is safe to ask about again, and not safe to kill, re-create or type
+into.
+
+Pins: `tests/unit/test_bringup_bounded_waits.py` runs against a real executable
+named `psmux` on a tmp PATH. It records every argv and hangs the verb/name pairs
+each test chooses. On Windows it dies with its `.cmd` launcher, so "killed" is
+observable. The pins cover:
+
+- the three answers;
+- one budget for N hung clients;
+- a dedupe hang, a kill-server hang and a stuck new-session, each through the
+  real `WindowsPlatform` bring-up;
+- `launch_verified` reporting the unknown name with its reason.
+
+They run at shrunk budgets. `TestTheProductionBudgets` pins the real ones. The
+three printers are pinned by `test_a_refused_session_says_why` in
+`test_attach.py` and `test_status.py`, and by
+`test_launch.py::TestGoPathCreationVerify`. The residuals are in the known-debt
+ledger.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
@@ -1939,6 +2033,40 @@ guarantee this test exists for is still covered on Windows by
 by cell, and the test itself runs for real on ubuntu and macOS. Worth trying
 next: pywinpty's WinPTY back end (`PtyProcess.spawn(backend=Backend.WinPTY)`),
 which predates win32-input-mode and may pass the CR through unencoded.
+
+**What the bounded bring-up still leaves open (2026-09-29):** there are three
+residuals of "The bring-up never waits forever" in §2. Each was found by reading
+the code. None has been seen on the fleet.
+
+1. *A timed-out new-session may still produce its session.* The psmux server
+   is a grandchild that the one-shot client forks (the reason priority is a
+   sweep, §2). Killing the client at `_CREATE_TIMEOUT_S` therefore need not
+   stop a server that was already forked. The window is refused and its
+   send-keys skipped. If the server comes up after all, `launch_verified`'s
+   probe finds it live and counts it created, and it sits at a bare shell with
+   no agent command. The next `magent up --revive`, or the interactive `up`,
+   repairs that. `--go` never revives, so it does not. Healthy creation measured 892ms against the
+   60s budget, so this needs a creation that is slow and not wedged.
+2. *Four helpers on the bring-up path are bounded only on paper on Windows.*
+   `has_session`, `kill_server`, `send_keys` and `capture_pane` still use
+   `subprocess.run(capture_output=True, timeout=…)`. That is the shape measured
+   answering a 5s timeout in 90s ("Doctor names the wedge", §2), because
+   `communicate()` waits on pipes a grandchild still holds. The bring-up reaches
+   `capture_pane` through `_wait_for_panes_ready`, which makes one call per
+   window, serially. Its 10s batch deadline is checked only between calls, so
+   it cannot cut one short. It reaches `has_session` through
+   `launch_verified`'s creation probe (`_CREATE_PROBE_TIMEOUT_S`, 3s, 16
+   workers). A wedged socket that leaves a
+   grandchild behind can hold each such call for as long as the grandchild
+   lives. The fix is the one `probe_control_plane` took: discard what is not
+   read, and bound what is read without `communicate()`.
+3. *`live_sessions` with a `timeout` pays it once per probe, in turn.*
+   `_probe_live` waits `proc.wait(timeout=timeout)` client by client, so N hung
+   probes cost N x timeout. It `kill()`s a timed-out probe without reaping it.
+   The default (`timeout=None`, unbounded) is deliberate for status, down and
+   the picker, because a slow server (~19s for 46 sockets) must not read dead.
+   So this only bites a caller that passes a timeout. `await_clients` is the
+   drop-in shape.
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
