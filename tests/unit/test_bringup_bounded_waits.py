@@ -383,9 +383,13 @@ class _Fake:
         running (killing the .cmd leaves the interpreter), so it can publish
         its stall AND its end after a first read. Counting one snapshot
         against a later one failed 5 of 150 loaded runs (6 ends, 5 stalls).
+        For the same reason no stall yet, or a live client still on its way to
+        its stall, is not settled: killed while booting, every client can
+        reach its hang only after the product has answered.
         """
         deadline = time.monotonic() + _GONE_GRACE_S
         while True:
+            calls = self._by_stem("calls")
             stalls = self._by_stem("stalls")
             ends = self._by_stem("ends")
             running = {
@@ -397,7 +401,13 @@ class _Fake:
             unended = [
                 stem for stem in stalls if sys.platform == "win32" and stem not in ends
             ]
-            if (not running and not unended) or time.monotonic() >= deadline:
+            booting = [
+                stem
+                for stem, c in calls.items()
+                if stem not in stalls and pid_alive(int(c["pid"]))
+            ]
+            settled = stalls and not running and not unended and not booting
+            if settled or time.monotonic() >= deadline:
                 break
             time.sleep(0.1)
         assert stalls, "the pin never reached its hanging client"
