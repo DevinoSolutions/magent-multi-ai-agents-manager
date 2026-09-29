@@ -282,7 +282,12 @@ def stepped_clock(monkeypatch):
     _fake_ssh.py): a flood pin's first words come before the cap on any
     platform's clock. remote_mux reads ``time.monotonic`` alone, so the
     stand-in carries only that -- any other ``time`` use there would fail
-    loudly, never read the real clock."""
+    loudly, never read the real clock.
+
+    Flood pins only: ``_finish``'s deadline reads this same clock, so a call
+    that does NOT pass the cap finds its whole bound spent at the next read
+    (``deadline - 1000.0`` is below zero) and stops waiting on its drains
+    and the child at once -- a false timeout, not the reply."""
     clock = SteppedClock()
     monkeypatch.setattr(
         "magent.remote_mux.time", types.SimpleNamespace(monotonic=clock.monotonic)
