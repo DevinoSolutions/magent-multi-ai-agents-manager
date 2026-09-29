@@ -118,6 +118,14 @@ def hangs():
     return False
 
 
+state = os.path.join(BASE, "state")
+os.makedirs(state, exist_ok=True)
+marker = os.path.join(state, name or "_")
+if verb == "new-session" and name in rules["late"]:
+    # The session is born, then the client never answers: psmux created it
+    # after the bring-up's wait had already given up on it.
+    open(marker, "w").close()
+
 if hangs():
     put("stalls", me, {{"pid": os.getpid(), "ppid": os.getppid(), "argv": argv}})
     if sys.platform == "win32":
@@ -148,9 +156,6 @@ if hangs():
     put("ends", me, {{"how": "released"}})
     sys.exit(0)
 
-state = os.path.join(BASE, "state")
-os.makedirs(state, exist_ok=True)
-marker = os.path.join(state, name or "_")
 if verb == "has-session":
     sys.exit(0 if name in rules["live"] or os.path.exists(marker) else 1)
 if verb == "kill-server":
@@ -204,6 +209,7 @@ class _Fake:
         hang: tuple[tuple[str, str] | tuple[str, str, int], ...] = (),
         live: tuple[str, ...] = (),
         bare: tuple[str, ...] = (),
+        late: tuple[str, ...] = (),
     ) -> None:
         self.base = base
         self.bin_dir = base / "bin"
@@ -214,6 +220,7 @@ class _Fake:
                     "hang": [list(h) for h in hang],
                     "live": list(live),
                     "bare": list(bare),
+                    "late": list(late),
                 }
             ),
             encoding="utf-8",
@@ -613,6 +620,32 @@ class TestTheBringUpNeverWaitsForever:
         assert fake.issued("send-keys", "api")
         fake.assert_no_client_left_behind()
 
+    def test_a_session_created_after_its_wait_gave_up_stays_failed(
+        self, fake_psmux, shrunk
+    ):
+        # psmux creates `web` only after the wave's deadline killed its
+        # new-session client, so the verify finds it LIVE -- but no agent
+        # command was ever typed into it. Counting it as brought up hands the
+        # user a bare shell under a success line; it stays failed, says why,
+        # and is not respawned on top of itself.
+        from magent.platform.windows import WindowsPlatform
+
+        fake = fake_psmux(hang=(("new-session", "web"),), late=("web",))
+        failed = _within(
+            _BUDGET_S,
+            fake,
+            lambda: psmux.launch_verified(WindowsPlatform(), _windows(["api", "web"])),
+        )
+
+        assert list(failed) == ["web"]
+        assert "new-session" in failed["web"]
+        assert "answers now" in failed["web"]
+        assert "magent up" in failed["web"]
+        assert len(fake.issued("new-session", "web")) == 1
+        assert fake.issued("send-keys", "web") == []
+        assert fake.issued("send-keys", "api")
+        fake.assert_no_client_left_behind()
+
     @staticmethod
     def _bare_panes_read_as_casualties(monkeypatch, windows):
         # The send verifier's REAL verdict over the fake's panes, not the
@@ -723,6 +756,51 @@ class TestTheReasonReachesTheReport:
         assert failed == {"api": "", "web": why}
         assert list(failed) == ["api", "web"]
         assert launches == [["api", "web"], ["api"]]
+
+    def test_a_refused_name_the_verify_finds_live_is_still_reported(
+        self, plat, monkeypatch
+    ):
+        # The platform gave up on `web`'s new-session, and psmux created it
+        # anyway, late: the verify reads it live. It has no agent command, so
+        # it is reported -- with the platform's reason AND what the verify saw
+        # -- and never counted among the sessions brought up.
+        why = "psmux new-session for web gave no answer within 60s"
+        launches: list[list[str]] = []
+
+        def _launch(windows):
+            launches.append([w.window_name for w in windows])
+            plat.psmux_sessions.update(w.window_name for w in windows)
+            return {"web": why}
+
+        monkeypatch.setattr(plat, "launch_psmux_session", _launch)
+        failed = psmux.launch_verified(plat, _windows(["api", "web"]))
+
+        assert list(failed) == ["web"]
+        assert failed["web"].startswith(why)
+        assert "answers now" in failed["web"]
+        assert "magent up" in failed["web"]
+        assert launches == [["api", "web"]]
+
+    def test_bring_up_never_counts_a_late_session_as_created(self, plat, monkeypatch):
+        why = "psmux new-session for web gave no answer within 60s"
+
+        def _launch(windows):
+            plat.psmux_sessions.update(w.window_name for w in windows)
+            return {"web": why}
+
+        monkeypatch.setattr(plat, "launch_psmux_session", _launch)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: plat)
+        monkeypatch.setattr(
+            psmux,
+            "eligible_projects",
+            lambda _cfg, _group: [
+                {"session": n, "resolved": ".", "cmd": "claude"} for n in ("api", "web")
+            ],
+        )
+        created, failed = psmux.bring_up(object())
+
+        assert created == ["api"]
+        assert list(failed) == ["web"]
 
     def test_a_merely_missing_name_is_still_respawned_and_carries_no_reason(self, plat):
         plat._psmux_launch_failures = {"web"}

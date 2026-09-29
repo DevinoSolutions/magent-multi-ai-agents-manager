@@ -1731,6 +1731,15 @@ def _missing_sessions(names: list[str], binary: str) -> list[str]:
     return [n for n, ok in zip(names, flags, strict=True) if not ok]
 
 
+# Appended to a refusal whose session the verify then found live: the refused
+# client did its job after all, too late for this bring-up to start the agent.
+# `magent up` revives a live session that rests at its shell.
+_LATE_LIVE = (
+    "; it answers now, but this bring-up typed no agent command into it"
+    " -- run `magent up` to revive it"
+)
+
+
 def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str, str]:
     """Create ``windows`` through the platform, then prove each session exists.
 
@@ -1759,6 +1768,13 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str,
     also misses it: the respawn would only repeat the wait that failed, and on
     a wedged socket double it. It is reported with the platform's reason.
 
+    A refusal is final even when the verify finds that session LIVE. A
+    new-session killed at its deadline can still have created the session
+    late, and then nothing ever typed the agent command into it: counted as
+    brought up, it is a bare shell under a success line (``--go`` never
+    revives). So it stays in the report, its reason extended by what the
+    verify saw (``_LATE_LIVE``).
+
     Never raises out of the verify -- and, since v3.10.10, never raises out of
     the CREATION either: one stuck session must not cost the wave its remaining
     ones. The first ``launch_psmux_session`` was the one call here left
@@ -1769,10 +1785,10 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str,
     below, which is the component that already knows how to respawn what is
     missing and report what stayed down.
 
-    Returns the sessions still missing after the one retry, in input order,
-    each mapped to why: the platform's refusal reason, or ``""`` when the log
-    is the only account (the Session-0 refusal is named by the printers via
-    ``launch.session0_note``).
+    Returns the sessions still missing after the one retry, plus every name
+    the platform refused, in input order, each mapped to why: the platform's
+    refusal reason, or ``""`` when the log is the only account (the Session-0
+    refusal is named by the printers via ``launch.session0_note``).
     """
     if not windows:
         return {}
@@ -1815,15 +1831,25 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str,
 
     def _report(down: list[str]) -> dict[str, str]:
         gone = set(down)
-        return {n: refused.get(n, "") for n in names if n in gone}
+        late = [n for n in names if n in refused and n not in gone]
+        if late:
+            log.warning(
+                "refused %s, which answers now: left without its agent command",
+                ", ".join(late),
+            )
+        return {
+            n: refused[n] + _LATE_LIVE
+            if n in refused and n not in gone
+            # ...and the missing ones, refused or not, as the platform left them.
+            else refused.get(n, "")
+            for n in names
+            if n in gone or n in refused
+        }
 
     # Settle first: the storm's timeouts were transient churn, and probing at
     # t=0 would misclassify slow-but-fine servers on a loaded host.
     time.sleep(_CREATE_VERIFY_SETTLE_S)
     missing = _missing_sessions(names, binary)
-    if not missing:
-        return {}
-
     respawn = [n for n in missing if n not in refused]
     if not respawn:
         return _report(missing)
