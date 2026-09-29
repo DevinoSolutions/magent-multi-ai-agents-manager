@@ -3531,6 +3531,18 @@ class TestWhatCountsAsUnreachable:
             "node second: failed (boom): cannot write\\nboom"
         ]
 
+    def test_an_unreachable_node_logs_its_last_line_alone(self, placed, caplog):
+        # The tail is a FAILED node's extra: an ssh banner ahead of the real
+        # refusal stays out of an unreachable node's line.
+        _capture_nodes_log(caplog)
+        err = remote_mux.RemoteError(
+            255, "banner\nPermission denied (publickey).", ("ssh",)
+        )
+        node_sync.NodeSyncer(_config(), pull=_pull_raising({"second": err})).tick()
+        assert _node_warnings(caplog, "second") == [
+            "node second: unreachable (Permission denied (publickey).)"
+        ]
+
     def test_only_the_flag_marks_an_over_cap_reply_never_the_text(self):
         """A node whose stderr merely STARTS with the cap's wording is not an
         over-cap reply: the detail stays its last line."""
