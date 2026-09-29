@@ -761,11 +761,22 @@ class TestRunOnDesktopOnWindows:
         assert "-ExecutionPolicy Bypass" in run_spec
         assert run_spec.endswith('run.ps1"')
 
-    def test_a_slow_command_times_out_without_a_fabricated_code(self, fake_schtasks):
+    def test_a_slow_command_times_out_without_a_fabricated_code(
+        self, fake_schtasks, tmp_path
+    ):
+        # The command outlives the budget: a cold powershell takes a second or
+        # more to reach it, and it then sleeps past the deadline before it
+        # leaves its marker. The marker is the proof it was not killed.
+        marker = tmp_path / "finished"
+        code = (
+            "import pathlib, sys, time; "
+            "time.sleep(4); pathlib.Path(sys.argv[1]).touch()"
+        )
         result = self._plat().run_on_desktop(
-            [sys.executable, "-c", "import time; time.sleep(3)"], timeout_s=0.8
+            [sys.executable, "-c", code, str(marker)], timeout_s=3
         )
 
+        assert not marker.exists(), "the command finished inside the budget"
         assert result.timed_out is True
         assert result.rc is None
         # The scratch directory is named, because it is the only evidence left.
@@ -778,6 +789,17 @@ class TestRunOnDesktopOnWindows:
         # doing the work that was asked for, and the pid we hold is a number
         # Windows recycles freely.
         assert "may still be running" in result.detail
+        assert "/End" not in [c[0] for c in _calls(fake_schtasks)]
+        # ...and none happened: the command runs to its end after we stopped
+        # waiting, and the launcher lives to record its real exit code.
+        work = Path(result.detail.rsplit("scratch left at ", 1)[1])
+        rc_file = work / "rc.txt"
+        deadline = time.monotonic() + 60
+        while not rc_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert rc_file.exists(), f"no exit code recorded in {work}"
+        assert rc_file.read_text(encoding="ascii") == "0\n"
+        assert marker.exists()
 
     def test_a_task_that_never_starts_is_not_waited_out(
         self, fake_schtasks, monkeypatch
