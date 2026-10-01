@@ -38,7 +38,9 @@ jobs:
 
   unit-tests:
     name: "Unit Tests (py${{ matrix.python }}, ${{ matrix.os }})"
-    timeout-minutes: 15
+    # Windows runners take 12-14 min for the unit suite alone; at 15 a slow one
+    # was cancelled at 98% with every test passing. The other OSes keep 15.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 25 || 15 }}
     strategy:
       fail-fast: false
       matrix:
