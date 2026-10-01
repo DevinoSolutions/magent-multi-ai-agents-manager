@@ -532,13 +532,24 @@ def sync_lines(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]:
     """This PC's half of a node's health: is the sync daemon alive, and how old
     is the sessions snapshot it last pulled from ``nick``. Reads only."""
     # heavy subsystem: in-body per policy (ssh/tar; --help never pays)
-    from magent import node_sync, nodes
+    from magent import launch, node_sync, nodes
+    from magent.cli.status import _node_sync_state
     from magent.remote_mux import ScriptLine
 
     lines: list[ScriptLine] = []
     state = _daemon_state()
+    # status's verdict, the one "is a sync expected" rule: "off" means nothing
+    # needs syncing, so a leftover heartbeat or an old snapshot is no trouble.
+    idle = _node_sync_state(cfg) == "off"
+    why_idle = (
+        "no node sessions to sync"
+        if launch.node_sync_env_enabled()
+        else "node sync is switched off (MAGENT_NODE_SYNC=0)"
+    )
     if state == "ok":
         lines.append(ScriptLine("ok", "sync-daemon", "running"))
+    elif state == "stale" and idle:
+        lines.append(ScriptLine("skip", "sync-daemon", f"not running -- {why_idle}"))
     elif state == "stale":
         lines.append(
             ScriptLine(
@@ -572,6 +583,15 @@ def sync_lines(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]:
         )
     elif not nodes.sessions_stale(snap, pull_interval_s=interval, now=now):
         lines.append(ScriptLine("ok", "snapshot", f"pulled {age:.0f}s ago"))
+    elif idle:
+        # Nothing is placed on a node, so no session reads this snapshot.
+        lines.append(
+            ScriptLine(
+                "skip",
+                "snapshot",
+                f"pulled {age:.0f}s ago -- not refreshed, {why_idle}",
+            )
+        )
     elif snap.ts > now:
         # sessions_stale reads a ts too far AHEAD as stale as well: this PC's
         # clock went backwards since the pull, it is not an old snapshot.
