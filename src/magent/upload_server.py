@@ -21,13 +21,21 @@ from urllib.parse import parse_qs, urlparse
 
 if TYPE_CHECKING:
     import logging
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 from magent import psmux, tailnet
 from magent.icons import render_icon
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger
-from magent.sessions import FLASH_MSG_MAX, FLASH_TINT_ERR, FLASH_TINT_OK
+from magent.procs import predates_boot
+from magent.sessions import (
+    FLASH_MSG_MAX,
+    FLASH_TINT_ERR,
+    FLASH_TINT_OK,
+    paths_line,
+    upload_limit_text,
+)
+from magent.sessions import MAX_UPLOAD_BYTES as _SHARED_MAX_UPLOAD_BYTES
 
 
 def _pid_path(port: int) -> Path:
@@ -35,14 +43,28 @@ def _pid_path(port: int) -> Path:
 
 
 def server_pid(port: int) -> int | None:
-    """Return the PID of the upload server recorded for this port, if any."""
+    """Return the PID of the upload server recorded for this port, if any.
+
+    A pid file written before the last boot records no server of ours: a
+    restart kills serve without letting it remove the file, and the OS hands
+    pid numbers out again. It is cleared and reads as None, because every
+    reader acts on the number -- `status` (DEAD vs off), `stop_server` (what to
+    taskkill) and the phone-URL port pick. The attention watchdog reads it for
+    its log line only and decides on the port probe alone.
+    """
     p = _pid_path(port)
     if not p.exists():
         return None
     try:
-        return int(p.read_text().strip())
+        pid = int(p.read_text().strip())
+        written = p.stat().st_mtime
     except (ValueError, OSError):
         return None
+    if predates_boot(written):
+        with contextlib.suppress(OSError):
+            p.unlink()
+        return None
+    return pid
 
 
 def stop_server(port: int) -> bool:
@@ -75,8 +97,35 @@ _UPLOAD_DIR = Path.home() / ".magent" / "uploads"
 
 # Memory-exhaustion guard: reject a declared/actual body past this size
 # instead of reading it all into memory. Not an auth control -- just an
-# operability ceiling on the hot path.
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+# operability ceiling on the hot path. Per REQUEST, so an Alt+V press carrying
+# several files shares one budget. The number lives in `magent.sessions`
+# because the Alt+V listener pre-checks it before reading a file off disk.
+MAX_UPLOAD_BYTES = _SHARED_MAX_UPLOAD_BYTES
+
+# The multipart framing a request carries on top of its files: boundaries,
+# each part's headers, the project/inject fields -- a few hundred bytes a file.
+# The limit a user is told is "100 MB of files", and that is what the page and
+# the Alt+V listener pre-check (summed file sizes); the REQUEST may be this much
+# larger, so a selection the pre-check passes is never refused for its
+# envelope. The files are held to MAX_UPLOAD_BYTES once parsed. Fixed and
+# named, so the ceiling on what is read into memory stays a known number.
+MULTIPART_ALLOWANCE_BYTES = 1024 * 1024
+
+
+def _too_large() -> dict[str, object]:
+    """The 413 envelope. It names the FILES limit a user can act on, whichever
+    check refused the request."""
+    return {
+        "ok": False,
+        "error": f"File too large - {upload_limit_text(MAX_UPLOAD_BYTES)} limit",
+    }
+
+
+def _request_limit() -> int:
+    """Largest Content-Length read into memory. At call time, so a test that
+    lowers MAX_UPLOAD_BYTES lowers this with it."""
+    return MAX_UPLOAD_BYTES + MULTIPART_ALLOWANCE_BYTES
+
 
 # --- Rejected-request drain (P4-02) -----------------------------------------
 # Windows failure mode this guards: when the handler sends an early 4xx and
@@ -92,9 +141,25 @@ MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 # on a client which declared more than it actually sent. The cap mirrors the
 # upload ceiling but is its OWN constant -- tuning MAX_UPLOAD_BYTES (or a test
 # lowering it to force a 413) must never quietly unbound the drain.
-_DRAIN_CAP_BYTES = MAX_UPLOAD_BYTES
+#
+# It sits PAST the request ceiling, by `_DRAIN_SLACK_BYTES`, because the client
+# the drain exists for is the honest one that sent a body just over the limit:
+# a drain that stops reading that body partway closes on unread bytes, and the
+# RST it was built to prevent comes back -- exactly for the over-limit reply
+# that most needs to arrive. A body more than the slack over the ceiling is cut
+# off and the connection closed; that client may see a reset, which is what a
+# megabyte-plus overshoot of a published limit earns. Reading ~102 MB into a
+# discard buffer costs time on a rejected request, never memory: it is read in
+# `_DRAIN_CHUNK_BYTES` blocks and each block is dropped.
+_DRAIN_SLACK_BYTES = 1024 * 1024
+_DRAIN_CAP_BYTES = MAX_UPLOAD_BYTES + MULTIPART_ALLOWANCE_BYTES + _DRAIN_SLACK_BYTES
 _DRAIN_CHUNK_BYTES = 64 * 1024
 _DRAIN_TIMEOUT_S = 0.5
+
+# How long one read or write on a client connection may wait for progress
+# (see UploadHandler.timeout). A minute of total silence mid-upload is a dead
+# link on any network magent is reached over, loopback or tailnet.
+CONNECTION_TIMEOUT_S = 60.0
 
 # In-session upload feedback for the MOBILE page: a paste's progress shows in
 # the SAME magent:<project> window it landed in, via the psmux (tmux) status
@@ -226,6 +291,12 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#1e1e2e;color:#cd
 .paste.show{display:block}
 .paste img{display:block;max-width:100%;max-height:40vh;border-radius:6px;
   margin:0 auto 8px;background:#11111b}
+/* A pasted file that is not an image: its name on a tile, where an image would
+   show its preview. */
+.paste-file{display:none;margin:0 auto 8px;padding:18px 12px;border-radius:6px;
+  background:#11111b;color:#cdd6f4;font-size:.85rem;text-align:center;
+  word-break:break-all}
+.paste-file.show{display:block}
 .paste-meta{display:flex;justify-content:space-between;gap:8px;font-size:.75rem;
   color:#9399b2;margin-bottom:8px}
 #paste-dest{color:#89b4fa;font-weight:600}
@@ -270,11 +341,12 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#1e1e2e;color:#cd
 
 <div class="drop" id="drop">
   <span id="drop-label">select a project first</span>
-  <input type="file" id="file" accept="image/*,video/*,.pdf,.txt,.json,.csv,.log" disabled>
+  <input type="file" id="file" multiple disabled>
 </div>
 
 <div class="paste" id="paste-box">
   <img id="paste-img" alt="pasted image">
+  <div class="paste-file" id="paste-file"><span id="paste-name"></span></div>
   <div class="paste-meta">
     <span id="paste-dest"></span>
     <span id="paste-size"></span>
@@ -322,6 +394,47 @@ const toast = document.getElementById('toast');
 const PEND_LABEL = 'saved - paste still pending';
 const PEND_NOTE = ' saved - psmux is slow, paste still pending';
 function isPending(d) { return !!(d && !d.injected && d.inject_pending); }
+
+// Any file type goes, up to the server's own limit -- checked HERE before a
+// byte is sent, so a phone does not spend a minute uploading a file the
+// server will only refuse. Both numbers are filled in from
+// sessions.MAX_UPLOAD_BYTES when the page is served, so they cannot drift.
+const MAX_BYTES = MAX_UPLOAD_BYTES_PLACEHOLDER;
+const MAX_LABEL = 'MAX_UPLOAD_LABEL_PLACEHOLDER';
+const TOO_BIG = 'too large - ' + MAX_LABEL + ' limit';
+
+// A folder is refused, in the same words Alt+V uses: a directory has no one
+// honest meaning as an upload, and sending only the files of a mixed selection
+// would hand the agent something the user did not pick. Only a paste or a
+// drop can carry a folder (a picker cannot select one), and there the item's
+// filesystem entry is the authority whenever the browser exposes it -- its
+// answer is final, either way. Without an entry, a folder shows up as an
+// empty File the browser has no MIME type for, and that shape is refused.
+// It is only a guess: an empty .toml, .log, .gitkeep or Makefile has the
+// same shape, so it is consulted for a paste or a drop WITHOUT an entry and
+// nowhere else.
+const FOLDER = 'folders not supported - copy files';
+function looksLikeFolder(f) { return f.size === 0 && !f.type; }
+// The item's filesystem entry, or null where the browser has none to give (a
+// synthetic item, a non-Chromium browser) -- never an exception mid-paste.
+function entryOf(it) {
+  try { return it.webkitGetAsEntry ? it.webkitGetAsEntry() : null; }
+  catch (e) { return null; }
+}
+function itemIsFolder(it) {
+  const entry = entryOf(it);
+  if (entry) return entry.isDirectory;
+  const f = it.getAsFile();
+  return !!(f && looksLikeFolder(f));
+}
+
+// Several files go as ONE request, one `file` part each, and the server makes
+// ONE paste of all their paths -- the same shape as an Alt+V press. The reply
+// lists what it saved; that count is what the page reports.
+function sentLabel(d, fallback) {
+  const n = (d.paths || []).length;
+  return n > 1 ? n + ' files' : fallback;
+}
 
 const chosen = document.getElementById('proj-chosen');
 
@@ -447,14 +560,40 @@ if (allPills.length) {
   if (pill) { pill.click(); pill.scrollIntoView({block: 'center'}); }
 })();
 
+// A folder DROPPED on the picker reaches `change` as a plain File; the drop
+// event, which fires first, still carries its items, so the decision is made
+// there. A plain pick is never guessed at. Opening the picker forgets a drop
+// that never became a selection.
+let droppedFolder = false;
+input.addEventListener('drop', e => {
+  const items = (e.dataTransfer || {}).items || [];
+  droppedFolder = [...items].some(it => it.kind === 'file' && itemIsFolder(it));
+});
+input.addEventListener('click', () => { droppedFolder = false; });
+
+function pickFail(msg) {
+  drop.className = 'drop err';
+  label.textContent = msg;
+  toast.textContent = msg;
+  toast.className = 'toast err';
+  input.value = '';
+  resetDropSoon();
+}
+
 input.addEventListener('change', async () => {
-  if (!input.files.length || !proj) return;
-  const file = input.files[0];
+  const files = [...input.files];
+  const folder = droppedFolder;
+  droppedFolder = false;
+  if (!files.length || !proj) return;
+  const what = files.length > 1 ? files.length + ' files' : files[0].name;
+  if (folder) { pickFail(FOLDER); return; }
+  const total = files.reduce((n, f) => n + f.size, 0);
+  if (total > MAX_BYTES) { pickFail(what + ': ' + TOO_BIG); return; }
   drop.className = 'drop busy';
-  label.textContent = file.name;
+  label.textContent = what;
 
   const form = new FormData();
-  form.append('file', file);
+  for (const f of files) form.append('file', f);
   form.append('project', proj);
   form.append('inject', '1');
 
@@ -463,35 +602,41 @@ input.addEventListener('change', async () => {
     const d = await r.json();
     if (d.ok) {
       const pending = isPending(d);
+      const sent = sentLabel(d, what);
       drop.className = pending ? 'drop ok pend' : 'drop ok';
       label.textContent = d.injected ? 'pasted into ' + proj
-        : pending ? PEND_LABEL : file.name;
-      toast.textContent = file.name + (pending ? PEND_NOTE : ' sent');
+        : pending ? PEND_LABEL : sent;
+      toast.textContent = sent + (pending ? PEND_NOTE : ' sent');
       toast.className = pending ? 'toast ok pend' : 'toast ok';
     } else {
-      drop.className = 'drop err';
-      label.textContent = d.error || 'failed';
-      toast.className = 'toast err';
+      pickFail(d.error || 'failed');
+      return;
     }
   } catch(e) {
-    drop.className = 'drop err';
-    label.textContent = 'network error';
-    toast.className = 'toast err';
+    pickFail('network error');
+    return;
   }
   input.value = '';
+  resetDropSoon();
+});
+
+function resetDropSoon() {
   setTimeout(() => {
     if (drop.classList.contains('ok') || drop.classList.contains('err')) {
       drop.className = 'drop ready';
       label.textContent = 'tap to select file';
     }
   }, 2000);
-});
+}
 
-// Ctrl+V clipboard upload: stage the pasted image (preview + target project),
-// send only on explicit confirm, and show live upload progress. XHR instead of
+// Ctrl+V clipboard upload: stage every pasted file (one image previews; one
+// non-image, or several files, show as a tile naming them; plus the target
+// project), send only on explicit confirm, and show live upload progress. XHR instead of
 // fetch because only XHR exposes upload-progress events.
 const pbox = document.getElementById('paste-box');
 const pimg = document.getElementById('paste-img');
+const pfile = document.getElementById('paste-file');
+const pname = document.getElementById('paste-name');
 const pdest = document.getElementById('paste-dest');
 const psize = document.getElementById('paste-size');
 const pbar = document.getElementById('paste-bar');
@@ -515,7 +660,7 @@ function refreshPaste() {
 pills.forEach(p => p.addEventListener('click', refreshPaste));
 
 function clearStage() {
-  if (staged) URL.revokeObjectURL(staged.url);
+  if (staged && staged.url) URL.revokeObjectURL(staged.url);
   staged = null;
   sending = false;
   pbox.className = 'paste';
@@ -528,25 +673,71 @@ function clearStage() {
 }
 
 window.addEventListener('paste', e => {
-  if (sending) return;  // never swap the image out from under an upload
+  if (sending) return;  // never swap the files out from under an upload
   const items = (e.clipboardData || {}).items || [];
+  const files = [];
+  let folder = false;
   for (const it of items) {
-    if (it.kind === 'file' && it.type.startsWith('image/')) {
-      e.preventDefault();
-      stageFile(it.getAsFile());
-      return;
-    }
+    // EVERY file item, of any type. A plain-text paste has no file item and
+    // falls through to the browser untouched.
+    if (it.kind !== 'file') continue;
+    if (itemIsFolder(it)) { folder = true; continue; }
+    const f = it.getAsFile();
+    if (f) files.push(f);
   }
+  if (!files.length && !folder) return;
+  e.preventDefault();
+  // One folder refuses the whole paste, exactly as it does an Alt+V press.
+  if (folder) { refuse(FOLDER); return; }
+  stageFiles(files);
 });
 
-function stageFile(file) {
-  if (staged) URL.revokeObjectURL(staged.url);
-  const ext = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+function refuse(msg) {
+  toast.textContent = msg;
+  toast.className = 'toast err';
+}
+
+// A nameless pasted blob still needs a sensible extension on disk.
+function extFor(type) {
+  const sub = String(type || '').split('/')[1] || '';
+  const known = {'jpeg': 'jpg', 'plain': 'txt', 'svg+xml': 'svg'};
+  if (known[sub]) return known[sub];
+  return /^[a-z0-9]+$/.test(sub) ? sub : 'bin';
+}
+
+function stageFiles(files) {
+  const total = files.reduce((n, f) => n + f.size, 0);
+  if (total > MAX_BYTES) {
+    const what = files.length > 1 ? files.length + ' files'
+      : (files[0].name || 'pasted file');
+    refuse(what + ': ' + TOO_BIG);
+    return;
+  }
+  if (staged && staged.url) URL.revokeObjectURL(staged.url);
   const ts = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15);
-  staged = {file: file, url: URL.createObjectURL(file),
-            name: 'paste-' + ts + '.' + ext};
-  pimg.src = staged.url;
-  psize.textContent = fmtSize(file.size);
+  // The ORIGINAL name when the browser has one (a copied file does); only a
+  // nameless blob gets a generated one (the server keeps same-named parts
+  // apart, so two nameless blobs cannot collide).
+  const list = files.map(f => ({
+    file: f, name: f.name || ('paste-' + ts + '.' + extFor(f.type))}));
+  const one = list.length === 1 ? list[0] : null;
+  const isImage = !!one && String(one.file.type || '').startsWith('image/');
+  staged = {files: list, url: isImage ? URL.createObjectURL(one.file) : null,
+            label: one ? one.name : list.length + ' files'};
+  // One image previews; anything else -- one non-image, or several files of
+  // any kind -- is a tile naming what will be sent.
+  if (isImage) {
+    pimg.src = staged.url;
+    pimg.style.display = '';
+    pfile.className = 'paste-file';
+  } else {
+    pimg.removeAttribute('src');
+    pimg.style.display = 'none';
+    pname.textContent = one ? one.name
+      : list.length + ' files: ' + list.map(s => s.name).join(', ');
+    pfile.className = 'paste-file show';
+  }
+  psize.textContent = fmtSize(total);
   pfill.style.width = '0%';
   pbar.className = 'bar';
   psend.className = '';
@@ -577,7 +768,7 @@ psend.addEventListener('click', () => {
   pbar.className = 'bar show';
 
   const form = new FormData();
-  form.append('file', staged.file, staged.name);
+  for (const s of staged.files) form.append('file', s.file, s.name);
   form.append('project', proj);
   form.append('inject', '1');
 
@@ -598,7 +789,7 @@ psend.addEventListener('click', () => {
       psend.className = pending ? 'ok pend' : 'ok';
       psend.textContent = pending ? 'Saved, pasting...'
         : (d.injected ? 'Pasted into ' + proj : 'Sent') + ' ✓';
-      toast.textContent = staged.name + (pending ? PEND_NOTE
+      toast.textContent = sentLabel(d, staged.label) + (pending ? PEND_NOTE
         : (d.injected ? ' pasted into ' + proj : ' sent'));
       toast.className = pending ? 'toast ok pend' : 'toast ok';
       setTimeout(clearStage, 2500);
@@ -692,7 +883,12 @@ def _build_html(sessions: list[dict[str, object]]) -> str:
     placeholder = (
         "\n".join(pills) if pills else '<p class="none">no active sessions</p>'
     )
-    return _HTML_TEMPLATE.replace("PROJECTS_PLACEHOLDER", placeholder)
+    # The limit first: a session name is user text and must never be
+    # rewritten by a later placeholder pass.
+    page = _HTML_TEMPLATE.replace(
+        "MAX_UPLOAD_BYTES_PLACEHOLDER", str(MAX_UPLOAD_BYTES)
+    ).replace("MAX_UPLOAD_LABEL_PLACEHOLDER", upload_limit_text(MAX_UPLOAD_BYTES))
+    return page.replace("PROJECTS_PLACEHOLDER", placeholder)
 
 
 # --- PWA assets -----------------------------------------------------------
@@ -701,7 +897,7 @@ _MANIFEST = json.dumps(
     {
         "name": "magent upload",
         "short_name": "magent",
-        "description": "Send images straight into your magent: sessions",
+        "description": "Send files straight into your magent: sessions",
         "start_url": "/",
         "scope": "/",
         "display": "standalone",
@@ -857,8 +1053,9 @@ INJECT_GRACE_S = 3.0
 INJECT_TIMEOUT_S = 60.0
 
 
-def _inject_paste(project: str, dest: Path) -> tuple[bool, bool]:
-    """Paste ``dest`` into ``project``'s pane. Returns ``(injected, pending)``.
+def _inject_paste(project: str, text: str) -> tuple[bool, bool]:
+    """Paste ``text`` -- the saved file paths as ONE line (``paths_line``) --
+    into ``project``'s pane. Returns ``(injected, pending)``.
 
     The paste runs on its own thread and the caller waits only ``INJECT_GRACE_S``
     for it, because an HTTP handler must not be hostage to a multiplexer: this
@@ -879,8 +1076,11 @@ def _inject_paste(project: str, dest: Path) -> tuple[bool, bool]:
     def _run() -> None:
         started = time.monotonic()
         try:
+            # `literal`: the line is TEXT -- quoted paths, several of them --
+            # and must never be read back as a psmux key name. Same `-l` wire
+            # as the local Alt+V paste and `magent send`; no Enter is sent.
             pasted = psmux.send_keys(
-                project, str(dest), target=project, timeout=INJECT_TIMEOUT_S
+                project, text, target=project, literal=True, timeout=INJECT_TIMEOUT_S
             )
             outcome.append(pasted)
         finally:
@@ -903,10 +1103,152 @@ def _inject_paste(project: str, dest: Path) -> tuple[bool, bool]:
     return (False, True)
 
 
+# How much of the original name a saved file keeps, in UTF-8 bytes. One path
+# component is capped at 255 (bytes on Linux, UTF-16 units on Windows), and
+# `<stamp>_<n>_` rides in front; 150 also keeps the whole path under Windows'
+# 260-character MAX_PATH from a typical home directory.
+_NAME_MAX_BYTES = 150
+# A "suffix" longer than this is not an extension worth keeping whole (a name
+# like `notes.from-the-meeting-with-everyone`), so it is truncated as the stem.
+_SUFFIX_MAX_BYTES = 20
+
+
+def _saved_name(filename: str) -> str:
+    """The part of a saved file's name that comes from the original: path
+    stripped, anything but a word character, dot or dash made ``_`` (so no
+    control character, quote, separator or line break survives into a pasted
+    path), and capped at ``_NAME_MAX_BYTES`` by trimming the stem -- the
+    suffix is what tells the agent what the file is, so it is kept.
+
+    A dotfile keeps its name (``.env`` arrives as ``<stamp>_.env``; the prefix
+    already stops it being hidden). Only a name that is nothing but dots
+    becomes ``upload``, and trailing dots go: Windows drops them on create,
+    and the returned path must name the file that exists.
+    """
+    basename = re.sub(r"[^\w.\-]", "_", Path(filename).name).rstrip(".")
+    if not basename:
+        return "upload"
+    suffix = Path(basename).suffix
+    if len(suffix.encode()) > _SUFFIX_MAX_BYTES:
+        suffix = ""
+    stem = basename[: len(basename) - len(suffix)]
+    budget = _NAME_MAX_BYTES - len(suffix.encode())
+    stem = stem.encode()[:budget].decode("utf-8", errors="ignore")
+    if not suffix:
+        stem = stem.rstrip(".")  # a cut can land on a dot, too
+    return (stem + suffix) or "upload"
+
+
+def _dest_for(upload_root: Path, stamp: int, filename: str) -> Path | None:
+    """Reserve where one uploaded file lands and return it:
+    ``<stamp>_<saved name>`` under the uploads dir, created empty, or ``None``
+    if the name would escape it.
+
+    Two files with one name must never overwrite each other -- the paste would
+    then name one file twice -- whether they came in one request or in two in
+    the same second. Only an exclusive create settles that across requests
+    (an ``exists()`` check cannot see a name another request chose but has not
+    written yet), so a clash bumps to ``<stamp>_<n>_<name>`` until one create
+    wins. That also covers a case-insensitive filesystem, where ``A.txt`` and
+    ``a.txt`` are one file. The caller writes into the reservation, and
+    removes it if the request is refused.
+    """
+    basename = _saved_name(filename)
+    name = f"{stamp}_{basename}"
+    n = 1
+    while True:
+        dest = (upload_root / name).resolve()
+        if not dest.is_relative_to(upload_root):
+            return None
+        try:
+            with dest.open("xb"):
+                return dest
+        except FileExistsError:
+            n += 1
+            name = f"{stamp}_{n}_{basename}"
+
+
+def _discard(dests: list[Path]) -> None:
+    """Remove a refused request's reservations: best-effort, never raises."""
+    for dest in dests:
+        with contextlib.suppress(OSError):
+            dest.unlink()
+
+
+# Suffixes a single upload is announced as an "image" for. The phone's everyday
+# upload is a screenshot, and its status-line confirmation predates any-file
+# uploads -- it keeps reading exactly as it always did.
+_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
+
+
+def _uploaded_what(file_count: int, suffix: str) -> str:
+    """What a mobile upload's confirmation calls what arrived: ``image`` for
+    one image, ``file`` for one anything-else, ``N files`` for several.
+    ``suffix`` is the comma-joined suffix list the upload log line carries."""
+    if file_count != 1:
+        return f"{file_count} files"
+    return "image" if suffix.lower() in _IMAGE_SUFFIXES else "file"
+
+
+# A quoted filename taken whole, so a name with a `;` in it (legal on every OS,
+# and now that any file uploads, a real case) is not cut at the `;` by the
+# token split below. Browsers percent-encode a `"` inside it.
+_FILENAME_RE = re.compile(r'\bfilename="([^"]*)"')
+
+
+class UploadIncomplete(Exception):
+    """The body ended before its declared length, or before the delimiter that
+    closes its last part. What did arrive is not the file the user sent, so
+    nothing of it is saved or pasted."""
+
+
+def _disposition(header_str: str) -> tuple[str, str]:
+    """``(name, filename)`` from one part's headers."""
+    name = ""
+    filename = ""
+    for line in header_str.split("\r\n"):
+        if "Content-Disposition:" in line:
+            for raw_token in line.split(";"):
+                token = raw_token.strip()
+                if token.startswith("name="):
+                    name = token.split("=", 1)[1].strip('"')
+                elif token.startswith("filename="):
+                    filename = token.split("=", 1)[1].strip('"')
+            quoted = _FILENAME_RE.search(line)
+            if quoted:
+                filename = quoted.group(1)
+    return name, filename
+
+
+def _next_delimiter(body: bytes, delim: bytes, start: int) -> int:
+    """Index of the CRLF that opens the next real delimiter at or after
+    ``start``, or -1. A delimiter is ``CRLF--boundary`` followed by CRLF (another
+    part) or ``--`` (the end); the same bytes followed by anything else are the
+    file's own content."""
+    needle = b"\r\n" + delim
+    at = body.find(needle, start)
+    while at >= 0:
+        after = at + len(needle)
+        if body.startswith((b"\r\n", b"--"), after):
+            return at
+        at = body.find(needle, at + 1)
+    return -1
+
+
 def _parse_multipart(
     handler: BaseHTTPRequestHandler,
-) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
-    """Minimal multipart/form-data parser. Returns (fields, files)."""
+) -> tuple[dict[str, str], dict[str, list[tuple[str, memoryview]]]]:
+    """Minimal multipart/form-data parser. Returns (fields, files).
+
+    ``files`` keeps EVERY part sent under a name, in order: one Alt+V press
+    carries a whole Explorer selection as several ``file`` parts of one request.
+    Each file's data is a ``memoryview`` into the one body read off the socket:
+    at 100 MB a request, splitting and slicing copies held four bodies at once.
+
+    Raises ``UploadIncomplete`` when fewer bytes arrived than were declared, or
+    the closing delimiter never came -- a cut-short last part still has its
+    headers, and saving it would announce a truncated file as uploaded.
+    """
     content_type = handler.headers.get("Content-Type", "")
     if "boundary=" not in content_type:
         return {}, {}
@@ -919,41 +1261,42 @@ def _parse_multipart(
         length = int(handler.headers.get("Content-Length", 0))
     except (TypeError, ValueError):
         length = 0
-    body = handler.rfile.read(min(length, MAX_UPLOAD_BYTES))
+    if length <= 0:
+        return {}, {}
+    try:
+        body = handler.rfile.read(min(length, _request_limit()))
+    except OSError as exc:  # a stalled or reset client, mid-body
+        raise UploadIncomplete(str(exc)) from exc
+    if len(body) < length:
+        raise UploadIncomplete(f"{len(body)} of {length} bytes arrived")
 
-    boundary_bytes = f"--{boundary}".encode()
-    parts = body.split(boundary_bytes)
-
+    view = memoryview(body)
+    delim = f"--{boundary}".encode()
     fields: dict[str, str] = {}
-    files: dict[str, tuple[str, bytes]] = {}
+    files: dict[str, list[tuple[str, memoryview]]] = {}
 
-    for part in parts:
-        if not part or part == b"--\r\n" or part == b"--":
-            continue
-        if b"\r\n\r\n" not in part:
-            continue
-        header_data, file_data = part.split(b"\r\n\r\n", 1)
-        if file_data.endswith(b"\r\n"):
-            file_data = file_data[:-2]
-
-        header_str = header_data.decode("utf-8", errors="replace")
-        name = ""
-        filename = ""
-        for line in header_str.split("\r\n"):
-            if "Content-Disposition:" in line:
-                for raw_token in line.split(";"):
-                    token = raw_token.strip()
-                    if token.startswith("name="):
-                        name = token.split("=", 1)[1].strip('"')
-                    elif token.startswith("filename="):
-                        filename = token.split("=", 1)[1].strip('"')
-
-        if filename:
-            files[name] = (filename, file_data)
-        elif name:
-            fields[name] = file_data.decode("utf-8", errors="replace")
-
-    return fields, files
+    # The first delimiter has no CRLF before it (it may follow a preamble).
+    at = body.find(delim)
+    while at >= 0:
+        after = at + len(delim)
+        if body.startswith(b"--", after):
+            return fields, files  # the closing delimiter: the body is whole
+        start = after + 2  # past the CRLF that ends the delimiter line
+        end = _next_delimiter(body, delim, start)
+        if end < 0:
+            break
+        head_end = body.find(b"\r\n\r\n", start, end)
+        if head_end >= 0:
+            name, filename = _disposition(
+                str(view[start:head_end], "utf-8", errors="replace")
+            )
+            data = view[head_end + 4 : end]
+            if filename:
+                files.setdefault(name, []).append((filename, data))
+            elif name:
+                fields[name] = str(data, "utf-8", errors="replace")
+        at = end + 2
+    raise UploadIncomplete("the closing delimiter never arrived")
 
 
 _FOCUS_TARGET_FILE = Path.home() / ".magent" / "focus-target"
@@ -977,6 +1320,12 @@ def _request_focus(project: str) -> None:
 
 
 class UploadHandler(BaseHTTPRequestHandler):
+    # Per socket OPERATION, not per request (StreamRequestHandler applies it
+    # with settimeout): a slow 100 MB upload that keeps moving is never cut
+    # off, but a client that declares a body and then stalls no longer pins a
+    # handler thread -- and its partial buffer -- forever. A stall mid-body is
+    # answered "Upload incomplete" and nothing is saved.
+    timeout = CONNECTION_TIMEOUT_S
     config_path: str | None = None
     cached_sessions: ClassVar[list[dict[str, object]]] = []
     sessions_ts: float = 0
@@ -984,7 +1333,8 @@ class UploadHandler(BaseHTTPRequestHandler):
     pid: int | None = None
     started_at: float = 0.0
 
-    def _sessions(self) -> list[dict[str, object]]:
+    @staticmethod
+    def _sessions_snapshot() -> list[dict[str, object]]:
         now = time.time()
         with _sessions_lock:
             if now - UploadHandler.sessions_ts > 10:
@@ -993,6 +1343,9 @@ class UploadHandler(BaseHTTPRequestHandler):
                 )
                 UploadHandler.sessions_ts = now
             return UploadHandler.cached_sessions
+
+    def _sessions(self) -> list[dict[str, object]]:
+        return self._sessions_snapshot()
 
     def _send_bytes(self, data: bytes, content_type: str, cache: bool = False) -> None:
         self.send_response(200)
@@ -1102,6 +1455,11 @@ class UploadHandler(BaseHTTPRequestHandler):
                 if UploadHandler.started_at
                 else 0.0
             )
+            # Lock-free and sweep-free on purpose: this is a liveness probe, and
+            # the sessions lock is held for as long as psmux takes to answer.
+            # `sessions_ts` is written AFTER the list, so a nonzero stamp means
+            # the list read below is a real sweep's result.
+            swept_at = UploadHandler.sessions_ts
             body = json.dumps(
                 {
                     "ok": True,
@@ -1109,8 +1467,15 @@ class UploadHandler(BaseHTTPRequestHandler):
                     "port": UploadHandler.port,
                     "pid": UploadHandler.pid,
                     "uptime_s": uptime,
-                    # P3-18: a COUNT, named distinctly from the /api/sessions LIST.
-                    "session_count": len(UploadHandler.cached_sessions),
+                    # P3-18: a COUNT, named distinctly from the /api/sessions
+                    # LIST. `null` = unknown (no sweep has landed yet), never a
+                    # false 0; `sessions_age_s` says how old a known count is.
+                    "session_count": (
+                        len(UploadHandler.cached_sessions) if swept_at else None
+                    ),
+                    "sessions_age_s": (
+                        max(0.0, time.time() - swept_at) if swept_at else None
+                    ),
                 }
             ).encode()
             self._send_bytes(body, "application/json")
@@ -1170,6 +1535,7 @@ class UploadHandler(BaseHTTPRequestHandler):
         injected = False
         inject_pending = False
         byte_count = 0
+        file_count = 0
         suffix = ""
         try:
             try:
@@ -1178,12 +1544,24 @@ class UploadHandler(BaseHTTPRequestHandler):
                 self._drain_request_body()
                 self._json_response({"ok": False, "error": "Bad Content-Length"}, 400)
                 return
-            if declared > MAX_UPLOAD_BYTES:
+            if declared > _request_limit():
                 self._drain_request_body()
-                self._json_response({"ok": False, "error": "File too large"}, 413)
+                self._json_response(_too_large(), 413)
                 return
 
-            fields, files = _parse_multipart(self)
+            try:
+                fields, files = _parse_multipart(self)
+            except UploadIncomplete as exc:
+                # A short body leaves the connection out of step with HTTP, and
+                # the client may already be gone: close, and answer if it can
+                # still hear.
+                log.warning("upload refused, body incomplete: %s", exc)
+                self.close_connection = True
+                with contextlib.suppress(OSError):
+                    self._json_response(
+                        {"ok": False, "error": "Upload incomplete"}, 400
+                    )
+                return
             project = fields.get("project", "") or flagged
             inject = fields.get("inject", "1") == "1"
 
@@ -1196,24 +1574,44 @@ class UploadHandler(BaseHTTPRequestHandler):
                 self._json_response({"ok": False, "error": "Unknown project"}, 400)
                 return
 
-            filename, data = files["file"]
-            byte_count = len(data)
-            suffix = Path(filename).suffix
-            basename = Path(filename).name.replace(" ", "_")
-            basename = re.sub(r"[^\w.\-]", "_", basename)
-            if not basename or basename.startswith("."):
-                basename = "upload"
-            safe_name = f"{int(time.time())}_{basename}"
+            parts = files["file"]
+            byte_count = sum(len(data) for _name, data in parts)
+            file_count = len(parts)
+            suffix = ",".join(Path(name).suffix for name, _data in parts)
+            if byte_count > MAX_UPLOAD_BYTES:
+                # The files, not the envelope: the same sum the page and the
+                # Alt+V listener checked, so the three can never disagree. The
+                # body is already read, so there is nothing left to drain.
+                self._json_response(_too_large(), 413)
+                return
 
             _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-            dest = (_UPLOAD_DIR / safe_name).resolve()
-            if not dest.is_relative_to(_UPLOAD_DIR.resolve()):
-                self._json_response({"ok": False, "error": "Invalid filename"}, 400)
-                return
-            dest.write_bytes(data)
+            upload_root = _UPLOAD_DIR.resolve()
+            stamp = int(time.time())
+            dests: list[Path] = []
+            # Every name is reserved before any byte is written, so an invalid
+            # one refuses the request whole instead of leaving half of it
+            # saved -- and a request that fails part-way takes its files back.
+            try:
+                for filename, _data in parts:
+                    dest = _dest_for(upload_root, stamp, filename)
+                    if dest is None:
+                        _discard(dests)
+                        self._json_response(
+                            {"ok": False, "error": "Invalid filename"}, 400
+                        )
+                        return
+                    dests.append(dest)
+                for dest, (_name, data) in zip(dests, parts, strict=True):
+                    dest.write_bytes(data)
+            except BaseException:
+                _discard(dests)
+                raise
 
             if inject and psmux.find_psmux():
-                injected, inject_pending = _inject_paste(project, dest)
+                injected, inject_pending = _inject_paste(
+                    project, paths_line([str(d) for d in dests])
+                )
             elif inject:
                 log.warning(
                     "upload project=%s requested inject but psmux is unavailable",
@@ -1224,7 +1622,10 @@ class UploadHandler(BaseHTTPRequestHandler):
             self._json_response(
                 {
                     "ok": True,
-                    "path": str(dest),
+                    # `path` is the first file, as it always was; `paths` is
+                    # every file, in the order they were sent.
+                    "path": str(dests[0]),
+                    "paths": [str(d) for d in dests],
                     "injected": injected,
                     # Three states, not two: pasted, definitely not pasted, and
                     # "still trying". A client that cannot tell the last two
@@ -1233,12 +1634,14 @@ class UploadHandler(BaseHTTPRequestHandler):
                 }
             )
         finally:
-            # INFO outcome line -- project + byte-count + injected + suffix only,
-            # NEVER the original filename (personal data; F-hygiene).
+            # INFO outcome line -- project + counts + injected + suffixes only,
+            # NEVER an original filename (personal data; F-hygiene).
             log.info(
-                "upload project=%s ok=%s bytes=%d injected=%s pending=%s suffix=%s",
+                "upload project=%s ok=%s files=%d bytes=%d injected=%s pending=%s "
+                "suffix=%s",
                 project,
                 ok,
+                file_count,
                 byte_count,
                 injected,
                 inject_pending,
@@ -1253,7 +1656,8 @@ class UploadHandler(BaseHTTPRequestHandler):
                     _flash(
                         None,
                         done,
-                        f"magent  {_FB_OK} image uploaded",
+                        f"magent  {_FB_OK} {_uploaded_what(file_count, suffix)} "
+                        "uploaded",
                         _FLASH_OK_MS,
                         style=_MSG_GREEN,
                     )
@@ -1543,12 +1947,28 @@ def _supervise_hotkey(
         return
     # heavy subsystem: in-body per policy. launch owns the spawn recipe; this
     # module must not import the cli package (LS-A-001).
-    from magent.launch import ensure_hotkey_listener
+    from magent.launch import (
+        SESSION0_HOTKEY_REFUSAL,
+        ListenerWatch,
+        ensure_hotkey_listener,
+        session0_block,
+    )
 
+    # A serve running in Session 0 (a foreground `magent serve` over ssh) would
+    # otherwise plant a detached listener there that outlives it -- and then
+    # retry the refusal every interval for the life of the server. Say it once.
+    refusal = session0_block(SESSION0_HOTKEY_REFUSAL)
+    if refusal:
+        log.warning("supervisor: %s", refusal)
+        return
+
+    # One watch for the life of the thread: the wedge confirm and the
+    # replacement cooldown are remembered across ticks, not per call.
+    watch = ListenerWatch()
     while True:
         try:
             with exclusive_lock("hotkey-supervisor"):
-                if ensure_hotkey_listener(server_url) is None:
+                if ensure_hotkey_listener(server_url, watch=watch) is None:
                     log.warning(
                         "supervisor: no Alt+V listener came up for %s; retrying in %ss",
                         server_url,
@@ -1601,6 +2021,176 @@ def _supervise_psmux_priority(
             return
 
 
+# --- node sync supervision ---------------------------------------------------
+# The fourth thing serve keeps alive, for the same reason as the other three:
+# serve is the process that is always there. Its own thread and its own gate
+# (MAGENT_NODE_SYNC); the "any project runs on a node" gate is read from the
+# config file each interval -- through ConfigWatch, so only when it changed --
+# which is how a node added to a running setup gets its daemon within a minute.
+NODE_SYNC_SUPERVISE_INTERVAL_S = 60.0
+
+
+def _supervise_node_sync(
+    config_path: str | None,
+    stop_event: threading.Event,
+    interval: float = NODE_SYNC_SUPERVISE_INTERVAL_S,
+) -> None:
+    """Keep ``magent node sync`` running for as long as this server runs.
+
+    Runs on a daemon thread off ``run_server``. Every failure is a log line and
+    another try next interval. The lock stops two serve processes (different
+    ports) from both spawning a daemon in the same instant; the daemon's own
+    lock would settle it anyway, this just avoids the wasted process.
+    """
+    # heavy subsystem: in-body per policy. launch owns the spawn recipe; this
+    # module must not import the cli package (LS-A-001).
+    from magent.launch import ensure_node_sync, node_sync_env_enabled
+    from magent.node_sync import SUPERVISOR_LOCK_NAME, ConfigWatch, DaemonLockUnknown
+    from magent.paths import find_config
+
+    log = get_logger("nodes")
+    if not node_sync_env_enabled():
+        log.info("node sync supervisor: disabled by MAGENT_NODE_SYNC")
+        return
+    watch: ConfigWatch | None = None
+    while True:
+        try:
+            # Inside the try: with serve's cwd deleted and no --config,
+            # find_config raises, and that is one failed tick, not a dead thread.
+            if watch is None:
+                watch = ConfigWatch(find_config(config_path))
+            config = watch.current()
+            if config is not None:
+                with contextlib.ExitStack() as held:
+                    # ONLY this lock means another serve is supervising; a
+                    # LockHeld from anywhere else is a failed check below.
+                    try:
+                        held.enter_context(exclusive_lock(SUPERVISOR_LOCK_NAME))
+                    except LockHeld:
+                        log.debug(
+                            "node sync supervisor: another server is supervising "
+                            "the daemon"
+                        )
+                    except OSError as e:
+                        # Its file would not open: skipped below, like the
+                        # daemon's lock under ensure_node_sync.
+                        raise DaemonLockUnknown(e) from e
+                    # else, not a `continue` in the except: that would skip
+                    # stop_event.wait(interval) below and spin the thread.
+                    else:
+                        ensure_node_sync(config, config_path)
+        except DaemonLockUnknown as exc:
+            # A lock file -- this one, or the daemon's -- would not open:
+            # Windows answers EACCES while one is still pending delete. Known
+            # and transient: not a failed check, and the next tick tries again.
+            # A PermissionError from anywhere else (the config, the spawn) can
+            # persist, and stays a failed check below.
+            log.warning(
+                "node sync supervisor: tick skipped (%s, errno %s): %s",
+                type(exc.error).__name__,
+                exc.error.errno,
+                exc.error,
+            )
+        except Exception:
+            log.exception("node sync supervisor: check failed")
+        if stop_event.wait(interval):
+            return
+
+
+# How often serve's reaper thread sweeps for finished, long-idle local sessions.
+# The threshold is at least 30 minutes, so a park lands within one interval of
+# it; the first sweep waits one interval so it cannot race serve's own bring-up.
+IDLE_REAP_INTERVAL_S = 300.0
+
+
+def _supervise_idle_reap(
+    config_path: str | None,
+    stop_event: threading.Event,
+    interval: float = IDLE_REAP_INTERVAL_S,
+) -> None:
+    """Park finished, long-idle local sessions for as long as serve runs.
+
+    Runs on a daemon thread off ``run_server``, beside the Alt+V listener and
+    the psmux priority sweep. It returns at startup, after one log line, only
+    on what no config edit can change for this process: the
+    ``MAGENT_IDLE_REAP`` kill switch and the two platform probes
+    (``reap.process_off_reason``). Everything in the config is read per sweep:
+    each one finds and reloads it, so ``settings.idleReap`` -- turned on,
+    turned off, or a broken file fixed -- takes effect at the next sweep
+    without a restart, and ``sweep_once`` applies the setting itself. A config
+    that will not resolve or load (``find_config`` reads the working directory,
+    which can be deleted under serve) skips that sweep with a warning naming
+    why.
+
+    Each sweep holds ``exclusive_lock("idle-reaper")`` so two serves on one box
+    never sweep at once. Every failure is a log line and another try next
+    interval -- this must never be able to take down the server it rides on.
+    """
+    from magent import config, paths, reap  # heavy subsystem: in-body per policy
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    log = get_logger("reap")
+    plat = get_platform()
+    off = reap.process_off_reason(plat)
+    if off is not None:
+        log.info("idle reaper %s", reap.off_phrase(off))
+        return
+    log.info("idle reaper on: sweeping every %.0fs", interval)
+    while not stop_event.wait(interval):
+        try:
+            with exclusive_lock("idle-reaper"):
+                try:
+                    cfg = config.load_config(str(paths.find_config(config_path)))
+                except (OSError, ValueError) as exc:
+                    log.warning(
+                        "idle reaper: config unreadable, skipping this sweep: %s", exc
+                    )
+                    continue
+                parked = [r for r in reap.sweep_once(cfg, plat=plat) if r.parked]
+                if parked:
+                    log.info(
+                        "idle reaper: parked %d session(s), freed~%dMB",
+                        len(parked),
+                        sum(r.freed for r in parked) // (1024 * 1024),
+                    )
+        except LockHeld:
+            log.debug("idle reaper: another serve holds the sweep lock")
+        except Exception:
+            log.exception("idle reaper: sweep failed")
+
+
+# --- Caller-supplied watchdogs ----------------------------------------------
+# Hooks the `serve` command hands in, each run on its own daemon thread for as
+# long as the server runs. Generic on purpose: the one in use today keeps the
+# attention daemon alive (cli/attention_cmd.attention_watchdog), and that needs
+# the daemon's pid/heartbeat/renderer judgement, which lives in the cli package
+# this module must never import (LS-A-001). Same cadence as the two
+# supervisors above.
+WATCHDOG_INTERVAL_S = 30.0
+
+
+def _run_watchdog(
+    tick: Callable[[], None],
+    stop_event: threading.Event,
+    interval: float = WATCHDOG_INTERVAL_S,
+) -> None:
+    """Call ``tick`` now, then once an interval until ``stop_event`` is set.
+
+    The first look is immediate: a serve that starts right after a restart is
+    exactly when whatever it watches is missing. A tick that raises is a log
+    line and another try next interval -- a watchdog must never be able to take
+    down the server it rides on.
+    """
+    log = get_logger("upload")
+    while True:
+        try:
+            tick()
+        except Exception:
+            log.exception("watchdog: check failed")
+        if stop_event.wait(interval):
+            return
+
+
 def _serve_bind(server: ThreadingHTTPServer, log: logging.Logger) -> None:
     """``serve_forever`` for a SECONDARY bind, on its own daemon thread.
 
@@ -1617,8 +2207,26 @@ def _serve_bind(server: ThreadingHTTPServer, log: logging.Logger) -> None:
         log.exception("upload server: bind %s stopped serving", server.server_address)
 
 
+def _warm_sessions() -> None:
+    """Fill ``UploadHandler.cached_sessions`` once, at startup, off-thread.
+
+    /health reports the cache and must never sweep psmux itself, so without
+    this a fresh serve had no count to report until the first ``/sessions``
+    request. Every failure is a log line: warming is an optimization of an
+    honest ``null``, never a reason for serve to fall over."""
+    try:
+        UploadHandler._sessions_snapshot()
+    except Exception:  # noqa: BLE001  # reason: a warm-up on a daemon thread must never kill serve; any discovery fault degrades to the honest null and a log line
+        get_logger("upload").warning(
+            "upload server: could not warm the session cache", exc_info=True
+        )
+
+
 def run_server(
-    port: int = 8080, config_path: str | None = None, host: str | None = None
+    port: int = 8080,
+    config_path: str | None = None,
+    host: str | None = None,
+    watchdogs: Sequence[Callable[[], None]] = (),
 ) -> None:
     log = get_logger("upload")
     UploadHandler.config_path = config_path
@@ -1686,6 +2294,11 @@ def run_server(
     for s in servers[1:]:
         threading.Thread(target=_serve_bind, args=(s, log), daemon=True).start()
 
+    # /health's session count comes from this cache; fill it now rather than
+    # when the first phone happens to load the page. Daemon: it must not hold
+    # the process open, and psmux may be slow.
+    threading.Thread(target=_warm_sessions, daemon=True).start()
+
     # Alt+V is only as alive as its listener, and nothing else in the product
     # ever re-checks it. Daemon thread: it must not hold the process open, and
     # a serve that is going down has nothing left to supervise anyway.
@@ -1703,6 +2316,31 @@ def run_server(
     threading.Thread(
         target=_supervise_psmux_priority, args=(boost_stop,), daemon=True
     ).start()
+
+    # ...and the node mirror is only as current as the daemon pulling it.
+    node_sync_stop = threading.Event()
+    threading.Thread(
+        target=_supervise_node_sync, args=(config_path, node_sync_stop), daemon=True
+    ).start()
+
+    # ...and a finished session left idle for hours holds memory the rest of
+    # the machine needs. Same owner for the same reason: serve is always up.
+    reap_stop = threading.Event()
+    threading.Thread(
+        target=_supervise_idle_reap,
+        args=(config_path, reap_stop),
+        daemon=True,
+        name="magent-reaper",
+    ).start()
+
+    # ...and whatever the command shell asked this server to keep an eye on.
+    # After the bind, like the ones above: a serve that lost the port to another
+    # one exits with PortInUse and must not have started anything on the way.
+    watchdog_stop = threading.Event()
+    for tick in watchdogs:
+        threading.Thread(
+            target=_run_watchdog, args=(tick, watchdog_stop), daemon=True
+        ).start()
 
     # Why this is not a bare `try/finally` any more: serve died silently twice
     # in one day and left NOTHING behind -- no traceback (a detached process has
@@ -1725,6 +2363,9 @@ def run_server(
     finally:
         hotkey_stop.set()
         boost_stop.set()
+        node_sync_stop.set()
+        reap_stop.set()
+        watchdog_stop.set()
         for s in servers[1:]:
             s.shutdown()  # called from a different thread than its serve_forever -> safe
         for s in servers:

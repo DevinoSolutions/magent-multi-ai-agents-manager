@@ -24,6 +24,7 @@ ROOT_ALLOWLIST = frozenset(
         ".git-blame-ignore-revs",
         ".gitignore",
         ".gitleaks.toml",
+        ".gitleaksignore",
         "CHANGELOG.md",
         "CLAUDE.md",
         "DESIGN.md",

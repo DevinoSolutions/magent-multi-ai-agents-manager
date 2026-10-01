@@ -643,6 +643,11 @@ def config_remove_tool(ctx: click.Context, name: str) -> None:
 @click.option("--title", default=None, help="Custom window title")
 @click.option("--host", default=None, help="SSH host for remote projects")
 @click.option("--windows", "-w", default=None, type=int, help="Number of windows")
+@click.option(
+    "--node",
+    default=None,
+    help="Run it on a node: a nick, or auto",
+)
 @click.pass_context
 def config_add(
     ctx: click.Context,
@@ -653,6 +658,7 @@ def config_add(
     title: str | None,
     host: str | None,
     windows: int | None,
+    node: str | None,
 ) -> None:
     """Add a project. Usage: magent config add ./myapp -g INTERNAL -t claude"""
     config_file = find_config(ctx.obj.get("config_path"))
@@ -670,8 +676,12 @@ def config_add(
         entry["host"] = host
     if windows:
         entry["windows"] = windows
+    if node:
+        entry["node"] = node
 
     _sublist(data, "projects").append(entry)
+    if node:
+        _refuse_invalid(data)
     _save_raw_config(config_file, data)
     click.echo(f"  Added {style(path, fg='cyan')}")
 
@@ -728,7 +738,16 @@ def config_disable(ctx: click.Context, path: str) -> None:
 @click.argument("value")
 @click.pass_context
 def config_set(ctx: click.Context, path: str, field: str, value: str) -> None:
-    """Set a field on a project. Usage: magent config set myapp group INTERNAL"""
+    """Set a field on a project. Usage: magent config set myapp group INTERNAL
+
+    ``node`` takes a nick under settings.nodes, ``auto`` (placed at bring-up)
+    or ``none`` (run it here again)."""
+    if field == "node":
+        _set_project_node(ctx, path, value)
+        click.echo(
+            f"  Set {style(field, bold=True)} = {style(value, fg='cyan')} on {path}"
+        )
+        return
     parsed: str | int | bool = value
     if value.lower() in ("true", "false"):
         parsed = value.lower() == "true"
@@ -990,25 +1009,52 @@ def config_edit(host: str | None) -> None:
     sys.exit(_remote_config_edit(_resolve_remote_target(host)))
 
 
-def _set_project_field(
-    ctx: click.Context, path: str, field: str, value: object
-) -> None:
+# ``config set <project> node none``: the project runs here again.
+NODE_NONE = "none"
+
+
+def _refuse_invalid(data: dict[str, object]) -> None:
+    """Exit 1, nothing written, when DATA would not load -- the one set of
+    rules ``load_config`` enforces (a node nick not under settings.nodes, a
+    node project that also names an ssh host), in its own words."""
+    why = _validate_config_text(json.dumps(data))
+    if why is not None:
+        click.echo(f"  Not saved: {why}", err=True)
+        sys.exit(1)
+
+
+def _set_project_node(ctx: click.Context, path: str, value: str) -> None:
+    """Pin the project at PATH to a node, or unpin it (``none``). The value is
+    always a string (a nick like ``42`` is not a number) and is validated
+    before anything is written."""
     config_file = find_config(ctx.obj.get("config_path"))
     data = _load_raw_config(config_file)
-    normalized = path.replace("\\", "/")
+    project = _find_project(data, path)
+    if value == NODE_NONE:
+        project.pop("node", None)
+    else:
+        project["node"] = value
+    _refuse_invalid(data)
+    _save_raw_config(config_file, data)
 
-    found = False
+
+def _find_project(data: dict[str, object], path: str) -> dict[str, object]:
+    """The project entry matching PATH (or its leaf name); exit 1 if none."""
+    normalized = path.replace("\\", "/")
     for p in _project_dicts(data):
         if (
             _as_str(p.get("path")) == normalized
             or Path(_as_str(p.get("path"))).name == path
         ):
-            p[field] = value
-            found = True
-            break
+            return p
+    click.echo(f"  No project matching '{path}' found.", err=True)
+    sys.exit(1)
 
-    if not found:
-        click.echo(f"  No project matching '{path}' found.", err=True)
-        sys.exit(1)
 
+def _set_project_field(
+    ctx: click.Context, path: str, field: str, value: object
+) -> None:
+    config_file = find_config(ctx.obj.get("config_path"))
+    data = _load_raw_config(config_file)
+    _find_project(data, path)[field] = value
     _save_raw_config(config_file, data)

@@ -357,6 +357,36 @@ def live_sessions(
 # answering were FROZEN live agents, not dead ones.
 SessionState = Literal["live", "absent", "unknown"]
 
+# The ONE exit code ``has-session`` answers "no such session" with: tmux's own
+# (1), measured on psmux 3.3.x (``has-session -t <name>`` -> rc 1 after the
+# session or its server is gone; every fake in the suite exits 1 the same way).
+# Its other answer is 0. Anything else is not an answer about the session at
+# all: a client that died abnormally (STATUS_DLL_INIT_FAILED 0xC0000142, an
+# access violation, a signal), a usage error, a launcher that could not start
+# it.
+HAS_SESSION_ABSENT_RC = 1
+
+
+def session_state_from_rc(rc: int | None) -> SessionState:
+    """What one ``has-session -t`` client's exit code says about its session.
+
+    ``None`` (the client never answered) and every code that is neither
+    ``0`` nor ``HAS_SESSION_ABSENT_RC`` are ``unknown``: only a positive "no
+    such session" may lead the bring-up to kill the socket and create it afresh,
+    and a crashed client has said nothing about the session it was asked about
+    -- on the 2026-08-18 wedge the ones that did not answer were FROZEN live
+    agents. The code is compared as reported, so the unsigned NTSTATUS
+    (3221225794) and its signed twin (-1073741502) are both ``unknown``.
+    """
+    if rc is None:
+        return "unknown"
+    if rc == 0:
+        return "live"
+    if rc == HAS_SESSION_ABSENT_RC:
+        return "absent"
+    return "unknown"
+
+
 # How long a killed client gets to be collected. A kill cannot be refused
 # (TerminateProcess / SIGKILL), so this is only the OS's own teardown -- bounded
 # anyway, so the reap can never become the unbounded wait it exists to end.
@@ -409,9 +439,10 @@ def probe_sessions(
 
     The same ``has-session -t`` probe as ``has_session`` -- ``-t`` is
     load-bearing, see there -- fanned out and bounded by ``await_clients``. A
-    probe that times out, or that could not be spawned, is "unknown", never
-    "absent": only a positive answer that the session is not there may lead to
-    killing its socket and creating it afresh.
+    probe that times out, that could not be spawned, or that exited with
+    anything but 0 or ``HAS_SESSION_ABSENT_RC`` (a crashed client) is
+    "unknown", never "absent": only a positive answer that the session is not
+    there may lead to killing its socket and creating it afresh.
     """
     procs: list[subprocess.Popen[bytes] | None] = []
     for name in names:
@@ -428,7 +459,16 @@ def probe_sessions(
             procs.append(None)
     states: dict[str, SessionState] = {}
     for name, rc in zip(names, await_clients(procs, timeout), strict=True):
-        states[name] = "unknown" if rc is None else ("live" if rc == 0 else "absent")
+        states[name] = session_state_from_rc(rc)
+        if rc not in (None, 0, HAS_SESSION_ABSENT_RC):
+            get_logger("launch").warning(
+                "has-session -t %s exited %d (%#x), which is neither 'live' (0)"
+                " nor 'no such session' (%d): reading it as unknown, not absent",
+                name,
+                rc,
+                rc & 0xFFFFFFFF,
+                HAS_SESSION_ABSENT_RC,
+            )
     return states
 
 
@@ -950,10 +990,11 @@ def _display_fan_out(names: list[str], fmt: str, psmux: str | None) -> dict[str,
     return out
 
 
-def _image_stem(raw: str) -> str:
+def image_stem(raw: str) -> str:
     """``C:\\x\\PWSH.EXE`` -> ``pwsh``: the leaf name, lower-cased, ``.exe``
     dropped -- the one spelling foreground readings and process image names are
-    both compared in."""
+    both compared in. Public because ``reap.py`` (and the real-psmux platform
+    test) compare image names in exactly this spelling."""
     leaf = raw.strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
     return leaf.removesuffix(".exe")
 
@@ -970,7 +1011,65 @@ def is_idle_command(raw: str) -> bool:
     stripped = raw.strip()
     if not stripped:
         return False
-    return _image_stem(stripped) in _IDLE_SHELLS
+    return image_stem(stripped) in _IDLE_SHELLS
+
+
+def pane_trees(
+    names: list[str], psmux: str | None = None
+) -> dict[str, list[tuple[str, int, int]] | None]:
+    """Each session's pane process SUBTREE (root first), or None when unknown.
+
+    ONE ``pane_pids`` fan-out and ONE ``snapshot_processes`` for the whole
+    call -- the shape ``idle_sessions`` needs, factored out so the reaper (R4)
+    reads a pane's tree the same single way. None for a name means its pid was
+    unreadable, or the snapshot failed, or the pid was not in the snapshot; a
+    caller must treat None as unknown, never as 'nothing runs there'.
+    """
+    if not names:
+        return {}
+    # In-body, like every procs/sessions use in this module: keeps this leaf
+    # importing only magent.log at load time.
+    from magent.procs import process_tree, snapshot_processes
+
+    pids = pane_pids(names, psmux=psmux)
+    snapshot = snapshot_processes()
+    out: dict[str, list[tuple[str, int, int]] | None] = {}
+    for name in names:
+        pid = pids.get(name)
+        out[name] = (
+            process_tree(pid, snapshot)
+            if pid is not None and snapshot is not None
+            else None
+        )
+    return out
+
+
+def _console_veto(
+    tree: list[tuple[str, int, int]], members: frozenset[int] | None
+) -> str | None:
+    """Why a pane whose tree looked idle must NOT be typed into, or None when
+    its console holds exactly its own subtree. ``members`` is the pane root's
+    console-client set from ``procs.console_clients``; ``tree`` is the pane's
+    subtree (root first)."""
+    if members is None:
+        return "console clients unreadable"
+    subtree = {pid for _img, pid, _ppid in tree}
+    if tree[0][1] not in members:
+        return "the pane shell is not on its own console"
+    outside = sorted(members - subtree)
+    if outside:
+        joined = ", ".join(str(p) for p in outside)
+        return f"process(es) {joined} outside the pane's tree share its console"
+    return None
+
+
+# pane name -> the (pane pid, console-veto reason) last logged for it. The veto
+# is logged ONCE per episode within one process: a long-lived caller asks again
+# (the menu redraws its status table), and a pane whose console can never be
+# read (a higher integrity level) would otherwise append the same WARNING
+# forever. The pane reading idle ends its episode; a changed reason (a
+# different outside pid) or a pane recreated under the same name is news.
+_console_vetoes_logged: dict[str, tuple[int, str]] = {}
 
 
 def idle_sessions(
@@ -978,6 +1077,8 @@ def idle_sessions(
     psmux: str | None = None,
     *,
     foreground: Mapping[str, str] | None = None,
+    images: frozenset[str] | None = None,
+    vetoed: dict[str, str] | None = None,
 ) -> set[str]:
     """The sessions among ``names`` whose agent is POSITIVELY gone: the pane
     rests at its shell with no agent anywhere under it.
@@ -992,7 +1093,7 @@ def idle_sessions(
     is ``bash`` (its Bash tool), ``pwsh``, ``grep`` or an MCP server -- with
     claude.exe alive under the pane (measured live: 4 of 31 sessions read that
     way, and revive would have typed ``cmd /c claude --continue`` + Enter into
-    each). A yes therefore needs all three of:
+    each). A yes therefore needs all four of:
 
     1. the foreground reading is a bare shell (``is_idle_command``) -- still a
        necessary condition, since a pane in the user's own program is not a
@@ -1003,16 +1104,26 @@ def idle_sessions(
     3. nothing in that process's subtree is an agent image
        (``sessions.agent_image_names``) or a live launcher
        (``_LAUNCHER_IMAGES`` -- the ``cmd /c`` magent typed, alive exactly as
-       long as the tool it started, registry image or not).
+       long as the tool it started, registry image or not);
+    4. the pane's CONSOLE holds exactly that subtree (``procs.console_clients``,
+       checked last and only for the panes that passed 1-3): an agent orphaned
+       out of the pane's process tree can still read the pane's console, and
+       anything typed into the pane would land in it.
 
     Anything unknown is a no -- an unreadable pid, a failed snapshot (always,
     off Windows), a pane process gone by the time of the snapshot: never inject
     keystrokes into a pane whose state we could not establish.
 
     Batched: one ``pane_pids`` fan-out and ONE process snapshot for the whole
-    call, paid only when some reading is a shell. A caller that already holds
-    the foreground readings (status's table) passes them as ``foreground``
-    instead of paying for that fan-out twice.
+    call, paid only when some reading is a shell, and ONE console-helper spawn,
+    paid only when some pane passed the tree stages. A caller that already
+    holds the foreground readings (status's table) passes them as
+    ``foreground`` instead of paying for that fan-out twice; ``images`` ADDS
+    image names, in any spelling (``image_stem`` normalizes them), to the
+    registry's agent-image set and the launcher -- so it can only make the
+    verdict safer, never hide a registry agent. A caller that must report WHY a
+    shell-resting pane was refused passes ``vetoed``, which receives
+    ``{name: reason}`` for every console-stage veto.
     """
     readings = (
         foreground
@@ -1023,24 +1134,44 @@ def idle_sessions(
     if not shells:
         return set()
 
-    # In-body, like every procs/sessions use in this module: keeps this leaf
-    # importing only magent.log at load time.
-    from magent.procs import process_tree, snapshot_processes
     from magent.sessions import agent_image_names
 
-    pids = pane_pids(shells, psmux=psmux)
-    snapshot = snapshot_processes()
-    if snapshot is None:
-        return set()
-    running = agent_image_names() | _LAUNCHER_IMAGES
-    idle: set[str] = set()
+    running = (
+        agent_image_names()
+        | {image_stem(image) for image in images or ()}
+        | _LAUNCHER_IMAGES
+    )
+    trees = pane_trees(shells, psmux=psmux)
+    candidates: list[tuple[str, list[tuple[str, int, int]]]] = []
     for name in shells:
-        pid = pids.get(name)
-        tree = process_tree(pid, snapshot) if pid is not None else None
+        tree = trees.get(name)
         if not tree or not is_idle_command(tree[0][0]):
             continue
-        if not any(_image_stem(image) in running for image, _pid, _ppid in tree):
+        if any(image_stem(image) in running for image, _pid, _ppid in tree):
+            continue
+        candidates.append((name, tree))
+    if not candidates:
+        return set()
+
+    # The image check on console clients is dropped on purpose: every client
+    # inside the subtree already passed the running-image check above, and the
+    # veto rejects any client outside it.
+    from magent.procs import console_clients
+
+    roots = [tree[0][1] for _name, tree in candidates]
+    clients = console_clients(roots)
+    idle: set[str] = set()
+    for name, tree in candidates:
+        reason = _console_veto(tree, clients.get(tree[0][1]))
+        if reason is None:
             idle.add(name)
+            _console_vetoes_logged.pop(name, None)
+            continue
+        if vetoed is not None:
+            vetoed[name] = reason
+        if _console_vetoes_logged.get(name) != (tree[0][1], reason):
+            _console_vetoes_logged[name] = (tree[0][1], reason)
+            get_logger("launch").warning("pane %s is not proven idle: %s", name, reason)
     return idle
 
 
@@ -1159,8 +1290,11 @@ _STATUS_BRAND = "#[bold,fg=green] magent #[default]"
 # ...and the width budget has to travel with it. tmux truncates status-left at
 # `status-left-length` (default 10, but a personal conf may set it far tighter),
 # so setting the brand without the length can render it mid-word. Style
-# directives don't count toward the limit; " magent " is 8 columns.
-_STATUS_BRAND_LEN = "10"
+# directives don't count toward the limit; " magent " is 8 cells, and the
+# length carries 2 more of headroom -- the 10 every local session has always
+# been given.
+_STATUS_BRAND_CELLS = 8
+_STATUS_LEFT_HEADROOM = 2
 
 # What a raw F2 says when it actually reaches psmux. See `decoration_argv` for
 # why this can never double-fire on a Windows attach window. Pure ASCII for the
@@ -1176,7 +1310,7 @@ _F2_FALLBACK_MSG = (
 # `#I:#W#F`, and with one window per session (magent's invariant) the `0:`
 # index is pure noise stealing bar columns from the name. Verified live on
 # psmux 3.3.8: `set -g window-status-format "#W"` renders exactly the name.
-_WINDOW_STATUS_FORMAT = "#W"
+WINDOW_STATUS_FORMAT = "#W"
 
 # ...and the name itself is width-budgeted like every other bar element. A
 # 30-char project name eats the whole bar; longer than this renders as the
@@ -1226,16 +1360,73 @@ def status_hints(code_hint: bool) -> tuple[str, str]:
     return _STATUS_HINTS_F1, _STATUS_HINTS_F1_LEN
 
 
+def _check_brand_nick(nick: str) -> None:
+    """Refuse a nick the status line cannot carry verbatim. The brand is a tmux
+    FORMAT string, so a ``#`` would be expanded on every redraw (``#(cmd)`` runs
+    a command, ``#[...]`` restyles the bar), and a non-ASCII or non-printable
+    glyph (a raw newline, a tab, a control character) breaks the "cells ==
+    len" law. Config validates nicks, but the typed view is lenient and not
+    every caller's nick went through ``settings.nodes``."""
+    if not nick or not nick.isascii() or not nick.isprintable() or "#" in nick:
+        msg = (
+            f"status brand nick must be non-empty printable ASCII without '#': {nick!r}"
+        )
+        raise ValueError(msg)
+
+
+def _brand_cells(nick: str | None) -> int:
+    """The brand's visible width in cells for ``nick`` (see ``status_brand``)."""
+    if nick is None:
+        return _STATUS_BRAND_CELLS
+    _check_brand_nick(nick)
+    return _STATUS_BRAND_CELLS + len(f"@{nick} ")
+
+
+def status_brand(nick: str | None) -> tuple[str, str]:
+    """The status-left brand and its width in cells. ``None`` is a session on
+    THIS machine: today's brand, byte for byte. A nick is a session running on
+    that pool machine (the nodes feature), branded ``magent @<nick>`` so a
+    window says where its agent actually is. ASCII only, same law as the hints:
+    the cell count is ``len``, and a wide glyph here would desync the bar.
+
+    Raises ``ValueError`` for an empty, non-ASCII or ``#``-bearing nick."""
+    cells = _brand_cells(nick)
+    if nick is None:
+        return _STATUS_BRAND, str(cells)
+    return _STATUS_BRAND + f"@{nick} ", str(cells)
+
+
+def status_left(nick: str | None) -> tuple[str, str]:
+    """``status-left`` and ``status-left-length`` for a session: the brand and
+    its cells plus the headroom every session gets. The one place both
+    multiplexers read it from, so a psmux bar and a node's tmux bar cannot
+    budget the brand differently."""
+    brand, _ = status_brand(nick)
+    return brand, str(_brand_cells(nick) + _STATUS_LEFT_HEADROOM)
+
+
+def f2_binding_argv(prefix: list[str], code_hint: bool) -> list[str]:
+    """The F2 half of a decoration, after ``prefix`` (``[psmux, "-L", name]``
+    here, ``[tmux, "-L", "magent"]`` on a node). See ``decoration_argv`` for why
+    an advertised F2 binds a fallback message and an unadvertised one is
+    unbound."""
+    if code_hint:
+        return [*prefix, "bind", "-n", "F2", "display-message", _F2_FALLBACK_MSG]
+    return [*prefix, "unbind-key", "-n", "F2"]
+
+
 def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     """The psmux commands that brand ``name`` and advertise its window hotkeys.
 
-    Six of them: magent *owns* F1 -> detach-client per session (the hint has to
-    be truthful on a machine with no personal ``bind -n F1`` in ~/.tmux.conf,
-    and owning the binding keeps the existing "back to the picker" semantics
-    rather than changing them), the status-right carries the hint text plus the
-    width budget it needs, the status-left carries the product brand plus
-    the width budget *it* needs, and the sixth is the F2 fallback below. Each
-    half sets its text and its length together or neither: a personal conf with
+    Ten of them. The first six: magent *owns* F1 -> detach-client per session
+    (the hint has to be truthful on a machine with no personal ``bind -n F1``
+    in ~/.tmux.conf, and owning the binding keeps the existing "back to the
+    picker" semantics rather than changing them), the status-right carries
+    the hint text plus the width budget it needs, the status-left carries
+    the product brand plus the width budget *it* needs, and the sixth is the
+    F2 fallback below. The last four own the window name and its status-bar
+    entry (see the inline comments). Each half sets its text and its length
+    together or neither: a personal conf with
     a tighter ``status-*-length`` would truncate the other half mid-label. All
     are ``-L <name>``-scoped, so they land on that session's own server and
     override whatever its tmux.conf set at start-up.
@@ -1268,17 +1459,14 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     key nothing advertises any more.
     """
     hints, hints_len = status_hints(code_hint)
-    f2 = (
-        [psmux, "-L", name, "bind", "-n", "F2", "display-message", _F2_FALLBACK_MSG]
-        if code_hint
-        else [psmux, "-L", name, "unbind-key", "-n", "F2"]
-    )
+    brand, brand_len = status_left(None)
+    f2 = f2_binding_argv([psmux, "-L", name], code_hint)
     return [
         [psmux, "-L", name, "bind", "-n", "F1", "detach-client"],
         [psmux, "-L", name, "set", "-g", "status-right", hints],
         [psmux, "-L", name, "set", "-g", "status-right-length", hints_len],
-        [psmux, "-L", name, "set", "-g", "status-left", _STATUS_BRAND],
-        [psmux, "-L", name, "set", "-g", "status-left-length", _STATUS_BRAND_LEN],
+        [psmux, "-L", name, "set", "-g", "status-left", brand],
+        [psmux, "-L", name, "set", "-g", "status-left-length", brand_len],
         f2,
         # The window NAME is magent's too (same doctrine as window titles):
         # psmux's automatic-rename shows the pane's current command, so the bar
@@ -1295,7 +1483,7 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
         [psmux, "-L", name, "set", "-g", "automatic-rename", "off"],
         # ...and the entry renders as the name alone: no `0:` index (one
         # window per session makes it noise), no flags suffix.
-        [psmux, "-L", name, "set", "-g", "window-status-format", _WINDOW_STATUS_FORMAT],
+        [psmux, "-L", name, "set", "-g", "window-status-format", WINDOW_STATUS_FORMAT],
         [
             psmux,
             "-L",
@@ -1303,7 +1491,7 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
             "set",
             "-g",
             "window-status-current-format",
-            _WINDOW_STATUS_FORMAT,
+            WINDOW_STATUS_FORMAT,
         ],
     ]
 
@@ -1522,8 +1710,8 @@ def eligible_projects(
     """Projects that map to a persistent psmux session.
 
     A project is eligible when it is enabled, runs a CLI agent (not an IDE),
-    and is local (no ``host``). When ``group`` is given, only projects tagged
-    with that group (case-insensitive) are returned.
+    and is local (no ``host``, no pool ``node``). When ``group`` is given,
+    only projects tagged with that group (case-insensitive) are returned.
 
     The ``cmd`` each entry carries is fresh-start aware: a project directory
     with no stored session for its tool gets the configured command WITHOUT its
@@ -1542,6 +1730,7 @@ def eligible_projects(
     mapping, and the default None, both mean the tool's own default store,
     which is byte-for-byte today's probe for every project.
     """
+    from magent.config import runs_on_node
     from magent.launch import _expand_base_dir, _resolve_path
     from magent.sessions import build_start_command, is_ide_tool
     from magent.titles import get_leaf_name
@@ -1561,6 +1750,11 @@ def eligible_projects(
         if is_ide_tool(tool):
             continue
         if proj.host:
+            continue
+        # A pool-node project runs on that node's tmux, never in a local psmux
+        # session (PR-D). A cloud project is a local pane and stays eligible
+        # (DECISION-15).
+        if runs_on_node(proj):
             continue
         leaf = proj.title or get_leaf_name(proj.path)
         sid = session_name(leaf)
@@ -1878,10 +2072,25 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str,
     return _report([n for n in missing if n in still_missing or n not in stuck])
 
 
+def _parked_session_id(rec: dict[str, object]) -> str | None:
+    """The conversation id a ``parked`` record resumes, or None when it holds
+    none usable. The id is typed into a shell, so only the shape a session file
+    may hold passes -- a truthiness test would type ``x & calc`` or a flag."""
+    from magent.sessions.live import SESSION_ID_RE
+
+    sid = rec.get("session_id")
+    if isinstance(sid, str) and SESSION_ID_RE.fullmatch(sid):
+        return sid
+    return None
+
+
 def revive_sessions(
     config: MagentConfig,
     only: list[str] | None = None,
     group: str | None = None,
+    *,
+    resume_parked: bool = False,
+    vetoed: dict[str, str] | None = None,
 ) -> list[str]:
     """Re-launch the agent in live sessions whose pane fell back to a shell.
 
@@ -1892,20 +2101,41 @@ def revive_sessions(
     session), then the live ones get ONE ``idle_sessions`` verdict -- the only
     thing that may put keystrokes into a pane, since typed into a LIVE agent
     the resume command is a submitted prompt. Returns the session ids revived.
+
+    A pane the idle reaper parked (its record says ``parked``) is left alone
+    unless ``resume_parked`` -- status's ``r<n>``, a human asking for that pane
+    back. Then it resumes by the record's id, never ``--continue``, and the
+    record is cleared once the resume is sent.
+
+    A caller that must say WHY a session was not revived passes ``vetoed``,
+    which receives ``{name: reason}`` for every eligible session in scope it
+    did not revive, and for every name in ``only`` it could not consider.
+    Without a psmux binary nothing is read, so only the names in ``only`` get
+    a reason, and a call with no ``only`` leaves ``vetoed`` empty.
     """
     from concurrent.futures import ThreadPoolExecutor
 
+    from magent import agent_state
+    from magent.sessions import build_resume_command
+
+    why: dict[str, str] = {} if vetoed is None else vetoed
     binary = find_psmux()
     if not binary:
+        why.update(dict.fromkeys(only or (), "psmux not found"))
         return []
 
     candidates: list[dict[str, object]] = []
-    for p in eligible_projects(config, group):
+    eligible = eligible_projects(config, group)
+    for p in eligible:
         if only is not None and _field_str(p, "session") not in only:
             continue
         if not p["cmd"]:
+            why[_field_str(p, "session")] = "its tool has no command configured"
             continue
         candidates.append(p)
+    known = {_field_str(p, "session") for p in eligible}
+    for sid in set(only or ()) - known:
+        why[sid] = "not an enabled local agent session in the config"
     if not candidates:
         return []
 
@@ -1915,12 +2145,54 @@ def revive_sessions(
     with ThreadPoolExecutor(max_workers=16) as pool:
         flags = list(pool.map(_live, candidates))
     live = [p for p, ok in zip(candidates, flags, strict=True) if ok]
-    idle = idle_sessions([_field_str(p, "session") for p in live], psmux=binary)
+    for p, ok in zip(candidates, flags, strict=True):
+        if not ok:
+            why[_field_str(p, "session")] = "its psmux session did not answer"
+    console: dict[str, str] = {}
+    idle = idle_sessions(
+        [_field_str(p, "session") for p in live], psmux=binary, vetoed=console
+    )
 
     revived: list[str] = []
     for p in live:
         sid = _field_str(p, "session")
         if sid not in idle:
+            # An unreadable pane reads as not idle too: neither is claimed alone.
+            # "not proven idle" holds for every console reason, the unreadable
+            # one included.
+            why[sid] = (
+                f"its pane is not proven idle: {console[sid]}"
+                if sid in console
+                else "its agent is still running, or its pane could not be read"
+            )
+            continue
+        cwd = _field_str(p, "resolved")
+        rec = agent_state.state_for(cwd) if cwd else None
+        if rec is not None and rec.get("state") == agent_state.PARKED:
+            # A bulk revive resuming it would undo the memory the park freed,
+            # on every up and every attach.
+            if not resume_parked:
+                why[sid] = "the idle reaper parked it"
+                continue
+            resume_id = _parked_session_id(rec)
+            if resume_id is None:
+                # Never --continue instead: with another agent in this
+                # directory it can open that agent's conversation.
+                get_logger("launch").warning(
+                    "revive: %s is parked without a resumable session id; leaving it",
+                    sid,
+                )
+                why[sid] = "it is parked without a resumable session id"
+                continue
+            resume = build_resume_command(
+                _field_str(p, "tool"), _field_str(p, "cmd"), resume_id
+            )
+            keys = f"cmd /c {resume}" if sys.platform == "win32" else resume
+            if send_keys(sid, keys, "Enter", target=sid, psmux=binary):
+                revived.append(sid)
+                agent_state.clear_state(cwd)  # its SessionStart hook writes anew
+            else:
+                why[sid] = "the resume could not be sent (see launch.log)"
             continue
         # The configured command already IS the resume command -- claude's
         # registry default is ``claude --continue``, which picks the dead
@@ -1936,6 +2208,8 @@ def revive_sessions(
         keys = f"cmd /c {resume}" if sys.platform == "win32" else resume
         if send_keys(sid, keys, "Enter", target=sid, psmux=binary):
             revived.append(sid)
+        else:
+            why[sid] = "the relaunch could not be sent (see launch.log)"
     return revived
 
 
@@ -1969,6 +2243,9 @@ def config_sessions(config_path: str | None) -> list[dict[str, object]]:
             continue
         tool = p.get("tool", default_tool)
         if isinstance(tool, str) and is_ide_tool(tool):
+            continue
+        # Raw dict: same rule as eligible_projects' node skip (DECISION-15).
+        if p.get("node") not in (None, "cloud"):
             continue
         proj_name = p.get("title") or Path(p["path"]).name
         out.append(

@@ -1,8 +1,38 @@
 from __future__ import annotations
 
+import os
 import re
 import struct
 from pathlib import Path
+from typing import NamedTuple
+
+from magent import log, procs
+from magent.sessions.live import SESSION_ID_RE, IdleProbe, LiveSession, SessionScan
+
+# Session files already reported unusable. Once per file per episode: a file
+# that parses again leaves the set, so its next fault is logged afresh.
+_warned_files: set[str] = set()
+
+
+def _warn_once(path: Path, why: str) -> None:
+    key = str(path)
+    if key in _warned_files:
+        return
+    _warned_files.add(key)
+    log.get_logger("reap").warning(
+        "unusable claude session file %s: %s", path.name, why
+    )
+
+
+class _SessionFile(NamedTuple):
+    pid: int
+    session_id: str
+    cwd: str
+    proc_start: int
+    kind: str
+    status: str
+    status_ts: float
+
 
 # claude.exe caps an encoded project-dir name at 200 UTF-16 units and makes the
 # cut name unique with the path's Java String.hashCode in base 36.
@@ -130,6 +160,16 @@ def has_claude_session(project_dir: str, config_dir: Path | None = None) -> bool
     return next(sess_dir.glob("*.jsonl"), None) is not None
 
 
+def claude_fresh_form(base_cmd: str) -> str | None:
+    """``base_cmd`` without its implicit-resume flag, or None when it has none
+    or names a session explicitly. No store is read: whether there is anything
+    to resume is the caller's question -- on this PC ``claude_fresh_command``
+    asks it, and on a pool node ``bring_up.sh`` asks the node's own store."""
+    if _EXPLICIT_RESUME_RE.search(base_cmd) or not _CONTINUE_RE.search(base_cmd):
+        return None
+    return _CONTINUE_RE.sub("", base_cmd).strip()
+
+
 def claude_fresh_command(
     base_cmd: str, project_dir: str, config_dir: Path | None = None
 ) -> str | None:
@@ -156,11 +196,10 @@ def claude_fresh_command(
     found to continue" at a dead shell. That is the honest answer for that
     store; surfacing it to the user is the caller's job.
     """
-    if _EXPLICIT_RESUME_RE.search(base_cmd) or not _CONTINUE_RE.search(base_cmd):
+    fresh = claude_fresh_form(base_cmd)
+    if fresh is None or has_claude_session(project_dir, config_dir):
         return None
-    if has_claude_session(project_dir, config_dir):
-        return None
-    return _CONTINUE_RE.sub("", base_cmd).strip()
+    return fresh
 
 
 def get_claude_session_ids(
@@ -185,3 +224,182 @@ def get_claude_session_ids(
     while len(ids) < count:
         ids.append(None)
     return ids
+
+
+def _parse_session_file(stem: str, text: str) -> _SessionFile | None:
+    """Parse one ``<pid>.json``'s bytes. Any missing field, wrong type, or a
+    pid that does not match the file name makes it unusable (None)."""
+    import json
+
+    from magent.json_depth import nests_too_deep
+
+    # Refused by magent's own depth bound, never left to the parser's recursion
+    # limit: json.loads reads absurd nesting without a RecursionError on some
+    # interpreters, so the same file would be usable there and not here.
+    if nests_too_deep(text):
+        return None
+    try:
+        raw = json.loads(text)
+    except (ValueError, RecursionError):  # RecursionError: the backstop
+        return None
+    if not isinstance(raw, dict):
+        return None
+    pid = raw.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or str(pid) != stem:
+        return None
+    sid = raw.get("sessionId")
+    if not isinstance(sid, str) or not SESSION_ID_RE.fullmatch(sid):
+        return None
+    cwd = raw.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    proc_start = raw.get("procStart")
+    if (
+        not isinstance(proc_start, str)
+        or not proc_start.isascii()
+        or not proc_start.isdigit()
+    ):
+        return None
+    try:
+        start = int(proc_start)
+    except ValueError:  # past int()'s digit limit: no FILETIME is that long
+        return None
+    kind = raw.get("kind")
+    status = raw.get("status")
+    if not isinstance(kind, str) or not isinstance(status, str):
+        return None
+    updated = raw.get("statusUpdatedAt")
+    if isinstance(updated, bool) or not isinstance(updated, int):
+        return None
+    try:
+        status_ts = updated / 1000.0
+    except OverflowError:  # past any float: no clock reads that
+        return None
+    return _SessionFile(
+        pid=pid,
+        session_id=sid,
+        cwd=cwd,
+        proc_start=start,
+        kind=kind,
+        status=status,
+        status_ts=status_ts,
+    )
+
+
+def read_session_files(config_dir: Path) -> SessionScan | None:
+    """Live claude sessions from ``<config_dir>/sessions/<pid>.json``, keyed by
+    pid, plus the pids whose files could not be used. The ONLY reader of this
+    directory in magent.
+
+    A file is returned only when a process with that pid is alive AND its
+    creation FILETIME equals ``procStart`` exactly (the stale-file rule: a hard
+    kill leaves the file behind with its last status). Only ``*.json`` names are
+    opened, so the ``.key`` files are never read; ``name`` is never read, so it
+    can never be logged.
+
+    A file that is there but unusable (unreadable, not UTF-8, not one JSON
+    object, nested past the parser's depth, a missing or mistyped field, a pid
+    that is not its name) is logged and its name's pid is reported in
+    ``unusable``: an agent nobody can read is unknown, never absent. A name that
+    is not a pid names no process and is left out.
+
+    A directory that does NOT exist yet is the normal empty state and returns
+    an empty scan (a fresh machine with no claude sessions). ``None`` means the
+    directory is there but could not be *listed* (a permission error, or a file
+    where the directory should be) -- an unknown the reaper vetoes on.
+    """
+    sessions_dir = config_dir / "sessions"
+    try:
+        entries = sorted(sessions_dir.iterdir())
+    except FileNotFoundError:
+        return SessionScan({}, frozenset())  # no dir yet: normal, not a failure
+    except OSError:
+        return None  # there, but unlistable: unknown
+    files = [p for p in entries if p.suffix == ".json"]
+    out: dict[int, LiveSession] = {}
+    unusable: set[int] = set()
+
+    def _unusable(path: Path, why: str) -> None:
+        _warn_once(path, why)
+        if path.stem.isascii() and path.stem.isdigit():
+            unusable.add(int(path.stem))
+
+    for path in files:
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            continue  # vanished between listing and read: normal, silent
+        except OSError as exc:
+            _unusable(path, f"unreadable ({exc})")
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            # Caught mid-write (the file is not replaced atomically, and free
+            # text can be non-ASCII): one unusable file, never a raise that
+            # would stop the sweep for the whole fleet.
+            _unusable(path, "not valid UTF-8")
+            continue
+        parsed = _parse_session_file(path.stem, text)
+        if parsed is None:
+            _unusable(path, "missing/invalid field or pid mismatch")
+            continue
+        _warned_files.discard(str(path))  # usable again: the next fault is news
+        ident = procs.process_identity(parsed.pid)
+        if ident is None or ident.created != parsed.proc_start:
+            continue  # dead or reused pid: drop silently, a stale file is normal
+        out[parsed.pid] = LiveSession(
+            pid=parsed.pid,
+            created=ident.created,
+            image=ident.image,
+            session_id=parsed.session_id,
+            cwd=parsed.cwd,
+            status=parsed.status,
+            status_ts=parsed.status_ts,
+            kind=parsed.kind,
+            quiet=parsed.status == "idle",
+        )
+    return SessionScan(out, frozenset(unusable))
+
+
+def last_activity(session: LiveSession, config_dir: Path) -> float | None:
+    """The newest mtime across ``session``'s main transcript and its
+    ``subagents/*.jsonl``, or None when the main transcript does not exist or
+    the tree cannot be read.
+
+    Never a partial reading: a subagent file that vanished between the listing
+    and its stat is skipped (cleanup removing an old one is normal), but any
+    other failure -- including a ``subagents`` dir that is there and cannot be
+    listed -- is None, the unknown the reaper vetoes on. A missing
+    ``subagents`` dir just means there are none."""
+    proj = _projects_dir(config_dir, session.cwd)
+    main = proj / f"{session.session_id}.jsonl"
+    try:
+        newest = main.stat().st_mtime
+    except OSError:
+        return None
+    sub_dir = proj / session.session_id / "subagents"
+    try:
+        with os.scandir(sub_dir) as it:
+            names = [e.path for e in it if e.name.endswith(".jsonl")]
+    except FileNotFoundError:
+        return newest  # no subagents dir: no subagents
+    except OSError:
+        return None  # there, but unlistable: unknown
+    for sub in names:
+        try:
+            # os.stat, not the DirEntry's cached listing data: on NTFS the
+            # listing's attributes "may not be current" (FindFirstFile's own
+            # caveat), and this is the file being written right now.
+            mtime = os.stat(sub).st_mtime
+        except FileNotFoundError:
+            continue  # removed since the listing
+        except OSError:
+            return None
+        newest = max(newest, mtime)
+    return newest
+
+
+claude_idle_probe = IdleProbe(
+    sessions_by_pid=read_session_files, last_activity=last_activity
+)

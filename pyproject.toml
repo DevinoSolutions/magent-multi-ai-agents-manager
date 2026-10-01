@@ -1,6 +1,6 @@
 [project]
 name = "magent-multi-ai-agents-manager"
-version = "3.19.4"
+version = "3.20.0"
 description = "Launch each project's AI coding agent in its own terminal, auto-tiled across every monitor"
 readme = "README.md"
 license = "AGPL-3.0"
@@ -98,6 +98,14 @@ Changelog = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/b
 requires = ["hatchling<1.32"]
 build-backend = "hatchling.build"
 
+# With no sdist table, hatchling ships the whole tree minus gitignored files.
+# docs/superpowers holds the agents' working plans and specs. They name local
+# machines and paths, and a source install needs none of them.
+# tests/dist/test_sdist_privacy.py builds this sdist and the wheel and fails on
+# a private marker in either, so a new leak cannot ride a release unnoticed.
+[tool.hatch.build.targets.sdist]
+exclude = ["docs/superpowers"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/magent"]
 
@@ -117,6 +125,8 @@ markers = [
     "needs_tailscale: e2e tests that require a live Tailscale node (CI-only, gated on MDTEST_TAILSCALE=1; skipped locally)",
     "node_contract: run the REAL published agent-state writer under real node and check magent's reader against it (needs node/npm + npm registry; skips cleanly otherwise)",
     "soak: long-run daemon stability tests (serve + attention -d under sustained churn for tens of minutes; CI-only, gated on MDTEST_SOAK=1)",
+    "nodes_real: magent nodes end to end against a real loopback node over real ssh (the node journey is CI-only, gated on MDTEST_NODES_REAL=1; the stand-in and env pins run everywhere)",
+    "live_process_table: opt OUT of the autouse guard that makes reap._stop's default snapshot fail the test -- only for a tier that must walk the REAL process table. Its kills still go through the own-pids guard.",
     "real_home: opt OUT of the autouse HOME redirect -- the test legitimately needs the machine's own home (CI-only tiers that seed the real ~/, e.g. the ssh flagship). Never use on a test that can run on a dev box.",
 ]
 

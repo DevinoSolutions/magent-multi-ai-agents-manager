@@ -3,12 +3,13 @@ import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
-from magent import agent_state, env, log
+from magent import agent_state, env, log, node_sync, procs, reap
 from magent.grid import MonitorRect
 from magent.platform import (
     HandoffResult,
@@ -18,6 +19,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
 )
 from magent.titles import get_leaf_name
+from tests.unit._fake_ssh import SteppedClock, make_fake_ssh
 
 # --- Real-home isolation ------------------------------------------------------
 # Captured at conftest IMPORT time, i.e. before any fixture has had the chance
@@ -72,12 +74,16 @@ PLAYWRIGHT_BROWSERS_PATH = _playwright_browsers_path()
 _IMPORT_BOUND_PATHS = (
     ("magent.cli.attach", "_LAST_HOST_FILE", "last-attach-host"),
     ("magent.cli.attention_cmd", "_PID_PATH", "attention.pid"),
+    ("magent.node_sync", "_PID_PATH", f"{node_sync.HEARTBEAT_NAME}.pid"),
+    ("magent.node_sync", "_FOLLOWS_PATH", f"{node_sync.HEARTBEAT_NAME}.config"),
     ("magent.cli.session_picker", "_FOCUS_TARGET_FILE", "focus-target"),
     ("magent.cli.session_picker", "_PICKER_ATTACHED_FILE", "picker-attached"),
     ("magent.upload_server", "_FOCUS_TARGET_FILE", "focus-target"),
     ("magent.upload_server", "_PICKER_ATTACHED_FILE", "picker-attached"),
     ("magent.upload_server", "_UPLOAD_DIR", "uploads"),
     ("magent.psmux", "DECOR_STAMP", "decor.stamp"),
+    ("magent.nodes", "NODES_DIR", "nodes"),
+    ("magent.nodes", "NODE_MAP_PATH", "nodes/node-map.json"),
     # win32-only module (it raises ImportError elsewhere by design), so this
     # entry is skipped rather than imported off-Windows.
     ("magent.hotkey", "_PID_PATH", "hotkey.pid"),
@@ -202,6 +208,13 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # the machine running the suite, on the config's port, with no pid for any
     # teardown to kill. Tests that are ABOUT the supervisor set it back to "1".
     monkeypatch.setenv("MAGENT_UPLOAD_SUPERVISOR", "0")
+    # ...and its mirror image: `magent serve` supervises the attention daemon.
+    # Any test that runs a real serve (unit `run_server`, every e2e/dist/soak
+    # serve fixture) would otherwise start a REAL detached `attention -d` behind
+    # it the moment the redirected home held an attention heartbeat -- a daemon
+    # that badges and flashes the developer's own windows and that no teardown
+    # knows the pid of. Tests that are ABOUT that supervisor set it back to "1".
+    monkeypatch.setenv("MAGENT_ATTENTION_SUPERVISOR", "0")
     # ...and a second, for the sharpest reason of the three. The psmux priority
     # sweep (psmux.boost_priority) is the ONE thing in this product that reaches
     # processes it did not spawn, by IMAGE NAME, and no HOME redirect can
@@ -220,9 +233,137 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # machine the suite runs on. Tests that are ABOUT the hand-off set the
     # policy explicitly.
     monkeypatch.setenv("MAGENT_SESSION0_POLICY", "allow")
+    # ...and a fourth, with the longest reach of all: `magent serve` keeps the
+    # node sync daemon alive, and that daemon ssh-es into every machine in
+    # settings.nodes with the developer's own keys, every pull interval. A test
+    # that starts a real serve would dial real machines. Off for every tier; the
+    # tests that are ABOUT the supervisor set it back to "1".
+    monkeypatch.setenv("MAGENT_NODE_SYNC", "0")
+    # ...and a fifth, the SHARPEST: the idle reaper (reap.sweep_once, owned by
+    # `magent serve`) is the only thing in the product that TERMINATES processes
+    # it did not spawn, by psmux session name and ~/.claude session file -- and
+    # no HOME redirect contains either. A test that starts a real serve or
+    # attention -d on a developer's box with reaping on would hard-kill that
+    # box's live fleet. Off for every tier; reaper tests turn it on IN PROCESS
+    # only (monkeypatch.setenv + resetting env._cached_env).
+    monkeypatch.setenv("MAGENT_IDLE_REAP", "0")
     log.reset_logging()
     yield
     log.reset_logging()
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_git_repo_env(monkeypatch):
+    """No test inherits a variable that AIMS git at a repo (every name in
+    ``env.GIT_LOCAL_ENV_VARS``, i.e. ``git rev-parse --local-env-vars``).
+
+    Same family as the HOME redirect, and not theoretical: the husky pre-push
+    hook runs the full gate, pytest included, with the hook's GIT_DIR exported
+    -- an ABSOLUTE path when pushing from a worktree, which is how this
+    project works. Under it a fixture's ``git init --bare`` rewrote the real
+    repo's shared config to ``core.bare=true``, its commit landed on the real
+    checked-out branch, and its ``push -u origin main`` went to the real
+    origin (reproduced against a scratch victim). Deleting them here covers
+    every fixture's git child and every product git read under test at once.
+    """
+    for name in env.GIT_LOCAL_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_ssh(monkeypatch):
+    """No test resolves the REAL ``ssh`` client. A test that installed no fake
+    sees "not installed" (``remote_mux.run`` raises RemoteError rc 127), a
+    shape every caller already handles.
+
+    Same family as ``MAGENT_PSMUX_BOOST=0``, for its sharpest reason: a node
+    call dials a real machine on the network under the developer's own keys,
+    and no HOME redirect contains a binary on PATH. Patched on the MODULE
+    attribute, so ``test_remote_mux.py``'s by-value import of ``find_ssh`` (the
+    test that proves PATH resolution) still gets the real resolver; the
+    ``fake_ssh`` fixture patches the same attribute afterwards and wins. The
+    ``needs_ssh`` node tier re-points it at the real client deliberately.
+
+    The attach pane's resolver is guarded too, at both of its halves:
+    ``attach_client.find_ssh`` (so an in-process pane argv names bare ``ssh``)
+    and ``attach_client._system_directory`` (so no test reads the real
+    Windows OpenSSH, including through the by-value real resolvers).
+    """
+    monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: None)
+    monkeypatch.setattr("magent.attach_client.find_ssh", lambda: None)
+    monkeypatch.setattr("magent.attach_client._system_directory", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_gh(monkeypatch):
+    """No test resolves the REAL ``gh``: it holds the developer's GitHub token,
+    and ``node setup`` registers an ssh key to their account with it. Same
+    device as ``_no_real_ssh``; the ``fake_gh`` fixture wins over it."""
+    monkeypatch.setattr("magent.remote_mux.find_gh", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_claude(monkeypatch):
+    """No test resolves the REAL ``claude`` for ``node_auth``: ``claude
+    setup-token`` mints a year-long credential on the developer's Claude
+    subscription and opens their browser to do it. Same device as
+    ``_no_real_gh``; the ``fake_claude`` fixture wins over it."""
+    monkeypatch.setattr("magent.node_auth.find_claude", lambda: None)
+
+
+@pytest.fixture
+def fake_claude(tmp_path, monkeypatch):
+    """A fake ``claude`` (the one fake, tests/unit/_fake_ssh.py, under another
+    name) wired in as node_auth's local claude."""
+    fake = make_fake_ssh(tmp_path, name="claude")
+    monkeypatch.setattr("magent.node_auth.find_claude", lambda: fake.path)
+    return fake
+
+
+@pytest.fixture
+def fake_ssh(tmp_path, monkeypatch):
+    """A real on-disk fake ``ssh`` wired in as remote_mux's client (THE fake:
+    tests/unit/_fake_ssh.py)."""
+    fake = make_fake_ssh(tmp_path)
+    monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: fake.path)
+    return fake
+
+
+# Every fake gh call is a cold cmd.exe (Windows) + interpreter start, ~130ms
+# on an idle box; under a loaded desktop one took past the product's 20s bound
+# and a pin that never meant to test a timeout read the timeout row. A test
+# that does mean it sets its own short GH_TIMEOUT_S, which wins over this.
+FAKE_GH_TIMEOUT_S = 120.0
+
+
+@pytest.fixture
+def fake_gh(tmp_path, monkeypatch):
+    """A fake ``gh`` (the one fake, tests/unit/_fake_ssh.py, under another
+    name) wired in as remote_mux's local gh, with headroom for a slow spawn
+    (``FAKE_GH_TIMEOUT_S``)."""
+    fake = make_fake_ssh(tmp_path, name="gh")
+    monkeypatch.setattr("magent.remote_mux.find_gh", lambda: fake.path)
+    monkeypatch.setattr("magent.remote_mux.GH_TIMEOUT_S", FAKE_GH_TIMEOUT_S)
+    return fake
+
+
+@pytest.fixture
+def stepped_clock(monkeypatch):
+    """remote_mux's clock replaced by a ``SteppedClock`` (tests/unit/
+    _fake_ssh.py): a flood pin's first words come before the cap on any
+    platform's clock. remote_mux reads ``time.monotonic`` alone, so the
+    stand-in carries only that -- any other ``time`` use there would fail
+    loudly, never read the real clock.
+
+    Flood pins only: ``_finish``'s deadline reads this same clock, so a call
+    that does NOT pass the cap finds its whole bound spent at the next read
+    (``deadline - 1000.0`` is below zero) and stops waiting on its drains
+    and the child at once -- a false timeout, not the reply."""
+    clock = SteppedClock()
+    monkeypatch.setattr(
+        "magent.remote_mux.time", types.SimpleNamespace(monotonic=clock.monotonic)
+    )
+    return clock
 
 
 # --- The tripwire -------------------------------------------------------------
@@ -429,6 +570,137 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     )
 
 
+# --- The kill guards ----------------------------------------------------------
+# The idle reaper's stop (reap._stop) is the one path in the product that
+# TERMINATES processes, and its default snapshot is the machine's whole live
+# process table -- where a stale parent pid can list a stranger under a test's
+# "agent". Two guards, autouse for every tier so no test can forget them and
+# no module can be outside them:
+#
+#   1. no live table: _stop's default snapshot is one that FAILS the test.
+#      Every test hands _stop its own (a fake, or the live table cut down to
+#      the pids it spawned). `@pytest.mark.live_process_table` opts out, for a
+#      tier that must walk the real table; its kills still go through 2.
+#   2. own processes only: every in-process kill goes through
+#      procs.terminate_verified, which here fails the test unless it names a
+#      process the test registered in `own_pids` -- by IDENTITY (pid, image,
+#      creation time), because a registered pid that died and was reused names
+#      a stranger -- before the kill reaches the OS. Under it, the kernel32
+#      procs hands out lets TerminateProcess land only inside that guarded
+#      call, on the pid it approved, and never lets TerminateJobObject land.
+#      No opt-out: a test that has to kill registers what it spawned.
+#      (os.kill, taskkill and psmux kill-server cannot be wrapped for every
+#      tier -- e2e teardown uses them on its own daemons -- so reap's reach is
+#      pinned instead: tests/unit/test_kill_guards.py.)
+
+
+def refuse_live_snapshot(stop, monkeypatch) -> None:
+    """Point ``stop``'s ``snapshot`` keyword default at a refusal. Asserts the
+    keyword is there first: ``setitem`` ADDS a missing key, so after a rename
+    this would guard a default nobody reads, and pass."""
+    defaults = stop.__kwdefaults__ or {}
+    assert "snapshot" in defaults, (
+        f"{stop.__qualname__} has no `snapshot` keyword default any more; the "
+        "live-table guard in tests/conftest.py must follow the rename."
+    )
+
+    def _refuse() -> None:
+        pytest.fail("reap._stop was handed the live process table")
+
+    monkeypatch.setitem(stop.__kwdefaults__, "snapshot", _refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_process_table(request, monkeypatch):
+    if request.node.get_closest_marker("live_process_table") is not None:
+        return
+    refuse_live_snapshot(reap._stop, monkeypatch)
+
+
+class OwnPids:
+    """The processes a test lets die -- each one it spawned, known by its
+    identity -- and the kill every in-process ``procs.terminate_verified`` goes
+    through: a kill aimed at anything else fails the test before it reaches the
+    OS. Keyed by identity, not pid: once a registered process dies its pid is
+    free, and the real terminate_verified would verify a stranger reusing it as
+    itself. ``kill`` is the real primitive unless a test swaps in a fake behind
+    the guard; ``kernel32`` is what procs hands out in place of its own."""
+
+    def __init__(self, kill, kernel32=None) -> None:
+        self.owned: dict[int, procs.ProcessIdentity] = {}
+        self.kill = kill
+        self.real_kernel32 = kernel32
+        self.approved: int | None = None  # the pid a guarded kill is ending
+
+    def add(self, pid: int, identity: procs.ProcessIdentity) -> None:
+        self.owned[pid] = identity
+
+    def terminate_verified(self, pid, expected):
+        owned = self.owned.get(pid)
+        if owned is None:
+            pytest.fail(f"a kill reached pid {pid}, which this test did not spawn")
+        if owned != expected:
+            pytest.fail(
+                f"a kill reached pid {pid} as {expected}, but the process this "
+                f"test spawned there is {owned}: that pid now names a process "
+                "this test did not spawn"
+            )
+        self.approved = pid
+        try:
+            return self.kill(pid, expected)
+        finally:
+            self.approved = None
+
+    def kernel32(self):
+        return GuardedKernel32(self.real_kernel32(), self)
+
+
+class GuardedKernel32:
+    """kernel32 as procs hands it out under every test. Every call passes
+    through except the two that end a process: TerminateProcess lands only
+    inside the guarded ``terminate_verified``, on a handle this object opened
+    for the very pid that call approved; TerminateJobObject never lands."""
+
+    def __init__(self, real, guard: OwnPids) -> None:
+        self._real = real
+        self._guard = guard
+        self._pid_of: dict[int, int] = {}  # open handle -> the pid it names
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def OpenProcess(self, rights, inherit, pid):
+        handle = self._real.OpenProcess(rights, inherit, pid)
+        if handle:
+            self._pid_of[handle] = pid
+        return handle
+
+    def CloseHandle(self, handle):
+        self._pid_of.pop(handle, None)
+        return self._real.CloseHandle(handle)
+
+    def TerminateProcess(self, handle, code):
+        pid = self._pid_of.get(handle)
+        if pid is None or pid != self._guard.approved:
+            pytest.fail(
+                f"TerminateProcess reached pid {pid} outside the guarded kill "
+                f"(approved: {self._guard.approved}): a kill path that bypasses "
+                "procs.terminate_verified"
+            )
+        return self._real.TerminateProcess(handle, code)
+
+    def TerminateJobObject(self, job, code):
+        pytest.fail("TerminateJobObject reached kernel32: no test kills through a job")
+
+
+@pytest.fixture(autouse=True)
+def own_pids(monkeypatch) -> OwnPids:
+    guard = OwnPids(procs.terminate_verified, procs._kernel32)
+    monkeypatch.setattr(procs, "terminate_verified", guard.terminate_verified)
+    monkeypatch.setattr(procs, "_kernel32", guard.kernel32)
+    return guard
+
+
 @pytest.fixture
 def tmp_config(tmp_path):
     """Write a config dict to a temp JSON file and return the path."""
@@ -492,6 +764,7 @@ class FakePlatform(Platform):
         supports_attention: bool = False,
         supports_hotkey: bool = False,
         supports_wt_keybindings: bool = False,
+        supports_attach_windows: bool = False,
         supports_nudge: bool = False,
         nudge_error: Exception | None = None,
         supports_close: bool = False,
@@ -503,6 +776,7 @@ class FakePlatform(Platform):
         interactive_session: bool = True,
         supports_handoff: bool = False,
         handoff_result=None,
+        pane_reset: str | None = None,
     ):
         self._monitors = (
             monitors
@@ -516,6 +790,7 @@ class FakePlatform(Platform):
         self._supports_attention = supports_attention
         self._supports_hotkey = supports_hotkey
         self._supports_wt_keybindings = supports_wt_keybindings
+        self._supports_attach_windows = supports_attach_windows
         self._supports_nudge = supports_nudge
         self._nudge_error = nudge_error
         self._supports_close = supports_close
@@ -543,6 +818,10 @@ class FakePlatform(Platform):
         self._supports_handoff = supports_handoff
         self._handoff_result = handoff_result
         self.handoffs: list[tuple[list[str], float]] = []
+        # The parked-pane reset: what pane_reset_command answers (None = this
+        # shell has no scripted reset) and every (shell_image, notice) asked.
+        self._pane_reset = pane_reset
+        self.pane_resets: list[tuple[str, str]] = []
         self.psmux_sessions: set[str] = set()
         self.psmux_launches: list[list[str]] = []
         self.attached_psmux: list[tuple] = []
@@ -603,6 +882,9 @@ class FakePlatform(Platform):
     def supports_wt_keybindings(self) -> bool:
         return self._supports_wt_keybindings
 
+    def supports_attach_windows(self) -> bool:
+        return self._supports_attach_windows
+
     def logon_session_is_interactive(self) -> bool:
         return self._interactive_session
 
@@ -616,6 +898,10 @@ class FakePlatform(Platform):
         if self._handoff_result is None:
             return HandoffResult(rc=0)
         return self._handoff_result
+
+    def pane_reset_command(self, shell_image: str, notice: str) -> str | None:
+        self.pane_resets.append((shell_image, notice))
+        return self._pane_reset
 
     def supports_attention_signals(self) -> bool:
         return self._supports_attention

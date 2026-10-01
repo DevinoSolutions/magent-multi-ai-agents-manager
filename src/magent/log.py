@@ -369,13 +369,23 @@ def write_heartbeat(name: str) -> None:
         pass
 
 
-def heartbeat_age(name: str) -> float | None:
-    """Seconds since the last heartbeat, or None if it was never written."""
+def heartbeat_mtime(name: str) -> float | None:
+    """Unix time of the last heartbeat, or None if it was never written.
+
+    The absolute stamp, where ``heartbeat_age`` is relative to now: a caller
+    that must compare the pulse against another timestamp (a process's creation
+    time, a previous tick's reading) needs the former.
+    """
     try:
-        mtime = _heartbeat_path(name).stat().st_mtime
+        return _heartbeat_path(name).stat().st_mtime
     except OSError:
         return None
-    return time.time() - mtime
+
+
+def heartbeat_age(name: str) -> float | None:
+    """Seconds since the last heartbeat, or None if it was never written."""
+    mtime = heartbeat_mtime(name)
+    return None if mtime is None else time.time() - mtime
 
 
 def heartbeat_fresh(name: str, max_age: float = HEARTBEAT_MAX_AGE) -> bool:

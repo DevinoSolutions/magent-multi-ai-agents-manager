@@ -26,6 +26,8 @@ import click
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from magent.nodes import Node
+
 from magent.cli import picker
 from magent.cli.app import main
 from magent.cli.background import _running_upload_port, _tailnet_host
@@ -77,6 +79,7 @@ def _status_label(state: str | None, age_s: float | None = None) -> str:
         agent_state.DONE: style("done", fg="green", bold=True),
         agent_state.NEEDS_INPUT: style("needs input", fg="red", bold=True),
         agent_state.ERROR: style("error", fg="red", bold=True),
+        agent_state.PARKED: style("parked", dim=True),
     }.get(state, "")
 
 
@@ -381,9 +384,13 @@ def sessions_cmd(ctx: click.Context, name: str | None, as_json: bool) -> None:
 def _emit_sessions_json(config_path: str | None) -> None:
     """Print each configured session with its live state, one JSON array.
 
-    Only stdout carries the JSON: this reads config with the raw
+    Only stdout carries the JSON: the local rows come from the raw
     ``config_sessions`` loader (no `load_config` version warning), and the
     per-session pane reads fan out on a small pool so a big fleet stays quick.
+    A config that names a pool node also gets a typed load for the node rows
+    (see ``_node_session_rows``): its version warning goes to stderr, and a
+    config that fails validation answers the ``{"ok": false, "error": ...}``
+    envelope with exit 1 instead of an array.
     """
     import json
     from concurrent.futures import ThreadPoolExecutor
@@ -423,4 +430,98 @@ def _emit_sessions_json(config_path: str | None) -> None:
             for name, row in zip(live_names, pool.map(_row, live_names), strict=True):
                 read[name] = row
     rows = [read[n] if n in read else _row(n) for n in names]
+    for row in rows:
+        row["node"] = None
+    rows += _node_session_rows(config_path)
     click.echo(json.dumps(rows, indent=2))
+
+
+def _node_session_rows(config_path: str | None) -> list[dict[str, object]]:
+    """``sessions --json`` rows for the node projects (PR-D), shaped like the
+    local ones plus ``node``. ``live`` is True / False from the sync daemon's
+    last pull, and None when that pull is stale -- an unreachable node is not
+    a dead session. ``state`` stays that vocabulary. ``model``/``effort`` of
+    a live row are read off its pane on the node, one bounded ssh capture
+    each (``remote_mux.capture_pane``), fanned out like the local reads; a
+    capture that fails leaves them None, as does every row not live -- a
+    stale node is not dialled at all."""
+    from magent import fleet, remote_mux  # heavy subsystem: in-body per policy
+
+    targets = _node_session_targets(config_path, as_json=True)
+    live = [
+        (row, node)
+        for row, node in targets
+        if row["state"] == "live" and node is not None
+    ]
+    if live:
+
+        def _pane(target: tuple[dict[str, object], Node]) -> str | None:
+            return remote_mux.capture_pane(target[1], str(target[0]["name"]))
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for (row, _), pane in zip(live, pool.map(_pane, live), strict=True):
+                if pane is not None:
+                    row["model"], row["effort"] = fleet.parse_footer(pane)
+    return [row for row, _ in targets]
+
+
+def _node_session_targets(
+    config_path: str | None, *, as_json: bool = False
+) -> list[tuple[dict[str, object], Node | None]]:
+    """Each node project's ``sessions --json`` row (``model``/``effort`` None)
+    with the Node its session runs on -- None when it is placed nowhere or
+    its node has left ``settings.nodes``. Reads files only: the state is the
+    sync daemon's last pull, never a dial. ``sessions --json`` and the fleet
+    commands (``peek``, and the refusals of ``send``/``model``) share it.
+
+    The typed config is loaded only when the raw file names a pool node, so
+    every config without one keeps the raw loader's no-version-warning path;
+    ``as_json`` is ``_load_config_or_exit``'s, for a failed validation."""
+    import json
+
+    from magent import env, nodes  # heavy subsystem: in-body per policy
+
+    config_file = find_config(config_path)
+    if not config_file.exists():
+        return []
+    raw = json.loads(config_file.read_text(encoding="utf-8"))
+    # Raw dict: same rule as config_sessions' node skip (DECISION-15). A
+    # deliberate SUPERSET of nodes.node_projects (it ignores enabled, IDE tools
+    # and duplicate sids): it may trigger a typed load that lists nothing, but
+    # it can never drop a node row. Mirroring those skips here would be a third
+    # spelling of node_projects' predicate to keep in step.
+    if not any(
+        isinstance(p, dict) and p.get("node") not in (None, "cloud")
+        for p in raw.get("projects", [])
+    ):
+        return []
+    cfg = _load_config_or_exit(config_file, as_json=as_json)
+    # The state is nodes.session_rows' (the one answer `status` gives too);
+    # the map is read again only for the folder, which status does not show.
+    entries = nodes.read_node_map()
+    out: list[tuple[dict[str, object], Node | None]] = []
+    for row in nodes.session_rows(cfg, now=time.time()):
+        entry = entries.get(str(row["name"]))
+        state = str(row["state"])
+        nick = row["node"]
+        node = None
+        if isinstance(nick, str):
+            # A nick the map kept after settings.nodes dropped it: no node to
+            # read, and the row still lists.
+            with contextlib.suppress(nodes.NodeConfigError):
+                node = nodes.node_for_nick(cfg, nick, local_user=env.local_username())
+        out.append(
+            (
+                {
+                    "name": row["session"],
+                    "cwd": (entry.cwd or entry.remote_root) if entry else "",
+                    "live": None if state == "stale" else state == "live",
+                    "state": state,
+                    "model": None,
+                    "effort": None,
+                    "node": nick,
+                },
+                node,
+            )
+        )
+    return out

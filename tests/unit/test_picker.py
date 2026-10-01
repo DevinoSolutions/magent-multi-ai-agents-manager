@@ -374,7 +374,7 @@ class TestRawModeGate:
     def _ttys(self, monkeypatch, *, stdin=True, stdout=True, console=True):
         monkeypatch.setattr(picker.sys.stdin, "isatty", lambda: stdin, raising=False)
         monkeypatch.setattr(picker.sys.stdout, "isatty", lambda: stdout, raising=False)
-        monkeypatch.setattr(picker, "_stdin_is_console", lambda: console)
+        monkeypatch.setattr(picker.console, "stdin_is_console", lambda: console)
 
     def test_a_real_tty_with_the_os_module_present_is_raw(self, monkeypatch):
         self._ttys(monkeypatch)

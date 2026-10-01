@@ -15,11 +15,16 @@ from __future__ import annotations
 
 import sys
 import time
+from typing import TYPE_CHECKING, NoReturn
 
 import click
 
 from magent.cli.app import main
+from magent.cli.session_picker import _node_session_targets
 from magent.style import style
+
+if TYPE_CHECKING:
+    from magent.nodes import Node
 
 # `magent send` exit codes (documented in the command help + README).
 _EXIT_OK = 0
@@ -76,6 +81,50 @@ def _resolve_or_exit(session: str, live: list[str]) -> str:
             f"  {style('No live sessions.', dim=True)} Run {style('magent up', bold=True)} first.",
             err=True,
         )
+    sys.exit(_EXIT_NOT_FOUND)
+
+
+def _node_sessions(config_path: str | None) -> dict[str, Node]:
+    """The node sessions a fleet command may name: session id -> the Node it
+    runs on, for every node row the sync daemon did not last see dead (live,
+    or stale -- not heard from, so worth one bounded try). Reads files only;
+    never dials."""
+    return {
+        str(row["name"]): node
+        for row, node in _node_session_targets(config_path)
+        if node is not None and row["state"] != "dead"
+    }
+
+
+def _resolve_target(config_path: str | None, session: str) -> tuple[str, Node | None]:
+    """Resolve ``session`` among this PC's live psmux sessions AND the node
+    sessions: ``(name, node)``, ``node`` set when the match runs on a node.
+    A name both carry is the local one. A missing psmux is fatal (exit 3)
+    only when no node session matches; no match at all exits 2, listing
+    both kinds."""
+    from magent import fleet, psmux  # heavy subsystem: in-body per policy
+
+    remote = _node_sessions(config_path)
+    psmux_bin = psmux.find_psmux() if remote else _require_psmux()
+    local = _live_names(config_path, psmux_bin) if psmux_bin else []
+    names = [*local, *(n for n in remote if n not in local)]
+    name = fleet.resolve_session(session, names)
+    if name is not None and name in remote and name not in local:
+        return name, remote[name]
+    if psmux_bin is None:
+        _require_psmux()
+    return _resolve_or_exit(session, names), None
+
+
+def _refuse_node(name: str, node: Node, command: str) -> NoReturn:
+    """``send``/``model`` against a node session: said plainly, exit 2 --
+    never "no live session matches", which it is not."""
+    click.echo(
+        f"  {style('x', fg='red')} {name} runs on node {node.nick}: "
+        f"`magent {command}` is not supported for node sessions yet "
+        f"(`magent peek {name}` is).",
+        err=True,
+    )
     sys.exit(_EXIT_NOT_FOUND)
 
 
@@ -163,16 +212,18 @@ def send_cmd(
     refuses if it is not live, pastes the text literally and presses Enter,
     then confirms the prompt left the input line.
 
-    Exit codes: 0 sent, 2 session not found, 3 psmux error, 4 send not
-    confirmed (the pane could not be read back, or the session never went
-    idle).
+    Exit codes: 0 sent, 2 session not found (or a node session: not
+    supported yet), 3 psmux error, 4 send not confirmed (the pane could not
+    be read back, or the session never went idle).
     """
     from pathlib import Path
 
     from magent import fleet, psmux  # heavy subsystem: in-body per policy
 
+    name, node = _resolve_target(ctx.obj.get("config_path"), session)
+    if node is not None:
+        _refuse_node(name, node, "send")
     psmux_bin = _require_psmux()
-    name = _resolve_or_exit(session, _live_names(ctx.obj.get("config_path"), psmux_bin))
 
     body = Path(file).read_text(encoding="utf-8") if file else (text or "")
 
@@ -277,7 +328,8 @@ def model_cmd(
     Usage: ``magent model <session> <model> [--effort E]`` or
     ``magent model --all <model> [--effort E]``. Busy sessions are retried
     until --max-minutes runs out; the footer is re-read to confirm each switch.
-    A per-session table is printed at the end.
+    A per-session table is printed at the end. A node session is refused
+    (exit 2): not supported yet; ``--all`` covers this PC's sessions.
     """
     from magent import fleet, psmux  # heavy subsystem: in-body per policy
 
@@ -291,9 +343,15 @@ def model_cmd(
             "usage: magent model <session> <model> [--effort E]  (or --all <model>)"
         )
 
-    psmux_bin = _require_psmux()
-    live = _live_names(ctx.obj.get("config_path"), psmux_bin)
-    targets = live if all_ else [_resolve_or_exit(session or "", live)]
+    if all_:
+        psmux_bin = _require_psmux()
+        targets = _live_names(ctx.obj.get("config_path"), psmux_bin)
+    else:
+        name, node = _resolve_target(ctx.obj.get("config_path"), session or "")
+        if node is not None:
+            _refuse_node(name, node, "model")
+        psmux_bin = _require_psmux()
+        targets = [name]
 
     if not targets:
         click.echo(f"  {style('No live sessions.', dim=True)} Run magent up first.")
@@ -370,17 +428,33 @@ def _print_model_table(rows: dict[str, dict[str, str]]) -> None:
 )
 @click.pass_context
 def peek_cmd(ctx: click.Context, session: str, lines: int) -> None:
-    """Print the last LINES of a session's pane -- a read-only glance."""
-    from magent import psmux  # heavy subsystem: in-body per policy
+    """Print the last LINES of a session's pane -- a read-only glance.
 
-    psmux_bin = _require_psmux()
-    name = _resolve_or_exit(session, _live_names(ctx.obj.get("config_path"), psmux_bin))
-    capture = psmux.read_pane(name, psmux=psmux_bin)
-    if capture.timed_out:
-        click.echo(
-            f"  {style('x', fg='red')} {_unread_pane(name)} (psmux did not answer).",
-            err=True,
-        )
-        sys.exit(_EXIT_PSMUX_ERROR)
-    tail = "\n".join(capture.text.rstrip().splitlines()[-max(1, lines) :])
+    A node session's pane is read on its node, with one bounded ssh call.
+    Exit codes: 0 printed, 2 session not found, 3 the pane could not be read
+    (psmux, or the node, did not answer)."""
+    # heavy subsystem: in-body per policy
+    from magent import psmux, remote_mux
+
+    name, node = _resolve_target(ctx.obj.get("config_path"), session)
+    if node is not None:
+        pane = remote_mux.capture_pane(node, name)
+        if pane is None:
+            click.echo(
+                f"  {style('x', fg='red')} could not read {name}'s pane on node "
+                f"{node.nick} (the node, or its tmux, did not answer).",
+                err=True,
+            )
+            sys.exit(_EXIT_PSMUX_ERROR)
+        text = pane
+    else:
+        capture = psmux.read_pane(name, psmux=_require_psmux())
+        if capture.timed_out:
+            click.echo(
+                f"  {style('x', fg='red')} {_unread_pane(name)} (psmux did not answer).",
+                err=True,
+            )
+            sys.exit(_EXIT_PSMUX_ERROR)
+        text = capture.text
+    tail = "\n".join(text.rstrip().splitlines()[-max(1, lines) :])
     click.echo(_stdout_safe(tail))

@@ -10,6 +10,7 @@ import types
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from magent import cli, wt_keys
 from magent import env as env_module
@@ -21,9 +22,12 @@ from magent.cli.doctor import (
     WARN,
     WEDGE_REPAIR_HINT,
     _check_agent_tools,
+    _check_claude_token,
     _check_config,
     _check_hotkey,
+    _check_idle_reap,
     _check_monitors,
+    _check_nodes,
     _check_psmux_wedge,
     _check_sentry,
     _check_tailscale,
@@ -32,6 +36,7 @@ from magent.cli.doctor import (
 )
 from magent.config import SCHEMA_VERSION, load_config
 from magent.grid import MonitorRect
+from magent.remote_mux import ScriptLine
 from tests.conftest import FakePlatform
 
 # A settings file nested past the JSON parser's depth: json.loads raises
@@ -357,6 +362,7 @@ class TestCheckHotkey:
         assert status == FAIL
         assert "no Alt+V listener" in detail
         assert LISTENER_REPAIR_HINT in detail
+        assert "down" not in detail.lower()  # never a fleet teardown
 
     def test_wedged_listener_fails_and_says_so(self, monkeypatch):
         self._platform(monkeypatch, supports_hotkey=True)
@@ -364,6 +370,7 @@ class TestCheckHotkey:
         status, detail = _check_hotkey(None)
         assert status == FAIL
         assert "heartbeat expired" in detail
+        assert "down" not in detail.lower()  # never a fleet teardown
 
     def test_listener_off_by_design_is_ok_and_names_its_owner(self, monkeypatch):
         self._platform(monkeypatch, supports_hotkey=True)
@@ -372,6 +379,45 @@ class TestCheckHotkey:
         status, detail = _check_hotkey(None)
         assert status == OK
         assert "starts with the upload server" in detail
+
+
+class TestCheckAttention:
+    """The attention daemon, through the same state machine `status` renders
+    (``cli.status._attention_state``) so the two surfaces cannot disagree.
+    WARN at worst: a machine without attention signals is quieter, not broken,
+    and serve revives a daemon that died."""
+
+    def _state(self, monkeypatch, state):
+        monkeypatch.setattr("magent.cli.status._attention_state", lambda: state)
+
+    def test_running_is_ok(self, monkeypatch):
+        self._state(monkeypatch, "on")
+        status, _detail = doctor._check_attention()
+        assert status == OK
+
+    def test_a_restart_is_not_a_problem_and_is_named(self, monkeypatch):
+        self._state(monkeypatch, "off-since-restart")
+        status, detail = doctor._check_attention()
+        assert status == OK
+        assert "not running since the last restart" in detail
+
+    def test_a_crash_warns_and_points_at_the_log(self, monkeypatch):
+        self._state(monkeypatch, "crashed")
+        status, detail = doctor._check_attention()
+        assert status == WARN
+        assert "attention.log" in detail
+
+    def test_a_wedged_daemon_warns(self, monkeypatch):
+        self._state(monkeypatch, "stale")
+        status, detail = doctor._check_attention()
+        assert status == WARN
+        assert "heartbeat expired" in detail
+
+    def test_never_started_is_ok(self, monkeypatch):
+        self._state(monkeypatch, "off")
+        status, detail = doctor._check_attention()
+        assert status == OK
+        assert "magent attention -d" in detail
 
 
 class TestCheckWtKeys:
@@ -525,6 +571,34 @@ class TestCheckPsmuxSessionZero:
         assert status == WARN
         assert "3 psmux server(s)" in detail
         assert "elevated shell" in detail
+
+
+class TestCheckDaemonsSession0:
+    """magent's OWN daemons stranded in Session 0 -- a serve there holds the
+    loopback port this desktop's Alt+V needs. Same posture as psmux-session0:
+    WARN at worst, and the one wording `status` prints too."""
+
+    def _stranded(self, monkeypatch, found):
+        monkeypatch.setattr("magent.cli.status.session0_daemons", lambda: list(found))
+
+    def test_a_clean_machine_is_quiet(self, monkeypatch):
+        self._stranded(monkeypatch, [])
+
+        status, detail = doctor._check_daemons_session0()
+
+        assert status == OK
+        assert "Session 0" in detail
+
+    def test_stranded_daemons_warn_with_the_shared_wording(self, monkeypatch):
+        from magent.cli.status import session0_daemons_message
+
+        found = [("upload server :8034", 70)]
+        self._stranded(monkeypatch, found)
+
+        status, detail = doctor._check_daemons_session0()
+
+        assert status == WARN
+        assert detail == session0_daemons_message(found)
 
 
 class TestCheckPsmuxWedge:
@@ -743,6 +817,195 @@ class TestCheckSentry:
         assert "[sentry]" not in detail
 
 
+class TestCheckIdleReap:
+    """WARN at worst: a reaper that is off is a choice. The one WARN that is
+    not about the config: reaping ON with the state hook unwired, which parks
+    nothing ever (R7 vetoes every session). Real ``reap.off_reason`` over a
+    FakePlatform; the hook settings file lives in conftest's tmp home."""
+
+    _REAP_EVENTS = ("UserPromptSubmit", "Stop", "Notification", "SessionStart")
+
+    @pytest.fixture(autouse=True)
+    def _platform(self, monkeypatch):
+        self.plat = FakePlatform(supports_psmux=True)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: self.plat)
+
+    @pytest.fixture
+    def reaping_on(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_IDLE_REAP", "1")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+    @staticmethod
+    def _cfg(*, enabled=True, minutes=120):
+        from magent.config import MagentConfig
+
+        cfg = MagentConfig(projects=[])
+        cfg.settings.idle_reap.enabled = enabled
+        cfg.settings.idle_reap.after_minutes = minutes
+        return cfg
+
+    @staticmethod
+    def _hooks(events, command="magent-state-hook --source claude"):
+        path = Path.home() / ".claude" / "settings.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        hook = {"hooks": [{"type": "command", "command": command}]}
+        path.write_text(
+            json.dumps({"hooks": {e: [hook] for e in events}}), encoding="utf-8"
+        )
+        return path
+
+    def test_no_config_says_the_reaper_waits_for_one(self):
+        assert _check_idle_reap(None) == (
+            WARN,
+            "config invalid or missing; the reaper stays off until it loads",
+        )
+
+    def test_the_env_kill_switch_is_ok_and_named(self):
+        # conftest pins MAGENT_IDLE_REAP=0 for every test.
+        assert _check_idle_reap(self._cfg()) == (OK, "off (MAGENT_IDLE_REAP=0)")
+
+    def test_an_invalid_environment_is_not_called_the_kill_switch(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_IDLE_REAP", "not-a-bool")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        assert _check_idle_reap(self._cfg()) == (
+            OK,
+            "off (the MAGENT_* environment did not validate)",
+        )
+
+    def test_the_env_check_is_the_one_that_flags_an_invalid_environment(
+        self, monkeypatch
+    ):
+        # The idle-reap line above stays OK because doctor's env check fails on
+        # the same environment: one flag, not two.
+        monkeypatch.setenv("MAGENT_IDLE_REAP", "not-a-bool")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        status, detail = doctor._check_env()
+        assert status == FAIL
+        assert "MAGENT_IDLE_REAP" in detail
+
+    def test_off_in_settings_is_ok_and_named(self, reaping_on):
+        assert _check_idle_reap(self._cfg(enabled=False)) == (
+            OK,
+            "off in settings.idleReap",
+        )
+
+    @pytest.mark.parametrize(
+        ("plat", "why"),
+        [
+            (FakePlatform(supports_psmux=False), "unsupported platform (no psmux)"),
+            (
+                FakePlatform(supports_psmux=True, interactive_session=False),
+                "non-interactive logon session",
+            ),
+        ],
+        ids=["no-psmux", "non-interactive"],
+    )
+    def test_a_platform_gate_is_ok_and_named(self, reaping_on, plat, why):
+        self.plat = plat
+        assert _check_idle_reap(self._cfg()) == (OK, f"off: {why}")
+
+    def test_on_and_wired_shows_the_threshold(self, reaping_on):
+        self._hooks(self._REAP_EVENTS)
+        assert _check_idle_reap(self._cfg()) == (OK, "on, parks after 120 min idle")
+
+    def test_the_module_form_counts_as_wired(self, reaping_on):
+        self._hooks(
+            self._REAP_EVENTS, command="py -3 -m magent.state_hook --source claude"
+        )
+        assert _check_idle_reap(self._cfg(minutes=45))[0] == OK
+
+    @pytest.mark.parametrize("minutes", [29, 5, 0, -1])
+    def test_a_value_under_the_floor_says_it_was_raised(self, reaping_on, minutes):
+        self._hooks(self._REAP_EVENTS)
+        assert _check_idle_reap(self._cfg(minutes=minutes)) == (
+            OK,
+            (
+                f"on, parks after 30 min idle (afterMinutes={minutes} raised to the "
+                "30-min floor)"
+            ),
+        )
+
+    def test_the_floor_itself_is_not_called_raised(self, reaping_on):
+        self._hooks(self._REAP_EVENTS)
+        assert _check_idle_reap(self._cfg(minutes=30)) == (
+            OK,
+            "on, parks after 30 min idle",
+        )
+
+    def test_on_with_no_hooks_warns_that_nothing_will_be_parked(self, reaping_on):
+        assert _check_idle_reap(self._cfg()) == (
+            WARN,
+            (
+                "on, parks after 120 min idle, but the state hook is not wired for "
+                "UserPromptSubmit, Stop, Notification, SessionStart; nothing will ever "
+                "be parked; run magent hooks install"
+            ),
+        )
+
+    @pytest.mark.parametrize("missing", _REAP_EVENTS)
+    def test_each_of_the_four_events_is_required(self, reaping_on, missing):
+        self._hooks(
+            [e for e in self._REAP_EVENTS if e != missing]
+            + ["PostToolUse", "SessionEnd"]
+        )
+        status, detail = _check_idle_reap(self._cfg())
+        assert status == WARN
+        assert f"not wired for {missing};" in detail
+
+    def test_someone_elses_hook_on_an_event_is_not_ours(self, reaping_on):
+        self._hooks(self._REAP_EVENTS)
+        self._hooks(["Stop"], command="notify-send done")
+        status, detail = _check_idle_reap(self._cfg())
+        assert status == WARN
+        assert (
+            "not wired for UserPromptSubmit, Stop, Notification, SessionStart;"
+            in detail
+        )
+
+    def test_a_hooks_value_that_is_not_a_map_is_unknown(self, reaping_on):
+        # hooks_cmd._load_settings refuses a file whose "hooks" is not an
+        # object, so doctor says it cannot tell, as `magent hooks status` does.
+        path = self._hooks(self._REAP_EVENTS)
+        path.write_text(json.dumps({"hooks": ["Stop"]}), encoding="utf-8")
+        status, detail = _check_idle_reap(self._cfg())
+        assert status == WARN
+        assert f'but {path} is unreadable ("hooks" is not a JSON object)' in detail
+        assert detail.endswith("; cannot tell whether the state hook is wired")
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "{not json",
+            "[1, 2]",
+            # Nested past the parser's depth: json.loads raises RecursionError,
+            # which no per-check guard in _run_checks would catch -- the whole
+            # `magent doctor` would crash instead of warning here.
+            '{"hooks": ' + "[" * 200_000 + "]" * 200_000 + "}",
+        ],
+        ids=["json", "not-a-map", "nested"],
+    )
+    def test_an_unreadable_hook_file_warns_and_names_it(self, reaping_on, text):
+        path = self._hooks(self._REAP_EVENTS)
+        path.write_text(text, encoding="utf-8")
+        status, detail = _check_idle_reap(self._cfg(minutes=5))
+        assert status == WARN
+        assert detail.startswith(
+            "on, parks after 30 min idle (afterMinutes=5 raised to the 30-min floor), "
+            f"but {path} is unreadable ("
+        )
+        assert detail.endswith("); cannot tell whether the state hook is wired")
+
+    def test_a_hook_file_the_os_will_not_read_warns_and_names_it(self, reaping_on):
+        # A refused read (here the path is a directory) is the same unknown as
+        # a file that does not parse, and `magent hooks status` agrees.
+        path = Path.home() / ".claude" / "settings.json"
+        path.mkdir(parents=True)
+        status, detail = _check_idle_reap(self._cfg())
+        assert status == WARN
+        assert f"but {path} is unreadable (" in detail
+        assert detail.endswith("); cannot tell whether the state hook is wired")
+
+
 class TestDoctorCli:
     def _all_ok(self, monkeypatch):
         monkeypatch.setattr(
@@ -816,12 +1079,269 @@ class TestDoctorCli:
             "terminal",
             "psmux wedge",
             "psmux-session0",
+            "daemons-session0",
             "monitors",
             "hotkey",
+            "attention",
             "wt-keys",
             "logs dir",
             "state dir",
             "sentry",
             "tailscale",
             "upload port",
+            "nodes",
+            "idle-reap",
+            "claude-token",
         } == names
+
+
+def _nodes_cfg(tmp_config, nicks=("second",)):
+    return load_config(
+        tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {
+                    "nodes": {n: {"host": f"box-{n}", "user": "demo"} for n in nicks}
+                },
+                "projects": [],
+            }
+        )
+    )
+
+
+class TestTheNodesRow:
+    def test_no_nodes_is_ok(self, tmp_config):
+        cfg = load_config(tmp_config({"version": SCHEMA_VERSION, "projects": []}))
+        assert _check_nodes(cfg) == ("ok", "no nodes configured")
+
+    def test_no_loadable_config_is_skipped_not_called_node_free(self):
+        # A missing or broken config may well configure nodes: say the row was
+        # skipped (the config row already fails), never "no nodes configured".
+        assert _check_nodes(None) == (
+            "ok",
+            "skipped -- config missing or invalid (see the config check)",
+        )
+
+    def test_healthy_nodes_are_ok(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                n: [ScriptLine("ok", "tmux", "tmux 3.4")] for n in nicks
+            },
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config, ("second", "fifth"))) == (
+            "ok",
+            "2 node(s) healthy",
+        )
+
+    @pytest.mark.parametrize("status", ["fail", "warn"])
+    def test_a_troubled_node_is_only_a_warning_naming_its_items(
+        self, tmp_config, monkeypatch, status
+    ):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                "second": [
+                    ScriptLine("ok", "tmux", ""),
+                    ScriptLine(status, "claude-login", "not logged in"),
+                ],
+                "fifth": [ScriptLine("ok", "tmux", "")],
+            },
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config, ("second", "fifth"))) == (
+            "warn",
+            "second: claude-login -- details: magent node doctor",
+        )
+
+    def test_troubled_nodes_join_by_semicolon_their_items_by_comma(
+        self, tmp_config, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                "second": [
+                    ScriptLine("warn", "github-key", "not registered"),
+                    ScriptLine("ok", "tmux", ""),
+                    ScriptLine("fail", "claude-login", "not logged in"),
+                ],
+                "third": [
+                    ScriptLine("ok", "tmux", ""),
+                    ScriptLine("skip", "snapshot", ""),
+                ],
+                "fifth": [ScriptLine("fail", "reach", "cannot reach demo@box-fifth")],
+            },
+        )
+        cfg = _nodes_cfg(tmp_config, ("second", "third", "fifth"))
+        assert _check_nodes(cfg) == (
+            "warn",
+            "second: github-key, claude-login; fifth: reach -- details: magent node doctor",
+        )
+
+    def test_nodes_keep_the_config_order(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {n: [ScriptLine("fail", "reach", "")] for n in nicks},
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config, ("second", "fifth"))) == (
+            "warn",
+            "second: reach; fifth: reach -- details: magent node doctor",
+        )
+
+    def test_a_row_neither_fail_nor_warn_is_healthy(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                "second": [ScriptLine("did", "x", ""), ScriptLine("key", "y", "")]
+            },
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config)) == ("ok", "1 node(s) healthy")
+
+    def test_doctor_hands_the_loaded_config_to_the_nodes_row(
+        self, runner, monkeypatch, tmp_config
+    ):
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {n: [ScriptLine("fail", "reach", "")] for n in nicks},
+        )
+        config_path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {
+                    "nodes": {"second": {"host": "box-second", "user": "demo"}}
+                },
+                "projects": [],
+            }
+        )
+
+        result = runner.invoke(cli.main, ["--config", config_path, "doctor", "--json"])
+
+        rows = {c["name"]: c for c in json.loads(result.stdout)["checks"]}
+        assert rows["nodes"] == {
+            "name": "nodes",
+            "status": "warn",
+            "detail": "second: reach -- details: magent node doctor",
+        }
+
+    def test_the_row_comes_right_after_upload_port(
+        self, runner, monkeypatch, tmp_config
+    ):
+        # ORDER, not just membership: the audit's row order is upload port,
+        # nodes, then mcp-relay (K12 pins its own row directly after this one).
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        config_path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+
+        result = runner.invoke(cli.main, ["--config", config_path, "doctor", "--json"])
+
+        names = [c["name"] for c in json.loads(result.stdout)["checks"]]
+        assert names.index("nodes") == names.index("upload port") + 1, names
+
+    def test_skip_rows_are_healthy_through_the_real_path(self, tmp_config, fake_ssh):
+        # No sync daemon and no snapshot: this PC's two rows are `skip`, and a
+        # node that is merely not synced yet is not a troubled one.
+        fake_ssh.set_reply("bash -s", stdout="ok\ttmux\ttmux 3.4\n")
+        assert _check_nodes(_nodes_cfg(tmp_config)) == ("ok", "1 node(s) healthy")
+
+    def test_an_unreachable_node_is_a_warning_through_the_real_path(
+        self, tmp_config, fake_ssh
+    ):
+        fake_ssh.set_reply(
+            "bash -s", stderr="ssh: connect to host box-second: No route\n", rc=255
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config)) == (
+            "warn",
+            "second: reach -- details: magent node doctor",
+        )
+
+    def test_a_node_s_unencodable_item_renders_on_a_legacy_code_page(
+        self, tmp_config, monkeypatch
+    ):
+        # The item names are the node's words (doctor.sh prints them, and
+        # _report_of's errors="replace" can put U+FFFD there), which cp1252 -- a
+        # redirected Windows stdout -- lacks: the row degrades a glyph, never
+        # the command.
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                "second": [
+                    ScriptLine("fail", "claude-login\N{REPLACEMENT CHARACTER}", "")
+                ]
+            },
+        )
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        cfg = _nodes_cfg(tmp_config)
+
+        def only_the_nodes_row(_f):
+            # Computed inside invoke, while the runner's cp1252 stdout is installed.
+            status, detail = _check_nodes(cfg)
+            return [{"name": "nodes", "status": status, "detail": detail}]
+
+        monkeypatch.setattr(doctor, "_run_checks", only_the_nodes_row)
+        result = CliRunner(charset="cp1252").invoke(
+            cli.main, ["--config", tmp_config({"version": SCHEMA_VERSION}), "doctor"]
+        )
+        assert result.exception is None, repr(result.exception)
+        assert "second: claude-login? -- details: magent node doctor" in result.stdout
+
+
+class TestTheClaudeTokenRow:
+    """The PC's node token, read by node_auth.token_health -- WARN at worst,
+    like the nodes row: an ageing token is advice, not a broken machine. Never
+    mints (doctor is not a person's command)."""
+
+    TOKEN = "sk-ant-oat01-DECOY-" + "ab12_-" * 16
+    DAY = 86400.0
+
+    def _write(self, *, age_s):
+        import time
+
+        from magent import node_auth
+
+        node_auth.write_token(self.TOKEN, now=time.time() - age_s)
+
+    def test_no_nodes_is_ok_whatever_the_file_says(self, tmp_config):
+        cfg = load_config(tmp_config({"version": SCHEMA_VERSION, "projects": []}))
+        assert _check_claude_token(cfg) == ("ok", "no nodes configured")
+
+    def test_no_loadable_config_is_skipped(self):
+        assert _check_claude_token(None) == (
+            "ok",
+            "skipped -- config missing or invalid (see the config check)",
+        )
+
+    def test_a_fresh_token_is_ok_and_names_its_end(self, tmp_config):
+        self._write(age_s=self.DAY)
+        status, detail = _check_claude_token(_nodes_cfg(tmp_config))
+        assert status == "ok"
+        assert detail.startswith("valid until ")
+
+    def test_no_token_yet_is_a_warning_naming_the_command(self, tmp_config):
+        from magent import node_auth
+
+        status, detail = _check_claude_token(_nodes_cfg(tmp_config))
+        assert status == "warn"
+        assert node_auth.REFRESH_COMMAND in detail
+
+    @pytest.mark.parametrize("days_left", [12, -3])
+    def test_an_ageing_or_expired_token_is_a_warning(self, tmp_config, days_left):
+        from magent import node_auth
+
+        self._write(age_s=node_auth.TOKEN_LIFETIME_S - days_left * self.DAY)
+        status, detail = _check_claude_token(_nodes_cfg(tmp_config))
+        assert status == "warn"
+        assert node_auth.REFRESH_COMMAND in detail
+        assert self.TOKEN not in detail
+
+    def test_it_never_mints(self, tmp_config, monkeypatch):
+        from magent import node_auth
+
+        def boom(*_a, **_k):
+            raise AssertionError("doctor minted")
+
+        monkeypatch.setattr(node_auth, "mint_token", boom)
+        monkeypatch.setattr(node_auth, "ensure_token", boom)
+        assert _check_claude_token(_nodes_cfg(tmp_config))[0] == "warn"

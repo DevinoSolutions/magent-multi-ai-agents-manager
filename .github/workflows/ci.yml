@@ -4,7 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # feat/nodes: the nodes integration lines get this same matrix through
+    # draft PRs into it (CI vehicles only; pushes to feat/nodes run nothing).
+    branches: [main, feat/nodes]
 
 permissions:
   contents: read

@@ -57,12 +57,11 @@ _BUDGET_S = 45.0
 # What each shrunk wait gets. Every hung client costs exactly this, and nine
 # waits in this file run to it, so it is what keeps the file fast (the Windows
 # e2e job has no minutes to spare). A healthy fake client shares the hung one's
-# deadline and must still answer inside it: one `python -I -S` start behind a
-# .cmd, measured at ~80ms a fan-out, on a fake the fixture has already run once
-# so a first-exec scan cannot land on the timed part. 0.5s was not enough: a
-# healthy kill-server overran it once on a loaded desktop, and a hosted
-# Windows runner is slower than that desktop. The production values are
-# pinned separately (TestTheProductionBudgets).
+# deadline but never races it: the fixture holds the product's first look at
+# every client until that client has answered or hung (_answer_first), because
+# a cold `python -I -S` start behind a .cmd outran even this on a loaded
+# desktop. The production values are pinned separately
+# (TestTheProductionBudgets).
 _SHRUNK_S = 1.0
 
 # How long a killed client gets to be gone before the pin calls it left behind.
@@ -84,6 +83,7 @@ BASE = {base!r}
 STALL_S = {stall!r}
 PANE_PID = {pane_pid!r}
 CRASH_RC = {crash_rc!r}
+SLOW_S = {slow!r}
 argv = sys.argv[1:]
 # Every psmux command magent issues is `-L <socket> <verb> ...`.
 name = argv[1] if len(argv) > 2 and argv[0] == "-L" else ""
@@ -158,6 +158,17 @@ put("calls", me, {{"pid": os.getpid(), "ppid": os.getppid(), "argv": argv}})
 rules = read(os.path.join(BASE, "rules.json"))
 if [verb, name] in rules["crash"]:
     raise RuntimeError("scripted crash: %s %s" % (verb, name))
+for rule in rules["exit"]:
+    # A client that dies with a scripted code and NO traceback: what a real
+    # psmux.exe does when Windows cannot initialize it (0xC0000142). Not a
+    # harness defect, so it is not routed through crashed().
+    if rule[:2] == [verb, name]:
+        # os._exit takes a C int: an NTSTATUS above 2**31 goes in as its signed twin.
+        os._exit(rule[2] - (1 << 32) if rule[2] > 0x7FFFFFFF else rule[2])
+if [verb, name] in rules["slow"] or ["*", name] in rules["slow"]:
+    # A healthy client that takes longer to answer than the shrunk budget:
+    # what one cold interpreter start behind a .cmd is on a loaded box.
+    time.sleep(SLOW_S)
 
 
 def issued():
@@ -310,8 +321,14 @@ class _Fake:
         bare: tuple[str, ...] = (),
         late: tuple[str, ...] = (),
         crash: tuple[tuple[str, str], ...] = (),
+        exits: tuple[tuple[str, str, int], ...] = (),
+        slow: tuple[tuple[str, str], ...] = (),
     ) -> None:
         self.base = base
+        # The budget each client was handed at its first timed wait, by the
+        # pid the product holds. Filled in by the fixture's Popen guard (see
+        # _answer_first).
+        self.granted: dict[int, float] = {}
         self.bin_dir = base / "bin"
         self.bin_dir.mkdir(parents=True)
         (base / "rules.json").write_text(
@@ -322,6 +339,8 @@ class _Fake:
                     "bare": list(bare),
                     "late": list(late),
                     "crash": [list(c) for c in crash],
+                    "exit": [list(e) for e in exits],
+                    "slow": [list(w) for w in slow],
                 }
             ),
             encoding="utf-8",
@@ -329,7 +348,11 @@ class _Fake:
         script = base / "fake_psmux.py"
         script.write_text(
             _FAKE.format(
-                base=str(base), stall=_STALL_S, pane_pid=_PANE_PID, crash_rc=_CRASH_RC
+                base=str(base),
+                stall=_STALL_S,
+                pane_pid=_PANE_PID,
+                crash_rc=_CRASH_RC,
+                slow=2 * _SHRUNK_S,
             ),
             encoding="utf-8",
         )
@@ -365,6 +388,25 @@ class _Fake:
     def stalls(self) -> list[dict[str, object]]:
         return self._records("stalls")
 
+    @staticmethod
+    def _held_pid(stall: dict[str, object]) -> set[int]:
+        # The pid the product holds for a hung client: the fake itself on
+        # POSIX (the launcher execs it), its .cmd launcher on Windows.
+        return {int(stall["pid"]), int(stall["ppid"])}
+
+    def reached_hang(self, pid: int) -> bool:
+        """The client the product holds as ``pid`` is sitting in its hang."""
+        return any(pid in self._held_pid(s) for s in self.stalls())
+
+    def granted_to_hung(self) -> list[float]:
+        """The budget each hung client was handed at its first timed wait."""
+        return [
+            self.granted[pid]
+            for s in self.stalls()
+            for pid in self._held_pid(s)
+            if pid in self.granted
+        ]
+
     def release(self) -> None:
         (self.base / "release").touch()
 
@@ -380,8 +422,9 @@ class _Fake:
     def assert_never_crashed(self) -> None:
         """No fake raised anything it was not scripted to.
 
-        A crash exits non-zero, which a has-session caller reads as a real
-        "absent" -- a harness defect wearing a product answer. This is what
+        A crash a caller could read as an answer (an uncaught traceback exits
+        rc 1, which IS has-session's "absent") is a harness defect wearing a
+        product answer. This is what
         turns it back into a failure that says what happened.
         """
         crashes = self.take_crashes()
@@ -447,6 +490,13 @@ class _Fake:
             assert not unended, f"hung clients that never ended: {unended}"
             hows = {stem: ends[stem]["how"] for stem in stalls}
             assert set(hows.values()) == {"launcher-killed"}, hows
+        # ...and killed at a REAL deadline. Every stand-in has answered before
+        # the product's clock starts (_answer_first), so a product that stopped
+        # waiting altogether would still read every healthy answer right; only
+        # the budget it handed the hung clients tells the two apart.
+        granted = self.granted_to_hung()
+        assert granted, "no hung client was ever given a timed wait"
+        assert max(granted) >= _SHRUNK_S / 2, granted
 
 
 @pytest.fixture
@@ -459,23 +509,48 @@ def fake_psmux(
     and caches its answer for the process, so the cache is cleared on both
     sides and the resolution is asserted. The Popen guard is the second
     belt: any psmux-looking binary other than the fake fails the test before
-    it can start.
+    it can start. It is also where every fake client is made to answer, or
+    hang, before the product's clock looks at it -- see ``_answer_first``.
     """
     fakes: list[_Fake] = []
+    settlers: dict[object, Callable[[], None]] = {}
     # Wraps whatever Popen is in force rather than subclassing it: conftest's
     # real-home guard has already replaced the class with a function.
     inner = subprocess.Popen
 
     def _only_the_fake(args: object, *a: object, **kw: object) -> object:
         exe = str(args[0] if isinstance(args, (list, tuple)) else args)
-        if Path(exe).name.lower().startswith(("psmux", "pmux", "tmux")):
-            allowed = {os.path.normcase(f.path) for f in fakes}
-            assert os.path.normcase(exe) in allowed, (
-                f"refusing to spawn a psmux that is not the fake: {exe}"
-            )
-        return inner(args, *a, **kw)
+        if not Path(exe).name.lower().startswith(("psmux", "pmux", "tmux")):
+            return inner(args, *a, **kw)
+        by_path = {os.path.normcase(f.path): f for f in fakes}
+        assert os.path.normcase(exe) in by_path, (
+            f"refusing to spawn a psmux that is not the fake: {exe}"
+        )
+        proc = inner(args, *a, **kw)
+        settlers[proc] = _answer_first(proc, by_path[os.path.normcase(exe)])
+        return proc
 
     monkeypatch.setattr(subprocess, "Popen", _only_the_fake)
+
+    # A fan-out's one deadline is taken on entry, so its clients are settled
+    # before it is -- not inside the first wait, where settling one client
+    # would spend the budget of the others.
+    real_await = psmux.await_clients
+
+    def _await_settled(
+        procs: list[subprocess.Popen[bytes] | None], timeout: float
+    ) -> list[int | None]:
+        for proc in procs:
+            if proc in settlers:
+                settlers[proc]()
+        return real_await(procs, timeout)
+
+    monkeypatch.setattr(psmux, "await_clients", _await_settled)
+    if sys.platform == "win32":
+        from magent.platform import windows
+
+        # Bound by name at import, so patched where the bring-up looks it up.
+        monkeypatch.setattr(windows, "await_clients", _await_settled)
 
     def make(**kw: object) -> _Fake:
         fake = _Fake(tmp_path / f"fake-psmux-{len(fakes)}", **kw)
@@ -502,6 +577,67 @@ def fake_psmux(
     psmux.find_psmux.cache_clear()
     for fake in fakes:
         fake.assert_never_crashed()
+
+
+def _answer_first(proc: subprocess.Popen[bytes], fake: _Fake) -> Callable[[], None]:
+    """Hold the product's first look at a fake client until it has answered or hung.
+
+    The shrunk budget is there to be spent by the HUNG client, and a healthy
+    stand-in shares its deadline: every one is a cold interpreter start behind
+    a launcher, which on a loaded box outran one second on its own and read as
+    "gave no answer" (about 1 run in 19 on the desktop). A real psmux answers
+    in ~80ms. So the first ``wait``/``communicate``/``poll`` on a client first
+    waits -- on a condition, not a clock -- until the client has exited or
+    published its stall, and only then runs with the timeout the product
+    asked for. Every client the product can see is therefore in its final
+    state before any budget starts: answered, or hung for good.
+
+    The budget each client is handed at its first timed wait is recorded
+    (``_Fake.granted``), because a product that stopped waiting at all would
+    read every settled answer right; ``assert_no_client_left_behind`` checks
+    the hung ones were given a real one.
+
+    Returns the settle step itself, for the fan-out wrapper to run up front.
+    """
+    real_wait, real_communicate, real_poll = proc.wait, proc.communicate, proc.poll
+    settled = False
+
+    def settle() -> None:
+        nonlocal settled
+        if settled:
+            return
+        settled = True
+        # Bounded like everything else here: a client that neither answers
+        # nor hangs is left to the product, and to the pins' own asserts.
+        end = time.monotonic() + _BUDGET_S
+        while real_poll() is None and not fake.reached_hang(proc.pid):
+            if time.monotonic() >= end:
+                return
+            time.sleep(0.02)
+
+    def granted(timeout: float | None) -> float | None:
+        settle()
+        if timeout is not None:
+            fake.granted.setdefault(proc.pid, timeout)
+        return timeout
+
+    def wait(timeout: float | None = None) -> int:
+        return real_wait(granted(timeout))
+
+    def communicate(
+        input: bytes | None = None,  # noqa: A002  # reason: Popen.communicate's own keyword
+        timeout: float | None = None,
+    ) -> tuple[bytes, bytes]:
+        return real_communicate(input, granted(timeout))
+
+    def poll() -> int | None:
+        settle()
+        return real_poll()
+
+    proc.wait = wait
+    proc.communicate = communicate
+    proc.poll = poll
+    return settle
 
 
 def _within(budget_s: float, fake: _Fake, fn: Callable[[], object]) -> object:
@@ -556,6 +692,21 @@ class TestTheDedupeProbeHasThreeAnswers:
         assert states == {"api": "live", "web": "unknown", "db": "absent"}
         fake.assert_no_client_left_behind(expect=1)
 
+    @pytest.mark.parametrize("rc", [2, _CRASH_RC, 194])
+    def test_a_client_that_died_abnormally_is_unknown_not_absent(self, fake_psmux, rc):
+        # Real processes, real exit codes. 194 is 0xC2, the low byte a POSIX
+        # process keeps of 0xC0000142; the Windows leg below sends the whole
+        # NTSTATUS. Neither is has-session's "no such session" (rc 1).
+        fake = fake_psmux(exits=(("has-session", "web", rc),), live=("api",))
+        states = _within(
+            _BUDGET_S,
+            fake,
+            lambda: psmux.probe_sessions(
+                ["api", "web", "db"], fake.path, timeout=_SHRUNK_S
+            ),
+        )
+        assert states == {"api": "live", "web": "unknown", "db": "absent"}
+
     def test_a_probe_that_cannot_even_start_is_unknown_not_absent(self, tmp_path):
         states = psmux.probe_sessions(
             ["api"], str(tmp_path / "no-such-psmux.exe"), timeout=_SHRUNK_S
@@ -576,17 +727,19 @@ class TestOneDeadlinePerFanOut:
     def test_n_hung_clients_cost_one_budget_not_n(self, fake_psmux):
         names = [f"s{i}" for i in range(10)]
         fake = fake_psmux(hang=tuple(("has-session", n) for n in names))
-        started = time.monotonic()
         states = _within(
             _BUDGET_S,
             fake,
             lambda: psmux.probe_sessions(names, fake.path, timeout=_SHRUNK_S),
         )
-        elapsed = time.monotonic() - started
         assert set(states.values()) == {"unknown"}
-        # A timeout per client, waited in turn, would be 10 x the budget.
-        assert elapsed < 5 * _SHRUNK_S, elapsed
         fake.assert_no_client_left_behind(expect=10)
+        # A timeout per client, waited in turn, would hand out 10 x the budget.
+        # Read off what each wait was GIVEN, not a wall clock: ten cold starts
+        # and ten kills on a loaded box are not what this pin is about.
+        granted = fake.granted_to_hung()
+        assert len(granted) == 10, granted
+        assert sum(granted) < 2 * _SHRUNK_S, granted
 
     def test_a_client_that_answered_keeps_its_answer_past_the_deadline(
         self, fake_psmux
@@ -599,11 +752,39 @@ class TestOneDeadlinePerFanOut:
         assert states == {"web": "unknown", "db": "absent"}
 
 
+class TestAStandInsStartUpIsNotTheBudget:
+    """What the shrunk budget measures is the HUNG client, never a stand-in's
+    own start-up.
+
+    Every fake client is a cold interpreter start behind a launcher, and on a
+    loaded box that start alone outran the one-second budget: a healthy client
+    read as a hung one ("gave no answer within 1s"), about 1 run in 19 on the
+    desktop, a different pin each time. A real psmux answers these in ~80ms;
+    the stand-in for it must not be the thing the budget catches.
+    """
+
+    def test_a_healthy_client_slower_than_the_budget_keeps_its_answer(self, fake_psmux):
+        fake = fake_psmux(
+            hang=(("has-session", "web"),),
+            live=("api",),
+            slow=(("has-session", "api"), ("has-session", "db")),
+        )
+        states = _within(
+            _BUDGET_S,
+            fake,
+            lambda: psmux.probe_sessions(
+                ["api", "web", "db"], fake.path, timeout=_SHRUNK_S
+            ),
+        )
+        assert states == {"api": "live", "web": "unknown", "db": "absent"}
+        fake.assert_no_client_left_behind(expect=1)
+
+
 class TestACrashedFakeIsNeverAnAnswer:
     """The harness's own defects fail by name.
 
-    A fake that raises exits non-zero, and a non-zero has-session IS the
-    product's "absent" -- so an unguarded crash does not fail a pin, it hands
+    A fake that raises would exit rc 1 unguarded, and rc 1 IS has-session's
+    "absent" -- so an unguarded crash does not fail a pin, it hands
     the pin a wrong answer to fail on (the red main: one of ten hung clients
     hit a PermissionError reading a sibling's record, and read "absent").
     """
@@ -768,6 +949,25 @@ class TestTheBringUpNeverWaitsForever:
             assert fake.issued("send-keys", name), name
         fake.assert_no_client_left_behind(expect=1)
 
+    @pytest.mark.parametrize("rc", [_CRASH_RC, 0xC0000142, 0xC0000142 - (1 << 32)])
+    def test_a_client_that_crashed_is_left_alone_and_named(
+        self, fake_psmux, shrunk, rc
+    ):
+        # STATUS_DLL_INIT_FAILED, unsigned and signed, and an internal error:
+        # the client died without answering, which is not "no such session".
+        # The same safety property as a hung probe -- the session may be a live
+        # agent -- so it is never killed, never re-created, never typed into.
+        fake = fake_psmux(exits=(("has-session", "web", rc),))
+        refused = self._launch(fake, ["api", "web", "db"])
+
+        assert list(refused) == ["web"]
+        assert "could not tell whether web is running" in refused["web"]
+        assert fake.issued("kill-server", "web") == []
+        assert fake.issued("new-session", "web") == []
+        assert fake.issued("send-keys", "web") == []
+        for name in ("api", "db"):
+            assert fake.issued("new-session", name), name
+
     def test_an_unanswered_kill_server_is_never_created_on_top_of(
         self, fake_psmux, shrunk
     ):
@@ -821,6 +1021,29 @@ class TestTheBringUpNeverWaitsForever:
         # it could not read.
         fake.assert_no_client_left_behind(expect=2)
 
+    def test_a_crashed_probe_is_never_repaired_by_the_verified_bring_up(
+        self, fake_psmux, shrunk
+    ):
+        # Through `launch_verified`: the creation verify counts the crashed
+        # name as MISSING and asks for a respawn, and the respawn goes back
+        # through the tri-state dedupe -- so the loop can never end in a
+        # kill-server on a session that only failed to ANSWER.
+        from magent.platform.windows import WindowsPlatform
+
+        fake = fake_psmux(exits=(("has-session", "web", 0xC0000142),))
+        failed = _within(
+            _BUDGET_S,
+            fake,
+            lambda: psmux.launch_verified(WindowsPlatform(), _windows(["api", "web"])),
+        )
+
+        assert list(failed) == ["web"]
+        assert "could not tell whether web is running" in failed["web"]
+        assert fake.issued("kill-server", "web") == []
+        assert fake.issued("new-session", "web") == []
+        assert fake.issued("send-keys", "web") == []
+        assert fake.issued("send-keys", "api")
+
     def test_a_session_created_after_its_wait_gave_up_stays_failed(
         self, fake_psmux, shrunk
     ):
@@ -856,13 +1079,21 @@ class TestTheBringUpNeverWaitsForever:
     def _bare_panes_read_as_casualties(monkeypatch, windows):
         # The send verifier's REAL verdict over the fake's panes, not the
         # fixture's "no casualty" stub: a `bare` name reads `pwsh` in the
-        # foreground, its pane process is a pwsh with nothing under it, and
-        # so it is exactly the pane the verifier would re-type into.
+        # foreground, its pane process is a pwsh with nothing under it, its
+        # console holds that pwsh alone, and so it is exactly the pane the
+        # verifier would re-type into. The console reading is faked too: the
+        # real helper would attach to a pid this fake invented and answer
+        # "unreadable", which vetoes every re-send.
         from magent import procs
 
         monkeypatch.setattr(windows, "idle_sessions", psmux.idle_sessions)
         monkeypatch.setattr(
             procs, "snapshot_processes", lambda: [("pwsh.exe", _PANE_PID, 1)]
+        )
+        monkeypatch.setattr(
+            procs,
+            "console_clients",
+            lambda pids, **_: {pid: frozenset({pid}) for pid in pids},
         )
 
     def test_a_send_that_never_answers_is_killed_and_never_re_sent(
@@ -895,6 +1126,27 @@ class TestTheBringUpNeverWaitsForever:
         assert shrunk._SEND_MAX_ATTEMPTS == 3
         assert len(fake.issued("send-keys", "web")) == 2
         fake.assert_no_client_left_behind(expect=1)
+
+    def test_a_window_whose_clients_are_all_slow_is_still_brought_up(
+        self, fake_psmux, shrunk
+    ):
+        # Every client for `api` -- the dedupe, the clear, the create, the
+        # send, the decoration and the creation verify -- starts slower than
+        # the shrunk budget, as all of them do on a loaded box. None of them
+        # hung, so none of them may be the reason `api` failed.
+        from magent.platform.windows import WindowsPlatform
+
+        fake = fake_psmux(slow=(("*", "api"),))
+        failed = _within(
+            _BUDGET_S,
+            fake,
+            lambda: psmux.launch_verified(WindowsPlatform(), _windows(["api"])),
+        )
+
+        assert failed == {}
+        assert len(fake.issued("new-session", "api")) == 1
+        assert fake.issued("send-keys", "api")
+        assert fake.issued("set", "api")
 
     def test_a_decoration_that_never_answers_is_killed(self, fake_psmux, shrunk):
         # Purely cosmetic, so it may cost a budget but never the bring-up.

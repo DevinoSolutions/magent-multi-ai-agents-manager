@@ -112,10 +112,12 @@ None of these imports any other `magent` module (`style.py` imports
   leaf. It is exercised only by tests. This wasn't raised as a finding in
   the audit that produced this document; flagged here for whoever looks next.
 - **`agent_state.py`** — file-per-session lifecycle store (`working`/`done`/
-  `needs-input`/`error`/`idle`), keyed by a hash of the session's normalized
-  cwd. Stdlib-only by design (its own docstring: it's imported from hook
-  handlers on the hot path of every agent turn, so it must stay
-  dependency-light). Has zero tests today (see Known Debt).
+  `needs-input`/`error`/`idle`, written by the agent's lifecycle hooks, plus
+  `parked`, written by magent's idle reaper and never by the hooks), keyed by
+  a hash of the session's normalized cwd. Stdlib-only by design (its own
+  docstring: it's imported from hook handlers on the hot path of every agent
+  turn, so it must stay dependency-light). Has zero tests today (see Known
+  Debt).
 - **`config.py`** — grouped with subsystems below for its behavioral role,
   but structurally a leaf (no `magent`-internal imports).
 
@@ -220,6 +222,15 @@ None of these imports any other `magent` module (`style.py` imports
   description this document deliberately does not repeat). `run_server` binds
   one `ThreadingHTTPServer` per address returned by `_bind_addresses` (see Key
   Decisions).
+- **`reap.py`** — the idle reaper (see Key Decisions, "A finished, long-idle
+  agent is parked, not killed"). Split in two: a pure core (`Signals` →
+  `decide` → `"reap"` or one of the closed `VETO_REASONS`; `threshold_s`,
+  `quiet_s`, `off_reason`) tested with no processes and no clock, and a thin
+  gather/act layer (`gather`, `_read_one`, `_stop`, `_park`) around it.
+  `sweep_once` is the one public entry, and `upload_server.
+  _supervise_idle_reap` its only production caller. Imports `agent_state`,
+  `env`, `log` and `procs` at the top; `psmux`, `fleet`, `sessions` and the
+  platform in-body.
 - **`hotkey.py`** — the Windows-only Alt+V clipboard-image listener.
   `if sys.platform != "win32": raise ImportError(...)` fires at import time,
   by design — every call site imports it lazily, behind a `supports_hotkey()`
@@ -227,14 +238,16 @@ None of these imports any other `magent` module (`style.py` imports
   comment at the import. Imports only `log` and `titles` from `magent`.
 - **`attach_client.py`** — the reconnecting ssh supervisor that runs inside
   every `magent attach` pane, shipped as its own `magent-attach-client`
-  console script (see Key Decisions). Imports `magent.style` only; `argparse`
+  console script (see Key Decisions). Imports `magent.style` and `magent.titles`
+  (plus `magent.env` in-body, for `spawn_attach_window`); `argparse`
   is imported in-body because `cli/attach.py` imports this module at the top
-  level (for `SSH_KEEPALIVE_OPTS` / `remote_attach_command` / the client exe
-  name) and the registration hub would otherwise put argparse on `magent
-  --help`'s critical path. It owns the two strings `cli/attach.py`'s corpse
-  detection is coupled to — the ssh keepalive options and the remote attach
-  command — so the marker `_attach_markers` scans for and the command a pane
-  actually runs cannot drift apart.
+  level (for `spawn_attach_window` / `client_exe` / the multiplexer constants /
+  the client exe name) and the registration hub would otherwise put argparse
+  on `magent --help`'s critical path. It owns the two strings `cli/attach.py`'s
+  corpse detection is coupled to — the ssh connection options
+  (`SSH_CONNECTION_OPTS`) and the remote attach command — so the marker
+  `_attach_markers` scans for and the command a pane actually runs cannot
+  drift apart.
 
 ### `cli/` command modules
 
@@ -934,6 +947,65 @@ noise), and neither does a server whose owner set `MAGENT_HOTKEY_SUPERVISOR=0`.
 `doctor`'s `hotkey` check imports the same state machine rather than reimplement
 it, so the two surfaces cannot disagree about whether Alt+V works.
 
+**The repair hint never goes through `down`.** `LISTENER_REPAIR_HINT` once said
+"magent down --all, then magent serve", which kills the agent in every
+configured session to revive a keyboard hook (pinned by
+`tests/unit/test_status.py`: the hint never contains `down`). The hint now
+follows from what the supervisor does, below: serve repairs a dead *or* wedged
+listener itself, so the only manual step left is serve not running
+(`magent serve --ensure`). `hotkey_cmd`'s "already running" line no longer says
+"stop it with `magent down --all`" either.
+
+**A wedged listener is replaced, not just reported.** A listener whose pid is
+alive but whose heartbeat stopped used to be permanent: `ensure_hotkey_listener`
+only restarted on a version/target mismatch, so the manifest still matched and
+`status` stayed red until a human ended the pid. `_supervise_hotkey` now carries
+one `launch.ListenerWatch` and `ensure_hotkey_listener(url, watch=watch)` calls
+`retire_wedged_listener` before its usual start. The design decisions, each of
+which is a way the replacement could otherwise hurt someone:
+
+- *The proof is four facts, not "the heartbeat is old".* The heartbeat file
+  exists and has been silent longer than `WEDGED_LISTENER_GRACE_S` (3x the
+  `status` stale threshold = 90s: "stale" is a label, this verdict ends a
+  process); the pid's identity is readable; its image is python; and it was
+  **created no later than the last pulse**. The last one is what survives a
+  python-on-python pid reuse -- a process born after the final heartbeat cannot
+  be the one that wrote it. A missing heartbeat is never a wedge (there is
+  nothing to compare a creation time against).
+- *Two ticks.* The same pid must show the same last pulse on two consecutive
+  supervisor ticks. A machine that slept looks wedged on the tick it wakes and
+  healthy on the next; the confirm turns that into a non-event.
+- *The kill is identity-verified.* `procs.terminate_verified` re-reads (image,
+  creation time) through the very handle it terminates with, so a pid recycled
+  between the proof and the kill is never hit. It is not `stop_listener`'s
+  `taskkill /PID /F`, which trusts the pid file blindly. `hotkey.forget_listener`
+  then drops the pid file, manifest and heartbeat without signalling anything
+  (a pid file can still read live for the instant before Windows finishes
+  tearing the process down, which is exactly when the replacement spawns).
+- *Replacement is not re-aiming.* The target is read from the manifest BEFORE the
+  kill (forgetting the listener clears the manifest) and the fresh listener is
+  started at exactly that target, so `magent attach`'s remote wiring survives.
+  Callers with no `watch` (the one-shot launch/attach paths) can never end
+  anything.
+- *Bounded.* `WEDGED_REPLACE_COOLDOWN_S` (300s) caps a listener that wedges the
+  instant it starts at 12 replacements an hour, and a kill that is refused
+  still starts the cooldown so it is not retried every tick. Each outcome is a
+  `hotkey.log` warning (replacing / could not end / cooldown -- the last once
+  per episode). `MAGENT_HOTKEY_SUPERVISOR=0` returns before the watch exists.
+- *It sees only what the other daemon seams let it see.* The pid comes from
+  `hotkey.listener_pid`, which discards a pid file written before the last boot,
+  so after a reboot a recycled pid is never even a candidate -- the identity
+  proof is the second line of defense, not the first. And
+  `ensure_hotkey_listener` asks `launch.session0_block` before it reads
+  anything: in Session 0 the start is refused, so a replacement there would end
+  the desktop's listener and put nothing back. Both pinned in
+  `tests/unit/test_daemon_lifecycle_seams.py`.
+
+Not covered, on purpose: a listener whose identity cannot be read (e.g. it runs
+elevated) is left alone with one warning per pid, and a heartbeat that pulses
+from a wedged *hook* (the message loop turns, Alt+V is dead) is invisible to
+this check -- the heartbeat proves the loop, not the chord.
+
 **Per-press feedback.** Every Alt+V press now ends in exactly one
 `ALTV outcome=<x> project=<y>` line in `hotkey.log` (closed vocabulary,
 `hotkey.ALTV_OUTCOMES`), and every failure also reaches the screen through the
@@ -1015,6 +1087,159 @@ when the upload server reads DEAD **and** the daemon is off **and** it would
 actually supervise (config on, env not opted out). Suggesting the daemon to
 someone who disabled it would be advice that does nothing.
 
+### The attention daemon is supervised by serve, and a restart is not a crash (2026-09-30)
+
+The decision above left one gap. The attention daemon supervised `serve`, but
+nothing supervised the daemon. On 2026-09-29 the owner restarted Windows. The
+next bring-up (`_start_psmux_and_upload`, the `--go`/menu launch path) started
+`serve`, and serve started the Alt+V listener. Nothing restarted the daemon.
+`status` then printed `CRASHED (daemon died — see logs)` about a daemon that had
+never crashed: the restart killed it before it could remove its heartbeat, and
+a leftover heartbeat was the crash marker.
+
+**1. Owner: `serve`.** The choice was between the bring-up path ensuring the
+daemon and serve's own supervisor thread ensuring it. Serve won, for two
+reasons.
+
+- The bring-up only runs when somebody launches. A daemon that crashes at 03:00
+  would stay dead until the next `--go`. That is the failure the upload-server
+  supervisor already fixed for serve.
+- Serve is the process that is effectively always up, and every entry point
+  already starts it: `--go`, the menu, `up` and `attach` (`serve --ensure`).
+
+So the supervision is now mutual, and each half covers the moment the other is
+dead. Serve runs a watchdog (`cli/attention_cmd.AttentionDaemonSupervisor`)
+that looks as soon as it binds and then every `WATCHDOG_INTERVAL_S` (30s). The
+first look is immediate because a serve that starts right after a reboot is
+exactly when the daemon is missing.
+
+*It revives only what was running.* The heartbeat file answers "was it
+running". Every clean stop removes it (`attention --stop`, `down --all`,
+Ctrl+C). A crash, a kill or a restart leaves it. So serve starts a daemon only
+when no daemon is live and a heartbeat lingers. A daemon the user never
+started, or stopped on purpose, stays stopped. A background process overruling
+a foreground decision would be the same kind of surprise as a watchdog nobody
+asked for. An explicit `settings.attention` autostart key was considered and
+left out: the heartbeat already records the user's intent, and there is no
+config switch whose absence means "yes".
+
+*It revives through the front door.* The revive runs the same `attention -d` a
+human types. Its `exclusive_lock("attention")` and live-pid check are what
+guarantee one daemon, so two serves on two ports, or a serve racing a human,
+end with one daemon and a "launch already in progress". It also skips a config
+the daemon would refuse. A config it cannot read, or one whose renderers are
+all off or unsupported, gets one log line and no spawn, rather than a spawn
+every cooldown that exits 1 forever.
+
+*The cooldown outlasts the launch.* `ATTENTION_RESPAWN_COOLDOWN_S` is 60s, and
+a test pins it above `procs.REGISTRATION_TIMEOUT_S`. The launcher holds the
+lock only until its child registers or that window runs out. A cooldown shorter
+than the window could start a second launcher beside a child that is merely
+slow ("A slow child is not a failed child"), and a late registration would
+leave two daemons.
+
+*Where the code lives.* `upload_server.run_server` takes generic
+`watchdogs` hooks and runs each on a daemon thread through `_run_watchdog`,
+after the bind. A serve that lost the port exits `PortInUse` having started
+nothing. The attention-specific judgement (pid, heartbeat, renderer plan)
+lives in `cli/attention_cmd.py` next to `_upload_watchdog`, so both halves of
+the mutual supervision sit in one file. `serve_cmd` builds the hook and hands
+it down, because a src module must not import the cli package (LS-A-001).
+
+*Two gates.* `MAGENT_ATTENTION_SUPERVISOR=0` is the opt-out, and like its three
+siblings it is a **test-isolation law**. A test that starts a real serve would
+otherwise start a real daemon behind it the moment its home held a heartbeat,
+and that daemon would badge the developer's windows with a pid no teardown
+knows. `tests/conftest.py` pins it to 0 for every tier, and every fixture that
+builds a child `env=` sets it next to `MAGENT_UPLOAD_SUPERVISOR`. The second
+gate is the Session-0 seam every daemon spawn passes, `launch.session0_block`
+(below). A serve in logon Session 0 (a foreground `magent serve` over ssh)
+would start a daemon on a desktop nobody sees, holding the `attention.pid` the
+real desktop's daemon needs, so serve supervises only where a launch would
+"run". `attention_watchdog` asks it before building the supervisor, and
+`AttentionDaemonSupervisor.tick` asks it again before every spawn (once per
+cooldown in the log), so no caller can route around it.
+
+**2. A restart is not a crash.** `procs.boot_time()` answers when the machine
+last started. It uses `GetTickCount64` on Windows, `sysctl kern.boottime` on
+macOS and `/proc/stat` `btime` elsewhere, all inside the `procs` leaf, so no
+business logic branches on `sys.platform`. `status` now has five attention
+states:
+
+- `crashed` is a lingering heartbeat from after the boot. It stays red and
+  exits 3.
+- `off-since-restart` is a lingering heartbeat whose last pulse predates the
+  boot. It prints "not running since the last restart" in yellow and exits 0.
+- `off` means no heartbeat. `on` and `stale` are unchanged.
+
+`off-since-restart` exits 0 because nothing failed. It is the same fact as
+`off`, plus the reason. Exit 3 means "something that should be running broke",
+and a monitor paging on every reboot would teach people to ignore it. The hint
+says what will actually happen: "the upload server restarts it" when a serving,
+supervising serve is up, otherwise the command to run. An unknown boot time
+keeps the old verdict. `doctor`'s `attention` check reads the same state
+machine and is WARN at worst.
+
+The same boot time closes a pid-reuse hole. `attention_cmd.daemon_pid()` treats
+a pid file written before the boot as stale, whatever that pid is doing now. A
+restart leaves the file behind and Windows hands pid numbers out again, and a
+recycled pid would read as a live daemon: `status` would report ON and serve
+would never revive the real one.
+
+The same hole existed for the other two pid files, and they are read by more
+than a status line.
+
+- **The listener's pid file.** `hotkey.listener_pid()` is the one reader behind
+  every listener decision. With a recycled pid, serve's supervisor kept it and
+  never started a listener, so Alt+V stayed dead after the reboot. `status` and
+  `doctor` called it STALE and blamed a wedged message loop.
+- **The upload server's pid file.** `upload_server.server_pid()` feeds three
+  decisions: `status` choosing between DEAD and off, `stop_server` choosing what
+  to taskkill, and the phone-URL port pick.
+
+Both readers now clear a pre-boot pid file and read None, so a `down --all`
+after a reboot can no longer kill an unrelated process that was handed the old
+number. The attention watchdog's own read of the serve pid stays log-only, and
+a test pins that. It decides on the port probe alone, so a live pid on record
+never stands in for a server that does not answer.
+
+"Before the boot" allows 30s of slack (`procs.BOOT_CLOCK_SLACK_S`), because the
+boot time is derived rather than recorded. Windows computes it as "now minus
+uptime", so a clock correction after the boot moves it, and Linux's btime is
+rounded. The two errors are not the same size. A live listener's pid file read
+as pre-boot would be discarded, and serve would start a second listener beside
+it: two keyboard hooks, and every Alt+V pasted twice. A heartbeat from just
+before a very fast restart that reads as newer than the boot only gets the old
+wording.
+
+*The teardown order follows the supervision edges.* `down --all` used to stop
+serve, then the listener, then the attention daemon, so for a moment the daemon
+outlived the serve it supervises. It could start a new serve in that moment,
+and that serve would then restart the listener. The order is now supervisor
+first, all the way down: the attention daemon, then serve, then the listener.
+The one edge that points back up is serve reviving attention, and it fires only
+while the daemon's heartbeat lingers. `stop_daemon` withdraws the heartbeat
+BEFORE the kill (and again after), so a deliberate stop is never mistaken for a
+crash in the gap between the kill and the cleanup. That alone left a window:
+the daemon's heartbeat thread pulses until the kill lands, so a pulse can slip
+in after the withdrawal, and a serve tick between the kill and the second clear
+saw exactly a crash. So the supervisor never acts on a heartbeat that is still
+fresh by `status`'s own window (`log.HEARTBEAT_MAX_AGE`, 30s). The same rule
+covers a daemon running in Session 0: this desktop cannot open its pid, so
+`daemon_pid()` is None while it keeps pulsing the shared heartbeat, and a
+revive there would be a second daemon. A real crash stops pulsing and is
+revived once the pulse goes stale, a tick or two later. A restart's heartbeat
+is almost always stale by the time serve is back up, so it is revived at the
+first look. `magent down --server`
+without `--all` still leaves a running daemon, which brings serve back within
+its cooldown, as it has since the upload-server supervisor landed.
+
+*Known gap.* Windows Fast Startup ("Shut down" with hybrid boot) resumes a
+hibernated kernel, so the uptime counter does not reset and the boot time is
+the last cold boot. A daemon killed by a Fast-Startup shutdown still reads
+`crashed`, which is the old behaviour, and serve still revives it, because
+revival does not depend on the boot time. A real Restart always cold-boots.
+
 ### One port, one server (2026-09-26)
 
 The watchdog above, `serve --ensure` and a hand-run `magent serve` can each
@@ -1064,6 +1289,23 @@ or `--ensure` spawn that loses the race is **supposed** to end here, so it is
 not a crash for Sentry. The CLI shell prints the reason and exits 1 instead of
 a traceback. An address that cannot be bound for any other reason (a Tailscale
 IP that went away) still degrades with a warning, as before.
+
+One spawner never asked first. Every `--go` and menu bring-up spawned
+`magent serve` without looking. On a machine whose server was already up, that
+second serve could only die of `PortInUse`: a WARNING in `upload.log` on every
+bring-up, which read like a duplicate-server fault. It now goes through
+`ensure_upload_server`, the same probe-then-spawn every other spawner uses.
+
+Audited and left as they are:
+- **Two addresses at once.** Two serves on the default addresses cannot both
+  bind, because loopback is always claimed first and is exclusive. Two
+  explicit, disjoint `--host` addresses are two servers by the user's choice.
+- **Session 0 does not change the answer.** Sockets are machine-wide, so a
+  Session-0 serve conflicts with the desktop's like any other process.
+- **The 0.3s port probe can say "free" wrongly.** It happens when a wedged
+  serve's backlog is full, or when a server is bound only to a non-loopback
+  address. The spawn it lets through dies of `PortInUse` at the watchdog's
+  cooldown pace, so it cannot produce a second server.
 
 Pins:
 - `tests/unit/test_upload_server.py::TestOnePortOneServer` (real sockets,
@@ -1338,6 +1580,7 @@ design ever said it was. Traced writer sets:
 | `attention.log` | `magent attention -d`, `magent watch`, `magent status` — anything that READS the agent-state store and hits `agent_state._warn_unusable`, plus `launch.UploadServerSupervisor` |
 | `upload.log` | `magent serve`, and `psmux`'s flash-timeout warning wherever it runs |
 | `platform.log` | every process that imports a platform backend at all |
+| `reap.log` | `magent serve` (the idle reaper's sweep thread: parks, veto changes, warnings), and any process that reads `reap.threshold_s` below the floor (`magent doctor`) |
 
 `logging.handlers.RotatingFileHandler` is a single-process design, and it fails
 **silently and expensively** when shared. It keeps the file open for the
@@ -1672,6 +1915,125 @@ psmux from the LISTENER process (the test itself), so the recording shim must
 win the test process's PATH and `find_psmux`'s lru cache must be cleared both
 ways.
 
+### A local file is pasted, not uploaded (2026-09-25)
+
+Every upload path accepts any file type, and Alt+V also takes files copied in
+Explorer (CF_HDROP, which wins over CF_DIB when both are on the clipboard). The
+decision that shapes it is what a LOCAL press does with them: it pastes the
+files' ORIGINAL absolute paths (`altv.paste_paths`) and nothing else. No copy
+into `~/.magent/uploads`, no upload, no size cap. The upload exists to move
+bytes between machines; on the machine that owns the pane the agent can
+already open the file where it lives, and a copy would only add a stale
+duplicate, a disk cost, and an arbitrary 100 MB ceiling on a file that never
+travels. "Local" is the same fork `native_paste` reads -- the manifest's
+`ssh_host` is null -- and unlike native paste this fork is NOT opt-in, because
+what it delivers is path TEXT, the one thing every agent demonstrably accepts
+(see above).
+
+The remote half and the edges:
+
+- **One request, one paste.** A remote press sends every file as a `file` part
+  of ONE `/upload` request, and the server saves them all and makes ONE paste
+  of `sessions.paths_line(saved)`. N requests would be N pastes racing into one
+  input line, and a paste is one attempt (the double-paste law); a separate
+  "paste this text" endpoint was the other way out and was refused, because the
+  upload server has no auth and must not grow a keystroke-injection verb.
+  The phone page uses the same shape: its picker takes several files and its
+  Ctrl+V stages every copied file, and one Send is one request. Consequence:
+  the 100 MB cap is per request, i.e. per press or per send.
+- **The line is quoted only where it has to be.** A path of plain characters
+  goes bare, so a single ordinary path is byte-for-byte what the one-image
+  inject always pasted. Otherwise double quotes, which is what Windows Terminal
+  writes when a file is dropped on it; a path containing `"`, `$` or a backtick
+  (which a double-quoted POSIX string still interprets) is single-quoted with
+  `'\''` escaping. Both sends -- the local paste and the server's inject -- are
+  `-l` (literal): the line is text and must never be read back as a psmux key
+  name. What quoting cannot make safe is refused outright: a path carrying a
+  control or line-break character (Unicode categories Cc, Zl, Zp -- newline,
+  ESC, NEL, U+2028/U+2029) could end or submit the input line it lands in, so
+  `sessions.paths_line` raises rather than build that line, and a local press
+  of such a path is refused whole (`path-unpasteable`, nothing typed). The
+  server never meets one: the names it saves are sanitized to word
+  characters, dots and dashes.
+- **A folder refuses the whole press.** Uploading a directory has no single
+  honest meaning (recurse? archive? the listing?), and a mix that uploaded only
+  the files would hand the agent a selection the user did not make. Nothing is
+  read or sent; the bar says `folders not supported - copy files`. The page
+  refuses in the same words, but its detection is weaker than Alt+V's `stat`:
+  a browser hands a folder over as a `File`. Only a paste or a drop can carry
+  a folder -- the picker cannot select one, so a plain pick is never checked.
+  On a paste or a drop, the item's entry (`webkitGetAsEntry()`, Chromium)
+  decides whenever the browser exposes it, in both directions. Only an item
+  with NO entry falls back to the shape a folder arrives as: an empty file the
+  browser has no MIME type for. That guess also matches a genuinely empty
+  `.toml`, `.log`, `.gitkeep` or `Makefile`, which is why it is confined to
+  items the browser gave no entry for (it once overruled the entry on the
+  picker, refusing an empty `.toml` Chrome had reported as a file). The
+  browser tier can only drive the fallback (a synthetic paste cannot carry a
+  directory entry), so the entry path is proven by nothing but the real
+  browser.
+- **The limit is one number with three enforcers, and it counts FILES.**
+  `sessions.MAX_UPLOAD_BYTES` (100 MB, in `sessions` so `altv` stays a leaf
+  that never imports the server) is the sum of the file sizes: the page checks
+  that sum before it sends, Alt+V checks it from a `stat` BEFORE any file is
+  read (an oversized press costs neither memory nor a round trip), and the
+  server checks the same sum once parsed (413 naming the limit). The request
+  itself may carry `upload_server.MULTIPART_ALLOWANCE_BYTES` (1 MiB, fixed and
+  named) of multipart framing on top; a larger Content-Length is refused
+  before a byte is read. Comparing Content-Length to the files limit, as the
+  server once did, refused selections a few hundred bytes under it that both
+  pre-checks had passed.
+- **`_DRAIN_CAP_BYTES` sits past the request ceiling.** The drain exists so an
+  honest client that sent just over the limit reads the 413 instead of a
+  Windows RST (the kernel resets a socket closed with unread bytes). A drain
+  that stops at the ceiling leaves exactly that client's tail unread, so it
+  reaches 1 MiB past it; a bigger overshoot is cut off and the connection
+  closed. It reads in 64 KB chunks, so the cost is time on a refused request,
+  never memory.
+- **A body is whole or it is nothing.** The server reads exactly the declared
+  Content-Length and parses with `memoryview` slices of that one buffer (at
+  100 MB a request, split-and-slice copies held four bodies at once). Fewer
+  bytes than declared, or a last part whose closing delimiter never came, is
+  `400 Upload incomplete` with nothing saved and nothing pasted -- a cut-short
+  part still has its headers, and saving it would announce a truncated file as
+  uploaded. Each connection has a per-OPERATION socket timeout
+  (`CONNECTION_TIMEOUT_S`, 60 s), so a client that declares a body and stalls
+  is let go the same way instead of pinning a handler thread, while a slow
+  upload that keeps moving is never cut off.
+- **Alt+V streams, under a boundary of its own.** A remote press sends its
+  files straight off disk, a block at a time, with an explicit Content-Length
+  (the server speaks no chunked encoding). As one `bytes` body it went out in
+  a single `sendall`, whose socket timeout is a TOTAL budget -- a large
+  selection over a slow link failed as "cannot reach magent serve" while still
+  moving -- and the long-lived listener held every file plus a joined copy.
+  Each request draws a random boundary (`secrets.token_hex`), as browsers do:
+  with a fixed one, any file containing that line was cut there and the server
+  said ok. A copied file that is gone, held by another app, or shrinks under
+  the send is named (`file-missing` / `file-unreadable`), never "unexpected
+  error" and never "cannot reach magent serve".
+
+A file keeps its own name (only a nameless clipboard blob gets a generated
+`paste-<ts>` one), because the name is often the most useful thing the agent
+is told about it -- dotfiles included: `.env` lands as `<stamp>_.env`, the
+prefix already keeping it from being hidden. The kept part is capped at 150
+UTF-8 bytes by trimming the stem on a character boundary, extension intact,
+so a legal 250-character name cannot push `<stamp>_<name>` past one path
+component's 255 limit. Same-named files never overwrite each other, within a
+request or across two in the same second: each name is RESERVED with an
+exclusive create and bumps to `<stamp>_<n>_<name>` until one create wins (an
+`exists()` check cannot see a name another request chose but has not written
+yet), and a request that is refused or fails part-way removes what it
+reserved.
+
+Proof: `tests/unit/test_altv.py::TestFilePress` / `TestPathsLine` /
+`TestTheRemoteBodyIsStreamed` / `TestARemoteFileThatWillNotRead`,
+`tests/unit/test_upload_server.py` (any-type byte-identity, several files, the
+limit at and one byte past the files cap, cut-short and stalled bodies,
+`TestParseMultipart`, `TestDestFor`), `tests/unit/test_hotkey.py::TestClipboardFiles` (a synthetic
+DROPFILES block through the real `DragQueryFileW`), and
+`tests/e2e/test_altv_flash.py::TestFilePress` -- the real spawn path for the
+remote upload, the local original-path paste and the folder refusal.
+
 ### The host brings itself up on its own desktop (2026-09-12)
 
 `magent attach <host>` asks the host to run `magent up` over ssh, and on
@@ -1853,6 +2215,73 @@ TestEnsureHandsOffFromSessionZero`, and `tests/e2e/test_session0_handoff.py`
 explicit child `env=` carries it: a CI runner is legitimately non-interactive,
 and the default would have it writing real scheduled tasks.
 
+### No daemon is planted in Session 0, and the ones already there are named (2026-09-30)
+
+The hand-off covered the two commands `magent attach` fires. Five other paths
+still left a SURVIVOR in Session 0 whenever they ran there, and all but the
+last are one ssh login away: `--go` and the menu's `u` (a detached serve plus
+an Alt+V listener), a foreground `magent serve` (its listener supervisor), and
+`magent attention -d` together with that daemon's own upload watchdog. The
+cost is sharper than a stranded psmux server's. A Session-0 serve holds the
+loopback port, so the desktop's serve dies of "port in use" while the desktop's
+Alt+V talks to a server that can see none of its sessions. A Session-0
+listener's keyboard hook never sees a key typed at the desktop.
+
+The same two altitudes apply, through the same policy function. The SEAMS every
+spawner passes through only refuse, via `launch.session0_block(base)`, which is
+`session0_disposition` plus the shared wording: `ensure_upload_server`,
+`UploadServerSupervisor.tick`, `start_hotkey_listener`,
+`ensure_hotkey_listener` (which can also END a wedged listener), serve's
+`_supervise_hotkey` and serve's `AttentionDaemonSupervisor.tick`. The
+watchdog's refusal is logged once per cooldown, not
+once per poll. The listener seam refuses before `magent.hotkey` is imported, so
+the refusal is testable on every OS. Serve's supervisor says it once and stands
+down instead of retrying every interval for the life of the server. `--go`
+prints the serve refusal in place of an upload URL nothing will answer. The one
+COMMAND shell among them, `attention -d`, hands off exactly like
+`serve --ensure`: it rebuilds its argv from its parameters, with the same budget
+constant and the same refusal wording. `--stop` is never handed off, because
+stopping is not planting.
+
+A foreground `magent serve`, `magent hotkey` or `magent attention` typed over
+ssh is left alone. It dies with the ssh job and plants nothing that outlives
+the typing.
+
+**The ones already there.** `status`, as one stderr line, and `doctor`'s
+`daemons-session0` check (WARN at worst) name them, and `status --json` carries
+an additive `daemons_session0` count. This follows the `psmux_session0`
+precedent: none of it moves the 0/1/3 contract. The lookup works like this:
+
+- **Identity** comes from magent's own pid files. A high-integrity process's
+  command line cannot be read from the desktop, so the pid file is the only
+  record of which process is which daemon.
+- **Liveness and session** come from `procs.session0_residents`: one snapshot
+  plus the handle-free `session_id_of`.
+- **When to ask** is decided by `active_console_session_id`, and only whether a
+  desktop exists. On a headless host Session 0 is where daemons belong.
+- **Recycled pids** are filtered out by image name: only `python*`/`magent*`
+  images count. A stale pid file must never accuse a service.
+
+That identity source forced one change underneath. `pid_alive` needs a handle,
+so it answered False for exactly these processes, and `listener_pid` /
+`daemon_pid` deleted their pid files as stale, destroying the evidence on the
+first `status`. They now delete only when `procs.pid_gone` holds, meaning no
+session either. For a live-but-unopenable pid they return None ("not ours to
+use") and keep the file. A pid file written before the last boot is the one
+exception, and it is checked first: it is cleared whatever its pid is doing,
+because it predates every process now alive, so an unopenable process holding
+that number is someone else's. The diagnostic reads the same way (its
+`_read_pid` ignores a pre-boot file, read-only), so a service handed a
+recycled number is never reported as a stranded magent daemon.
+
+Proof:
+- `tests/unit/test_session0_daemons.py` (every seam refuses and the command
+  shell hands off);
+- `tests/unit/test_session0_diagnostic.py` (residents, `pid_gone`, the kept pid
+  files, the collection and the wording);
+- `TestSessionZeroDaemons` in `test_status.py` and `TestCheckDaemonsSession0`
+  in `test_doctor.py`.
+
 ### The attach client is the renderer, so the human's colour setting wins (2026-09-13)
 
 `env.spawn_child_env()` has stripped the launching shell's colour overrides
@@ -1992,6 +2421,13 @@ console is in the pane shell's subtree and none is an agent image or a
 launcher; any failure of the helper reads busy. That check is a prerequisite
 for the idle reaper, which types a mode reset and a resume into panes it has
 emptied, and it should land with it.
+
+*It landed with the reaper (2026-09-27).* The check is now the last stage of
+`idle_sessions`: `procs.console_clients` asks one detached helper per call,
+and a pane stays idle only when every process on its console is inside the
+pane shell's subtree and none is an agent or a launcher. A helper that
+fails, times out or cannot attach reads busy. See "A finished, long-idle
+agent is parked, not killed".
 
 Pins: `tests/unit/test_psmux.py::TestReviveNeverTypesIntoALiveAgent`,
 `::TestIdleSessions`, `::TestTheFanOutWaitsOnOneDeadline`,
@@ -2135,8 +2571,11 @@ The total is bounded, not fast: about 30 + 30 s, plus per wave 60 + 10
 `absent` or `unknown`. `has_session` and `live_sessions` fold "never answered"
 into "not live". That is the right fold for a status table. It is the wrong
 fold for a bring-up, because there "not live" leads to kill-server and a fresh
-new-session. Only `absent` (has-session answered, non-zero) may lead to either.
-A probe that timed out, or could not even be spawned, is `unknown`. That window
+new-session. Only `absent` (has-session answered rc 1, tmux's "no such session"
+-- `psmux.HAS_SESSION_ABSENT_RC`) may lead to either. A probe that timed out,
+could not even be spawned, or died with any other code (0xC0000142
+STATUS_DLL_INIT_FAILED, an access violation, a signal, a usage error) is
+`unknown`: a crashed client has said nothing about its session. That window
 is refused with the reason "could not tell whether <name> is running". It gets
 no kill-server, no new-session and no send-keys.
 
@@ -2208,10 +2647,545 @@ printer is pinned byte for byte on all three surfaces
 `test_status.py` and `test_launch.py`; written green before the three copies
 were folded into one). The residuals are in the known-debt ledger.
 
+### An auto node is chosen by its load history, and a recall is explicit (2026-09-24)
+
+**Placement reads history, not a reading.** `"node": "auto"` is resolved by
+`launch.place_node_projects`, its own phase between selection and launch, so a
+dispatcher only ever sees a nick; `up` runs the same phase once before its
+fan-out so one `up` spreads like `--go`, and an auto project it cannot place
+fails in its own row with the placer's reason. The score is spec §11
+over the sync daemon's last 30 minutes of samples: the p75 of `load1 / nproc`,
+plus half of how far the window's peak rises above 1.5 times that p75, plus
+half of how far the newest free memory falls below 15%, plus 0.05 per session
+of ours; ties go by config order. A node under 10% free memory
+(`MEM_HARD_FLOOR`) is not a candidate while another is above it. A node with
+fewer than five samples in the window gets exactly one live `sample` call,
+which is then its only sample, and none under `--dry-run` or a tile-only pass;
+a node that does not answer it is left unscored. A single reading would place
+a session on a box that happened to be idle for one second of a bursty minute.
+
+**A placement sticks, and placing writes nothing.** A project stays on its
+node until that node leaves `settings.nodes`; only then is it re-placed, with
+the reason printed. The placement phase never writes `node-map.json`: the
+bring-up records it once it has actually happened, so a failed
+launch leaves nothing sticky behind, and `magent node plan` can render the
+very same objects while writing nothing, pinned byte-for-byte. Nothing moves a
+running session on its own; `magent node recall --to` is the only mover.
+
+**The node decides what a plain re-up resumes.** A session brought up again
+passes no resume id: `bring_up.sh` runs `claude --continue` over
+the node's own transcripts, or the fresh form when there are none. The PC's
+pulled copy can be one pull stale, and an explicit `--resume` has no fresh
+fallback on a node that lost the file. `claude --resume <id>` is used only
+where magent installed that conversation first: `recall --to` (installed
+by `install_transcripts.sh`, under the name magent's one encoder
+gives the node's own `realpath`; the node never encodes) and the resume
+`recall --local` prints.
+
+**Recall never races the daemon, and a pull it cannot finish stops it.** The
+last pull goes through `node_sync.final_pull`, under the lock the daemon's tick
+holds. The placement is cleared at the end of a recall and a cleared placement
+is never pulled again, so a pull that a re-run could still complete stops the
+recall before anything is stopped, installed or cleared: a node that answered
+with an error, a pull that left files behind, a placement the pull no longer
+found, or a node map another process holds busy or left torn all exit 1
+with the project still placed and "run the recall again" -- except a pull
+stuck at its mark, which a re-run would only meet again: that stop names
+nodes.log, where both marks are, instead; a daemon still
+holding the node past the wait exits 3 the same way. Only a node that does not
+answer at all (ssh's own 255, or a timeout), or one this config cannot pull
+from, is reported and not fatal, because no re-run helps: the last `repos.json`
+record stands in for the live commit report, and the command that stops the
+session is printed with its target single-quoted, `kill-session -t '=<sid>'`,
+because zsh reads a bare `=word` as a command lookup. That command is one
+`ssh <target> "…"` line only for a plain sid; any other sid gets two steps
+(ssh, then run it on the node) with its `'` escaped, since the local shell
+would expand `$(…)`, a backtick or `!` inside the double quotes. "Stopped" is
+printed only when `remote_mux.kill_session` returned True; when the call
+failed, recall says the session may still be running and prints that command.
+
+**`--local` installs by the rules a `--to` send uses.** The local folder is
+the one a launch opens, resolved by `launch._resolve_path` and never
+`Path.resolve()`d, because Claude files a conversation under the path the
+session was started in, link and all. The pulled mirror is copied by
+`remote_mux.copy_mirror`, which shares its membership rule with the tar that
+ships a mirror to a node: no link is followed, a mirror that is itself a link
+is refused, and a pull's `.part` temp is never copied. A local file the node's
+copy changed is named, because it may be work this PC had.
+
+**Not yet measured (plan G Task 16, a user-run probe):** whether
+`claude --resume <id>` resumes a conversation installed under another
+folder's name. Until it is measured, when the conversation's id is known,
+`recall --local` prints the exact command, `claude --resume <id>`, and
+under it a `resume by hand` line: run `claude --resume` in the project's
+folder and pick the conversation from the list; with no id it prints plain
+`claude`. `recall --to` starts the moved session on the new node with
+`claude --resume <id>`, or fresh when no conversation was pulled.
+
+### A finished, long-idle agent is parked, not killed (2026-09-27)
+
+Idle agents hold memory. Measured on this box: 31 agents held 57.6 GB of commit
+(`claude.exe` alone 30.3 GB) on a machine at 151.5 of 253.7 GB, and stopping the
+four sessions idle for more than two hours would have returned about 9.3 GB.
+What an idle agent does NOT hold is anything its conversation needs: Claude Code
+writes whole transcript records, and `claude --resume <sessionId>` in the same
+pane picks the conversation back up (measured against a real Claude Code in
+poc-reap2: the transcript byte-identical after the kill, the resumed agent
+recalling its last reply).
+
+**Decision: `magent serve` parks a session whose agent finished its turn and has
+been idle past `settings.idleReap.afterMinutes`. It hard-kills the agent's
+process tree, keeps everything else, and records the session as `parked`.**
+`reap.py` splits the risky logic from the I/O: a pure core (`Signals` →
+`decide` → `"reap"` or one of `VETO_REASONS`) tested with no processes and no
+clock, and a thin gather/act layer (`gather`, `_read_one`, `_stop`, `_park`,
+`sweep_once`) around it.
+
+*The pane is kept; only the agent goes.* The pane's shell, the psmux session,
+the window and its tile are untouched, and nothing above the agent root (the
+`cmd /c` wrapper, the pane shell) is ever killed. After the kill the pane gets
+one typed line, `Platform.pane_reset_command`: for PowerShell it turns off the
+mouse, paste and keyboard modes the agent left on, pops the alternate screen,
+clears, and prints a notice naming the exact resume command. A shell with no
+reset line, or a re-walk that does not read the pane idle, leaves the dead frame
+on screen with a WARNING; a resume repaints the whole frame anyway.
+
+*Finished only* (the user's decision, 2026-09-27). A session is idle only when
+its last turn ENDED. The three whitelists are record `done`/`idle` (R7), Claude
+Code status `idle` (R6) and pane `idle`/`limit` (R9). Two meanings of "waiting
+on the user" must not be confused here. `needs-input`, Claude Code's `waiting`
+and an on-screen dialog are a turn BLOCKED mid-way on a question or a
+permission prompt; killing one abandons the pending tool call, and on resume
+Claude Code drops that turn rather than redo it. `done` is "your turn": the
+turn is over and the user has not looked yet. Blocked is never parked;
+your-turn is, which is why a parked `done` session loses its `[+]` title badge
+and sinks to the bottom of `watch`. `working` is never parked either: the Stop
+hook writes it while the `background_tasks` ledger still lists a subagent or a
+shell.
+
+*Every reading must agree, and unknown is never idle.* Ten rows (R1-R10) and 24
+named reasons, cheapest first; the first failure spares the session, and a
+session's reason is logged only when it changes. Two checks carry the design:
+
+- **`record-stale`** (R7): the record's `ts` must not predate the agent root's
+  creation time. A record older than the process was written for a previous
+  agent in that directory, or by a hook that has since died (which is exactly
+  what happened on this box for two months), and it says nothing about this
+  agent.
+- **The console-membership check**, the last stage of `psmux.idle_sessions`
+  (see "An idle pane is proven, not read off the foreground"). An orphaned
+  agent is outside the pane shell's parent-pid subtree but still on its
+  console, so it would receive anything typed. The reset is typed only after
+  `idle_sessions` re-walks the emptied pane and asks its console who is on it.
+
+R10 re-reads every per-session row for the same agent pid and creation time just
+before the stop, which closes the window between the sweep's first read and the
+kill. At most `REAP_MAX_PER_SWEEP` (3) sessions are parked per sweep, oldest
+quiet first, so an upstream change that makes every session read idle costs
+three sessions, not the fleet.
+
+*The kill is identity-guarded, and only what is proven is killed.* It is a hard
+kill and never a clean `/exit`: typing into the pane is the dangerous verb (an
+Enter can answer an open dialog, and a mangled `/exit` once reached the model as
+a prompt), and a clean exit buys only housekeeping. `_stop` reads a
+`procs.precise_filetime` bound, then a fresh snapshot, and keeps an entry only
+if its identity reads, it was created before the bound (not a newcomer on a
+reused pid), and it was created after its kept parent (Toolhelp never rewrites a
+parent pid, so an older process listed under a pid is an adopted stranger). It
+refuses the whole stop when the agent root's identity differs from the recorded
+one, or the listed tree contains the pane pid or a psmux image. Each kill is
+`procs.terminate_verified`: ONE handle opened with terminate and query rights,
+the image and creation time re-read through it, and only then
+`TerminateProcess`. The handle pins the process object, so the pid cannot be
+reused between the check and the kill (pid reuse within seconds was measured
+twice). Children die before their parents and the agent root last, followed by
+one bounded straggler pass.
+
+*The record is written LAST.* `parked` reaches `agent_state` only after the
+agent root is confirmed dead. A stop that refused, or a root that outlived it,
+writes nothing and types nothing, and the agent joins a per-process failed set,
+so a live agent can never be marked parked. No SessionEnd hook runs on a hard
+kill, so this write is the only record of the outcome. `parked` is additive:
+`RECORD_VERSION` goes to 2, the key set and value types are unchanged, v1
+writers (an older installed hook, Codex's `notify` recipe) stay valid, and the
+resumed agent's SessionStart overwrites `parked` with `idle`.
+
+*Resume is `--resume <id>`, and only when asked.* `psmux.revive_sessions` takes
+`resume_parked`, and only `status`'s `r<n>` passes True. It types
+`build_resume_command(tool, cmd, session_id)`, never `--continue`, and clears
+the record once the send lands. The id is typed into a shell, so it must fully
+match `sessions.live.SESSION_ID_RE`; a parked record without such an id is left
+alone with a WARNING. A bulk revive (`magent up`, and the `up --json --revive`
+that `magent attach` runs on the host) leaves a parked session alone, because
+resuming on every attach would undo the saving.
+
+*Owned by `serve`, like the other sweeps.* `upload_server._supervise_idle_reap`
+is a daemon thread next to `_supervise_psmux_priority`, for the same reasons:
+serve is effectively always up, and after the Session-0 hand-off it runs on the
+desktop, where the fleet's processes can be opened and terminated. The process
+gates (`reap.process_off_reason`: the env, psmux support, an interactive logon
+session) are read once at startup. `settings.idleReap` is re-read every sweep,
+so turning it on, or fixing a broken config, needs no restart. Each sweep runs
+under `lockfile.exclusive_lock("idle-reaper")`, so two serves on different ports
+never sweep at once. The cadence is `IDLE_REAP_INTERVAL_S` (300 s), the
+threshold has a 30-minute floor (`reap.threshold_s`), and every age comes from
+disk, so a serve restart neither delays nor hastens a park.
+
+*The kill switch is the sharpest test-isolation law.* `MAGENT_IDLE_REAP=0` joins
+`MAGENT_PSMUX_BOOST` and the two supervisor switches, and it outranks them: the
+reaper is the only code in the product that TERMINATES processes it did not
+spawn, reached by psmux session name and `~/.claude` session file, and a HOME
+redirect contains neither. `tests/conftest.py` pins it off for every tier and
+every child `env=` carries it. Two autouse kill guards sit under every test as
+well: `reap._stop`'s default snapshot fails the test instead of walking the live
+process table (`@pytest.mark.live_process_table` opts out), and every in-process
+`procs.terminate_verified` refuses a process the test did not register in
+`own_pids` -- by identity (pid, image, creation time), so a reused pid is a
+stranger. Under it, the kernel32 `procs` hands out lets `TerminateProcess` land
+only inside that guarded call and never lets `TerminateJobObject` land. The
+kills no guard can wrap for every tier (`os.kill`, `taskkill`, psmux
+`kill-server`, which e2e teardown uses on its own daemons) are pinned out of
+reap's source instead. Unlike `MAGENT_PSMUX_BOOST`, an invalid `MAGENT_*` environment turns
+the reaper OFF instead of falling back to the default: the one supervisor whose
+verb is destructive fails closed.
+
+*Doctor names the silent failure.* Reaping is on by default while the hooks are
+opt-in, and with no records R7 spares every session forever. The `idle-reap`
+check is WARN-at-worst: OK names the threshold (and an `afterMinutes` raised to
+the floor) or the gate that is off, and it WARNs when reaping is on but the
+state hook is not wired for UserPromptSubmit, Stop, Notification and
+SessionStart.
+
+Everything goes to `reap.log`: one INFO line per park (the session, its id, the
+agent's identity, the idle age, the killed and survivor counts, `freed~<MB>`),
+a session's reason whenever it changes, and a WARNING or ERROR for every
+failure.
+
+Pins: `tests/unit/test_reap_decide.py` (one test per veto, the strict age
+boundary, NaN and unknown times), `test_reap_gather.py`, `test_reap_stop.py`
+(the snapshot bound, adopted strangers, stragglers, the guards, and win32 kills
+of processes each test spawns), `test_reap_park.py` (the order, nothing parked
+unless the stop verified, the record last), `test_reap_sweep.py` (the gate,
+order and cap, R10, the failed set), `test_reap_thread.py`,
+`test_reap_resume.py`, `test_reap_isolation.py`, `test_sessions_live.py`,
+`test_kill_guards.py` (the conftest guards and reap's reach, pinned by what
+they do),
+`test_platform_pane_reset.py`,
+`tests/unit/test_procs.py::TestTerminateVerified` / `::TestConsoleClients` /
+`::TestProcessIdentity`, `tests/unit/test_fleet.py::TestInputDraft`,
+`tests/unit/test_doctor.py::TestCheckIdleReap` and
+`tests/unit/test_state_hook.py::TestStateHookNeverWritesParked`. The
+real-multiplexer tier, `tests/e2e/test_reap_real.py`, has run green only on
+its POSIX leg; its Windows legs have not run yet (see Known debt).
+
+### A node signs in on the subscription, and git on the gh login (2026-09-30)
+
+The nodes design shipped the user scope but not the Claude login: "auth
+transfer minus Claude login", with a manual `ssh <user>@<host> claude` as the
+last step of every `node setup`, and a per-node GitHub ssh key that needed an
+extra `gh` scope (`admin:public_key`) before it could be registered. Both were
+manual steps per node. This replaces that decision: `magent node setup` hands a
+node working Claude and GitHub access by itself, and the only thing a human
+ever does is one browser approval, once per PC per year.
+
+**Claude runs on the subscription, from a token minted once.** `claude
+setup-token` is Claude Code's own "long-lived authentication token (requires
+Claude subscription)". After one browser approval it prints an OAuth token
+(`sk-ant-oat...`, one year) that bills to the Pro/Max subscription. It is not an
+API key. `node_auth.ensure_token` runs it the first time a setup needs a token,
+and at no other time. It keeps the token in `~/.magent/claude-oauth-token`
+(0600 and this user's on POSIX; a protected single-ACE DACL set at CreateFile
+time on Windows) and reuses it for every node and every later setup. It
+re-mints only when the token is within `RENEW_BEFORE_S` of its year, when its
+file cannot be trusted, or on `magent node auth refresh`, which is the repair
+the doctor names when Anthropic rejects the token.
+
+**Why not copy the login.** `~/.claude/.credentials.json` and every ccswap
+slot hold a REFRESH token, and a refresh token rotates. The first machine to
+refresh it invalidates the copy on every other machine, so a node refreshing a
+copied chain would sign this PC out, along with every live session on it. A
+setup-token token has no refresh chain to share, so one token can sit on any
+number of nodes at once.
+
+**Why never an API key.** An API key bills per token, not to the
+subscription. Claude Code ranks an API key (or an `apiKeyHelper`) ABOVE an
+OAuth token, so a stray `ANTHROPIC_API_KEY` in a node's login environment would
+silently win. So setup-token runs under `env.claude_mint_env()` (no
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or older `CLAUDE_CODE_OAUTH_TOKEN`),
+the payload refuses anything that is not an `sk-ant-oat` token, and node
+sessions drop both key variables before the agent starts.
+
+**The token reaches a session through ONE seam.** `remote_mux._login_argv`
+builds every node pane's command, the resume and the fresh fallback alike. It
+now runs `SESSION_AUTH_PRELUDE` first: unset `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`, then have the shell read
+`~/.magent/claude-oauth-token` into `CLAUDE_CODE_OAUTH_TOKEN` and export it.
+The shell reads the file, so the token is never in an argv, the tmux command
+line or a log. The file gets there as the payload's owner-only
+`claude-oauth-token` member; the manifest carries its digest, never the token.
+`node_apply`'s `claude_auth` step installs it 0600 and masks it out of every
+row, as it does the gh token. The node's own `~/.claude/.credentials.json` is
+never touched. Nobody logs in on a node any more, so nobody clicks through
+Claude Code's first-run screen there either. With a token in place,
+`claude_onboarding` sets `hasCompletedOnboarding` in the node's
+`~/.claude.json`; that is the only key it changes.
+
+**The token never reaches a screen.** setup-token's stdout is read through a
+pipe. `node_auth._Forwarder` passes its UI to the terminal only up to the first
+`sk-ant-` and nothing after it, so the user sees the browser prompt and the
+success line but never the secret. Errors and log lines quote lengths and exit
+codes, never output. Tests pin that no token substring reaches captured
+output, a log, a fake's argv or a doctor row. The fakes record credential
+environment variables by sha256 only.
+
+**The paste prompt reaches the person while setup-token waits.** Its
+`Paste code here if prompted >` has no newline after it. The forwarder passes
+it on as it arrives, but a reader that shows whole lines only (a PowerShell
+`ForEach-Object`/`Tee-Object` pipeline, a pager) holds it until the next
+newline. The first live `node setup` ran through such a pipeline, and the
+prompt appeared only after the 900s mint had timed out. So when magent's own
+stdout is not a terminal, `mint_token(line_buffered=True)` ends an unfinished
+line once setup-token has been quiet for `QUIET_S`. It adds only a newline,
+never a held byte, so a quiet stretch in the middle of `sk-ant-` still shows
+nothing. setup-token's stdin stays this terminal's either way, and that is
+where the pasted code goes. A timeout names the next step: run
+`magent node auth refresh` in a terminal, not through a pipe.
+
+**GitHub needs no key and no new scope.** A node already gets this PC's gh
+login. `node_apply`'s `git` step makes it git's `github.com` credential helper
+(`gh auth setup-git`, put back if it went missing). It also adds
+`url.https://github.com/.insteadOf` for `git@github.com:` and
+`ssh://git@github.com/` to the node user's global git config, so an ssh remote
+is fetched and pushed over https through gh. The per-node ssh key becomes
+optional. `register_ssh_key` tries it only when this PC's gh already holds
+`admin:public_key`. Every other case is a `skip` ("not needed: git uses the gh
+login"), never a failure, and setup never asks for `gh auth refresh`.
+
+**The doctor proves both, and names the repair.**
+
+- `claude-auth`: the token file is a plain, owner-only file holding a
+  subscription token. `claude auth status --json`, run with the token
+  exported and the key variables dropped, reports `authMethod` `oauth_token`;
+  an `apiKeySource` or `api_key*` method is a fail, because that key would
+  win. Then a `count_tokens` call with the token on curl's stdin checks that
+  Anthropic still accepts it. No model runs, so nothing is billed. A 401, or a
+  403 that says "revoked", fails with `magent node auth refresh`.
+- `github`: `git credential fill` for `github.com`, asked exactly as a clone
+  would ask. Both rewrites must be present. Then GitHub's `/user`, with the
+  credential on curl's stdin, must answer 200.
+
+No ssh to github.com is involved any more, so the doctor writes nothing, not
+even known_hosts.
+
+**What was verified, and what is assumed.** Verified on Claude Code 2.1.284:
+`setup-token`'s help text; `auth status --json` reports `oauth_token` for a
+`CLAUDE_CODE_OAUTH_TOKEN`, `none` without one, and `api_key` with
+`apiKeySource` when `ANTHROPIC_API_KEY` is also set (checked with decoy values
+under a throwaway home). Assumed: that `count_tokens` accepts a setup-token
+bearer with the `oauth-2025-04-20` beta and bills nothing, and that
+`hasCompletedOnboarding` is the only first-run gate on a headless node. The
+live `magent node setup` is where both are first proven.
+
+Pins: `tests/unit/test_node_auth.py` (mint once, reuse, renewal, force,
+forwarder, file modes and DACL), `tests/unit/test_node_apply.py`
+(`TestTheClaudeSubscriptionToken`, `TestNoFirstRunScreenStandsBeforeTheToken`,
+`TestGitUsesTheGhLogin`), `tests/unit/test_remote_mux.py`
+(`TestANodeSessionStartsOnTheSubscription`, run under real bash),
+`tests/unit/test_node_provision.py` (the doctor's two checks under real bash,
+the optional key, the PC's token shipping) and `tests/unit/test_node_cmd.py`
+(`TestNodeSetupMintsTheClaudeTokenOnce`, `TestNodeAuth`).
+
+### A node joins in three commands, and nothing after them needs a hand (2026-09-30)
+
+The product rule: a person who installs magent and has root ssh to a machine
+gets a project running there without an AI agent, or a human, finishing any
+step for them. The documented path is three commands, `magent node add
+<host>`, `magent config add <path> --node auto` and `magent up`, plus one
+browser Approve per PC. Five pieces make that true.
+
+**`node add` is setup.** It writes `settings.nodes` through the raw round-trip
+(creating the config when there is none) and then runs `node setup`'s whole
+flow inline (`node_cmd.run_setup`, which `node setup`, `node add` and a
+bring-up's inline setup all call). The nick is derived from the host with the
+same rule config load applies, so a derived nick always loads. Everything
+that can refuse (the host shape, the public key, the user name) is checked
+before anything is written. `node remove` edits config only, and refuses
+while the node map places a session there: a removed node with a live session
+would be a session nobody can reach. A project the removal would strand
+(pinned to that nick, or `auto` with no node left) is switched to run on this
+PC in the same save: asked at a person's console (default yes), `--local`
+anywhere else, and otherwise refused naming the projects and that one
+command -- never the validator's own words.
+
+**A bring-up never walks a project onto a node that cannot run it.**
+`node_onboard.ready_gate` runs before `up` and `--go`. Readiness is the
+placement read (`nodes.placement_samples`: the load window, one live reading
+for a thin node), not a second probe, so "ready" and "placeable" cannot
+disagree. A node is not ready when it does not answer, or when it has no
+Claude token while this PC has none to give it; a tokenless node is ready when
+this PC holds one, because the bring-up's own provision ships it. At a
+terminal the gate asks once and runs setup inline. Anywhere else it asks
+nothing, mints nothing, sends nothing, and turns that project off for this run
+in one line naming the fix. A daemon or the `up` that `magent attach` runs
+over ssh must never block on a question nobody sees, and must never start a
+browser approval nobody can click; an AST pin keeps every mint behind
+`node_cmd._can_approve()`.
+
+**"A person is here" is ONE check, and it is not `isatty`.** On Windows NUL
+is a character device, so `sys.stdin.isatty()` is True under `< NUL`,
+`stdin=DEVNULL`, Task Scheduler and every detached child magent spawns.
+Measured: `magent node add` run with stdin=NUL started `claude setup-token`
+and opened a browser on the desktop. `console.human_at_console()` is isatty
+AND, on win32, `GetConsoleMode` on the stdin handle (NUL, pipes and files
+fail it). `_can_approve`, and through it the ready gate, the renewal offer,
+`node auth refresh` and the GitHub login offer, ask it; so does the picker's
+raw-mode gate, which had the same trap and the same fix already. An AST pin
+allows `sys.stdin.isatty()` in `console.py` and in `cli/app.py`'s two older
+first-run/menu gates only. Those two pick a line-based prompt that reads EOF
+and exits under NUL; nothing is started for a person there.
+
+**No GitHub login is offered, not printed.** A node's git clones over https
+with this PC's gh login, which provision shares. With no login, setup used to
+print `gh auth login` and the node's first private clone then failed: a step
+for the user. At a person's console, setup now asks once (default yes) and
+runs `gh auth login --web --git-protocol https` in that terminal
+(`remote_mux.login_gh`, the one gh call that is not bounded by
+`GH_TIMEOUT_S`: a person is reading a code), then goes on and provisions with
+it. Anywhere else it prints one `gh-login` line and asks nothing, and the
+github-key rows, which would only repeat it, are not run. A rejected token
+that comes from `$GH_TOKEN` is not offered a login, because no login can
+replace it.
+
+**The token has a lifecycle the person sees before it bites.**
+`node_auth.token_health()` is the one reader. From `WARN_BEFORE_S` (30 days)
+before the token's year ends, `status`, `doctor` and the node commands say so
+in one line, and at a terminal the node commands offer the renewal: one forced
+mint, then `push_token` provisions every configured node. A node that does not
+answer gets the new token at its next bring-up, which always provisions. The
+state is additive in `status --json` (`claude_token`) and never part of the
+0/1/3 verdict: an ageing token is advice, not degradation.
+
+**A pin is validated as a whole config.** `config add --node` and `config set
+<p> node` run the resulting text through the validator `load_config` uses, and
+write nothing on refusal, so a pin can never leave a config that no longer
+loads.
+
+**The sync daemon stops when nothing is placed.** The brief allowed two
+lifetimes: exit once idle, or be owned by the attention daemon. Idle exit won,
+because serve already owns the daemon's START (`_supervise_node_sync` ->
+`launch.ensure_node_sync`) and serve is up on a real box far more often than
+`attention -d`. Moving ownership would have left the daemon unsupervised
+whenever attention was down. So `node_sync.expected(config)` (wanted AND
+something placed in the node map) is the one question serve's spawn,
+`status` and `node doctor` all ask. `run_sync_loop` exits `IDLE_EXIT_S` (10
+minutes) after the map stops placing a session, and the next placement makes
+serve start it again. A daemon started by `magent --config <file> up`
+re-reads THAT file: it stops once the file is missing on
+`GONE_AFTER_MISSES` consecutive reads, records the file it follows in
+`~/.magent/node-sync.config`, and `status` names it when it is not the config
+`status` read. `ensure_node_sync` still never re-aims a live daemon; a
+deliberate `--config` bring-up must not be fought by a serve reading another
+file. No new supervisor and no new env var, so no new test-isolation opt-out:
+`MAGENT_NODE_SYNC` still gates serve's spawn.
+
+**The folder is trusted before the agent starts.** Claude Code asks the first
+time it starts in a folder, and its default answer exits; nobody is at a
+node's pane to answer. bring_up.sh runs `node_apply.trust_main` after the
+ship and before the session starts, which sets only
+`projects[<folder>].hasTrustDialogAccepted` in the node's `~/.claude.json`
+(its physical name too when it differs). A folder at or above the node user's
+home is refused, since Claude trusts every folder below a trusted one.
+
+A node's own statusLine is part of the same rule. A node with no
+`statusLine` gets magent's `~/.magent/bin/statusline.py` (python3, stdlib),
+which prints the `<Model> · <effort>` footer `fleet.parse_footer` reads, so
+`sessions --json` shows a node session's model like a local one. A node's
+existing statusLine is never replaced.
+
+Pins: `tests/unit/test_node_zero_hands.py` (the three commands, whole, with no
+input: one mint, the token in no argv and no screen, only in the 0600 payload
+member), `tests/unit/test_node_onboard.py`, `tests/unit/test_node_ready_gate.py`,
+`tests/unit/test_node_token_renewal.py`, `tests/unit/test_config_node_pin.py`,
+`tests/unit/test_node_sync_lifetime.py`, and `tests/e2e/test_nodes_real.py`
+D7 (the session starts on the node, the folder trusted).
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
 
+**The three-command path is proven whole only over fakes (2026-09-30):**
+`tests/unit/test_node_zero_hands.py` runs `node add`, `config add --node
+auto` and `up` end to end through the real CLI, but the machines are THE fake
+ssh, gh and claude. The nodes_real e2e tier proves the node half on a real
+sshd (the session starts, the token arrives by file, the folder is trusted),
+but cannot run the product's own `node add`: without `--user` the node user is
+this PC's login name, which on a CI runner is the runner's own account, and
+setup.sh would run as root on the runner (packages, users, sshd drop-ins) with
+nothing the rig's stamp-guarded teardown could undo. A real mint needs a
+browser. Closing it needs a disposable node (a container or VM the job owns
+whole) where setup may run as root unguarded.
+
+**A node session keeps the token it started with (2026-09-30):** the
+session prelude reads `~/.magent/claude-oauth-token` once, when the pane
+starts. After `magent node auth refresh` the next bring-up ships the new token,
+but a session that was already running keeps the old one in its environment
+until it restarts. A shell a human opens by hand on the node (a new tmux
+window, a plain ssh login) gets no token at all; a `claude` started there uses
+the node's own login, if it has one. Both are left as they are: re-exporting
+into live agents would mean typing into them, and the fleet's panes are the
+only place magent starts claude.
+
+**`node setup` keeps one node-key edge (2026-09-27; a second, the dangling
+`.pub`, closed 2026-09-28):** `setup.sh`'s `user_node_key` refuses a symlinked
+`~/.ssh` or `~/.ssh/id_ed25519` and makes the key 0600 on every run (F-ACL-1: a
+default ACL overrides the umask, so ssh-keygen can leave a new key 0644). One
+edge of that is left as it is on purpose.
+
+*Closed: a dangling `.pub` link is refused, not written through.* The derive
+branch's `> "$id.pub"` and ssh-keygen's own `.pub` write at generation run
+whenever no `.pub` resolves, so a dangling link there used to have its target
+created. `user_node_key` now refuses a `.pub` that is a link and does not
+resolve (`[ -h "$id.pub" ] && [ ! -e "$id.pub" ]`) with its own fail row and
+rc 1, before either write. The key's chmod still runs first, and the row
+carries its repair note. Only the dangling case is refused, so the trade this
+entry first named (adding `$id.pub` to the symlink refusal would fail a live
+link too) was never forced: a live symlinked `.pub` is only read and stays
+`skip` + `key`. Pins: `tests/unit/test_node_provision.py::
+TestSetupShUnderRealBash::test_a_dangling_node_key_pub_is_never_written_through`
+and `::test_a_live_symlinked_node_key_pub_is_only_read`.
+
+*A dotfile-managed key now fails setup.* A node whose `~/.ssh/id_ed25519` is a
+symlink to a 0600 key (a dotfile manager's layout) went `skip` + `key` before
+F-ACL-1 and now fails every `node setup` with rc 1. That is deliberate: the
+key's chmod runs on every run and is never done through a link, the rule
+`user_authorized` already applies to `authorized_keys`. The fail row names the
+symlink, so the user knows what to change. Pin: `TestSetupShUnderRealBash::
+test_a_symlinked_node_key_never_reaches_its_target`.
+
+**A failed `.pub` derive deletes a `.pub` link to a directory (2026-09-29):**
+the dangling-`.pub` refusal above leaves a `.pub` link that resolves alone,
+and a link to a directory does resolve, so it is not refused. `[ -f ]` is
+false for it, so with a private key present `user_node_key` takes the derive
+branch: `ssh-keygen -y ... > "$id.pub"` fails on the directory, and the
+cleanup `rm -f -- "$id.pub"` then removes the user's link (never the
+directory it points at) before the fail row. Pre-existing, the same at rc1,
+and left unpinned: the refusal's `[ ! -e ]` is what the spec asked for, and
+the mutant that would tell it from `[ ! -f ]` (R8) survives on exactly this
+case. The fix, if it matters, is to refuse any `.pub` link that is not a
+regular file, before the derive, the way the dangling one is.
+
+**`stop_daemon` can kill a stranger named by a stale pid file (2026-09-29):**
+`node_sync.stop_daemon` kills only while the daemon's lock is held, and kills
+the pid the pid file names if that pid is alive. A daemon that died without
+its own cleanup (a crash, a forced kill) leaves its pid file behind, and a new
+daemon that has taken the lock but not yet written its pid is paired with that
+file. If the OS has handed the old number to another process by then,
+`daemon_pid()` reads it as live and the stop kills that process. The window is the few
+instructions between `run_sync_loop`'s lock and its pid write. Pre-existing;
+the wait for a late pid (2026-09-29) reads the same file first and neither
+widens nor narrows it. The fix would be a pid written under the lock with
+something only the daemon knows (its lock-time stamp, or its start time
+checked against the process's), not a liveness check.
 **Two Session-0 hand-off failures the launcher cannot describe (2026-09-29):**
 both sit before or outside the Python launcher, so its fast, worded answers
 cannot cover them.
@@ -2261,6 +3235,25 @@ by cell, and the test itself runs for real on ubuntu and macOS. Worth trying
 next: pywinpty's WinPTY back end (`PtyProcess.spawn(backend=Backend.WinPTY)`),
 which predates win32-input-mode and may pass the CR through unencoded.
 
+**Auto placement never rebalances (2026-09-24):** an `auto` project stays on
+the node it was placed on until that node leaves `settings.nodes`. A node that
+grows busy keeps its sessions; moving one is a manual
+`magent node recall <project> --to <nick>`. Deliberate: a
+move stops a live session and ships its conversation, which is not something
+to do behind the user's back. If it bites, the fix is a `node plan` hint
+naming the better node, never an automatic move.
+
+**Recall moves Claude Code conversations only (2026-09-24):** `magent node
+recall` refuses a project whose tool is not `claude` (exit 2). Codex has no
+transcript layout magent pulls, and no resume-by-id form recall could print.
+Its sessions come home by git alone: commit and push on the node, pull here.
+
+**A bring-up's repo record knows the commit, not the branch (2026-09-24):**
+`repos.json` written at bring-up carries each repo's sha from
+`bring_up.sh`, with an empty branch and an unknown unpushed count, because the
+bring-up reports only commits. A recall from a node that no longer answers
+therefore prints the last known sha without a branch. A recall from a node
+that answers records the full `repo_status.sh` report and replaces it.
 **What the bounded bring-up still leaves open (2026-09-29):** there are five
 residuals of "The bring-up never waits forever" in §2. Items 1-3 and 5 were
 found by reading the code, and none has been seen on the fleet. Item 4 was
@@ -2331,15 +3324,16 @@ counted created", is closed: a refusal is now final, see §2.)
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
-`_run_ssh` inherits the console on POSIX exactly as it does on Windows) and its unit tier
-runs everywhere, but the only code that spawns it is `cli/attach.py::
-_spawn_windows`, which opens `wt` windows. There is no macOS/Linux client
-window-spawn path for remote attach to wire it into — a pre-existing gap this
-change neither widens nor closes. A future POSIX attach client should call
-`_pane_command` as-is. Related and narrower: the corpse scan recognizes the
-supervisor by its Windows executable name (`magent-attach-client.exe`), which
-is fine because `process_cmdlines` is Windows-only today; a POSIX process scan
-would need the extensionless name added.
+`_run_ssh` inherits the console on POSIX exactly as it does on Windows) and its
+unit tier runs everywhere, but the only code that spawns it is
+`attach_client.py::spawn_attach_window`, which opens `wt` windows. There is no
+macOS/Linux client window-spawn path for remote attach to wire it into — a
+pre-existing gap this change neither widens nor closes. A future POSIX attach
+client should call `attach_client.pane_command` as-is. Related and narrower:
+the corpse scan recognizes the supervisor by its Windows executable name
+(`magent-attach-client.exe`), which is fine because `process_cmdlines` is
+Windows-only today; a POSIX process scan would need the extensionless name
+added.
 
 **Title badges are ambient state, not guaranteed state (2026-07-07, narrowed
 2026-08-15):** the attention daemon's `BadgeRenderer` rewrites window titles via
@@ -2462,8 +3456,10 @@ fires), and the test asserts the bytes the product writes to
 `~/.magent/uploads` are byte-identical to what was attached, plus the page's
 title/form contract so a template regression fails loudly. *Honest gap (small,
 deliberate):* hosted Linux runners have no `psmux` binary and `LinuxPlatform`
-does not implement `launch_psmux_session`, so the test symlinks real `tmux` in
-as `psmux` and stands up a real detached `tmux` session on a private socket
+does not implement `launch_psmux_session`, so the test puts a `psmux` on PATH
+that execs real `tmux` (a sh wrapper since 2026-09-25, so it can record each
+`send-keys` argv and a test can count pastes) and stands up a real detached
+`tmux` session on a private socket
 (`TMUX_TMPDIR` confined to tmp). Session discovery, upload validation, AND the
 `send-keys` injection therefore all exercise a genuinely live multiplexer — the
 only substitution is the multiplexer *binary's name*, and the deliverable under
@@ -2544,6 +3540,69 @@ could take effect, pasting the prompt into a session about to go busy and then
 reporting a false exit 4 on it; and `magent peek` died with `UnicodeEncodeError`
 whenever stdout was redirected on Windows, because a pane carries the AGENT's
 glyphs and a redirected stdout is cp1252.
+
+**The idle reaper is Windows-only (2026-09-27):** off Windows `serve`'s reaper
+thread exits at startup (`unsupported platform (no psmux)`), and even with a
+multiplexer every session would read `tree-unknown`: POSIX has no Toolhelp
+snapshot, no `process_identity`/`terminate_verified`, and no console-membership
+check. A port needs all three: a process tree with start times (`/proc` or
+`ps`), a kill that pins its target (a pidfd on Linux), and "who shares this
+pane's terminal" (controlling-tty/session membership) in place of the console
+check. None is built.
+
+**Finished sessions the reaper never parks (2026-09-27):** each errs toward not
+parking, and each shows in `reap.log` as a reason that never changes.
+Multi-window projects (R3 `shared-cwd`: the state store is keyed by cwd, so a
+record cannot say which window it describes; parking one window needs a store
+keyed by psmux session); a session nobody has prompted since launch (R8
+`no-transcript`); an agent orphaned from its pane tree (R5 `no-agent`); a
+finished reply that ends in a question (R9 `pane-dialog`, because
+`fleet.classify_state` reads a dialog from phrases such as "do you want"
+anywhere on screen; the follow-up, if it fires often, is a narrower R9-only
+test, since `send`/`peek` depend on `classify_state` as it is); and placeholder
+text in an empty input box, which reads as a `draft`. Codex is out by data: its
+`AgentTool` has no `idle_probe`. Per-project account routing moves session
+files and transcripts under a per-session `CLAUDE_CONFIG_DIR`, while
+`sweep_once` reads one `config_dir`; until the probe takes the per-session map,
+a routed pane reads `no-agent`, which is inert and never wrong.
+
+**What a park leaves behind (2026-09-27):** orphaned children of the agent
+(already cut from the tree before the snapshot) are not chased, since neither a
+parent-pid walk nor `taskkill /T` reaches them; the park line's survivor count
+measures what they hold rather than assuming it. Claude Code's own leftovers
+(the stale `sessions/<pid>.json` and its `.key`, plugin `.in_use/<pid>` markers,
+`session-env/<sid>/`) are deliberately not cleaned: they are undocumented files,
+and a wrong delete could hide a live session. A child a process makes during its
+own `TerminateProcess` call, after the clock read that bounds its stragglers, is
+neither killed nor counted as a survivor: a sub-millisecond window, and never a
+wrong kill. The tighter bound, a clock read inside `terminate_verified` after
+`TerminateProcess` while the handle still pins the pid, is not built. The psmux server and warm-spare
+overhead (about 480 MB of working set per session) is not reclaimed either. And
+a parked record can lose its meaning: the store's TTL sweep
+(`settings.attention.stateTtlDays`) deletes it, or another writer for the same
+directory replaces it. The pane then counts as an ordinary dead pane and a bulk
+revive types the configured `--continue` command; the notice in the pane still
+names the exact id.
+
+**procs' kernel32 is pinned against a deny list (2026-09-29):**
+`test_kill_guards.py` pins five process enders in procs by name
+(`TerminateProcess`, `TerminateJobObject`, `NtTerminateProcess`,
+`ZwTerminateProcess`, `EndTask`), so a kernel32 call that ends a process by
+another name (`_kernel32().GenerateConsoleCtrlEvent`, `DebugActiveProcess`)
+passes every procs scan. Only the console helper's kernel32 is a closed list.
+
+**The idle reaper's Windows real-multiplexer legs have not run (POSIX leg
+green on a Linux host, 2026-09-28):** `tests/e2e/test_reap_real.py` (a stand-in agent
+parked and resumed in a real psmux pane, with draft, dialog, subagent, orphan
+and kill-switch variants) is written and rides the `end-to-end` job. Its POSIX
+leg ran green against a real tmux on a Linux host, but that leg proves only
+that nothing is parked (`tree-unknown`). The Windows park and veto legs, which
+carry the proof, have not run anywhere: they were never run on the development
+machine, which carries a live fleet, and off CI the tier skips unless
+`MDTEST_REAP_REAL=1`. Until a Windows CI run is green, the stop's real-process
+proof is the unit tier's win32 tests over processes each test spawns, and the
+pane reset, the notice read back through `capture-pane`, and the orphan variant
+are proven only against fakes.
 
 **Ten findings carried open into the next audit cycle** (deliberately
 triaged out of the fix pass that produced this document, not overlooked):

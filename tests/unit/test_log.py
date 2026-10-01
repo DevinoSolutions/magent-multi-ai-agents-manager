@@ -39,10 +39,10 @@ class TestGetLogger:
         assert "hello from test" in log_file.read_text(encoding="utf-8")
 
     def test_first_use_from_many_threads_attaches_one_handler(self, monkeypatch):
-        # A first call for a name can come from a thread pool (the status-line
-        # decoration fan-out, psmux.decorate_sessions); a check-then-set race
-        # would stack a handler per thread and write every record that many
-        # times.
+        # A first call for a name can come from a thread pool (the node
+        # bring-up fan-out, or the status-line decoration fan-out,
+        # psmux.decorate_sessions); a check-then-set race would stack a
+        # handler per thread and write every record that many times.
         real = log._SharedRotatingFileHandler
 
         def slow(*a, **kw):
@@ -294,6 +294,17 @@ class TestHeartbeat:
         assert age is not None
         assert age < 1.0
         assert log.heartbeat_fresh("hotkey") is True
+
+    def test_mtime_is_the_absolute_stamp_age_is_relative_to(self):
+        import time
+
+        assert log.heartbeat_mtime("nonexistent") is None
+        before = time.time()
+        log.write_heartbeat("hotkey")
+        mtime = log.heartbeat_mtime("hotkey")
+        assert mtime is not None
+        # mtime granularity is filesystem-dependent; a second of slack.
+        assert before - 1.0 <= mtime <= time.time() + 1.0
 
     def test_missing_heartbeat_is_none_and_not_fresh(self):
         assert log.heartbeat_age("nonexistent") is None

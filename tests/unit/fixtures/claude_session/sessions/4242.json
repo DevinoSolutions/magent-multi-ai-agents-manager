@@ -1,0 +1,10 @@
+{
+  "pid": 4242,
+  "sessionId": "11111111-2222-3333-4444-555555555555",
+  "cwd": "/projects/demo",
+  "procStart": "133100000000000000",
+  "kind": "interactive",
+  "status": "idle",
+  "statusUpdatedAt": 1790000000000,
+  "name": "redacted-do-not-log"
+}

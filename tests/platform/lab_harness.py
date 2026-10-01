@@ -140,6 +140,8 @@ def child_env(home: Path) -> dict[str, str]:
     env["HOMEDRIVE"] = drive
     env["HOMEPATH"] = tail or "\\"
     env["HOME"] = home_s
+    # The MAGENT_* strip drops conftest's pin: never a child with reaping on.
+    env["MAGENT_IDLE_REAP"] = "0"
     return env
 
 

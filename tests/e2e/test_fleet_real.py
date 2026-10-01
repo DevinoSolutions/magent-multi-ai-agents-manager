@@ -277,7 +277,10 @@ class _Fleet:
         # image-name priority sweep, the Session-0 desktop hand-off).
         self.env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
         self.env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+        self.env["MAGENT_ATTENTION_SUPERVISOR"] = "0"
         self.env["MAGENT_PSMUX_BOOST"] = "0"
+        self.env["MAGENT_NODE_SYNC"] = "0"
+        self.env["MAGENT_IDLE_REAP"] = "0"
         self.env["MAGENT_SESSION0_POLICY"] = "allow"
         self.env.update(extra_env)
 

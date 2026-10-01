@@ -3,10 +3,10 @@
 `status` covers *daemons*; doctor covers *environment*: is the config
 loadable and current, does the env validate, are the agent CLIs and a
 terminal on PATH, can anything tile (monitors), are the runtime dirs
-writable, is Tailscale reachable, is the upload port sane. Every check is
-a small function returning (status, detail) so each is unit-testable; the
-command is just the runner. Exit 0 = no failures (warns allowed), 1 = any
-check failed.
+writable, is Tailscale reachable, is the upload port sane, are the nodes
+healthy. Every check is a small function returning (status, detail) so
+each is unit-testable; the command is just the runner. Exit 0 = no
+failures (warns allowed), 1 = any check failed.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 from typing import TYPE_CHECKING
 
 import click
@@ -206,6 +207,27 @@ def _check_psmux_session0() -> CheckResult:
     if not stranded:
         return (OK, "no psmux server runs in logon Session 0")
     return (WARN, psmux.session0_message(len(stranded)))
+
+
+def _check_daemons_session0() -> CheckResult:
+    """Is one of magent's OWN daemons stranded in Session 0?
+
+    The daemon spawn seams now refuse there, but an older magent -- or a
+    foreground `magent serve` typed over ssh -- may already have left a serve,
+    an Alt+V listener or an attention daemon behind. A Session-0 serve is the
+    sharp one: it holds the loopback port this desktop's Alt+V needs, so the
+    desktop's own serve dies of "port in use" while nothing it can see serves.
+
+    WARN, never FAIL, for the psmux-session0 reason: this desktop cannot stop
+    them, so they must not fail a doctor run. Asked only while a desktop
+    exists -- on a headless host Session 0 is where daemons belong.
+    """
+    from magent.cli.status import session0_daemons, session0_daemons_message
+
+    stranded = session0_daemons()
+    if not stranded:
+        return (OK, "no magent daemon runs in logon Session 0")
+    return (WARN, session0_daemons_message(stranded))
 
 
 def _check_monitors() -> CheckResult:
@@ -436,6 +458,166 @@ def _check_upload_port(cfg: MagentConfig | None) -> CheckResult:
     return (OK, f"port {port} is free")
 
 
+def _check_nodes(cfg: MagentConfig | None) -> CheckResult:
+    """Every configured node folded into one row -- WARN at worst: a node that
+    is down or not set up yet is not this machine's environment failing. The
+    per-node rows are `magent node doctor`'s; this reads the same report, so
+    with nodes configured it costs up to one remote_mux.DOCTOR_TIMEOUT_S.
+
+    A node's trouble is its fail and warn rows, named by item; any other row
+    (ok, skip -- a node with nothing synced yet) is healthy."""
+    if cfg is None:
+        return (OK, "skipped -- config missing or invalid (see the config check)")
+    if not cfg.settings.nodes:
+        return (OK, "no nodes configured")
+    # Sibling command modules, imported in-body so doctor.py's import never
+    # depends on the registration hub's import order.
+    from magent.cli import node_cmd
+    from magent.cli.fleet_cmd import _stdout_safe
+
+    report = node_cmd.doctor_report(cfg, list(cfg.settings.nodes))
+    troubled: list[str] = []
+    for nick, lines in report.items():
+        items = [line.item for line in lines if line.status in (FAIL, WARN)]
+        if items:
+            troubled.append(f"{nick}: {', '.join(items)}")
+    if not troubled:
+        return (OK, f"{len(report)} node(s) healthy")
+    # The items are the node's words (doctor.sh prints them), which a redirected
+    # Windows stdout (cp1252) may not encode: lose a glyph, never the command.
+    # A nick cannot need it, nor hold a separator: load_config admits only
+    # [a-z0-9-]{1,6}.
+    return (
+        WARN,
+        _stdout_safe("; ".join(troubled)) + " -- details: magent node doctor",
+    )
+
+
+# The lifecycle events whose records the idle reaper reads: working, done,
+# needs-input and idle. Without them R7 vetoes every session.
+_REAP_HOOK_EVENTS = ("UserPromptSubmit", "Stop", "Notification", "SessionStart")
+
+
+def _check_idle_reap(cfg: MagentConfig | None) -> CheckResult:
+    """Will the idle reaper park anything? WARN at worst: a reaper that is off
+    is a choice, so it is OK and names the gate, through ``reap.off_reason`` --
+    the same translation serve's sweeps read. The WARN that matters is ON with
+    the state hook unwired, which silently parks nothing, ever."""
+    from magent import reap  # heavy subsystem: in-body per policy
+    from magent.cli.hooks_cmd import (
+        _default_settings_file,
+        _event_wired,
+        _load_settings,
+    )
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    if cfg is None:
+        return (WARN, "config invalid or missing; the reaper stays off until it loads")
+    off = reap.off_reason(cfg, get_platform())
+    if off is not None:
+        return (OK, reap.off_phrase(off))
+    minutes = int(reap.threshold_s(cfg) // 60)
+    configured = cfg.settings.idle_reap.after_minutes
+    on = f"on, parks after {minutes} min idle"
+    if configured != minutes:
+        on += f" (afterMinutes={configured} raised to the {minutes}-min floor)"
+    path = _default_settings_file()
+    # _load_settings returns (never raises) why a file it cannot use is
+    # unusable -- unreadable, not JSON, nested too deeply, or not the shape
+    # Claude Code writes -- and `magent hooks status` reads the same answer.
+    settings = _load_settings(path)
+    if isinstance(settings, str):
+        return (
+            WARN,
+            (
+                f"{on}, but {path} is unreadable ({settings}); cannot tell whether "
+                "the state hook is wired"
+            ),
+        )
+    hooks = settings.get("hooks")
+    wiring = hooks if isinstance(hooks, dict) else {}
+    unwired = [e for e in _REAP_HOOK_EVENTS if not _event_wired(wiring.get(e))]
+    if unwired:
+        return (
+            WARN,
+            (
+                f"{on}, but the state hook is not wired for {', '.join(unwired)}; "
+                "nothing will ever be parked; run magent hooks install"
+            ),
+        )
+    return (OK, on)
+
+
+def _check_attention() -> CheckResult:
+    """Is the attention daemon running, and if not, is that a fault.
+
+    Reads the same state machine `status` renders (``cli.status.
+    _attention_state``) so the two surfaces can never disagree. WARN at worst:
+    without the daemon the fleet is quieter (no badges, flashes or pushes), not
+    broken, and a serve that is up revives one that died. A daemon a restart
+    took down is not a fault at all -- reporting it as a crash is exactly the
+    wording this check exists to get right.
+    """
+    from magent.cli.status import _attention_state, _attention_supervised
+
+    state = _attention_state()
+    # Promised only when serve is allowed to keep that promise.
+    revive = "; a running upload server restarts it" if _attention_supervised() else ""
+    if state == "on":
+        return (OK, "attention daemon running (heartbeat fresh)")
+    if state == "stale":
+        return (
+            WARN,
+            (
+                "attention daemon process is alive but its heartbeat expired -- "
+                "stop it with `magent attention --stop` and start it again"
+            ),
+        )
+    if state == "crashed":
+        return (
+            WARN,
+            (
+                "attention daemon died without stopping cleanly (see "
+                f"~/.magent/logs/attention.log{revive})"
+            ),
+        )
+    if state == "off-since-restart":
+        return (
+            OK,
+            (
+                "attention daemon not running since the last restart "
+                f"(start with `magent attention -d`{revive})"
+            ),
+        )
+    return (OK, "attention daemon not running (start with `magent attention -d`)")
+
+
+def _check_claude_token(cfg: MagentConfig | None) -> CheckResult:
+    """The Claude token nodes sign in with (node_auth.token_health) -- WARN at
+    worst, like the nodes row, and read only when nodes are configured: an
+    ageing token on a PC without nodes is nobody's problem. Reads the file;
+    never mints (a mint needs a person at a terminal, and doctor is a report)."""
+    if cfg is None:
+        return (OK, "skipped -- config missing or invalid (see the config check)")
+    if not cfg.settings.nodes:
+        return (OK, "no nodes configured")
+    from magent import node_auth
+
+    health = node_auth.token_health()
+    if health.warning is not None:
+        return (WARN, health.warning)
+    if health.stored is None:
+        return (
+            WARN,
+            (
+                "no Claude token for nodes to sign in with yet -- run: "
+                f"{node_auth.REFRESH_COMMAND}"
+            ),
+        )
+    day = time.strftime("%Y-%m-%d", time.gmtime(health.stored.expires_at))
+    return (OK, f"valid until {day}")
+
+
 def _run_checks(config_file: Path) -> list[dict[str, str]]:
     (config_res, cfg) = _check_config(config_file)
     checks: list[tuple[str, CheckResult]] = [("config", config_res)]
@@ -445,14 +627,19 @@ def _run_checks(config_file: Path) -> list[dict[str, str]]:
         ("terminal", _check_terminal),
         ("psmux wedge", _check_psmux_wedge),
         ("psmux-session0", _check_psmux_session0),
+        ("daemons-session0", _check_daemons_session0),
         ("monitors", _check_monitors),
         ("hotkey", lambda: _check_hotkey(cfg)),
+        ("attention", _check_attention),
         ("wt-keys", _check_wt_keys),
         ("logs dir", _check_logs_dir),
         ("state dir", _check_state_dir),
         ("sentry", _check_sentry),
         ("tailscale", _check_tailscale),
         ("upload port", lambda: _check_upload_port(cfg)),
+        ("nodes", lambda: _check_nodes(cfg)),
+        ("idle-reap", lambda: _check_idle_reap(cfg)),
+        ("claude-token", lambda: _check_claude_token(cfg)),
     ]
     checks.extend((name, fn()) for name, fn in rest)
     return [

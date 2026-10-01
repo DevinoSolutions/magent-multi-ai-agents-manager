@@ -16,6 +16,7 @@ so all of this runs on every OS.
 """
 
 import json
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -69,6 +70,7 @@ class _Upload:
         self.status = status
         self.raw = raw
         self.requests: list[tuple[str, bytes]] = []
+        self.headers: list[dict[str, str]] = []
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -76,6 +78,7 @@ class _Upload:
                 length = int(self.headers.get("Content-Length", 0))
                 # Drain BEFORE replying -- see the class docstring.
                 outer.requests.append((self.path, self.rfile.read(length)))
+                outer.headers.append(dict(self.headers.items()))
                 json_reply = outer.raw is None
                 body = json.dumps(outer.reply).encode() if json_reply else outer.raw
                 self.send_response(outer.status)
@@ -336,14 +339,21 @@ class TestFailuresAreSpecific:
         assert set(altv.ALTV_OUTCOMES) == {
             "ok",
             "ok-native",
+            "ok-paths",
             "not-a-magent-window",
             "no-image",
             "clipboard-unreadable",
+            "folder-refused",
+            "file-missing",
+            "file-unreadable",
+            "too-large",
             "serve-unreachable",
             "upload-rejected",
             "inject-failed",
             "inject-pending",
             "native-failed",
+            "paths-failed",
+            "path-unpasteable",
             "error",
         }
         # Every outcome the user can SEE needs words for the bar. The
@@ -357,8 +367,14 @@ class TestFailuresAreSpecific:
         # into "every outcome that is not an exception". Exactly three
         # outcomes leave the screenshot recoverable: the paste landed (upload
         # or native -- native consumes nothing, the clipboard still holds it),
-        # or it has not landed YET.
-        assert set(altv.ALTV_SAFE_OUTCOMES) == {"ok", "ok-native", "inject-pending"}
+        # or it has not landed YET. `ok-paths` is the local file press: the
+        # paths landed and the files themselves were never touched.
+        assert set(altv.ALTV_SAFE_OUTCOMES) == {
+            "ok",
+            "ok-native",
+            "ok-paths",
+            "inject-pending",
+        }
         assert set(altv.ALTV_SAFE_OUTCOMES) <= set(altv.ALTV_OUTCOMES)
 
 
@@ -516,6 +532,13 @@ class TestStatusBarHygiene:
         from magent.sessions import FLASH_MSG_MAX
 
         assert len(altv._ascii_clip("x" * 400)) == FLASH_MSG_MAX
+
+    def test_no_image_covers_copied_files_too(self):
+        # A press with nothing usable on the clipboard must not tell a user who
+        # copied a file in Explorer that only images count.
+        assert altv.OUTCOME_REASONS["no-image"] == (
+            "clipboard has no image or file - copy one first"
+        )
 
     def test_every_shipped_phrase_is_ascii(self):
         for text in [
@@ -775,3 +798,814 @@ class TestNativeEnabledGate:
         monkeypatch.setenv("MAGENT_ALTV_NATIVE", "0")
         monkeypatch.setattr("magent.env._cached_env", None)
         assert altv.native_enabled() is False
+
+
+class TestTheUploadLimitIsShared:
+    """One number, named the same way on every path that enforces it."""
+
+    def test_the_limit_is_one_hundred_megabytes(self):
+        from magent import sessions, upload_server
+
+        assert sessions.MAX_UPLOAD_BYTES == 100 * 1024 * 1024
+        # The server enforces the very constant the listener pre-checks against.
+        assert upload_server.MAX_UPLOAD_BYTES == sessions.MAX_UPLOAD_BYTES
+
+    def test_the_limit_reads_in_megabytes(self):
+        from magent.sessions import upload_limit_text
+
+        assert upload_limit_text(100 * 1024 * 1024) == "100 MB"
+        # A test-lowered cap still names itself honestly instead of "0 MB".
+        assert upload_limit_text(10) == "10 bytes"
+
+    def test_the_too_large_reason_names_the_limit(self):
+        assert "100 MB" in altv.OUTCOME_REASONS["too-large"]
+
+
+class TestPathsLine:
+    """Several files paste as ONE line; a path is quoted only when it has to be."""
+
+    def test_plain_paths_are_space_separated_and_bare(self):
+        from magent.sessions import paths_line
+
+        assert paths_line(["C:\\a\\x.py", "/tmp/y.zip"]) == "C:\\a\\x.py /tmp/y.zip"
+
+    def test_a_single_plain_path_is_byte_for_byte_itself(self):
+        # Compatibility: the server's one-file inject pasted str(dest) verbatim.
+        from magent.sessions import paths_line
+
+        assert paths_line(["/home/u/.magent/uploads/1_x.png"]) == (
+            "/home/u/.magent/uploads/1_x.png"
+        )
+
+    def test_spaces_and_shell_specials_are_double_quoted(self):
+        from magent.sessions import paths_line
+
+        assert paths_line(["C:\\My Docs\\a b.txt", "/tmp/plain"]) == (
+            '"C:\\My Docs\\a b.txt" /tmp/plain'
+        )
+        for special in ("a;b", "a&b", "a(1)", "a'b", "a|b", "a<b>", "a#b"):
+            assert paths_line([f"/tmp/{special}"]) == f'"/tmp/{special}"', special
+
+    def test_what_double_quotes_still_expand_falls_back_to_single_quotes(self):
+        # Inside "..." a POSIX shell still expands $ and backticks and ends the
+        # string at a ", so those paths go in '...' (a ' inside is '\'').
+        from magent.sessions import paths_line
+
+        assert paths_line(['/tmp/say "hi"']) == "'/tmp/say \"hi\"'"
+        assert paths_line(['/tmp/it\'s "x"']) == "'/tmp/it'\\''s \"x\"'"
+        assert paths_line(["/tmp/a$b"]) == "'/tmp/a$b'"
+        assert paths_line(["/tmp/a`b"]) == "'/tmp/a`b'"
+
+    # Every character here can end or rewrite the line it is pasted into, and a
+    # line break SUBMITS in an agent pane -- quoting cannot make one safe.
+    _UNPASTEABLE = ("\n", "\r", "\t", "\x1b", "\x7f", "\x85", "\u2028", "\u2029")
+
+    @pytest.mark.parametrize("ch", _UNPASTEABLE)
+    def test_a_control_or_line_break_character_is_never_pasted(self, ch):
+        from magent.sessions import paths_line, unpasteable_path
+
+        path = f"C:\\x\\a{ch}b.txt"
+        assert unpasteable_path(path)
+        with pytest.raises(ValueError, match="control or line-break"):
+            paths_line(["C:\\x\\fine.txt", path])
+
+    def test_ordinary_non_ascii_names_still_paste(self):
+        from magent.sessions import paths_line, unpasteable_path
+
+        name = (
+            "/tmp/caf\N{LATIN SMALL LETTER E WITH ACUTE} "
+            "\N{CJK UNIFIED IDEOGRAPH-6587}.txt"
+        )
+        assert not unpasteable_path(name)
+        assert paths_line([name]) == f'"{name}"'
+
+
+def _files(tmp_path, **named: bytes) -> list[str]:
+    """Real files on disk. ``__`` in a key becomes a space, ``_dot_`` a dot."""
+    out = []
+    for name, data in named.items():
+        path = tmp_path / name.replace("__", " ").replace("_dot_", ".")
+        path.write_bytes(data)
+        out.append(str(path))
+    return out
+
+
+class TestFilePress:
+    """Alt+V with files copied in Explorer (CF_HDROP).
+
+    LOCAL (no ssh host): the pane's agent shares this filesystem, so the
+    ORIGINAL paths are pasted -- nothing is uploaded or copied, and there is no
+    size cap. REMOTE: every file travels in ONE upload request and the server
+    pastes all their paths in one line. Either way: one paste attempt, never a
+    retry, and a folder anywhere in the copy refuses the whole press.
+    """
+
+    def _flashes(self, monkeypatch) -> list[tuple[str, str | None]]:
+        seen: list[tuple[str, str | None]] = []
+        monkeypatch.setattr(
+            altv,
+            "flash_async",
+            lambda url, project, message, duration_ms=None, tint=None: seen.append(
+                (message, tint)
+            ),
+        )
+        return seen
+
+    def _sends(self, monkeypatch, delivered: bool = True) -> list[tuple]:
+        from magent import psmux
+
+        calls: list[tuple] = []
+
+        def _send_keys(name, *keys, target=None, literal=False, **kw):
+            calls.append((name, keys, target, literal))
+            return delivered
+
+        monkeypatch.setattr(psmux, "send_keys", _send_keys)
+        return calls
+
+    def _no_upload(self, monkeypatch):
+        monkeypatch.setattr(
+            altv,
+            "upload_files",
+            lambda *a, **k: pytest.fail("this press must never upload"),
+        )
+
+    def test_local_pastes_the_original_paths_in_one_line_and_uploads_nothing(
+        self, monkeypatch, tmp_path
+    ):
+        from magent.sessions import FLASH_TINT_OK, paths_line
+
+        seen = self._flashes(monkeypatch)
+        calls = self._sends(monkeypatch)
+        self._no_upload(monkeypatch)
+        paths = _files(tmp_path, a_dot_py=b"print(1)", my__notes_dot_txt=b"hi")
+
+        outcome = altv.handle_file_press(
+            "http://127.0.0.1:1", "proj", lambda: paths, local=True
+        )
+
+        assert outcome == "ok-paths"
+        # ONE send, the whole selection, literal text, aimed at the pane.
+        assert calls == [("proj", (paths_line(paths),), "proj", True)]
+        assert f'"{paths[1]}"' in calls[0][1][0]  # the spaced one is quoted
+        assert seen[-1] == (f"{altv.FLASH_PREFIX}2 file paths pasted", FLASH_TINT_OK)
+
+    def test_local_has_no_size_cap(self, monkeypatch, tmp_path):
+        self._flashes(monkeypatch)
+        calls = self._sends(monkeypatch)
+        monkeypatch.setattr(altv, "MAX_UPLOAD_BYTES", 4)
+        paths = _files(tmp_path, big_dot_bin=b"x" * 64)
+        assert (
+            altv.handle_file_press("http://x:1", "proj", lambda: paths, local=True)
+            == "ok-paths"
+        )
+        assert len(calls) == 1
+
+    def test_local_narrates_acknowledgement_then_pasting_then_outcome(
+        self, monkeypatch, tmp_path
+    ):
+        from magent import psmux
+
+        order: list[str] = []
+        monkeypatch.setattr(
+            altv,
+            "flash_async",
+            lambda url, project, message, duration_ms=None, tint=None: order.append(
+                message
+            ),
+        )
+        monkeypatch.setattr(
+            psmux, "send_keys", lambda *a, **k: order.append("send") or True
+        )
+        paths = _files(tmp_path, a_dot_py=b"x")
+
+        def _capture():
+            order.append("capture")
+            return paths
+
+        altv.handle_file_press("http://x:1", "proj", _capture, local=True)
+        assert order == [
+            altv.FLASH_PREFIX + altv.PHASE_CAPTURING,
+            "capture",
+            altv.FLASH_PREFIX + altv.PHASE_PASTING,
+            "send",
+            altv.FLASH_PREFIX + "file path pasted",
+        ]
+
+    def test_a_failed_local_paste_is_reported_once_and_never_retried(
+        self, monkeypatch, tmp_path
+    ):
+        from magent.sessions import FLASH_TINT_ERR
+
+        seen = self._flashes(monkeypatch)
+        calls = self._sends(monkeypatch, delivered=False)
+        self._no_upload(monkeypatch)
+        paths = _files(tmp_path, a_dot_py=b"x")
+
+        outcome = altv.handle_file_press(
+            "http://x:1", "proj", lambda: paths, local=True
+        )
+
+        assert outcome == "paths-failed"
+        assert len(calls) == 1  # exactly one attempt: a killed send may have landed
+        assert seen[-1] == (
+            altv.FLASH_PREFIX + altv.OUTCOME_REASONS["paths-failed"],
+            FLASH_TINT_ERR,
+        )
+
+    @pytest.mark.parametrize("local", [True, False])
+    def test_a_folder_refuses_the_whole_press_and_nothing_moves(
+        self, monkeypatch, tmp_path, local
+    ):
+        seen = self._flashes(monkeypatch)
+        calls = self._sends(monkeypatch)
+        self._no_upload(monkeypatch)
+        folder = tmp_path / "some dir"
+        folder.mkdir()
+        # Mixed: a real file AND a folder -- still refused whole, no partial.
+        paths = [*_files(tmp_path, a_dot_py=b"x"), str(folder)]
+
+        outcome = altv.handle_file_press(
+            "http://127.0.0.1:1", "proj", lambda: paths, local=local
+        )
+
+        assert outcome == "folder-refused"
+        assert calls == []
+        assert seen[-1][0] == altv.FLASH_PREFIX + "folders not supported - copy files"
+
+    @pytest.mark.parametrize("local", [True, False])
+    def test_a_file_that_vanished_is_named_and_nothing_moves(
+        self, monkeypatch, tmp_path, local
+    ):
+        seen = self._flashes(monkeypatch)
+        calls = self._sends(monkeypatch)
+        self._no_upload(monkeypatch)
+        paths = [*_files(tmp_path, a_dot_py=b"x"), str(tmp_path / "gone.txt")]
+
+        outcome = altv.handle_file_press(
+            "http://127.0.0.1:1", "proj", lambda: paths, local=local
+        )
+
+        assert outcome == "file-missing"
+        assert calls == []
+        assert seen[-1][0] == altv.FLASH_PREFIX + altv.OUTCOME_REASONS["file-missing"]
+
+    @pytest.mark.parametrize("ch", ["\n", "\x1b", "\x85", "\u2028"])
+    def test_a_local_path_with_a_control_character_is_refused_not_typed(
+        self, monkeypatch, tmp_path, ch
+    ):
+        # The original path IS what a local press types; one carrying a line
+        # break would submit whatever the user had in the input line.
+        import pathlib
+
+        seen = self._flashes(monkeypatch)
+        calls = self._sends(monkeypatch)
+        self._no_upload(monkeypatch)
+        weird = str(tmp_path / f"a{ch}b.txt")
+        monkeypatch.setattr(pathlib.Path, "is_file", lambda self: True)
+        monkeypatch.setattr(pathlib.Path, "is_dir", lambda self: False)
+
+        outcome = altv.handle_file_press(
+            "http://x:1",
+            "proj",
+            lambda: [*_files(tmp_path, ok_dot_txt=b"x"), weird],
+            local=True,
+        )
+
+        assert outcome == "path-unpasteable"
+        assert calls == [], "nothing is typed -- not even the clean paths"
+        assert seen[-1][0] == (
+            altv.FLASH_PREFIX + altv.OUTCOME_REASONS["path-unpasteable"]
+        )
+
+    def test_an_empty_read_is_unreadable_not_no_image(self, monkeypatch):
+        seen = self._flashes(monkeypatch)
+        self._no_upload(monkeypatch)
+        outcome = altv.handle_file_press("http://x:1", "proj", list, local=True)
+        assert outcome == "clipboard-unreadable"
+        assert "copied files" in seen[-1][0]
+
+    def test_remote_uploads_every_file_in_one_request(self, monkeypatch, tmp_path):
+        seen = self._flashes(monkeypatch)
+        calls = self._sends(monkeypatch)
+        zip_bytes = bytes(range(256)) * 3  # binary, CR/LF included
+        paths = _files(tmp_path, a_dot_zip=zip_bytes, script_dot_py=b"print(1)\r\n")
+        server = _Upload({"ok": True, "paths": ["/u/1", "/u/2"], "injected": True})
+        try:
+            outcome = altv.handle_file_press(
+                server.url, "proj", lambda: paths, local=False
+            )
+        finally:
+            server.close()
+
+        assert outcome == "ok"
+        assert calls == [], "the SERVER pastes a remote press, never the listener"
+        assert len(server.requests) == 1, "one request carries the whole selection"
+        path, body = server.requests[0]
+        assert path == "/upload?project=proj"
+        assert b'filename="a.zip"' in body and zip_bytes in body
+        assert b'filename="script.py"' in body and b"print(1)\r\n" in body
+        assert b'name="inject"\r\n\r\n1\r\n' in body
+        assert seen[-1][0] == f"{altv.FLASH_PREFIX}2 files sent"
+
+    def test_remote_narrates_uploading_before_the_post(self, monkeypatch, tmp_path):
+        order: list[str] = []
+        monkeypatch.setattr(
+            altv,
+            "flash_async",
+            lambda url, project, message, duration_ms=None, tint=None: order.append(
+                message
+            ),
+        )
+        monkeypatch.setattr(
+            altv,
+            "upload_files",
+            lambda url, project, files: (
+                order.append("upload") or ("ok", "file sent", "")
+            ),
+        )
+        paths = _files(tmp_path, a_dot_py=b"x")
+        altv.handle_file_press("http://x:1", "proj", lambda: paths, local=False)
+        assert order == [
+            altv.FLASH_PREFIX + altv.PHASE_CAPTURING,
+            altv.FLASH_PREFIX + altv.PHASE_UPLOADING,
+            "upload",
+            altv.FLASH_PREFIX + "file sent",
+        ]
+
+    def test_remote_over_the_limit_is_refused_before_any_file_is_read(
+        self, monkeypatch, tmp_path
+    ):
+        import pathlib
+
+        seen = self._flashes(monkeypatch)
+        self._no_upload(monkeypatch)
+        monkeypatch.setattr(altv, "MAX_UPLOAD_BYTES", 10)
+        paths = _files(tmp_path, a_dot_bin=b"x" * 8, b_dot_bin=b"y" * 8)
+        monkeypatch.setattr(
+            pathlib.Path,
+            "read_bytes",
+            lambda self: pytest.fail("an over-limit file must never be read"),
+        )
+
+        outcome = altv.handle_file_press(
+            "http://x:1", "proj", lambda: paths, local=False
+        )
+
+        assert outcome == "too-large"
+        assert seen[-1][0] == altv.FLASH_PREFIX + "too large - 10 bytes limit"
+
+    def test_remote_pending_keeps_its_meaning(self, monkeypatch, tmp_path):
+        seen = self._flashes(monkeypatch)
+        paths = _files(tmp_path, a_dot_py=b"x")
+        server = _Upload({"ok": True, "injected": False, "inject_pending": True})
+        try:
+            outcome = altv.handle_file_press(
+                server.url, "proj", lambda: paths, local=False
+            )
+        finally:
+            server.close()
+        assert outcome == "inject-pending"
+        assert seen[-1][0] == (
+            altv.FLASH_PREFIX + "file saved - psmux is slow, paste still pending"
+        )
+
+    def test_an_unexpected_error_is_caught_logged_and_shown(self, monkeypatch, caplog):
+        seen = self._flashes(monkeypatch)
+
+        def _boom():
+            raise OSError("clipboard went away")
+
+        with caplog.at_level("INFO", logger="magent.hotkey"):
+            outcome = altv.handle_file_press("http://x:1", "proj", _boom, local=True)
+        assert outcome == "error"
+        assert "ALTV outcome=error project=proj" in caplog.text
+        assert seen[-1][0] == altv.FLASH_PREFIX + altv.OUTCOME_REASONS["error"]
+
+
+def _server_view(headers: dict[str, str], body: bytes):
+    """What the REAL server parser makes of a request the listener sent."""
+    import io
+
+    from magent.upload_server import _parse_multipart
+
+    class _Handler:
+        pass
+
+    handler = _Handler()
+    handler.headers = {
+        "Content-Type": headers["Content-Type"],
+        "Content-Length": str(len(body)),
+    }
+    handler.rfile = io.BytesIO(body)
+    return _parse_multipart(handler)
+
+
+class TestUploadLimitText:
+    def test_exactly_one_megabyte_reads_in_megabytes(self):
+        from magent.sessions import upload_limit_text
+
+        assert upload_limit_text(1024 * 1024) == "1 MB"
+
+    def test_a_zero_limit_never_reads_as_zero_megabytes(self):
+        from magent.sessions import upload_limit_text
+
+        assert upload_limit_text(0) == "0 bytes"
+
+
+class TestTheListenerRequestRoundTrips:
+    """The listener's multipart, read back by the server's own parser."""
+
+    def _send(self, monkeypatch, files):
+        monkeypatch.setattr(altv, "flash_async", lambda *a, **k: None)
+        server = _Upload({"ok": True, "injected": True})
+        try:
+            assert altv.upload_files(server.url, "proj", files)[0] == "ok"
+        finally:
+            server.close()
+        return _server_view(server.headers[0], server.requests[0][1])
+
+    def test_a_file_ending_in_crlf_keeps_its_last_bytes(self, monkeypatch):
+        fields, files = self._send(monkeypatch, [("a.bat", b"echo 1\r\n\r\n")])
+        assert files["file"] == [("a.bat", b"echo 1\r\n\r\n")]
+        assert fields == {"project": "proj", "inject": "1"}
+
+    def test_a_quote_in_a_name_cannot_cut_the_name_short(self, monkeypatch):
+        _fields, files = self._send(monkeypatch, [('say "hi".txt', b"x")])
+        assert files["file"] == [("say _hi_.txt", b"x")]
+
+    def test_a_line_break_in_a_name_cannot_end_the_header(self, monkeypatch):
+        _fields, files = self._send(monkeypatch, [("a\r\nb.txt", b"x")])
+        assert files["file"] == [("a__b.txt", b"x")]
+
+
+class TestReport:
+    def test_ok_paths_is_logged_as_a_success_not_a_warning(self, monkeypatch, caplog):
+        monkeypatch.setattr(altv, "flash_async", lambda *a, **k: None)
+        with caplog.at_level("INFO", logger="magent.hotkey"):
+            altv.report("http://x:1", "p", "ok-paths", "file path pasted")
+        records = [r for r in caplog.records if "outcome=ok-paths" in r.getMessage()]
+        assert records
+        assert all(r.levelname == "INFO" for r in records)
+
+
+class TestRemoteLimitBoundary:
+    def test_a_selection_exactly_at_the_limit_is_sent(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(altv, "flash_async", lambda *a, **k: None)
+        monkeypatch.setattr(altv, "MAX_UPLOAD_BYTES", 16)
+        sent: list[object] = []
+        monkeypatch.setattr(
+            altv,
+            "upload_files",
+            lambda url, project, files: sent.append(files) or ("ok", "sent", ""),
+        )
+        paths = _files(tmp_path, a_dot_bin=b"x" * 8, b_dot_bin=b"y" * 8)
+        outcome = altv.handle_file_press("http://x:1", "p", lambda: paths, local=False)
+        assert outcome == "ok"
+        assert len(sent) == 1
+
+
+# What the kernel may hold of a body on each end of the stand-in slow link.
+# Loopback is not a slow link: Linux autotunes the sender's buffer to
+# tcp_wmem's max (4 MiB, measured) against a reader that is slow on purpose,
+# so it swallows most of a 6 MiB body in a few quick sends and the only slow
+# operation left is the wait for the reply while that backlog drains -- ~1.9 s
+# against a 2 s budget, the 8-in-10 "serve-unreachable" on an idle Linux box.
+# Capped, the slowness stays in the sends, where a real slow link puts it.
+_LINK_BUFFER_BYTES = 64 * 1024
+
+
+class _SlowUpload:
+    """A stand-in /upload that reads the body slowly but steadily: a link that
+    is always making progress, just not fast.
+
+    Both kernel buffers are capped (``_LINK_BUFFER_BYTES``): the server's here,
+    the client's through ``monkeypatch`` on the connection urllib opens.
+    """
+
+    def __init__(self, chunk: int, pause_s: float, monkeypatch: pytest.MonkeyPatch):
+        self.received: list[int] = []
+        real_connect = socket.create_connection
+
+        def capped_connect(*args, **kwargs):
+            sock = real_connect(*args, **kwargs)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _LINK_BUFFER_BYTES)
+            return sock
+
+        monkeypatch.setattr(socket, "create_connection", capped_connect)
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                left = int(self.headers.get("Content-Length", 0))
+                got = 0
+                while left > 0:
+                    data = self.rfile.read(min(chunk, left))
+                    if not data:
+                        break
+                    got += len(data)
+                    left -= len(data)
+                    time.sleep(pause_s)
+                outer.received.append(got)
+                reply = json.dumps({"ok": True, "injected": True}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(reply)))
+                self.end_headers()
+                self.wfile.write(reply)
+
+            def log_message(self, *args):
+                pass
+
+        # Set before listen() so every accepted socket inherits it.
+        self.server = HTTPServer(("127.0.0.1", 0), Handler, bind_and_activate=False)
+        self.server.socket.setsockopt(
+            socket.SOL_SOCKET, socket.SO_RCVBUF, _LINK_BUFFER_BYTES
+        )
+        self.server.server_bind()
+        self.server.server_activate()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self._thread.join(timeout=10)
+
+
+class TestTheRemoteBodyIsStreamed:
+    """A remote press sends its files straight off disk, a block at a time."""
+
+    def test_a_file_containing_the_old_fixed_boundary_arrives_byte_identical(
+        self, monkeypatch, tmp_path
+    ):
+        # Any file goes now -- a log, a .eml, a HAR, a test fixture -- and one
+        # that happened to hold the listener's FIXED boundary line used to be
+        # cut there, with the server saying ok.
+        monkeypatch.setattr(altv, "flash_async", lambda *a, **k: None)
+        payload = b"line one\r\n------MagentUpload\r\nline three\r\n"
+        paths = _files(tmp_path, dump_dot_txt=payload)
+        server = _Upload({"ok": True, "injected": True})
+        try:
+            outcome = altv.handle_file_press(
+                server.url, "proj", lambda: paths, local=False
+            )
+        finally:
+            server.close()
+        assert outcome == "ok"
+        _fields, files = _server_view(server.headers[0], server.requests[0][1])
+        assert files["file"] == [("dump.txt", payload)]
+
+    def test_every_request_draws_its_own_boundary(self, monkeypatch):
+        monkeypatch.setattr(altv, "flash_async", lambda *a, **k: None)
+        server = _Upload({"ok": True, "injected": True})
+        try:
+            for _ in range(2):
+                altv.upload_files(server.url, "proj", [("a.txt", b"x")])
+        finally:
+            server.close()
+        first, second = (h["Content-Type"] for h in server.headers)
+        assert first != second
+        assert len(first.split("boundary=", 1)[1]) >= len("----MagentUpload") + 32
+
+    def test_the_body_length_is_declared_up_front(self, monkeypatch, tmp_path):
+        # The server reads exactly Content-Length and speaks no chunked
+        # encoding, so a streamed body must still say how long it is.
+        monkeypatch.setattr(altv, "flash_async", lambda *a, **k: None)
+        paths = _files(tmp_path, a_dot_bin=bytes(range(256)) * 40)
+        server = _Upload({"ok": True, "injected": True})
+        try:
+            altv.handle_file_press(server.url, "proj", lambda: paths, local=False)
+        finally:
+            server.close()
+        headers = server.headers[0]
+        assert "Transfer-Encoding" not in headers
+        assert int(headers["Content-Length"]) == len(server.requests[0][1])
+
+    def test_a_remote_press_never_loads_a_whole_file(self, monkeypatch, tmp_path):
+        # The listener is long-lived; holding every file (and then a joined
+        # copy of them all) is 200 MB for one 100 MB press.
+        import pathlib
+
+        monkeypatch.setattr(altv, "flash_async", lambda *a, **k: None)
+        paths = _files(tmp_path, a_dot_bin=b"a" * 5000, b_dot_bin=b"b" * 7000)
+        monkeypatch.setattr(
+            pathlib.Path,
+            "read_bytes",
+            lambda self: pytest.fail("a remote press must stream, not read_bytes"),
+        )
+        server = _Upload({"ok": True, "injected": True})
+        try:
+            outcome = altv.handle_file_press(
+                server.url, "proj", lambda: paths, local=False
+            )
+        finally:
+            server.close()
+        assert outcome == "ok"
+        _fields, files = _server_view(server.headers[0], server.requests[0][1])
+        assert files["file"] == [("a.bin", b"a" * 5000), ("b.bin", b"b" * 7000)]
+
+    def test_a_slow_but_steady_link_is_not_a_timeout(self, monkeypatch, tmp_path):
+        # The timeout bounds each socket operation, not the whole send: a
+        # large selection over a slow tailnet takes as long as it takes, and
+        # only a link that STOPS moving is "cannot reach magent serve".
+        monkeypatch.setattr(altv, "flash_async", lambda *a, **k: None)
+        # ~60 ms between reads against a 2 s per-operation budget: wide enough
+        # that a loaded CI box never starves one operation past it, while the
+        # whole send (~2.9 s) still outlasts it -- a single-sendall body, whose
+        # timeout is a TOTAL budget, fails here.
+        monkeypatch.setattr(altv, "UPLOAD_HTTP_TIMEOUT_S", 2.0)
+        size = 6 * 1024 * 1024
+        paths = _files(tmp_path, big_dot_bin=b"z" * size)
+        server = _SlowUpload(chunk=128 * 1024, pause_s=0.06, monkeypatch=monkeypatch)
+        # When the last block of the body left, so the slowness is proven to be
+        # in the SEND -- the thing this test is about -- and not in the wait for
+        # the reply, which one operation's budget bounds as a whole.
+        real_read = altv._StreamedBody.read
+        last_block: list[float] = []
+
+        def timed_read(body, size=-1):
+            chunk = real_read(body, size)
+            if chunk:
+                last_block[:] = [time.monotonic()]
+            return chunk
+
+        monkeypatch.setattr(altv._StreamedBody, "read", timed_read)
+        started = time.monotonic()
+        try:
+            outcome = altv.handle_file_press(
+                server.url, "proj", lambda: paths, local=False
+            )
+        finally:
+            server.close()
+        assert outcome == "ok"
+        assert last_block and last_block[0] - started > altv.UPLOAD_HTTP_TIMEOUT_S, (
+            "the send was not slow enough: the kernel buffered the body"
+        )
+        assert server.received and server.received[0] > size
+
+    def test_a_file_that_grows_mid_send_sends_only_what_it_declared(
+        self, monkeypatch, tmp_path
+    ):
+        # Content-Length is fixed when the body is built. A file that grows after
+        # it was sized (a log still being written) must send exactly the size it
+        # declared: one byte more and the server's read stops short of the
+        # closing delimiter, so the press is refused as a cut-short body.
+        monkeypatch.setattr(altv, "flash_async", lambda *a, **k: None)
+        original = b"line one\r\n" * 50
+        paths = _files(tmp_path, app_dot_log=original)
+        real_init = altv._StreamedBody.__init__
+
+        def sized_then_grown(self, segments):
+            real_init(self, segments)
+            with open(paths[0], "ab") as grow:
+                grow.write(b"GROWN AFTER SIZING\r\n" * 20)
+
+        monkeypatch.setattr(altv._StreamedBody, "__init__", sized_then_grown)
+        server = _Upload({"ok": True, "injected": True})
+        try:
+            outcome = altv.handle_file_press(
+                server.url, "proj", lambda: paths, local=False
+            )
+        finally:
+            server.close()
+        assert outcome == "ok"
+        headers, (_path, body) = server.headers[0], server.requests[0]
+        boundary = headers["Content-Type"].split("boundary=", 1)[1]
+        assert len(body) == int(headers["Content-Length"])
+        assert body.endswith(f"--{boundary}--\r\n".encode())
+        assert original + b"\r\n--" + boundary.encode() in body
+        assert b"GROWN" not in body
+
+
+class TestARemoteFileThatWillNotRead:
+    """A copied file that fails between the check and the send is NAMED -- never
+    the generic "unexpected error", and never "cannot reach magent serve"."""
+
+    def _flashes(self, monkeypatch) -> list[str]:
+        seen: list[str] = []
+        monkeypatch.setattr(
+            altv,
+            "flash_async",
+            lambda url, project, message, duration_ms=None, tint=None: seen.append(
+                message
+            ),
+        )
+        return seen
+
+    def test_a_file_held_by_another_app_is_unreadable(self, monkeypatch, tmp_path):
+        import pathlib
+
+        seen = self._flashes(monkeypatch)
+        paths = _files(tmp_path, locked_dot_xlsx=b"x" * 64)
+
+        def _locked(self, *a, **k):
+            raise PermissionError(13, "The process cannot access the file", str(self))
+
+        monkeypatch.setattr(pathlib.Path, "open", _locked)
+        server = _Upload({"ok": True, "injected": True})
+        try:
+            outcome = altv.handle_file_press(
+                server.url, "proj", lambda: paths, local=False
+            )
+        finally:
+            server.close()
+        assert outcome == "file-unreadable"
+        assert server.requests == [], "nothing is sent for a file that would not open"
+        assert seen[-1] == altv.FLASH_PREFIX + altv.OUTCOME_REASONS["file-unreadable"]
+
+    def test_a_file_deleted_after_the_check_is_missing(self, monkeypatch, tmp_path):
+        seen = self._flashes(monkeypatch)
+        # The refusal check passed; the file went before it could be sized.
+        monkeypatch.setattr(altv, "_refusal", lambda paths: None)
+        monkeypatch.setattr(
+            altv, "upload_files", lambda *a, **k: pytest.fail("nothing to upload")
+        )
+        outcome = altv.handle_file_press(
+            "http://x:1", "proj", lambda: [str(tmp_path / "gone.bin")], local=False
+        )
+        assert outcome == "file-missing"
+        assert seen[-1] == altv.FLASH_PREFIX + altv.OUTCOME_REASONS["file-missing"]
+
+    def test_a_file_deleted_before_it_opens_is_missing(self, monkeypatch, tmp_path):
+        seen = self._flashes(monkeypatch)
+        src = tmp_path / "gone.bin"
+        server = _Upload({"ok": True, "injected": True})
+        try:
+            outcome = altv.upload_files(server.url, "proj", [("gone.bin", src)])
+        finally:
+            server.close()
+        assert outcome[0] == "file-missing"
+        assert server.requests == []
+        assert seen == []  # upload_files returns; the press is what reports
+
+    def test_a_file_that_shrinks_mid_send_is_named_not_a_dead_server(
+        self, monkeypatch, tmp_path
+    ):
+        import types
+
+        seen = self._flashes(monkeypatch)
+        paths = _files(tmp_path, growing_dot_log=b"x" * 100)
+        # Sized at 10000 bytes when opened; only 100 are there to send.
+        monkeypatch.setattr(
+            altv,
+            "os",
+            types.SimpleNamespace(
+                fstat=lambda fd: types.SimpleNamespace(st_size=10_000)
+            ),
+        )
+        monkeypatch.setattr(altv, "MAX_UPLOAD_BYTES", 1 << 30)
+        server = _Upload({"ok": True, "injected": True})
+        # The shrink guard is the only thing that stops the body stream
+        # looping forever on a file with fewer bytes than it was sized at. The
+        # press runs on a thread with a deadline, and the stand-in's read of
+        # the declared length is bounded, so losing the guard FAILS in seconds
+        # instead of hanging the suite (and the CI job) with no result.
+        server.server.RequestHandlerClass.timeout = 5
+        result: list[str] = []
+        press = threading.Thread(
+            target=lambda: result.append(
+                altv.handle_file_press(server.url, "proj", lambda: paths, local=False)
+            ),
+            daemon=True,
+        )
+        press.start()
+        press.join(15)
+        try:
+            assert not press.is_alive(), "the body stream spun on a file that shrank"
+        finally:
+            server.close()
+        assert result == ["file-unreadable"]
+        assert seen[-1] == altv.FLASH_PREFIX + "a copied file changed while it was sent"
+
+    def test_a_read_that_fails_mid_send_is_unreadable(self, monkeypatch, tmp_path):
+        import io
+        import pathlib
+        import types
+
+        seen = self._flashes(monkeypatch)
+        paths = _files(tmp_path, flaky_dot_bin=b"x" * 64)
+
+        class _Flaky(io.BytesIO):
+            def read(self, size=-1):
+                raise OSError(5, "Input/output error")
+
+            def fileno(self):
+                return 0
+
+        monkeypatch.setattr(pathlib.Path, "open", lambda self, *a, **k: _Flaky())
+        monkeypatch.setattr(
+            altv,
+            "os",
+            types.SimpleNamespace(fstat=lambda fd: types.SimpleNamespace(st_size=64)),
+        )
+        server = _Upload({"ok": True, "injected": True})
+        try:
+            outcome = altv.handle_file_press(
+                server.url, "proj", lambda: paths, local=False
+            )
+        finally:
+            server.close()
+        assert outcome == "file-unreadable"
+        assert seen[-1] == altv.FLASH_PREFIX + altv.OUTCOME_REASONS["file-unreadable"]

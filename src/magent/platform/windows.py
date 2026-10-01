@@ -14,6 +14,7 @@ from ctypes import POINTER, WINFUNCTYPE, byref, create_unicode_buffer, windll
 from pathlib import Path
 from typing import Literal
 
+from magent.attach_client import ssh_program
 from magent.grid import MonitorRect, Rect
 from magent.log import get_logger
 from magent.platform import (
@@ -43,6 +44,7 @@ from magent.psmux import (
     code_on_path,
     decoration_argv,
     idle_sessions,
+    image_stem,
     probe_sessions,
 )
 
@@ -116,6 +118,10 @@ _NUDGE_SETTLE_S = 0.15
 # than stall the flow; a timeout is reported as "we could not look", and the
 # caller then leaves every window alone.
 _PROC_SCAN_TIMEOUT_S = 10.0
+
+# Characters that make `cmd /k` quote-strip or re-parse an argv[0]; an ssh
+# client path carrying one is handed to cmd as its bare name instead.
+_CMD_METACHARS = frozenset(' &()^%!"')
 
 # --- Session-0 desktop hand-off (see run_on_desktop) --------------------------
 # Scratch root for one per-call directory holding the launcher script and its
@@ -217,12 +223,12 @@ def _schtasks_exe() -> str | None:
 def _ps_quote(value: str) -> str:
     """Wrap ``value`` as ONE PowerShell single-quoted literal.
 
-    Single-quoted, so nothing inside is expanded: these are paths, and a
-    ``$`` or a backtick in one must arrive exactly as written. Doubling is the
-    only escape a single-quoted PowerShell string has, and PowerShell ends
-    such a string on FIVE code points, not one: U+0027 and the typographic
-    U+2018, U+2019, U+201A and U+201B. Every one of them is doubled, or a
-    value holding one breaks out.
+    Single-quoted, so nothing inside is expanded: these are paths and the
+    parked-pane notice, and a ``$`` or a backtick in one must arrive exactly
+    as written. Doubling is the only escape a single-quoted PowerShell string
+    has, and PowerShell ends such a string on FIVE code points, not one:
+    U+0027 and the typographic U+2018, U+2019, U+201A and U+201B. Every one of
+    them is doubled, or a value holding one breaks out.
     """
     return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", value) + "'"
 
@@ -717,10 +723,30 @@ class WindowsPlatform(Platform):
             raise OSError(f"process scan exited {proc.returncode}: {detail[:200]}")
         return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
+    def pane_reset_command(self, shell_image: str, notice: str) -> str | None:
+        if image_stem(shell_image) not in {"pwsh", "powershell"}:
+            return None  # only the two PowerShell stems have a scripted reset
+        # poc-reap2 A4, verbatim: turn OFF the modes the agent left on (mouse
+        # 1000/1002/1003/1006, focus 1004, bracketed paste 2004, the kitty
+        # keyboard stack <u and modifyOtherKeys >4;0m), pop the alternate screen
+        # (1049l) and show the cursor (25h); then clear and print the notice.
+        # The notice is ONE single-quoted literal whatever quote characters
+        # it holds (_ps_quote doubles all five): to the parser, none of it
+        # is code.
+        return (
+            "$e=[char]27; [Console]::Write("
+            '"$e[?1000l$e[?1002l$e[?1003l$e[?1006l$e[?1004l$e[?2004l'
+            '$e[<u$e[>4;0m$e[?1049l$e[?25h"); '
+            "Clear-Host; Write-Host " + _ps_quote(notice)
+        )
+
     def supports_attention_signals(self) -> bool:
         return True
 
     def supports_wt_keybindings(self) -> bool:
+        return True
+
+    def supports_attach_windows(self) -> bool:
         return True
 
     def set_window_title(self, handle: object, title: str) -> bool:
@@ -786,7 +812,17 @@ class WindowsPlatform(Platform):
             # is a single, cleanly-quoted token. Building one `ssh ... "..."`
             # string and handing it to `cmd /k` double-nests the quotes, which
             # cmd mangles (the inner quotes leak to the remote shell).
-            args.extend(["--", "cmd", "/k", "ssh", "-t", opts.ssh_host, remote])
+            # argv[0] by attach_client's rule, so this pane dials the same
+            # client (and agent) as the attach panes and the node calls.
+            client = ssh_program()
+            # `cmd /k` strips the first and last quote of a line that starts
+            # with one, so a client path that needs quoting (C:\Program Files)
+            # would eat the remote command's closing quote, and one carrying
+            # `&` or `^` is re-parsed by cmd. Only the PATH fallback yields
+            # such a path, and the bare name finds it again.
+            if any(c in _CMD_METACHARS for c in client):
+                client = "ssh"
+            args.extend(["--", "cmd", "/k", client, "-t", opts.ssh_host, remote])
         else:
             args.extend(["--", "cmd", "/k", opts.command])
 
@@ -1044,11 +1080,15 @@ class WindowsPlatform(Platform):
         input box -- and an agent that is already up and running its Bash tool
         reads ``bash`` in the foreground, so the foreground reading alone
         cannot be the guard. Anything unknown (an unreadable pane, a failed
-        process snapshot) counts as "not a casualty": never inject into a
-        pane whose state we could not establish.
+        process snapshot, an unreadable console) counts as "not a casualty":
+        never inject into a pane whose state we could not establish. A
+        console veto -- a shell-resting pane that is still unsafe to type
+        into -- is named in this log, since it leaves the pending set exactly
+        like a send that landed.
 
         One verdict per round for the whole pending set (one foreground
-        fan-out, one pane-pid fan-out, one process snapshot), not a
+        fan-out, one pane-pid fan-out, one process snapshot, and one
+        console-helper spawn when a pane passed the tree stages), not a
         round-trip per session: a full batch would otherwise serialize five.
 
         Never raises. A pane that stays bare through every attempt is logged
@@ -1060,7 +1100,12 @@ class WindowsPlatform(Platform):
         sends = 1  # the caller already typed the command once
         while True:
             time.sleep(_SEND_VERIFY_SETTLE_S)
-            idle = idle_sessions(list(pending), psmux=psmux)
+            vetoed: dict[str, str] = {}
+            idle = idle_sessions(list(pending), psmux=psmux, vetoed=vetoed)
+            for name, reason in vetoed.items():
+                # Resting at its shell but unsafe to type into: it leaves
+                # `pending` like a landed send, so say here that it did not.
+                log.warning("not re-sending into %s: %s", name, reason)
             pending = {name: w for name, w in pending.items() if name in idle}
             if not pending:
                 return

@@ -53,10 +53,13 @@ def _child_env(home) -> dict[str, str]:
     # ...and `attention -d` now supervises `magent serve` the same way, so a
     # test daemon would otherwise start a REAL upload server on this machine.
     env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+    env["MAGENT_ATTENTION_SUPERVISOR"] = "0"
     # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
     # no HOME redirect contains: a test-spawned serve/daemon must never
     # re-prioritise the developer's real psmux fleet.
     env["MAGENT_PSMUX_BOOST"] = "0"
+    env["MAGENT_NODE_SYNC"] = "0"
+    env["MAGENT_IDLE_REAP"] = "0"
     # ...and the Session-0 hand-off must never fire from a test: a runner
     # (or an ssh-driven leg) is legitimately non-interactive, and the
     # default policy would create a REAL scheduled task on somebody's
@@ -331,9 +334,12 @@ def test_healthy_upload_lands_real_file_and_injects_into_live_session(serve):
 
 
 def test_oversized_body_gets_real_413_envelope_not_a_reset(serve):
-    from magent.upload_server import MAX_UPLOAD_BYTES
+    from magent.sessions import upload_limit_text
+    from magent.upload_server import MAX_UPLOAD_BYTES, MULTIPART_ALLOWANCE_BYTES
 
-    body = b"x" * (MAX_UPLOAD_BYTES + 1)  # honest Content-Length, really sent
+    # One byte past the REQUEST ceiling (the files limit plus the multipart
+    # allowance), honest Content-Length, really sent.
+    body = b"x" * (MAX_UPLOAD_BYTES + MULTIPART_ALLOWANCE_BYTES + 1)
     conn = serve.connect(timeout=120)
     try:
         conn.request(
@@ -350,7 +356,11 @@ def test_oversized_body_gets_real_413_envelope_not_a_reset(serve):
         conn.close()
 
     assert resp.status == 413
-    assert json.loads(raw) == {"ok": False, "error": "File too large"}
+    # The refusal names the limit, so a phone user knows what to send instead.
+    assert json.loads(raw) == {
+        "ok": False,
+        "error": f"File too large - {upload_limit_text(MAX_UPLOAD_BYTES)} limit",
+    }
 
 
 def test_a_second_serve_on_the_same_port_exits_and_leaves_the_first_alone(serve):

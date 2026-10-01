@@ -17,15 +17,15 @@ from magent.discover import (
 class TestIsRealProject:
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows paths")
     def test_rejects_shallow_windows_path(self):
-        assert not _is_real_project(r"C:\Users\amind")
+        assert not _is_real_project(r"C:\Users\alice")
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows paths")
     def test_rejects_generic_dir_windows(self):
-        assert not _is_real_project(r"C:\Users\amind\OneDrive\Desktop\Projects")
+        assert not _is_real_project(r"C:\Users\alice\Documents\Projects")
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows paths")
     def test_accepts_deep_windows_path(self):
-        assert _is_real_project(r"C:\Users\amind\OneDrive\Desktop\Projects\myapp")
+        assert _is_real_project(r"C:\Users\alice\Documents\Projects\myapp")
 
     @pytest.mark.skipif(sys.platform == "win32", reason="Unix paths")
     def test_rejects_shallow_unix_path(self):
@@ -37,7 +37,7 @@ class TestIsRealProject:
 
     def test_rejects_generic_leaf_name(self):
         if sys.platform == "win32":
-            assert not _is_real_project(r"C:\Users\amind\stuff\deep\Desktop")
+            assert not _is_real_project(r"C:\Users\alice\stuff\deep\Desktop")
         else:
             assert not _is_real_project("/home/user/stuff/Desktop")
 
@@ -56,8 +56,8 @@ class TestUriToPath:
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows URI")
     def test_windows_file_uri(self):
-        result = _uri_to_path("file:///c%3A/Users/amind/project")
-        assert result == "c:/Users/amind/project"
+        result = _uri_to_path("file:///c%3A/Users/alice/project")
+        assert result == "c:/Users/alice/project"
 
     def test_non_file_uri_returns_none(self):
         assert _uri_to_path("https://example.com") is None

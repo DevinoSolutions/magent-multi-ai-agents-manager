@@ -13,15 +13,16 @@ page.
 Nothing about magent is mocked: the server, the socket, the multipart POST,
 the file write, and the psmux ``send-keys`` injection all run for real. The one
 substituted piece is the multiplexer *binary*: on the hosted Linux runner there
-is no ``psmux``, so we symlink real ``tmux`` in as ``psmux`` and stand up a real
-detached ``tmux`` session on a private socket. That makes session discovery,
-validation, AND injection genuinely exercise a live multiplexer — the file
-transfer, the deliverable under test, is 100% real.
+is no ``psmux``, so a ``psmux`` that execs real ``tmux`` goes on PATH and we
+stand up a real detached ``tmux`` session on a private socket. That makes
+session discovery, validation, AND injection genuinely exercise a live
+multiplexer — the file transfer, the deliverable under test, is 100% real. The
+wrapper only records each ``send-keys`` argv on its way through, so a test can
+count the pastes one send made.
 
 One test needs that multiplexer to be SLOW rather than fast, to reach the
-reply's third paste state (``inject_pending``): there the symlink becomes a
-one-line ``sh`` wrapper that sleeps before a ``send-keys`` and then execs the
-same real tmux. See ``_BrowserServe._install_psmux``.
+reply's third paste state (``inject_pending``): there the wrapper also sleeps
+before a ``send-keys``. See ``_BrowserServe._install_psmux``.
 
 CI-only by design (same posture as the monitor-lab tier): gated on
 ``MDTEST_BROWSER=1`` and a present Playwright/chromium, so a dev machine that
@@ -117,7 +118,8 @@ _OUTCOME_TIMEOUT_MS = 25_000
 
 class _BrowserServe:
     """A real ``magent serve`` on loopback, backed by a real tmux session
-    reachable through a ``tmux``->``psmux`` symlink, fully isolated in tmp."""
+    reachable through a ``psmux`` wrapper that execs tmux, fully isolated in
+    tmp."""
 
     TITLE = "browserproj"  # session_name(title) == title (no . : space)
 
@@ -209,29 +211,44 @@ class _BrowserServe:
     def _install_psmux(self, tmux: str, stall_s: float) -> None:
         """Put a ``psmux`` on PATH that IS real tmux.
 
-        With no stall that is the plain symlink this tier has always used. With
-        one it becomes a two-line ``sh`` wrapper that sleeps before a
-        ``send-keys`` and then execs the SAME real tmux, so the paste is merely
-        slow and still lands -- the measured production condition (a control
-        command against a busy or unfocused terminal has been timed from 3 s to
-        past 70 s), and the only one that makes ``/upload`` answer
-        ``inject_pending``. Every other subcommand -- the session probes, the
-        status-line flashes, teardown's ``kill-server`` -- goes straight
-        through, so nothing but the paste is delayed and the multiplexer under
-        test stays a real one.
+        It is a few-line ``sh`` wrapper that execs the SAME real tmux, after
+        recording the argv of every ``send-keys`` (one line per paste, args
+        split by ``\\x1f``) so a test can count the pastes a send made -- see
+        ``sends()``. With a stall it also sleeps before a ``send-keys``, so the
+        paste is merely slow and still lands -- the measured production
+        condition (a control command against a busy or unfocused terminal has
+        been timed from 3 s to past 70 s), and the only one that makes
+        ``/upload`` answer ``inject_pending``. Every other subcommand -- the
+        session probes, the status-line flashes, teardown's ``kill-server`` --
+        goes straight through, so nothing but the paste is touched and the
+        multiplexer under test stays a real one.
         """
+        self.send_log = self.bindir / "send-keys.log"
+        log = shlex.quote(str(self.send_log))
+        stall = f"    sleep {stall_s:g}\n" if stall_s else ""
         link = self.bindir / "psmux"
-        if not stall_s:
-            os.symlink(tmux, link)
-            return
         link.write_text(
             "#!/bin/sh\n"
             'for a in "$@"; do\n'
-            f'  if [ "$a" = "send-keys" ]; then sleep {stall_s:g}; break; fi\n'
+            '  if [ "$a" = "send-keys" ]; then\n'
+            f"    printf '%s\\037' \"$@\" >> {log}; printf '\\n' >> {log}\n"
+            f"{stall}"
+            "    break\n"
+            "  fi\n"
             "done\n"
             f'exec {shlex.quote(tmux)} "$@"\n'
         )
         link.chmod(0o755)
+
+    def sends(self) -> list[list[str]]:
+        """The argv of every ``send-keys`` the server ran, oldest first."""
+        if not self.send_log.exists():
+            return []
+        return [
+            line.rstrip("\x1f").split("\x1f")
+            for line in self.send_log.read_text().splitlines()
+            if line
+        ]
 
     def _child_env(self) -> dict[str, str]:
         env = {
@@ -250,10 +267,13 @@ class _BrowserServe:
         # ...and `attention -d` now supervises `magent serve` the same way, so a
         # test daemon would otherwise start a REAL upload server on this machine.
         env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+        env["MAGENT_ATTENTION_SUPERVISOR"] = "0"
         # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
         # no HOME redirect contains: a test-spawned serve/daemon must never
         # re-prioritise the developer's real psmux fleet.
         env["MAGENT_PSMUX_BOOST"] = "0"
+        env["MAGENT_NODE_SYNC"] = "0"
+        env["MAGENT_IDLE_REAP"] = "0"
         # ...and the Session-0 hand-off must never fire from a test: a runner
         # (or an ssh-driven leg) is legitimately non-interactive, and the
         # default policy would create a REAL scheduled task on somebody's
@@ -528,9 +548,170 @@ def test_clipboard_paste_upload_confirms_and_lands_byte_identical(
     assert landed, f"no file landed in {serve.uploads_dir}"
     assert len(landed) == 1, f"expected exactly one upload, got {landed}"
     assert landed[0].read_bytes() == expected, "pasted bytes differ on disk"
-    assert "paste-" in landed[0].name and landed[0].name.endswith(".png"), landed[
-        0
-    ].name
+    # The browser named the pasted file, so it keeps THAT name; only a
+    # nameless blob gets a generated paste-<ts> one.
+    assert landed[0].name.endswith("_clip.png"), landed[0].name
+
+
+def test_a_pasted_non_image_file_shows_a_tile_and_lands_byte_identical(
+    serve, page, tmp_path
+):
+    """Any file pastes, not just images: a copied archive stages as a file
+    tile carrying its own name (there is no image to preview), sends through
+    the same confirm step, and lands byte-identical under its original name."""
+    payload = bytes(range(256)) * 16  # binary, every byte value, CR/LF included
+
+    page.goto(serve.url)
+    expect(page).to_have_title("magent upload")
+
+    page.evaluate(
+        """(b64) => {
+          const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+          const dt = new DataTransfer();
+          dt.items.add(new File([bytes], 'notes.zip', {type: 'application/zip'}));
+          window.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt}));
+        }""",
+        base64.b64encode(payload).decode(),
+    )
+
+    # Staged as a FILE: the tile names it, and no image preview is shown.
+    expect(page.locator("#paste-box")).to_be_visible()
+    expect(page.locator("#paste-file")).to_be_visible()
+    expect(page.locator("#paste-name")).to_have_text("notes.zip")
+    expect(page.locator("#paste-img")).to_be_hidden()
+    expect(page.locator("#paste-send")).to_be_disabled()
+
+    page.locator(".pill", has_text=serve.TITLE).click()
+    page.locator("#paste-send").click()
+    expect(page.locator("#paste-send")).to_contain_text("\N{CHECK MARK}")
+    expect(page.locator("#toast")).to_contain_text("notes.zip")
+
+    landed = _wait_until(
+        lambda: (
+            sorted(serve.uploads_dir.glob("*")) if serve.uploads_dir.is_dir() else []
+        ),
+        timeout=10,
+    )
+    assert landed, f"no file landed in {serve.uploads_dir}"
+    assert len(landed) == 1, f"expected exactly one upload, got {landed}"
+    assert landed[0].read_bytes() == payload, "pasted bytes differ on disk"
+    assert landed[0].name.endswith("_notes.zip"), landed[0].name
+
+
+def _landed(serve, count: int) -> list[Path]:
+    return _wait_until(
+        lambda: (
+            sorted(serve.uploads_dir.glob("*"))
+            if serve.uploads_dir.is_dir()
+            and len(list(serve.uploads_dir.glob("*"))) >= count
+            else []
+        ),
+        timeout=10,
+    )
+
+
+def _assert_one_paste_of(serve, landed: list[Path]) -> None:
+    """Exactly ONE send-keys, carrying every saved path on one line -- the
+    same one-request/one-paste shape an Alt+V press of several files makes."""
+    from magent.sessions import paths_line
+
+    sends = _wait_until(serve.sends, timeout=10)
+    assert len(sends) == 1, f"expected one paste, got {sends}"
+    assert sends[0][-1] == paths_line([str(p.resolve()) for p in landed]), sends
+
+
+def test_pasting_several_files_sends_them_together_in_one_paste(serve, page, tmp_path):
+    """Copy two files, Ctrl+V once: both are staged (a tile naming them, no
+    image preview), one Send uploads them in ONE request, both land
+    byte-identical, and the pane gets ONE paste naming both."""
+    first = bytes(range(256)) * 4
+    second = b"line one\r\nline two\n"
+
+    page.goto(serve.url)
+    expect(page).to_have_title("magent upload")
+
+    page.evaluate(
+        """([a, b]) => {
+          const raw = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+          const dt = new DataTransfer();
+          dt.items.add(new File([raw(a)], 'a.zip', {type: 'application/zip'}));
+          dt.items.add(new File([raw(b)], 'b.txt', {type: 'text/plain'}));
+          window.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt}));
+        }""",
+        [base64.b64encode(first).decode(), base64.b64encode(second).decode()],
+    )
+
+    expect(page.locator("#paste-file")).to_be_visible()
+    expect(page.locator("#paste-name")).to_have_text("2 files: a.zip, b.txt")
+    expect(page.locator("#paste-img")).to_be_hidden()
+    expect(page.locator("#paste-send")).to_be_disabled()  # still gated on a pick
+
+    page.locator(".pill", has_text=serve.TITLE).click()
+    page.locator("#paste-send").click()
+    expect(page.locator("#paste-send")).to_contain_text(
+        "\N{CHECK MARK}", timeout=_OUTCOME_TIMEOUT_MS
+    )
+    expect(page.locator("#toast")).to_contain_text("2 files")
+
+    landed = _landed(serve, 2)
+    assert len(landed) == 2, f"expected two uploads, got {landed}"
+    by_name = {p.name.split("_", 1)[1]: p for p in landed}
+    assert by_name["a.zip"].read_bytes() == first
+    assert by_name["b.txt"].read_bytes() == second
+    _assert_one_paste_of(serve, [by_name["a.zip"], by_name["b.txt"]])
+
+
+def test_picking_several_files_sends_them_together_in_one_paste(serve, page, tmp_path):
+    """The picker takes several files too, with the same one-request shape."""
+    a = tmp_path / "a.log"
+    a.write_bytes(b"alpha\n")
+    b = tmp_path / "b.bin"
+    b.write_bytes(bytes(range(256)))
+
+    page.goto(serve.url)
+    page.locator(".pill", has_text=serve.TITLE).click()
+    page.set_input_files("#file", [str(a), str(b)])
+
+    expect(page.locator("#drop")).to_have_class(
+        re.compile(r"\bok\b"), timeout=_OUTCOME_TIMEOUT_MS
+    )
+    expect(page.locator("#toast")).to_contain_text("2 files")
+
+    landed = _landed(serve, 2)
+    assert len(landed) == 2, f"expected two uploads, got {landed}"
+    by_name = {p.name.split("_", 1)[1]: p for p in landed}
+    assert by_name["a.log"].read_bytes() == a.read_bytes()
+    assert by_name["b.bin"].read_bytes() == b.read_bytes()
+    _assert_one_paste_of(serve, [by_name["a.log"], by_name["b.bin"]])
+
+
+@pytest.mark.parametrize("with_a_file", [False, True], ids=["folder", "mixed"])
+def test_a_pasted_folder_is_refused_and_nothing_is_sent(serve, page, with_a_file):
+    """A folder -- alone, or among files -- refuses the whole paste in Alt+V's
+    words; nothing is staged, uploaded or pasted.
+
+    A synthetic paste cannot carry a directory ENTRY, so this drives the other
+    half of the page's detection: the empty File with no MIME type a folder
+    arrives as, consulted only for an item the browser gave no entry for.
+    """
+    page.goto(serve.url)
+    page.locator(".pill", has_text=serve.TITLE).click()
+    page.evaluate(
+        """(withFile) => {
+          const dt = new DataTransfer();
+          if (withFile) dt.items.add(new File(['x'], 'a.txt', {type: 'text/plain'}));
+          dt.items.add(new File([], 'some folder'));
+          window.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt}));
+        }""",
+        with_a_file,
+    )
+
+    expect(page.locator("#toast")).to_have_text("folders not supported - copy files")
+    expect(page.locator("#toast")).to_have_class(re.compile(r"\berr\b"))
+    expect(page.locator("#paste-box")).to_be_hidden()
+    time.sleep(1)  # a refused paste must stay refused, not upload a beat later
+    assert not serve.uploads_dir.exists() or not any(serve.uploads_dir.iterdir())
+    assert serve.sends() == []
 
 
 # Every class/text the result surfaces ever took, recorded from inside the page.

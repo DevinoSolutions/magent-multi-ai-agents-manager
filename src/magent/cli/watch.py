@@ -33,6 +33,7 @@ def _state_label(state: str) -> str:
         "done": style(padded, fg="green", bold=True),
         "working": style(padded, fg="yellow"),
         "idle": style(padded, dim=True),
+        "parked": style(padded, dim=True),
     }
     return labels.get(state, padded)
 

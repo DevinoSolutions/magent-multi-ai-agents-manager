@@ -341,6 +341,33 @@ class TestStopDaemonClearsHeartbeat:
         assert attention_cmd.stop_daemon() is True
         assert log.heartbeat_age(attention_cmd.HEARTBEAT_NAME) is None
 
+    def test_the_heartbeat_is_withdrawn_before_the_kill(self, monkeypatch, tmp_path):
+        # serve revives a daemon that is gone while its heartbeat lingers. If
+        # the heartbeat outlived the kill by even one serve tick, a deliberate
+        # stop would be read as a crash and undone -- so the revival marker is
+        # withdrawn first, and the process only killed after.
+        pid_file = tmp_path / "attention.pid"
+        pid_file.write_text("4321")
+        monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
+        alive = {4321}
+        monkeypatch.setattr(attention_cmd, "pid_alive", lambda pid: pid in alive)
+        monkeypatch.setattr(attention_cmd.sys, "platform", "win32")
+        at_kill: list[float | None] = []
+
+        class _Result:
+            returncode = 0
+
+        def _kill(*_a, **_k):
+            at_kill.append(log.heartbeat_age(attention_cmd.HEARTBEAT_NAME))
+            alive.discard(4321)
+            return _Result()
+
+        monkeypatch.setattr(attention_cmd.subprocess, "run", _kill)
+        log.write_heartbeat(attention_cmd.HEARTBEAT_NAME)
+
+        assert attention_cmd.stop_daemon() is True
+        assert at_kill == [None]
+
 
 class TestEngineFromConfig:
     """engine_from_config threads settings.attention staleness into the engine so
@@ -643,3 +670,262 @@ class TestUploadWatchdog:
 
         assert result.exit_code == 0, result.output
         assert captured["on_tick"] is not None
+
+
+class TestAPidFileFromBeforeTheBootIsNotALiveDaemon:
+    """A reboot leaves attention.pid behind, and Windows hands pid numbers out
+    again: the recorded pid can come back on an unrelated process. Read
+    naively that is a "running" daemon nobody can stop -- and a serve that
+    would never revive the real one. A pid file older than the boot cannot
+    name the daemon, whatever that pid is doing now."""
+
+    def test_a_pre_boot_pid_file_reads_as_no_daemon_and_is_cleared(
+        self, monkeypatch, tmp_path
+    ):
+        pid_file = tmp_path / "attention.pid"
+        pid_file.write_text(str(os.getpid()))  # alive -- as a recycled pid is
+        os.utime(pid_file, (1000.0, 1000.0))
+        monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
+        monkeypatch.setattr("magent.procs.boot_time", lambda: 5000.0)
+
+        assert attention_cmd.daemon_pid() is None
+        assert not pid_file.exists()
+
+    def test_a_pid_file_written_since_the_boot_is_read_as_before(
+        self, monkeypatch, tmp_path
+    ):
+        pid_file = tmp_path / "attention.pid"
+        pid_file.write_text(str(os.getpid()))
+        monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
+        monkeypatch.setattr("magent.procs.boot_time", lambda: 1000.0)
+
+        assert attention_cmd.daemon_pid() == os.getpid()
+        assert pid_file.exists()
+
+    def test_an_unknown_boot_time_changes_nothing(self, monkeypatch, tmp_path):
+        pid_file = tmp_path / "attention.pid"
+        pid_file.write_text(str(os.getpid()))
+        os.utime(pid_file, (1000.0, 1000.0))
+        monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
+        monkeypatch.setattr("magent.procs.boot_time", lambda: None)
+
+        assert attention_cmd.daemon_pid() == os.getpid()
+
+
+class _SpawnSpy:
+    """Stands in for launch.spawn_detached: records argv, spawns nothing."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: list[str], extra_flags: int = 0):
+        self.calls.append(list(args))
+        return types.SimpleNamespace(poll=lambda: None)
+
+
+class _Clock:
+    def __init__(self, t: float = 100.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class TestAttentionDaemonSupervisor:
+    """`serve` revives the attention daemon -- the other half of the mutual
+    supervision (`attention -d` already revives serve). Measured after a
+    Windows restart: the bring-up brought serve and the Alt+V listener back,
+    and nothing brought the attention daemon back at all."""
+
+    _WANTS: ClassVar[dict[str, object]] = {
+        "version": config.SCHEMA_VERSION,
+        "projects": [{"path": "api"}],
+    }
+    _NOTHING_TO_DO: ClassVar[dict[str, object]] = {
+        "version": config.SCHEMA_VERSION,
+        "projects": [{"path": "api"}],
+        "settings": {"attention": {"badge": False, "flash": False}},
+    }
+
+    def _world(self, monkeypatch, tmp_path, *, heartbeat: bool, cfg: dict):
+        monkeypatch.setattr(attention_cmd, "_PID_PATH", tmp_path / "attention.pid")
+        if heartbeat:
+            # A stale pulse: a daemon that stopped pulsing. A fresh one proves
+            # nothing dead and is never acted on.
+            log.write_heartbeat(attention_cmd.HEARTBEAT_NAME)
+            hb = log.HEARTBEAT_DIR / f"{attention_cmd.HEARTBEAT_NAME}.heartbeat"
+            stamp = time.time() - log.HEARTBEAT_MAX_AGE - 5
+            os.utime(hb, (stamp, stamp))
+        fp = FakePlatform(supports_attention=True)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        spy = _SpawnSpy()
+        monkeypatch.setattr("magent.launch.spawn_detached", spy)
+        path = tmp_path / "cfg.json"
+        path.write_text(json.dumps(cfg), encoding="utf-8")
+        return spy, str(path)
+
+    def test_a_daemon_that_was_running_and_is_gone_is_restarted(
+        self, monkeypatch, tmp_path
+    ):
+        spy, cfg = self._world(monkeypatch, tmp_path, heartbeat=True, cfg=self._WANTS)
+        sup = attention_cmd.AttentionDaemonSupervisor(cfg)
+
+        assert sup.tick() is True
+        assert len(spy.calls) == 1
+        argv = spy.calls[0]
+        # The SAME launcher a human runs: its lock and its live-pid check are
+        # what guarantee there is never a second daemon, and its renderer
+        # validation is the one the daemon itself applies.
+        assert argv[-2:] == ["attention", "-d"]
+        assert argv[argv.index("--config") + 1] == cfg
+
+    def test_a_live_daemon_is_left_alone(self, monkeypatch, tmp_path):
+        spy, cfg = self._world(monkeypatch, tmp_path, heartbeat=True, cfg=self._WANTS)
+        (tmp_path / "attention.pid").write_text(str(os.getpid()))
+        sup = attention_cmd.AttentionDaemonSupervisor(cfg)
+
+        assert sup.tick() is False
+        assert spy.calls == []
+
+    def test_a_daemon_that_never_ran_is_not_started(self, monkeypatch, tmp_path):
+        # No heartbeat file = never started, or stopped CLEANLY (`attention
+        # --stop`, `down --all` and Ctrl+C all remove it). Neither is serve's
+        # to undo: reviving a daemon the user stopped would be a background
+        # process overruling a foreground decision.
+        spy, cfg = self._world(monkeypatch, tmp_path, heartbeat=False, cfg=self._WANTS)
+        sup = attention_cmd.AttentionDaemonSupervisor(cfg)
+
+        assert sup.tick() is False
+        assert spy.calls == []
+
+    def test_a_config_with_nothing_to_render_is_not_started(
+        self, monkeypatch, tmp_path
+    ):
+        # `attention -d` would refuse with "nothing to do" and exit 1; spawning
+        # it once a cooldown forever would be a respawn loop that can only fail.
+        spy, cfg = self._world(
+            monkeypatch, tmp_path, heartbeat=True, cfg=self._NOTHING_TO_DO
+        )
+        sup = attention_cmd.AttentionDaemonSupervisor(cfg)
+
+        assert sup.tick() is False
+        assert spy.calls == []
+
+    def test_an_unreadable_config_is_not_started(self, monkeypatch, tmp_path):
+        spy, cfg = self._world(monkeypatch, tmp_path, heartbeat=True, cfg=self._WANTS)
+        (tmp_path / "cfg.json").write_text("{not json", encoding="utf-8")
+        sup = attention_cmd.AttentionDaemonSupervisor(cfg)
+
+        assert sup.tick() is False
+        assert spy.calls == []
+
+    def test_respawns_are_bounded_by_the_cooldown(self, monkeypatch, tmp_path):
+        # A daemon that dies on startup must not be respawned every interval.
+        spy, cfg = self._world(monkeypatch, tmp_path, heartbeat=True, cfg=self._WANTS)
+        clock = _Clock()
+        sup = attention_cmd.AttentionDaemonSupervisor(cfg, cooldown_s=60.0, now=clock)
+
+        assert sup.tick() is True
+        clock.t += 30.0
+        assert sup.tick() is False
+        clock.t += 31.0
+        assert sup.tick() is True
+        assert len(spy.calls) == 2
+
+    def test_the_cooldown_outlasts_a_slow_launch(self):
+        # The `-d` launcher holds the attention lock only until its child
+        # registers or REGISTRATION_TIMEOUT_S runs out. A cooldown shorter than
+        # that window could start a second launcher beside a child that is
+        # merely slow -- and a slow child that registers late is two daemons.
+        from magent.procs import REGISTRATION_TIMEOUT_S
+
+        assert attention_cmd.ATTENTION_RESPAWN_COOLDOWN_S > REGISTRATION_TIMEOUT_S
+
+    def test_the_log_says_why_it_restarted(self, monkeypatch, tmp_path, caplog):
+        _spy, cfg = self._world(monkeypatch, tmp_path, heartbeat=True, cfg=self._WANTS)
+        monkeypatch.setattr("magent.procs.boot_time", lambda: time.time() + 60)
+        sup = attention_cmd.AttentionDaemonSupervisor(cfg)
+
+        with caplog.at_level("WARNING", logger="magent.attention"):
+            assert sup.tick() is True
+
+        assert "since the last restart" in caplog.text
+        assert "starting magent attention -d" in caplog.text
+
+
+class TestAttentionWatchdog:
+    """The per-interval hook `serve` runs, or None when serve must not
+    supervise the daemon."""
+
+    def _enable(self, monkeypatch):
+        # conftest pins it OFF for every tier: a test that starts a real serve
+        # must never get a real attention daemon started behind it.
+        monkeypatch.setenv("MAGENT_ATTENTION_SUPERVISOR", "1")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+    def test_the_suite_wide_fixture_pins_it_off(self):
+        assert attention_cmd.attention_supervision_enabled() is False
+        assert attention_cmd.attention_watchdog(None) is None
+
+    def test_on_it_ticks_a_supervisor(self, monkeypatch):
+        self._enable(monkeypatch)
+        ticks: list[str | None] = []
+
+        class _Recording:
+            cooldown_s = 60.0
+
+            def __init__(self, config_path, **_kw):
+                self.config_path = config_path
+
+            def tick(self):
+                ticks.append(self.config_path)
+                return False
+
+        monkeypatch.setattr(attention_cmd, "AttentionDaemonSupervisor", _Recording)
+
+        hook = attention_cmd.attention_watchdog("cfg.json")
+
+        assert hook is not None
+        hook()
+        assert ticks == ["cfg.json"]
+
+    def test_a_failing_check_is_logged_not_raised(self, monkeypatch, caplog):
+        # It rides on serve: supervision must never take down the server that
+        # is actually serving uploads.
+        self._enable(monkeypatch)
+
+        class _Broken:
+            cooldown_s = 60.0
+
+            def __init__(self, *_a, **_kw):
+                pass
+
+            def tick(self):
+                raise OSError("spawn refused")
+
+        monkeypatch.setattr(attention_cmd, "AttentionDaemonSupervisor", _Broken)
+        hook = attention_cmd.attention_watchdog(None)
+        assert hook is not None
+
+        with caplog.at_level("ERROR", logger="magent.attention"):
+            hook()  # must not raise
+
+        assert "attention supervisor" in caplog.text
+
+    def test_a_non_interactive_logon_session_does_not_supervise(self, monkeypatch):
+        # A `magent serve` run over ssh on Windows lives in Session 0: a daemon
+        # it started would badge windows on a desktop nobody can see, and hold
+        # the attention.pid the real desktop's daemon needs.
+        self._enable(monkeypatch)
+        fp = FakePlatform(interactive_session=False)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        monkeypatch.setenv("MAGENT_SESSION0_POLICY", "refuse")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert attention_cmd.attention_watchdog(None) is None
+
+    def test_a_broken_environment_degrades_to_supervising(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_LOG_LEVEL", "NOT-A-LEVEL")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert attention_cmd.attention_supervision_enabled() is True

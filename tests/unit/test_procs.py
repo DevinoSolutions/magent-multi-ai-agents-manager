@@ -8,9 +8,15 @@ os.kill(pid, 0) branch on POSIX.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import time
+from pathlib import Path
 
 import pytest
 
@@ -31,6 +37,13 @@ from magent.procs import (
     snapshot_processes,
     spawn_unjobbed,
 )
+
+# The BASE interpreter: a venv python on Windows is a launcher that re-execs
+# the base interpreter as its child, so a pid from `sys.executable` would name
+# the launcher, not the process that holds (or lacks) the console.
+_BASE_PY = getattr(sys, "_base_executable", None) or sys.executable
+# -I -S: isolated, no site, so no venv/user layer forks underneath either.
+_SLEEP = [_BASE_PY, "-I", "-S", "-c", "import time; time.sleep(40)"]
 
 
 class TestProcessTree:
@@ -617,3 +630,600 @@ class TestTheDefaultWindowIsBounded:
 
         assert pid is None
         assert REGISTRATION_TIMEOUT_S <= clock.now < REGISTRATION_TIMEOUT_S + 0.5
+
+
+class TestConsoleClients:
+    """procs.console_clients against real processes on a real hidden console."""
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="consoles are a win32 concept")
+    def test_own_console_with_a_child_reads_both_pids(self):
+        from magent.procs import console_clients
+
+        # A hidden console of our own with one child sharing it. The holder is
+        # spawned CREATE_NO_WINDOW off the BASE executable with -I -S: Windows
+        # gives it a fresh windowless console (no launcher shim re-execs first),
+        # the suite's own console is untouched, and the grandchild inherits it.
+        script = (
+            "import subprocess,sys,time;"
+            "p=subprocess.Popen([sys.executable,'-I','-S','-c','import time;time.sleep(20)']);"
+            "open(sys.argv[1],'w').write(str(p.pid));"
+            "time.sleep(20)"
+        )
+        d = Path(tempfile.mkdtemp(prefix="magent-con-test-"))
+        pidfile = d / "child.pid"
+        holder = subprocess.Popen(
+            [_BASE_PY, "-I", "-S", "-c", script, str(pidfile)],
+            creationflags=0x08000000,  # CREATE_NO_WINDOW: a console, no window
+        )
+        child_pid: int | None = None
+        try:
+            for _ in range(100):
+                if pidfile.exists() and pidfile.stat().st_size:
+                    break
+                time.sleep(0.1)
+            child_pid = int(pidfile.read_text().strip())
+            clients = console_clients([holder.pid])
+            got = clients[holder.pid]
+            assert got is not None
+            assert got == {holder.pid, child_pid}
+        finally:
+            if child_pid is not None:
+                # The grandchild outlives the holder's kill by its full sleep.
+                with contextlib.suppress(OSError):
+                    os.kill(child_pid, signal.SIGTERM)
+            holder.kill()
+            holder.wait()
+            shutil.rmtree(d, ignore_errors=True)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="consoles are a win32 concept")
+    def test_a_detached_process_reads_none(self):
+        from magent.procs import console_clients
+
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(20)"],
+            creationflags=0x00000008,  # DETACHED_PROCESS -> no console
+        )
+        try:
+            assert console_clients([child.pid])[child.pid] is None
+        finally:
+            child.kill()
+            child.wait()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="consoles are a win32 concept")
+    def test_an_exited_pid_reads_none(self):
+        from magent.procs import console_clients
+
+        child = subprocess.Popen([_BASE_PY, "-I", "-S", "-c", "pass"])
+        child.wait()
+        assert console_clients([child.pid])[child.pid] is None
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="consoles are a win32 concept")
+    def test_a_tiny_timeout_reads_none_for_every_pid(self):
+        from magent.procs import console_clients
+
+        clients = console_clients([os.getpid()], timeout=0.001)
+        assert clients == {os.getpid(): None}
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="consoles are a win32 concept")
+    def test_a_temp_dir_that_cannot_be_made_reads_none_not_a_raise(self, monkeypatch):
+        from magent.procs import console_clients
+
+        def _full(*_a, **_k):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(tempfile, "mkdtemp", _full)
+        assert console_clients([os.getpid(), 4]) == {os.getpid(): None, 4: None}
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="consoles are a win32 concept")
+    def test_a_helper_that_cannot_start_reads_none_not_a_raise(
+        self, monkeypatch, tmp_path
+    ):
+        from magent import procs
+
+        missing = str(tmp_path / "no-such-python.exe")
+        monkeypatch.setattr(procs, "_helper_python", lambda: missing)
+        assert procs.console_clients([os.getpid()]) == {os.getpid(): None}
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="consoles are a win32 concept")
+    def test_a_hung_helper_is_killed_at_the_deadline(self, monkeypatch):
+        from magent import procs
+
+        # A helper that never answers: the call must come back near its timeout
+        # and the helper must be dead -- not waited out for its whole sleep.
+        spawned: list[subprocess.Popen] = []
+        real_popen = subprocess.Popen
+
+        def _spy(*a, **kw):
+            proc = real_popen(*a, **kw)
+            spawned.append(proc)
+            return proc
+
+        monkeypatch.setattr(procs, "_CONSOLE_HELPER", "import time; time.sleep(30)")
+        monkeypatch.setattr(subprocess, "Popen", _spy)
+        try:
+            t0 = time.monotonic()
+            got = procs.console_clients([os.getpid()], timeout=0.5)
+            elapsed = time.monotonic() - t0
+            assert got == {os.getpid(): None}
+            assert elapsed < 3.0
+            assert len(spawned) == 1
+            assert spawned[0].poll() is not None
+            assert not pid_alive(spawned[0].pid)
+        finally:
+            for p in spawned:
+                p.kill()
+                p.wait()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="consoles are a win32 concept")
+    def test_the_answer_dir_is_removed(self, monkeypatch, tmp_path):
+        from magent.procs import console_clients
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        console_clients([os.getpid()])
+        assert not list(tmp_path.glob("magent-con-*"))
+
+    def test_off_windows_every_pid_is_none(self):
+        from magent.procs import console_clients
+
+        if sys.platform == "win32":
+            pytest.skip("this asserts the POSIX early return")
+        assert console_clients([1, 2]) == {1: None, 2: None}
+
+    def test_no_pids_is_empty(self):
+        from magent.procs import console_clients
+
+        assert console_clients([]) == {}
+
+
+class TestFiletimeToEpoch:
+    def test_off_by_the_1601_epoch_offset(self):
+        from magent.procs import filetime_to_epoch
+
+        # 1601-01-01 is 0; the unix epoch is 11644473600 seconds later.
+        assert filetime_to_epoch(0) == -11_644_473_600.0
+        assert filetime_to_epoch(11_644_473_600 * 10_000_000) == 0.0
+
+
+class TestPreciseFiletime:
+    @pytest.mark.skipif(sys.platform != "win32", reason="FILETIME identity is win32")
+    def test_it_is_the_wall_clock_on_the_filetime_scale(self):
+        from magent.procs import filetime_to_epoch, precise_filetime
+
+        now = precise_filetime()
+        assert now is not None
+        assert abs(filetime_to_epoch(now) - time.time()) < 2.0
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="FILETIME identity is win32")
+    def test_it_brackets_a_process_created_between_two_reads(self):
+        """reap._stop compares these two clocks: a process created before a
+        read must read as earlier (else it is spared as a newcomer), and one
+        created after must read as later (a pid reused after the snapshot)."""
+        from magent.procs import precise_filetime, process_identity
+
+        before = precise_filetime()
+        child = subprocess.Popen(_SLEEP)
+        after = precise_filetime()
+        try:
+            ident = process_identity(child.pid)
+            assert ident is not None
+            assert before is not None and after is not None
+            assert before < ident.created < after
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_off_windows_there_is_no_clock_to_bound_a_snapshot(self):
+        from magent.procs import precise_filetime
+
+        if sys.platform == "win32":
+            pytest.skip("this asserts the POSIX early return")
+        assert precise_filetime() is None
+
+
+class TestProcessIdentity:
+    @pytest.mark.skipif(sys.platform != "win32", reason="FILETIME identity is win32")
+    def test_reads_a_child_we_spawned(self):
+        from magent.procs import process_identity
+
+        child = subprocess.Popen(_SLEEP)
+        try:
+            ident = process_identity(child.pid)
+            assert ident is not None
+            assert ident.image.lower() in {"python.exe", "python"}
+            assert ident.created > 0
+        finally:
+            child.kill()
+            child.wait()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="FILETIME identity is win32")
+    def test_an_exited_pid_is_none(self):
+        from magent.procs import process_identity
+
+        child = subprocess.Popen([_BASE_PY, "-I", "-S", "-c", "pass"])
+        child.wait()
+        assert process_identity(child.pid) is None
+
+    def test_off_windows_is_none(self):
+        from magent.procs import process_identity
+
+        if sys.platform == "win32":
+            pytest.skip("this asserts the POSIX early return")
+        assert process_identity(os.getpid()) is None
+
+
+class TestTerminateVerified:
+    @pytest.mark.skipif(sys.platform != "win32", reason="TerminateProcess is win32")
+    def test_the_right_identity_is_killed_and_bytes_returned(self, own_pids):
+        from magent.procs import process_identity, terminate_verified
+
+        child = subprocess.Popen(_SLEEP)
+        try:
+            ident = process_identity(child.pid)
+            assert ident is not None
+            own_pids.add(child.pid, ident)
+            freed = terminate_verified(child.pid, ident)
+            assert freed is not None and freed > 0
+            for _ in range(50):
+                if child.poll() is not None:
+                    break
+                time.sleep(0.1)
+            assert child.poll() is not None
+        finally:
+            child.kill()
+            child.wait()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="TerminateProcess is win32")
+    def test_a_wrong_create_time_kills_nothing(self, own_pids):
+        from magent.procs import ProcessIdentity, process_identity, terminate_verified
+
+        child = subprocess.Popen(_SLEEP)
+        try:
+            ident = process_identity(child.pid)
+            assert ident is not None
+            wrong = ProcessIdentity(image=ident.image, created=ident.created + 999)
+            # Registered as the identity the call names, so it reaches the
+            # primitive whose check is under test; no process has that one.
+            own_pids.add(child.pid, wrong)
+            assert terminate_verified(child.pid, wrong) is None
+            assert child.poll() is None  # still alive
+        finally:
+            child.kill()
+            child.wait()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="TerminateProcess is win32")
+    def test_an_exited_pid_returns_none(self, own_pids):
+        from magent.procs import ProcessIdentity, terminate_verified
+
+        child = subprocess.Popen([_BASE_PY, "-I", "-S", "-c", "pass"])
+        pid = child.pid
+        gone = ProcessIdentity(image="python.exe", created=1)
+        own_pids.add(pid, gone)
+        child.wait()
+        assert terminate_verified(pid, gone) is None
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="TerminateProcess is win32")
+    def test_the_agent_subtree_dies_and_its_parent_shell_lives(self, own_pids):
+        """shell stand-in -> agent -> grandchild, each the next one's real
+        parent. Killing ``process_tree(agent)`` takes the agent and the
+        grandchild and never the shell. (The deepest-first ORDER is reap._stop's
+        and is pinned there; this pins that each link is killable and that the
+        tree stops at the agent.)"""
+        from magent.procs import (
+            ProcessIdentity,
+            process_identity,
+            process_tree,
+            snapshot_processes,
+            terminate_verified,
+        )
+
+        # sys.executable inside a -I -S base process is that base itself, so
+        # no launcher layer is ever inserted between the links.
+        agent_code = (
+            "import subprocess,sys,time;"
+            "g=subprocess.Popen([sys.executable,'-I','-S','-c','import time;time.sleep(40)']);"
+            "print(g.pid,flush=True);"
+            "time.sleep(40)"
+        )
+        shell_code = (
+            "import subprocess,sys,time;"
+            "a=subprocess.Popen([sys.executable,'-I','-S','-c',sys.argv[1]],"
+            "stdout=subprocess.PIPE,text=True);"
+            "print(a.pid,flush=True);"
+            "print(a.stdout.readline().strip(),flush=True);"
+            "time.sleep(40)"
+        )
+        shell = subprocess.Popen(
+            [_BASE_PY, "-I", "-S", "-c", shell_code, agent_code],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        # Identities are captured the moment each pid is known: cleanup goes
+        # through the identity-guarded kill, never at a bare pid that may have
+        # been freed and reused by then.
+        links: list[tuple[int, ProcessIdentity]] = []
+        try:
+            assert shell.stdout is not None
+            agent_pid = int(shell.stdout.readline().strip())
+            agent_ident = process_identity(agent_pid)
+            assert agent_ident is not None
+            links.append((agent_pid, agent_ident))
+            own_pids.add(agent_pid, agent_ident)
+            grand_pid = int(shell.stdout.readline().strip())
+            grand_ident = process_identity(grand_pid)
+            assert grand_ident is not None
+            links.append((grand_pid, grand_ident))
+            own_pids.add(grand_pid, grand_ident)
+
+            tree = process_tree(agent_pid, snapshot_processes() or [])
+            assert {pid for _img, pid, _ppid in tree} == {agent_pid, grand_pid}
+            for _img, pid, _ppid in reversed(tree):
+                ident = process_identity(pid)
+                assert ident is not None
+                assert terminate_verified(pid, ident) is not None
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and any(
+                process_identity(pid) == ident for pid, ident in links
+            ):
+                time.sleep(0.1)
+            assert process_identity(grand_pid) != grand_ident  # the grandchild died
+            assert process_identity(agent_pid) != agent_ident  # the agent died
+            assert shell.poll() is None  # its parent shell is untouched
+        finally:
+            for pid, ident in reversed(links):
+                terminate_verified(pid, ident)  # no-op once dead or reused
+            shell.kill()
+            shell.wait()
+            if shell.stdout is not None:
+                shell.stdout.close()
+
+    def test_off_windows_returns_none(self, own_pids):
+        from magent.procs import ProcessIdentity, terminate_verified
+
+        if sys.platform == "win32":
+            pytest.skip("this asserts the POSIX early return")
+        # Registered so the call reaches the primitive; the early return (and,
+        # past it, the image mismatch) means it never opens this process.
+        nobody = ProcessIdentity(image="x", created=1)
+        own_pids.add(os.getpid(), nobody)
+        assert terminate_verified(os.getpid(), nobody) is None
+
+
+class _FakeKernel32:
+    """kernel32 as terminate_verified sees it, answered from fields: each read
+    can fail (returns 0), and every TerminateProcess is recorded. A live-process
+    identity by default -- image ``claude.exe``, created ``5000``."""
+
+    def __init__(
+        self,
+        *,
+        open_ok: bool = True,
+        exit_code: int | None = 259,  # STILL_ACTIVE; None = the read fails
+        image: str | None = "C:\\Users\\alice\\.local\\bin\\claude.exe",
+        created: int | None = 5000,
+        terminate_ok: bool = True,
+    ) -> None:
+        self.open_ok = open_ok
+        self.exit_code = exit_code
+        self.image = image
+        self.created = created
+        self.terminate_ok = terminate_ok
+        self.terminated: list[int] = []
+
+        def _memory_info(handle, counters, cb):
+            return 0  # the byte count is not what these pins are about
+
+        # A plain function, so _private_bytes can set .argtypes on it.
+        self.K32GetProcessMemoryInfo = _memory_info
+
+    def OpenProcess(self, rights, inherit, pid):
+        return 42 if self.open_ok else 0
+
+    def CloseHandle(self, handle):
+        return 1
+
+    def GetExitCodeProcess(self, handle, code_ref):
+        if self.exit_code is None:
+            return 0
+        code_ref._obj.value = self.exit_code
+        return 1
+
+    def QueryFullProcessImageNameW(self, handle, flags, buf, size_ref):
+        if self.image is None:
+            return 0
+        buf.value = self.image
+        return 1
+
+    def GetProcessTimes(self, handle, creation, exit_, kernel, user):
+        if self.created is None:
+            return 0
+        creation._obj.dwLowDateTime = self.created & 0xFFFFFFFF
+        creation._obj.dwHighDateTime = self.created >> 32
+        return 1
+
+    def TerminateProcess(self, handle, code):
+        self.terminated.append(handle)
+        return 1 if self.terminate_ok else 0
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="TerminateProcess is win32")
+class TestTerminateVerifiedGuards:
+    """Unknown never kills: every read that fails, and every identity that
+    differs in image OR creation time, refuses before TerminateProcess. Driven
+    through a fake kernel32, because a real exited pid fails at the image read
+    and would hide which guard did the refusing."""
+
+    EXPECTED = ("claude.exe", 5000)
+
+    @pytest.fixture(autouse=True)
+    def _the_fake_pid_is_ours(self, own_pids):
+        from magent.procs import ProcessIdentity
+
+        # Answered by the fake kernel32, not the OS.
+        own_pids.add(4242, ProcessIdentity(*self.EXPECTED))
+
+    def _run(self, own_pids, **fake_kwargs):
+        from magent import procs
+
+        # The fake OS sits where the real one does: behind the kernel32 the
+        # conftest guard hands out, so a kill here passes both guards.
+        fake = _FakeKernel32(**fake_kwargs)
+        own_pids.real_kernel32 = lambda: fake
+        image, created = self.EXPECTED
+        result = procs.terminate_verified(
+            4242, procs.ProcessIdentity(image=image, created=created)
+        )
+        return result, fake
+
+    def test_the_matching_identity_is_killed(self, own_pids):
+        # The control: without it every "never called" below would be vacuous.
+        result, fake = self._run(own_pids)
+        assert result == 0
+        assert fake.terminated == [42]
+
+    @pytest.mark.parametrize(
+        "fake_kwargs",
+        [
+            pytest.param({"open_ok": False}, id="unopenable"),
+            pytest.param({"exit_code": None}, id="exit-code-unreadable"),
+            pytest.param({"exit_code": 0}, id="already-exited"),
+            pytest.param({"image": None}, id="image-unreadable"),
+            pytest.param({"created": None}, id="times-unreadable"),
+            pytest.param({"image": "C:\\bin\\node.exe"}, id="same-time-other-image"),
+            pytest.param({"created": 5001}, id="same-image-other-time"),
+        ],
+    )
+    def test_anything_short_of_the_same_identity_kills_nothing(
+        self, own_pids, fake_kwargs
+    ):
+        result, fake = self._run(own_pids, **fake_kwargs)
+        assert result is None
+        assert fake.terminated == []
+
+    def test_a_failed_terminate_reports_nothing_killed(self, own_pids):
+        result, fake = self._run(own_pids, terminate_ok=False)
+        assert result is None
+        assert fake.terminated == [42]
+
+
+class TestNoDirectConsoleApiOutsideTheHelper:
+    """AttachConsole/FreeConsole/AllocConsole must appear ONLY inside the
+    helper source string -- magent must never swap ITS OWN process's console."""
+
+    def test_no_src_module_touches_the_console_swap_api(self):
+        import ast
+        from pathlib import Path
+
+        import magent
+
+        banned = {"AttachConsole", "FreeConsole", "AllocConsole"}
+        root = Path(magent.__file__).parent
+        modules = sorted(root.rglob("*.py"))
+        assert any(p.name == "procs.py" for p in modules)
+        for path in modules:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                name = (
+                    node.attr
+                    if isinstance(node, ast.Attribute)
+                    else node.id
+                    if isinstance(node, ast.Name)
+                    else None
+                )
+                if name in banned:
+                    raise AssertionError(
+                        f"{name} is referenced in {path.relative_to(root)}; "
+                        "console swaps belong only inside procs._CONSOLE_HELPER's "
+                        "source string"
+                    )
+
+
+class TestBootTime:
+    """When this machine last booted -- the fact that tells "a daemon died
+    while the machine was up" (a crash) from "a daemon that has not run since
+    the last restart" (nothing crashed; the machine went down under it). The
+    user-facing surfaces used to call both CRASHED."""
+
+    def test_it_is_known_on_every_os_the_suite_runs_on(self):
+        # Windows (GetTickCount64), Linux (/proc/stat btime) and macOS
+        # (kern.boottime) all answer, so None here is a broken probe, not an
+        # unknown platform.
+        from magent.procs import boot_time
+
+        boot = boot_time()
+        assert boot is not None
+        assert 0 < time.time() - boot < 20 * 365 * 24 * 3600
+
+    def test_the_running_test_process_started_after_it(self):
+        # The one ordering every OS guarantees: nothing alive now was written
+        # before the boot. A file this process creates must not predate it.
+        from magent.procs import predates_boot
+
+        assert predates_boot(time.time()) is False
+
+    def test_linux_btime_is_read_from_proc_stat(self):
+        from magent.procs import _btime_from_proc_stat
+
+        text = (
+            "cpu  10 0 5 100 0 0 0 0 0 0\n"
+            "intr 1 2 3\n"
+            "ctxt 12345\n"
+            "btime 1727654400\n"
+            "processes 99\n"
+        )
+        assert _btime_from_proc_stat(text) == 1727654400.0
+
+    def test_a_proc_stat_without_btime_is_unknown(self):
+        from magent.procs import _btime_from_proc_stat
+
+        assert _btime_from_proc_stat("cpu 1 2 3\n") is None
+        assert _btime_from_proc_stat("btime not-a-number\n") is None
+        assert _btime_from_proc_stat("") is None
+
+    def test_a_timestamp_before_the_boot_predates_it(self, monkeypatch):
+        from magent import procs
+
+        monkeypatch.setattr(procs, "boot_time", lambda: 1000.0)
+
+        assert procs.predates_boot(1000.0 - procs.BOOT_CLOCK_SLACK_S - 1) is True
+        assert procs.predates_boot(1000.0) is False
+        assert procs.predates_boot(5000.0) is False
+
+    def test_a_timestamp_just_before_the_boot_is_given_the_benefit_of_the_doubt(
+        self, monkeypatch
+    ):
+        # The boot time is derived, not recorded: Windows computes it as "now
+        # minus uptime", so a clock correction after the boot moves it, and
+        # Linux's btime is rounded. A pid file a LIVE listener wrote seconds
+        # after the boot must never read as pre-boot -- that verdict discards it
+        # and a supervisor starts a second listener beside the first (two
+        # keyboard hooks, every Alt+V pasted twice). Erring the other way only
+        # costs a very fast restart the old wording.
+        from magent import procs
+
+        monkeypatch.setattr(procs, "boot_time", lambda: 1000.0)
+
+        assert procs.BOOT_CLOCK_SLACK_S >= 10
+        assert procs.predates_boot(1000.0 - procs.BOOT_CLOCK_SLACK_S + 1) is False
+
+    def test_an_unknown_boot_time_never_claims_a_timestamp_predates_it(
+        self, monkeypatch
+    ):
+        # The fallback is today's behaviour: with no boot time, nothing is
+        # re-labelled, so every caller keeps reading exactly what it read before.
+        from magent import procs
+
+        monkeypatch.setattr(procs, "boot_time", lambda: None)
+
+        assert procs.predates_boot(0.0) is False
+
+    def test_a_failing_probe_is_unknown_not_an_exception(self, monkeypatch):
+        # A status line must never die of a boot-time probe.
+        from magent import procs
+
+        def _boom() -> float | None:
+            raise OSError("probe failed")
+
+        monkeypatch.setattr(procs, "_probe_boot_time", _boom)
+
+        assert procs.boot_time() is None

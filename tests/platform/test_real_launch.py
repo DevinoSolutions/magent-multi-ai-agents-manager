@@ -71,10 +71,13 @@ def _child_env(home) -> dict[str, str]:
     # ...and `attention -d` now supervises `magent serve` the same way, so a
     # test daemon would otherwise start a REAL upload server on this machine.
     env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+    env["MAGENT_ATTENTION_SUPERVISOR"] = "0"
     # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
     # no HOME redirect contains: a test-spawned serve/daemon must never
     # re-prioritise the developer's real psmux fleet.
     env["MAGENT_PSMUX_BOOST"] = "0"
+    env["MAGENT_NODE_SYNC"] = "0"
+    env["MAGENT_IDLE_REAP"] = "0"
     # ...and the Session-0 hand-off must never fire from a test: a runner
     # (or an ssh-driven leg) is legitimately non-interactive, and the
     # default policy would create a REAL scheduled task on somebody's

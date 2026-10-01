@@ -12,6 +12,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -472,6 +473,52 @@ class TestStartPsmuxAndUpload:
         assert fp.attached_psmux == []
 
 
+class TestTheGoPathEnsuresTheServerRatherThanSpawningOne:
+    """`--go` and the menu's "u" used to spawn `magent serve` on EVERY bring-up,
+    with no look at the port first. Since the exclusive bind that second serve
+    only dies with "port ... is already in use" (the upload.log warnings seen
+    from strange pids on 2026-09-29); before it, it was a real second server.
+    The phase now goes through the one probe-then-spawn seam every other
+    spawner already uses."""
+
+    def _run(self, monkeypatch, *, answering: bool) -> list[list[str]]:
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(launch, "_probe_upload_port", lambda _p: answering)
+        monkeypatch.setattr(launch, "spawn_detached", spawned.append)
+        monkeypatch.setattr("magent.launch.tailnet.ip4", lambda: None)
+        monkeypatch.setattr(
+            "magent.launch.start_hotkey_listener", lambda *_a, **_k: None
+        )
+        cfg = MagentConfig(
+            projects=[],
+            settings=Settings(psmux=True, upload_server=True, upload_port=9911),
+        )
+        result = _LaunchResult(
+            targets=[],
+            psmux_windows=[
+                PsmuxWindowOpts(window_name="a", cwd="/tmp/a", command="claude")
+            ],
+            psmux_colors={"a": None},
+        )
+        _start_psmux_and_upload(
+            FakePlatform(supports_psmux=True),
+            cfg,
+            RunOpts(config_path="cfg.json"),
+            result,
+        )
+        return spawned
+
+    def test_a_server_already_answering_is_left_alone(self, monkeypatch, capsys):
+        assert self._run(monkeypatch, answering=True) == []
+        # The URL is still advertised: it names the server that IS running.
+        assert "localhost:9911" in capsys.readouterr().out
+
+    def test_a_dead_port_gets_the_argv_every_other_spawner_uses(self, monkeypatch):
+        assert self._run(monkeypatch, answering=False) == [
+            launch.upload_server_argv(9911, "cfg.json")
+        ]
+
+
 class TestGoPathCreationVerify:
     """The --go path reaches psmux through the same `launch_psmux_session` the
     attach path's `bring_up` does, so it shares the creation verify: a session
@@ -680,11 +727,11 @@ class TestSupervisedHotkeyTarget:
         manifest = {
             "version": "9.9.9",
             "server_url": "http://deck:8034",
-            "ssh_host": "amin@deck",
+            "ssh_host": "demo@deck",
         }
         assert launch.supervised_hotkey_target(manifest, "http://127.0.0.1:8034") == (
             "http://deck:8034",
-            "amin@deck",
+            "demo@deck",
         )
 
     def test_a_local_listener_keeps_its_null_ssh_host(self):
@@ -707,10 +754,10 @@ class TestSupervisedHotkeyTarget:
         )
 
     def test_a_manifest_missing_its_url_falls_back_rather_than_aiming_at_none(self):
-        manifest = {"version": "9.9.9", "server_url": None, "ssh_host": "amin@deck"}
+        manifest = {"version": "9.9.9", "server_url": None, "ssh_host": "demo@deck"}
         url, ssh_host = launch.supervised_hotkey_target(manifest, "http://fallback:1")
         assert url == "http://fallback:1"
-        assert ssh_host == "amin@deck"
+        assert ssh_host == "demo@deck"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="hotkey is Windows-only")
@@ -742,7 +789,7 @@ class TestEnsureHotkeyListener:
             manifest={
                 "version": "9.9.9",
                 "server_url": "http://deck:8034",
-                "ssh_host": "amin@deck",
+                "ssh_host": "demo@deck",
             },
         )
 
@@ -750,7 +797,294 @@ class TestEnsureHotkeyListener:
 
         # NOT the supervisor's own loopback URL -- that would read as a target
         # change and kill the listener `magent attach` set up.
-        assert calls == [("http://deck:8034", "amin@deck")]
+        assert calls == [("http://deck:8034", "demo@deck")]
+
+
+def _filetime(epoch: float) -> int:
+    """The FILETIME ``procs.filetime_to_epoch`` maps back to ``epoch``."""
+    return int((epoch + 11_644_473_600) * 10_000_000)
+
+
+class TestWedgedListenerReason:
+    """The proof a live-pid listener is wedged, not merely quiet or recycled.
+
+    Pure: every input is a plain value, so the whole decision runs on every OS.
+    """
+
+    NOW = 10_000.0
+    STALE = NOW - launch.WEDGED_LISTENER_GRACE_S - 5  # last pulse, past the grace
+
+    def _ident(self, *, image="python.exe", created_epoch=None):
+        from magent.procs import ProcessIdentity
+
+        born = self.STALE - 600 if created_epoch is None else created_epoch
+        return ProcessIdentity(image=image, created=_filetime(born))
+
+    def test_a_python_older_than_its_last_pulse_and_silent_past_the_grace_is_wedged(
+        self,
+    ):
+        reason = launch.wedged_listener_reason(self.STALE, self.NOW, self._ident())
+        assert reason is not None
+        assert "heartbeat" in reason
+
+    def test_a_pulse_inside_the_grace_is_not_a_wedge(self):
+        fresh = self.NOW - launch.WEDGED_LISTENER_GRACE_S + 5
+        assert launch.wedged_listener_reason(fresh, self.NOW, self._ident()) is None
+
+    def test_no_heartbeat_file_is_never_a_wedge(self):
+        # Missing is what `status` calls "off"/"crashed"; a listener that never
+        # pulsed gives us nothing to compare its creation time against.
+        assert launch.wedged_listener_reason(None, self.NOW, self._ident()) is None
+
+    def test_an_unreadable_identity_is_never_a_wedge(self):
+        assert launch.wedged_listener_reason(self.STALE, self.NOW, None) is None
+
+    def test_a_reused_pid_is_never_a_wedge(self):
+        # Created AFTER the last pulse: this pid is not the process that pulsed,
+        # it is whatever inherited the number when the listener died.
+        born_later = self.STALE + 30
+        ident = self._ident(created_epoch=born_later)
+        assert launch.wedged_listener_reason(self.STALE, self.NOW, ident) is None
+
+    def test_a_pid_that_is_not_python_is_never_a_wedge(self):
+        for image in ("notepad.exe", "claude.exe", "explorer"):
+            ident = self._ident(image=image)
+            assert launch.wedged_listener_reason(self.STALE, self.NOW, ident) is None, (
+                image
+            )
+
+    def test_pythonw_and_a_capitalised_image_still_count_as_python(self):
+        for image in ("pythonw.exe", "Python.EXE", "python3.13.exe"):
+            ident = self._ident(image=image)
+            assert launch.wedged_listener_reason(self.STALE, self.NOW, ident), image
+
+    def test_the_grace_is_a_multiple_of_the_stale_threshold_not_a_bare_number(self):
+        from magent.log import HEARTBEAT_INTERVAL, HEARTBEAT_MAX_AGE
+
+        # Comfortably past what `status` already calls stale, and many missed
+        # pulses -- a wedge verdict is a kill, so it must be slower than a label.
+        assert launch.WEDGED_LISTENER_GRACE_S >= 2 * HEARTBEAT_MAX_AGE
+        assert launch.WEDGED_LISTENER_GRACE_S >= 6 * HEARTBEAT_INTERVAL
+
+
+class TestListenerWatch:
+    def test_a_wedge_needs_the_same_pid_and_pulse_on_two_ticks(self):
+        watch = launch.ListenerWatch()
+        assert watch.confirm(501, 100.0) is False  # first sighting: just note it
+        assert watch.confirm(501, 100.0) is True  # unchanged a tick later
+
+    def test_a_pulse_in_between_resets_the_confirm(self):
+        # A machine that slept: the heartbeat is old at the first tick, then the
+        # listener wakes and pulses. That is a recovery, not a wedge.
+        watch = launch.ListenerWatch()
+        watch.confirm(501, 100.0)
+        assert watch.confirm(501, 160.0) is False
+
+    def test_a_different_pid_resets_the_confirm(self):
+        watch = launch.ListenerWatch()
+        watch.confirm(501, 100.0)
+        assert watch.confirm(502, 100.0) is False
+
+    def test_cooldown_bounds_replacements(self):
+        watch = launch.ListenerWatch()
+        assert watch.in_cooldown(1_000.0) is False  # nothing replaced yet
+        watch.last_replaced = 1_000.0
+        cd = launch.WEDGED_REPLACE_COOLDOWN_S
+        assert watch.in_cooldown(1_000.0 + cd - 1) is True
+        assert watch.in_cooldown(1_000.0 + cd) is False
+
+    def test_the_cooldown_outlasts_the_time_a_fresh_wedge_takes_to_prove(self):
+        # A listener that wedges the instant it is born still needs the grace
+        # plus one confirm tick before it can be judged; the cooldown must be a
+        # real bound on top of that, not a number the natural cadence already beats.
+        from magent.upload_server import HOTKEY_SUPERVISE_INTERVAL_S
+
+        proof_s = launch.WEDGED_LISTENER_GRACE_S + HOTKEY_SUPERVISE_INTERVAL_S
+        assert 2 * proof_s <= launch.WEDGED_REPLACE_COOLDOWN_S
+
+
+class TestRetireWedgedListener:
+    """The verdict -> kill -> forget sequence, with every process seam faked.
+
+    ``magent.hotkey`` raises ImportError off win32, so a stand-in module is
+    dropped into ``sys.modules`` -- the sequence under test runs on every OS and
+    no test ever creates, signals or hooks a real listener.
+    """
+
+    PID = 501
+    NOW = 10_000.0
+    MONO = 50_000.0
+    STALE = NOW - launch.WEDGED_LISTENER_GRACE_S - 5
+
+    @pytest.fixture
+    def rig(self, monkeypatch):
+        import types
+
+        from magent.procs import ProcessIdentity
+
+        r = types.SimpleNamespace(
+            killed=[], forgotten=[], mtime=self.STALE, identity=None, kill_result=1234
+        )
+        r.identity = ProcessIdentity("python.exe", _filetime(self.STALE - 600))
+
+        def _kill(pid, expected):
+            r.killed.append((pid, expected))
+            return r.kill_result
+
+        fake_hotkey = types.ModuleType("magent.hotkey")
+        fake_hotkey.forget_listener = lambda: r.forgotten.append(True)
+        monkeypatch.setitem(sys.modules, "magent.hotkey", fake_hotkey)
+        monkeypatch.setattr("magent.launch.heartbeat_mtime", lambda name: r.mtime)
+        monkeypatch.setattr("magent.launch.process_identity", lambda pid: r.identity)
+        monkeypatch.setattr("magent.launch.terminate_verified", _kill)
+        return r
+
+    def _retire(self, watch, now=None, mono=None):
+        return launch.retire_wedged_listener(
+            self.PID,
+            watch,
+            now=self.NOW if now is None else now,
+            mono=self.MONO if mono is None else mono,
+        )
+
+    def test_first_sighting_kills_nothing(self, rig):
+        assert self._retire(launch.ListenerWatch()) is False
+        assert rig.killed == [] and rig.forgotten == []
+
+    def test_second_sighting_ends_the_verified_process_and_forgets_it(self, rig):
+        watch = launch.ListenerWatch()
+        self._retire(watch)
+
+        assert self._retire(watch) is True
+
+        assert rig.killed == [(self.PID, rig.identity)]  # the identity we proved
+        assert rig.forgotten == [True]
+        assert watch.last_replaced == self.MONO
+
+    def test_a_healthy_listener_is_left_alone_and_the_confirm_resets(self, rig):
+        watch = launch.ListenerWatch()
+        self._retire(watch)
+        rig.mtime = self.NOW - 3  # it pulsed
+
+        assert self._retire(watch) is False
+        assert watch.suspect is None
+        rig.mtime = self.STALE  # and wedged again later: back to a first sighting
+        assert self._retire(watch) is False
+        assert rig.killed == []
+
+    def test_a_reused_pid_is_not_killed(self, rig):
+        from magent.procs import ProcessIdentity
+
+        rig.identity = ProcessIdentity("python.exe", _filetime(self.STALE + 40))
+        watch = launch.ListenerWatch()
+        self._retire(watch)
+        assert self._retire(watch) is False
+        assert rig.killed == [] and rig.forgotten == []
+
+    def test_a_refused_kill_forgets_nothing_and_still_starts_the_cooldown(
+        self, rig, caplog
+    ):
+        # terminate_verified returns None when the identity moved or the handle
+        # was refused. Nothing died, so nothing may be forgotten (a second
+        # listener spawned over a live one is the worse failure) -- and the
+        # attempt still counts, or a permanently refused kill retries forever.
+        rig.kill_result = None
+        watch = launch.ListenerWatch()
+        self._retire(watch)
+
+        with caplog.at_level("WARNING", logger="magent.hotkey"):
+            assert self._retire(watch) is False
+
+        assert rig.forgotten == []
+        assert watch.last_replaced == self.MONO
+        assert "could not end" in caplog.text
+
+    def test_the_cooldown_stops_a_kill_storm_and_logs_once(self, rig, caplog):
+        watch = launch.ListenerWatch()
+        self._retire(watch)
+        self._retire(watch)  # replaced at MONO
+        assert len(rig.killed) == 1
+
+        soon = self.MONO + launch.WEDGED_REPLACE_COOLDOWN_S - 1
+        with caplog.at_level("WARNING", logger="magent.hotkey"):
+            for _ in range(4):  # the fresh listener wedged again, four ticks running
+                self._retire(watch, mono=soon)
+        assert len(rig.killed) == 1
+        assert caplog.text.count("cooldown") == 1  # one line, not one per tick
+
+        later = self.MONO + launch.WEDGED_REPLACE_COOLDOWN_S
+        self._retire(watch, mono=later)
+        assert len(rig.killed) == 2  # and it is bounded, not banned
+
+    def test_the_replacement_is_logged_with_the_reason(self, rig, caplog):
+        watch = launch.ListenerWatch()
+        self._retire(watch)
+        with caplog.at_level("WARNING", logger="magent.hotkey"):
+            self._retire(watch)
+        assert "replacing wedged listener pid=501" in caplog.text
+        assert "heartbeat" in caplog.text
+
+    def test_no_heartbeat_file_does_not_even_read_the_identity(self, rig, monkeypatch):
+        rig.mtime = None
+
+        def _boom(pid):
+            raise AssertionError("identity read for a listener that is not suspect")
+
+        monkeypatch.setattr("magent.launch.process_identity", _boom)
+        assert self._retire(launch.ListenerWatch()) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="hotkey is Windows-only")
+class TestEnsureReplacesAWedgedListener:
+    """``ensure_hotkey_listener`` wires the retire step in without ever
+    re-aiming: the replacement inherits the manifest's target."""
+
+    REMOTE: ClassVar[dict[str, str]] = {
+        "version": "9.9.9",
+        "server_url": "http://deck:8034",
+        "ssh_host": "demo@deck",
+    }
+
+    def _wire(self, monkeypatch, *, retire_result):
+        state = {"manifest": dict(self.REMOTE), "spawns": []}
+        monkeypatch.setattr("magent.hotkey.listener_pid", lambda: 777)
+        monkeypatch.setattr(
+            "magent.hotkey.listener_manifest", lambda: state["manifest"]
+        )
+
+        def _retire(pid, watch, **kw):
+            state["manifest"] = None  # forgetting the listener clears its manifest
+            return retire_result
+
+        monkeypatch.setattr("magent.launch.retire_wedged_listener", _retire)
+        monkeypatch.setattr(
+            "magent.launch.start_hotkey_listener",
+            lambda url, ssh_host=None: state["spawns"].append((url, ssh_host)) or 4242,
+        )
+        return state
+
+    def test_the_replacement_keeps_the_remote_target(self, monkeypatch):
+        state = self._wire(monkeypatch, retire_result=True)
+
+        pid = launch.ensure_hotkey_listener(
+            "http://127.0.0.1:8034", watch=launch.ListenerWatch()
+        )
+
+        assert pid == 4242
+        # Read BEFORE the kill cleared the manifest: not the supervisor's own
+        # loopback URL, which would silently un-wire `magent attach`.
+        assert state["spawns"] == [("http://deck:8034", "demo@deck")]
+
+    def test_without_a_watch_nothing_is_ever_retired(self, monkeypatch):
+        def _boom(*a, **k):
+            raise AssertionError("retire_wedged_listener without a watch")
+
+        state = self._wire(monkeypatch, retire_result=True)
+        monkeypatch.setattr("magent.launch.retire_wedged_listener", _boom)
+
+        launch.ensure_hotkey_listener("http://127.0.0.1:8034")
+
+        assert state["spawns"] == [("http://deck:8034", "demo@deck")]
 
 
 class TestLocalHotkeyListener:
@@ -888,6 +1222,46 @@ class TestLaunchProjects:
         assert result.targets[0].mode == "contains"
         assert result.targets[0].is_new is True
         assert len(fp.launched_vscode) == 1
+
+
+class TestTheRemoteSshWarningAsksTheClientRule:
+    """The "ssh not on PATH" warning asks attach_client's rule, the one the
+    remote panes dial through -- so Windows' own OpenSSH with nothing on PATH
+    is not a missing client, and nothing found anywhere still warns."""
+
+    def _launch(self):
+        fp = FakePlatform()
+        projects = [ProjectConfig(path="/srv/api", tool="claude", host="u@host")]
+        cfg = MagentConfig(
+            projects=projects,
+            settings=Settings(
+                tools={"claude": "claude --continue"}, default_tool="claude"
+            ),
+        )
+        _launch_projects(fp, cfg, RunOpts(), projects, None)
+
+    def test_the_system_client_alone_is_not_a_missing_client(
+        self, monkeypatch, capsys, fake_sleep
+    ):
+        from magent import attach_client
+
+        monkeypatch.setattr(
+            attach_client, "find_ssh", lambda: r"C:\Windows\System32\OpenSSH\ssh.exe"
+        )
+        monkeypatch.setattr("shutil.which", lambda _name: None)
+        self._launch()
+        assert "no ssh client found" not in capsys.readouterr().out
+
+    def test_no_client_anywhere_still_warns(self, monkeypatch, capsys, fake_sleep):
+        from magent import attach_client
+
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: None)
+        monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+        self._launch()
+        out = capsys.readouterr().out
+        # The rule looks past PATH (Windows' own OpenSSH first).
+        assert "Remote projects configured but no ssh client found." in out
+        assert "PATH" not in out
 
 
 class TestPrepareGrid:
@@ -2064,6 +2438,26 @@ class TestUploadServerSupervisor:
             sup.tick()
 
         assert "recorded pid 4321 is alive" in caplog.text
+
+    def test_a_live_recorded_pid_never_stops_a_respawn(self, monkeypatch):
+        # The pid file is read for the LOG LINE only. A live pid on record --
+        # a wedged serve, or a number the OS handed out again after a restart --
+        # must not stand in for a server that does not answer.
+        spawned = self._wire(monkeypatch, alive=[False])
+        monkeypatch.setattr("magent.upload_server.server_pid", lambda _p: 4321)
+        monkeypatch.setattr(launch, "pid_alive", lambda _p: True)
+        sup = launch.UploadServerSupervisor(8099, now=_FakeClock())
+
+        assert sup.tick() is True
+        assert len(spawned) == 1
+
+    def test_an_answering_port_is_left_alone_with_no_pid_on_record(self, monkeypatch):
+        spawned = self._wire(monkeypatch, alive=[True])
+        monkeypatch.setattr("magent.upload_server.server_pid", lambda _p: None)
+        sup = launch.UploadServerSupervisor(8099, now=_FakeClock())
+
+        assert sup.tick() is False
+        assert spawned == []
 
     def test_no_pid_file_says_so(self, monkeypatch, caplog):
         self._wire(monkeypatch, alive=[False])

@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import dataclasses
 import os
-import shutil
 import socket
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import click
 
-from magent import tailnet
+from magent import attach_client, tailnet
+from magent.config import NODE_AUTO, runs_on_node
 from magent.grid import TileSlot, compute_grid
-from magent.log import get_logger
+from magent.log import HEARTBEAT_MAX_AGE, get_logger, heartbeat_fresh, heartbeat_mtime
 from magent.platform import (
     Platform,
     PsmuxWindowOpts,
@@ -25,13 +28,17 @@ from magent.platform import (
 from magent.procs import (
     REGISTRATION_TIMEOUT_S,
     await_registration,
+    filetime_to_epoch,
     pid_alive,
+    process_identity,
     spawn_unjobbed,
+    terminate_verified,
 )
 from magent.sessions import (
     AGENT_TOOLS,
     build_resume_command,
     build_start_command,
+    fresh_start_command,
     ide_command,
     is_ide_tool,
 )
@@ -45,6 +52,15 @@ if TYPE_CHECKING:
 
     from magent.config import MagentConfig, ProjectConfig
     from magent.env import MagentEnv
+    from magent.nodes import (
+        LoadSample,
+        LocalGitState,
+        Node,
+        NodeMapEntry,
+        Recipe,
+    )
+    from magent.nodes import Placement as NodePlacement
+    from magent.procs import ProcessIdentity
 
 
 def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[bytes]:
@@ -97,6 +113,22 @@ SESSION0_SERVE_REFUSAL = (
     "needs for Alt+V. Run 'magent serve' on the host's own desktop, or set "
     "MAGENT_SESSION0_POLICY=allow for a headless host."
 )
+# The two other survivors a Session-0 magent could plant. Neither is a command
+# `magent attach` fires, so they are refused at their spawn seams (and `attention
+# -d`, a command shell like `serve --ensure`, hands off first).
+SESSION0_HOTKEY_REFUSAL = (
+    "refusing to start the Alt+V listener from a non-interactive logon session "
+    "(Session 0 / ssh): its keyboard hook would never see a key typed at this "
+    "host's desktop. Run 'magent serve' on the host's own desktop (it starts "
+    "the listener), or set MAGENT_SESSION0_POLICY=allow for a headless host."
+)
+SESSION0_ATTENTION_REFUSAL = (
+    "refusing to start the attention daemon from a non-interactive logon "
+    "session (Session 0 / ssh): it would badge windows on a desktop it cannot "
+    "see and revive the upload server out of this desktop's reach. Run "
+    "'magent attention -d' on the host's own desktop, or set "
+    "MAGENT_SESSION0_POLICY=allow for a headless host."
+)
 # The same refusal with a different cause, and worth its own sentence: the
 # policy DID ask for a hand-off and there is simply nowhere to hand off TO.
 # Telling that user to "run it on the desktop" would be advice they cannot
@@ -112,6 +144,7 @@ SESSION0_NO_DESKTOP = (
 # `serve --ensure` returns the moment a detached server answers.
 SESSION0_UP_TIMEOUT_S = 900.0
 SESSION0_SERVE_TIMEOUT_S = 60.0
+SESSION0_ATTENTION_TIMEOUT_S = 60.0
 
 
 def session0_disposition(plat: Platform) -> Literal["run", "handoff", "refuse"]:
@@ -154,17 +187,28 @@ def session0_refusal(plat: Platform, base: str = SESSION0_REFUSAL) -> str:
     return base
 
 
+def session0_block(base: str, plat: Platform | None = None) -> str | None:
+    """Why a daemon spawn seam must not spawn here, or None when it may run.
+
+    The question every daemon spawn seam asks (``base`` names what was
+    refused). A seam is not the command the user typed, so it can never hand
+    off -- only refuse, exactly like the psmux choke point. The wording falls
+    to ``SESSION0_NO_DESKTOP`` when there is no desktop to go to.
+    """
+    plat = plat or get_platform()
+    if session0_disposition(plat) == "run":
+        return None
+    return session0_refusal(plat, base)
+
+
 def session0_note() -> str | None:
-    """The one-line reason session creation is blocked here, or None.
+    """The one-line reason a spawn is blocked here, or None when it may run.
 
     What the "N session(s) failed to come up" printers add so a casualty list
     carries its cause. A user staring at 40 failed names must not have to find
     launch.log to learn that nothing was even attempted.
     """
-    plat = get_platform()
-    if session0_disposition(plat) == "run":
-        return None
-    return session0_refusal(plat)
+    return session0_block(SESSION0_REFUSAL)
 
 
 def report_bring_up_casualties(
@@ -285,7 +329,14 @@ def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int |
     this exact target (see ``hotkey_restart_reason``); anything else is killed
     and respawned. Repeat calls with identical arguments are therefore a no-op,
     which matters because `magent attach` re-runs this on every attach.
+
+    Refused in a non-interactive logon session (Session 0), before anything
+    else: a keyboard hook there never sees a key typed at the desktop.
     """
+    refusal = session0_block(SESSION0_HOTKEY_REFUSAL)
+    if refusal:
+        get_logger("hotkey").warning("%s", refusal)
+        return None
     from magent.hotkey import (  # ImportError off-Windows (hotkey.py guards); must stay lazy
         listener_manifest,
         listener_pid,
@@ -340,7 +391,159 @@ def supervised_hotkey_target(
     return manifest.get("server_url") or default_url, manifest.get("ssh_host")
 
 
-def ensure_hotkey_listener(default_url: str) -> int | None:
+# A listener whose pid is alive but whose heartbeat stopped is WEDGED: the
+# process exists, the keyboard hook may or may not still fire, and nothing ever
+# replaced it (`ensure_hotkey_listener` only asked "is there a pid?"). The
+# heartbeat proves the message loop is turning, so a silent one means Alt+V and
+# F2 are dead behind a live pid.
+#
+# 3x the stale threshold `status` already reports (HEARTBEAT_MAX_AGE, 30s) = 90s,
+# nine missed 10s pulses. "Stale" is a label; this verdict ends a process, so it
+# must be slower than the label and clear of every benign silence: a busy
+# machine, a debugger pause, a laptop that slept (which stalls serve's own
+# supervisor thread just the same, and is separately absorbed by the two-tick
+# confirm on `ListenerWatch`).
+WEDGED_LISTENER_GRACE_S = 3 * HEARTBEAT_MAX_AGE
+
+# At most one replacement per five minutes. A fresh listener needs ~90s of grace
+# plus a 30s confirm tick before it can be judged wedged again, so the natural
+# floor on the kill/spawn cycle is already ~2 minutes; the cooldown is the real
+# bound on top of it (max 12 an hour) for a listener that wedges the instant it
+# starts, e.g. a broken hook install -- kill/spawn churn there would flash
+# console windows and steal keyboard-hook ownership on every cycle, and a
+# listener that is broken at birth is not fixed by replacing it faster.
+WEDGED_REPLACE_COOLDOWN_S = 300.0
+
+
+@dataclass
+class ListenerWatch:
+    """What one supervisor remembers between ticks about the listener it watches.
+
+    In-memory on purpose: a serve restart is a fresh look at the world, and the
+    first tick after it can only ever be a first sighting.
+    """
+
+    suspect: tuple[int, float] | None = None  # (pid, heartbeat mtime) last seen wedged
+    last_replaced: float | None = None  # time.monotonic() of the last attempt
+    cooldown_logged: bool = False
+    unverifiable_pid: int | None = None  # the pid we already warned we cannot prove
+
+    def confirm(self, pid: int, mtime: float) -> bool:
+        """True once the SAME pid has shown the SAME last pulse on two ticks.
+
+        A machine that slept looks wedged on the tick it wakes (old heartbeat)
+        and healthy on the next (the listener pulsed in between); requiring the
+        pulse to be unchanged across a tick apart turns that into a non-event.
+        """
+        key = (pid, mtime)
+        if self.suspect == key:
+            return True
+        self.suspect = key
+        return False
+
+    def in_cooldown(self, mono: float) -> bool:
+        return (
+            self.last_replaced is not None
+            and mono - self.last_replaced < WEDGED_REPLACE_COOLDOWN_S
+        )
+
+
+def wedged_listener_reason(
+    last_pulse: float | None, now: float, identity: ProcessIdentity | None
+) -> str | None:
+    """Why a live-pid listener is provably wedged, or None (leave it alone).
+
+    Pure, like ``hotkey_restart_reason``. Every clause exists to keep a kill from
+    landing on the wrong thing:
+
+    - no heartbeat file: nothing to compare against (`status` calls that off or
+      crashed, and it is not ours to end);
+    - a pulse inside the grace: alive, or at worst slow;
+    - an unreadable identity: we cannot prove what the pid is;
+    - an image that is not python: a recycled pid now owned by something else;
+    - created AFTER the last pulse: also a recycled pid. This is the proof
+      that survives a python-on-python reuse -- a process born after the final
+      heartbeat cannot be the one that wrote it.
+    """
+    if last_pulse is None:
+        return None
+    silent_s = now - last_pulse
+    if silent_s <= WEDGED_LISTENER_GRACE_S:
+        return None
+    if identity is None:
+        return None
+    if not identity.image.lower().startswith("python"):
+        return None
+    if filetime_to_epoch(identity.created) > last_pulse:
+        return None
+    return (
+        f"heartbeat silent for {silent_s:.0f}s "
+        f"(grace {WEDGED_LISTENER_GRACE_S:.0f}s) with the process still alive"
+    )
+
+
+def retire_wedged_listener(
+    pid: int, watch: ListenerWatch, *, now: float, mono: float
+) -> bool:
+    """End ``pid`` if it is a proven, twice-confirmed, off-cooldown wedged
+    listener. True only when it was actually ended and its files forgotten --
+    the caller then spawns the replacement.
+
+    The kill goes through ``procs.terminate_verified``, which re-reads the
+    identity through the very handle it terminates with, so a pid recycled
+    between the proof and the kill is never hit. It is NOT ``stop_listener``'s
+    ``taskkill /PID /F``, which trusts the pid file blindly.
+
+    Never raises for an expected refusal: a kill that did not happen returns
+    False with a log line, and still starts the cooldown so it is not retried
+    every tick.
+    """
+    from magent.hotkey import forget_listener  # ImportError off-Windows; stays lazy
+
+    log = get_logger("hotkey")
+    last_pulse = heartbeat_mtime("hotkey")
+    if last_pulse is None or now - last_pulse <= WEDGED_LISTENER_GRACE_S:
+        watch.suspect = None  # healthy, or nothing to judge by
+        return False
+    identity = process_identity(pid)
+    reason = wedged_listener_reason(last_pulse, now, identity)
+    if reason is None or identity is None:
+        watch.suspect = None
+        if identity is None and watch.unverifiable_pid != pid:
+            watch.unverifiable_pid = pid
+            log.warning(
+                "listener pid=%d heartbeat is silent for %.0fs but its identity "
+                "cannot be read; leaving it alone",
+                pid,
+                now - last_pulse,
+            )
+        return False
+    if not watch.confirm(pid, last_pulse):
+        return False
+    if watch.in_cooldown(mono):
+        if not watch.cooldown_logged:
+            watch.cooldown_logged = True
+            log.warning(
+                "wedged listener pid=%d not replaced: cooldown (%.0fs) after the "
+                "last replacement",
+                pid,
+                WEDGED_REPLACE_COOLDOWN_S,
+            )
+        return False
+    watch.last_replaced = mono
+    watch.cooldown_logged = False
+    log.warning("replacing wedged listener pid=%d: %s", pid, reason)
+    if terminate_verified(pid, identity) is None:
+        log.warning("could not end wedged listener pid=%d; leaving it in place", pid)
+        return False
+    watch.suspect = None
+    forget_listener()
+    return True
+
+
+def ensure_hotkey_listener(
+    default_url: str, watch: ListenerWatch | None = None
+) -> int | None:
     """Make sure SOME Alt+V listener is running; never re-aim a healthy one.
 
     The supervision entry point (``upload_server``'s serve loop calls this on an
@@ -353,17 +556,35 @@ def ensure_hotkey_listener(default_url: str) -> int | None:
     spawn, and the "never two listeners" property is exactly the one that
     function already had.
 
+    With a ``watch`` it also replaces a WEDGED listener (see
+    ``retire_wedged_listener``). Replacement is not re-aiming: the target is
+    read from the manifest BEFORE the old listener is ended -- ending it forgets
+    the manifest -- and the new one is started at exactly that target, so
+    `magent attach`'s remote wiring survives it. Without a ``watch`` (the
+    one-shot callers) nothing is ever ended.
+
+    Refused in a non-interactive logon session (Session 0) before the pid is
+    even read: ``start_hotkey_listener`` would refuse the replacement there, so
+    retiring a wedged listener first would end one and put nothing back.
+
     Windows-only, like everything hotkey: the caller owns the
     ``supports_hotkey()`` gate that keeps the import below reachable.
     """
+    refusal = session0_block(SESSION0_HOTKEY_REFUSAL)
+    if refusal:
+        get_logger("hotkey").warning("%s", refusal)
+        return None
     from magent.hotkey import (  # ImportError off-Windows (hotkey.py guards); must stay lazy
         listener_manifest,
         listener_pid,
     )
 
-    if listener_pid() is None:
+    pid = listener_pid()
+    if pid is None:
         return start_hotkey_listener(default_url, None)
     url, ssh_host = supervised_hotkey_target(listener_manifest(), default_url)
+    if watch is not None:
+        retire_wedged_listener(pid, watch, now=time.time(), mono=time.monotonic())
     return start_hotkey_listener(url, ssh_host)
 
 
@@ -432,11 +653,21 @@ def ensure_upload_server(port: int, config_path: str | None = None) -> bool:
     """
     if _probe_upload_port(port):
         return False
+    # The choke point for every serve spawner that does not hand off (--go,
+    # menu "u", and anything run over ssh): a Session-0 serve takes the port
+    # this host's desktop needs. Asked only once a spawn is due, so a live
+    # server costs no probe of the logon session.
+    refusal = session0_block(SESSION0_SERVE_REFUSAL)
+    if refusal:
+        get_logger("upload").warning("%s", refusal)
+        return False
     spawn_detached(upload_server_argv(port, config_path))
     return True
 
 
-def _validated_env() -> MagentEnv | None:
+def _validated_env(
+    label: str = "upload supervisor", log_name: str = "attention"
+) -> MagentEnv | None:
     """The env singleton, or None if it no longer validates.
 
     A daemon must never die of an environment variable it does not use, and by
@@ -444,6 +675,8 @@ def _validated_env() -> MagentEnv | None:
     already failed loudly at CLI entry -- so an env that goes bad underneath a
     detached process degrades to the defaults with a log line, exactly as
     ``upload_server.supervision_enabled`` and ``log._configured_level`` do.
+    ``label`` names the asking supervisor and ``log_name`` is its log, so the
+    line lands where that supervisor's reader looks.
     """
     from pydantic import ValidationError
 
@@ -452,8 +685,8 @@ def _validated_env() -> MagentEnv | None:
     try:
         return get_env()
     except ValidationError:
-        get_logger("attention").warning(
-            "upload supervisor: environment did not validate; using defaults"
+        get_logger(log_name).warning(
+            "%s: environment did not validate; using defaults", label
         )
         return None
 
@@ -464,6 +697,111 @@ def upload_supervision_enabled() -> bool:
     the supervisor answers before it offers the daemon as a repair."""
     env = _validated_env()
     return True if env is None else env.upload_supervisor
+
+
+# --- Node sync supervision ---------------------------------------------------
+# The same doctrine one more time: `magent serve` is the process that is always
+# there, so it keeps `magent node sync` alive (upload_server._supervise_node_sync
+# -> ensure_node_sync every NODE_SYNC_SUPERVISE_INTERVAL_S). Two gates, like the
+# upload watchdog's: the config must have a node project to sync, and
+# MAGENT_NODE_SYNC must not say 0 -- the opt-out for a user who runs the daemon
+# themselves, and the test-isolation law (a real daemon dials real machines).
+# The env gates ONLY this supervised spawn: `magent node sync --once/-d` typed by
+# a person (or an e2e test) never reads it.
+
+
+def node_sync_env_enabled() -> bool:
+    """Whether MAGENT_NODE_SYNC permits serve to keep the node sync daemon alive.
+    Fail-open on an env that no longer validates, like every supervisor: the
+    config gate (``node_sync.expected``) still has to pass."""
+    # in-body: keeps launch's import list the launch path's
+    from magent.node_sync import LOG_NAME
+
+    env = _validated_env("node sync supervisor", LOG_NAME)
+    return True if env is None else env.node_sync
+
+
+def node_sync_enabled(config: MagentConfig) -> bool:
+    """Both gates: the env allows it, and ``node_sync.expected`` -- a project
+    runs on a node AND a session is placed on one. Without the second, serve
+    would respawn the daemon that just wound down for want of work."""
+    # in-body: keeps launch's import list the launch path's
+    from magent.node_sync import expected
+
+    return node_sync_env_enabled() and expected(config)
+
+
+def node_sync_argv(config_path: str | None) -> list[str]:
+    """The argv of a detached ``magent node sync`` (the foreground loop)."""
+    args = [sys.executable, "-m", "magent"]
+    if config_path:
+        args += ["--config", config_path]
+    return [*args, "node", "sync"]
+
+
+@dataclass
+class _NodeSyncReport:
+    """What ensure_node_sync last said about a wedged daemon: the warning
+    fires on the transition into a wedge and the recovery on the way out,
+    never once per supervisor interval."""
+
+    wedged: bool = False
+
+
+_node_sync_report = _NodeSyncReport()
+
+
+def ensure_node_sync(config: MagentConfig, config_path: str | None = None) -> bool:
+    """Start the node sync daemon detached unless it is gated off or already
+    running. True ONLY when a spawn was actually issued (the
+    ``ensure_upload_server`` contract); False when a gate is off, when a
+    healthy daemon is already running, and when the running one is wedged.
+
+    "Running" is the daemon's LOCK (``node_sync.daemon_running``), never its pid
+    file: after a crash or a reboot the pid file survives, the number is
+    recycled onto an unrelated process, and a pid check would read "alive"
+    forever -- never respawning, and pointing the user's `--stop` at a
+    stranger. The pid is read for the log line only.
+
+    A live daemon is NEVER re-aimed or replaced: it re-reads its own config file
+    when that changes, and a second one would only lose the lock. A held lock
+    with a stale heartbeat is a wedged daemon -- reported once, left for the
+    user (`magent node sync --stop`), never killed from here. The respawn rate
+    of a daemon that keeps dying is the caller's interval.
+
+    A lock file that would not open (Windows answers EACCES while one is
+    pending delete) is ``node_sync.DaemonLockUnknown``: whether a daemon runs is
+    unknown, so nothing is spawned, and the caller can tell it from a refused
+    spawn.
+    """
+    if not node_sync_enabled(config):
+        return False
+    from magent import node_sync  # in-body: same reason as node_sync_enabled
+
+    log = get_logger(node_sync.LOG_NAME)
+    try:
+        running = node_sync.daemon_running()
+    except OSError as e:
+        raise node_sync.DaemonLockUnknown(e) from e
+    if not running:
+        _node_sync_report.wedged = False
+        spawn_detached(node_sync_argv(config_path))
+        return True
+    if heartbeat_fresh(node_sync.HEARTBEAT_NAME):
+        if _node_sync_report.wedged:
+            _node_sync_report.wedged = False
+            log.info("node sync: the daemon's heartbeat is fresh again")
+        return False
+    if not _node_sync_report.wedged:
+        _node_sync_report.wedged = True
+        log.warning(
+            (
+                "node sync: the daemon (pid %s) holds its lock but its heartbeat "
+                "is stale; leaving it (`magent node sync --stop` to restart it)"
+            ),
+            node_sync.daemon_pid(),
+        )
+    return False
 
 
 def upload_respawn_cooldown_s() -> float:
@@ -572,6 +910,12 @@ class UploadServerSupervisor:
             )
             return False
         self._last_spawn = now
+        refusal = session0_block(SESSION0_SERVE_REFUSAL)
+        if refusal:
+            # Stamped like a spawn so the refusal is logged once per cooldown,
+            # not once per poll; there is no child for _still_starting to time.
+            log.warning("upload supervisor: %s", refusal)
+            return False
         # ASCII only: this line goes to a rotating logfile that gets read back
         # through whatever the host console's code page happens to be.
         log.warning(
@@ -603,6 +947,9 @@ class RunOpts:
     # "every enabled project" -- which is what a skipped checklist (no terminal,
     # or `--all`) means, and what this phase has always done.
     only: frozenset[str] | None = None
+    # Node projects (PR-D): start one whose local tree is dirty or has
+    # unpushed commits anyway -- the node gets origin's copy (D7).
+    allow_dirty: bool = False
 
 
 @dataclass
@@ -613,14 +960,20 @@ class _Target:
     is_new: bool
 
 
-def _resolve_path(raw: str, base_dir: str | None) -> str | None:
+def _candidate_path(raw: str, base_dir: str | None) -> str | None:
+    """Where ``raw`` would be, expanded and joined to ``base_dir`` when it
+    is relative; None when relative with no base. Touches no disk."""
     expanded = os.path.expandvars(os.path.expanduser(raw))
     if Path(expanded).is_absolute():
-        return expanded if Path(expanded).is_dir() else None
+        return expanded
     if base_dir:
-        joined = os.path.join(base_dir, expanded)
-        return joined if Path(joined).is_dir() else None
+        return os.path.join(base_dir, expanded)
     return None
+
+
+def _resolve_path(raw: str, base_dir: str | None) -> str | None:
+    candidate = _candidate_path(raw, base_dir)
+    return candidate if candidate and Path(candidate).is_dir() else None
 
 
 def _expand_base_dir(base_dir: str) -> str:
@@ -681,6 +1034,18 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
     if projects is None:
         return 0
 
+    # "node": "auto" becomes a nick here, before any dispatcher runs -- the
+    # same slot account routing takes on its branch. A dry run or a tile-only
+    # pass never opens a connection to sample a node.
+    placements = place_node_projects(
+        config, projects, live=not (opts.dry_run or opts.tile_only)
+    )
+    for note in placements.notes:
+        click.echo(f"  {style('!', fg='yellow')} {style(note, dim=True)}")
+    for line in placements.refused:
+        click.echo(f"  {style('x', fg='red')} {line}")
+    projects = placements.projects
+
     base_dir = config.base_dir
     if base_dir:
         base_dir = _expand_base_dir(base_dir)
@@ -696,6 +1061,8 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
         return 2
 
     _start_psmux_and_upload(plat, config, opts, result)
+    if result.node_projects:
+        result = _bring_up_node_windows(plat, config, opts, result)
 
     targets = (
         _retile_targets(config, opts, result) if opts.retile_all else result.targets
@@ -765,6 +1132,183 @@ def _select_projects(config: MagentConfig, opts: RunOpts) -> list[ProjectConfig]
 
 
 @dataclass(frozen=True)
+class NodePlacements:
+    """What the placement phase hands the launch phase (spec §11): the
+    projects with every ``"auto"`` replaced by a concrete nick (an unplaceable
+    one is dropped), the lines to print, and each auto project's Placement --
+    `magent node plan` renders these same objects. ``notes`` are advisories;
+    ``refused`` are failures -- an auto project not brought up because where
+    it runs is unknown -- printed as a red ``x`` like ``up``'s.
+
+    The same facts per project, for a caller that reports each project
+    on its own row (``bring_up_node_projects``' outcomes): ``unplaced``
+    maps each dropped auto project's name to why it was not launched --
+    the words ``refused``/``notes`` print after the name -- and
+    ``history_notes`` are the notes about a node's unreadable load
+    history, which every project scored in this pass rests on."""
+
+    projects: list[ProjectConfig]
+    notes: list[str]
+    placements: dict[str, NodePlacement]
+    refused: list[str] = dataclasses.field(default_factory=list)
+    unplaced: dict[str, str] = dataclasses.field(default_factory=dict)
+    history_notes: tuple[str, ...] = ()
+
+
+def _kept(
+    config: MagentConfig, entries: dict[str, NodeMapEntry], proj: ProjectConfig
+) -> bool:
+    from magent import nodes
+
+    held = entries.get(nodes.project_name(proj))
+    return held is not None and held.nick in config.settings.nodes
+
+
+def live_sampler(config: MagentConfig) -> Callable[[str], LoadSample | None]:
+    """The sparse rule's one live reading per node, through remote_mux. A node
+    that cannot be resolved or does not answer is left unscored, never fatal."""
+    from magent import env, nodes, remote_mux
+
+    user = env.local_username()
+    log = get_logger("launch")
+    # Warm remote_mux's own logger here, on the calling thread: get_logger is
+    # check-then-set, so two first calls racing on sampler worker threads
+    # could each attach a handler and double every "nodes" line.
+    get_logger("nodes")
+
+    def sample(nick: str) -> LoadSample | None:
+        try:
+            node = nodes.node_for_nick(config, nick, local_user=user)
+            reading = remote_mux.sample(node)
+        except (nodes.NodeConfigError, remote_mux.RemoteError) as exc:
+            log.warning("live load sample for node %s failed: %s", nick, exc)
+            return None
+        return reading
+
+    return sample
+
+
+def _unplaced_reason(samples: dict[str, list[LoadSample]], *, live: bool) -> str:
+    """Why no node could be scored, named per cause. ``samples`` is
+    ``placement_samples``' output, where a node ends up with no sample only
+    when its window was empty and either no live reading was allowed (a dry
+    run or a tile-only pass -- the wording fits both) or the live reading
+    failed -- a thin node always gets one."""
+    from magent import nodes
+
+    blank = ", ".join(nick for nick, window in samples.items() if not window)
+    if not blank:
+        return nodes.PLACE_REASONS["no-data"]
+    if not live:
+        return f"no live reading taken: {blank} would take a live reading at launch"
+    return f"live reading failed for {blank} (see ~/.magent/logs/launch.log)"
+
+
+def place_node_projects(
+    config: MagentConfig,
+    projects: list[ProjectConfig],
+    *,
+    live: bool = True,
+    now: float | None = None,
+) -> NodePlacements:
+    """Resolve every ``"node": "auto"`` project to a nick (spec §11).
+
+    Its own phase between selection and launch, so a dispatcher only ever sees
+    a concrete nick. It NEVER writes node-map.json: the bring-up records a
+    placement once it has actually happened, so a failed launch leaves nothing
+    sticky behind. Nothing is sampled when every auto project is already
+    placed on a configured node. ``live=False`` (``--dry-run``, tile-only)
+    never opens a connection: a thin node is then scored on what it has.
+    Only ``auto`` is ever placed: local, pinned and ``cloud`` projects
+    (DECISION-15; ``cloud`` is pin-only) pass through untouched.
+
+    The map is read strictly (``_node_map_for_placement``). Unreadable, NO
+    ``auto`` project is placed: each is dropped with the map's refusal (in
+    ``refused``, a failure) and an ``"unknown"`` Placement (D17: its node is
+    None), nothing is sampled, and the rest of the fleet goes on. A node
+    whose load history cannot be read is placed on as if it had none (one
+    live reading, or unscored in a dry run) and named in ``notes``.
+    """
+    from magent import nodes
+    from magent.config import NODE_AUTO
+
+    auto = [p for p in projects if p.node == NODE_AUTO]
+    if not auto:
+        return NodePlacements(list(projects), [], {})
+    entries, unreadable = _node_map_for_placement()
+    if unreadable is not None:
+        # Read as {}, an auto project already running on a node would be
+        # scored onto a fresh one: a second session while the first runs.
+        get_logger("nodes").warning(
+            "auto placement skipped, node map unreadable: %s", unreadable
+        )
+        unknown = {
+            nodes.project_name(p): _map_unreadable_text(unreadable) for p in auto
+        }
+        return NodePlacements(
+            [p for p in projects if p.node != NODE_AUTO],
+            [],
+            {name: nodes.Placement(None, "unknown") for name in unknown},
+            refused=[f"{name}: {text}" for name, text in unknown.items()],
+            unplaced=unknown,
+        )
+    when = time.time() if now is None else now
+    samples: dict[str, list[LoadSample]] = {}
+    sampled: frozenset[str] = frozenset()
+    unreadable_history: dict[str, OSError | ValueError] = {}
+    if not all(_kept(config, entries, p) for p in auto):
+        samples, sampled = nodes.placement_samples(
+            config,
+            now=when,
+            live_sample=live_sampler(config) if live else None,
+            on_unreadable=unreadable_history.__setitem__,
+        )
+    spread: dict[str, int] = {}
+    out: list[ProjectConfig] = []
+    # An unreadable history is unknown, not "never sampled": said, class only.
+    history_notes = tuple(
+        f"@{nick}: its load history is unreadable ({type(exc).__name__});"
+        + (" scored on one live reading" if nick in sampled else " not scored")
+        for nick, exc in unreadable_history.items()
+    )
+    notes: list[str] = list(history_notes)
+    unplaced: dict[str, str] = {}
+    chosen: dict[str, NodePlacement] = {}
+    for proj in projects:
+        if proj.node != NODE_AUTO:
+            out.append(proj)
+            continue
+        name = nodes.project_name(proj)
+        held = entries.get(name)
+        placement = nodes.place(
+            config,
+            samples,
+            now=when,
+            map_entry=held.nick if held else None,
+            placed=spread,
+            live=sampled,
+        )
+        chosen[name] = placement
+        if placement.note:
+            notes.append(f"{name}: {placement.note}")
+        if placement.nick is None:
+            unplaced[name] = (
+                f"not launched -- {_unplaced_reason(samples, live=live)};"
+                ' pin a node with "node": "<nick>"'
+            )
+            notes.append(f"{name}: {unplaced[name]}")
+            continue
+        # A kept project's session is already running there and already counts
+        # in that node's my_sessions; adding it to the spread would count it twice.
+        if placement.reason != "kept":
+            spread[placement.nick] = spread.get(placement.nick, 0) + 1
+        out.append(dataclasses.replace(proj, node=placement.nick))
+    return NodePlacements(
+        out, notes, chosen, unplaced=unplaced, history_notes=history_notes
+    )
+
+
+@dataclass(frozen=True)
 class _LaunchResult:
     """Everything the launch phase produces for the downstream phases."""
 
@@ -775,6 +1319,9 @@ class _LaunchResult:
     # already-running probe used. `_retile_targets` reads it to find
     # magent-owned windows that no configured project accounts for.
     open_titles: tuple[str, ...] = ()
+    # Node projects this launch owes a bring-up (PR-D): collected by the loop,
+    # brought up after the local phases, before tiling.
+    node_projects: tuple[ProjectConfig, ...] = ()
 
 
 def _discovered_targets(
@@ -840,9 +1387,13 @@ def _launch_projects(
     windows), build the tiling target list. Pure w.r.t. tiling -- it never
     moves a window."""
     has_remote = any(p.host for p in projects)
-    if has_remote and not shutil.which("ssh"):
+    # attach_client's rule, the client the remote panes dial: Windows' own
+    # OpenSSH with nothing on PATH is not a missing client.
+    if has_remote and attach_client.find_ssh() is None:
         click.echo(
-            style("  ! Remote projects configured but 'ssh' not on PATH.", fg="yellow")
+            style(
+                "  ! Remote projects configured but no ssh client found.", fg="yellow"
+            )
         )
 
     targets: list[_Target] = []
@@ -850,6 +1401,7 @@ def _launch_projects(
     tools = config.settings.tools
     use_psmux = config.settings.psmux and plat.supports_psmux()
     psmux_windows: list[PsmuxWindowOpts] = []
+    node_projects: list[ProjectConfig] = []
     _psmux_colors: dict[str, str | None] = {}
 
     win_snapshot = plat.snapshot_windows()
@@ -864,9 +1416,17 @@ def _launch_projects(
             return key in win_snapshot
         return any(key.lower() in t.lower() for t in win_snapshot)
 
+    node_map = _node_map_snapshot(config, projects)
+
     for proj in projects:
         tool = proj.tool or config.settings.default_tool
         is_remote = bool(proj.host)
+
+        if runs_on_node(proj) and not is_ide_tool(tool):
+            new_count += _dispatch_node_project(
+                config, opts, proj, tool, _is_running, targets, node_projects, node_map
+            )
+            continue
 
         if is_ide_tool(tool):
             new_count += _dispatch_ide_project(
@@ -903,6 +1463,7 @@ def _launch_projects(
         psmux_windows=psmux_windows,
         psmux_colors=_psmux_colors,
         open_titles=tuple(win_snapshot),
+        node_projects=tuple(node_projects),
     )
 
 
@@ -1117,6 +1678,219 @@ def _dispatch_cli_agent_project(
     return new_count
 
 
+def _node_map_snapshot(
+    config: MagentConfig, projects: list[ProjectConfig]
+) -> dict[str, NodeMapEntry]:
+    """ONE read of the node map for the whole launch loop: every node
+    project's badge and dry-run preview answer from it, so none can disagree
+    with another. A launch with no node project in it never reads the map."""
+    if not any(
+        runs_on_node(proj)
+        and not is_ide_tool(proj.tool or config.settings.default_tool)
+        for proj in projects
+    ):
+        return {}
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    # Best effort on purpose: a badge and a dry-run line only DISPLAY; every
+    # placement decision reads strictly (``_node_map_for_placement``).
+    return nodes.read_node_map()
+
+
+def _node_map_for_placement() -> tuple[
+    dict[str, NodeMapEntry], OSError | ValueError | None
+]:
+    """The node map for a decision that places or stops something: ``(entries,
+    None)``, or ``({}, the error)`` when it cannot be read -- torn, or still
+    busy after its retries. Never ``read_node_map``'s ``{}``: an unreadable
+    map is UNKNOWN, not "nothing is placed", and read as empty an ``auto``
+    project running on a node would look free to place again. A pinned
+    project needs no map to resolve, so only ``auto`` ones are refused
+    (``_map_unreadable_text``)."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    try:
+        return nodes.load_node_map_strict(), None
+    except (OSError, ValueError) as exc:
+        return {}, exc
+
+
+def _map_unreadable_text(exc: OSError | ValueError) -> str:
+    """An ``auto`` project's one-line refusal under an unreadable map, in the
+    sentence every surface shares (``nodes.map_unread_text``). The error CLASS
+    only: the full error goes to nodes.log."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    return (
+        f"{nodes.map_unread_text(exc)}, so where this auto project runs is"
+        " unknown; not brought up"
+    )
+
+
+def _folder_unknown_text(exc: OSError | ValueError, leaf: str, nick: str) -> str:
+    """A pinned project's one-line refusal when its only folder rivals are
+    ``auto`` projects an unreadable map hides. The error CLASS only."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    return (
+        f"{nodes.map_unread_text(exc)}, so whether '{leaf}' on {nick} is already"
+        " in use is unknown; not brought up"
+    )
+
+
+def _dispatch_node_project(
+    config: MagentConfig,
+    opts: RunOpts,
+    proj: ProjectConfig,
+    tool: str,
+    is_running: Callable[[str, str], bool],
+    targets: list[_Target],
+    node_projects: list[ProjectConfig],
+    node_map: dict[str, NodeMapEntry],
+) -> int:
+    """A pool-node project: one window, titled by its session id. The
+    bring-up itself runs after the local phases (``_bring_up_node_windows``);
+    here it is listed, targeted for tiling and queued. The target is
+    provisional until then: the bring-up re-keys it on the title the window
+    actually opened under. The window is always C's ``magent:<sid>``, so the
+    already-open probe matches in ``magent-name`` mode. ``node_map`` is the
+    loop's one snapshot (``_node_map_snapshot``)."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    sid = nodes.node_sid(proj)
+    running = is_running(sid, "magent-name")
+    held = node_map.get(nodes.project_name(proj))
+    label = held.nick if proj.node == NODE_AUTO and held else str(proj.node)
+    _log_project(nodes.project_name(proj), tool, running, None, node=label)
+    targets.append(_Target(name=sid, key=sid, mode="magent-name", is_new=not running))
+    # The skip comes BEFORE the preview: a dry run says what the real run
+    # would do, and for an open window or a re-tile that is nothing.
+    if running or opts.tile_only:
+        return 0
+    if opts.dry_run:
+        _echo_node_dry_run(config, proj, held)
+        return 0
+    node_projects.append(proj)
+    return 1
+
+
+def _echo_node_dry_run(
+    config: MagentConfig, proj: ProjectConfig, held: NodeMapEntry | None
+) -> None:
+    """Where ``proj`` would land, from config and the map alone: no ssh, no
+    git, no write. ``held`` is the map entry the caller already read, so the
+    badge and this preview answer from one snapshot."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+    from magent.env import local_username
+    from magent.node_sync import printable
+
+    try:
+        # A folder this user may not read is named, like a bad pin.
+        project_dir = _node_project_dir(config, proj) or Path(proj.path)
+        node = nodes.resolve(
+            config,
+            proj,
+            local_user=local_username(),
+            placed=held.nick if held else None,
+        )
+        # Inside the try: a folder with no usable name is refused here too,
+        # and a dry run names that reason rather than raising it.
+        folder = nodes.remote_root_for(node, project_dir)
+    except (ValueError, OSError) as exc:
+        # The row the real run's outcome would show (``_node_error_text``).
+        if isinstance(exc, OSError):
+            get_logger("nodes").warning("dry run: %s: %s", nodes.node_sid(proj), exc)
+            text = _local_error_text(exc)
+        else:
+            text = printable(str(exc))
+        click.echo(f"      {style('x', fg='red')} {text}")
+        return
+    click.echo(style(f"      -> {node.target}:{folder}", dim=True))
+    # DECISION-24: the real run provisions first (``_provision_once``).
+    click.echo(style(f"      would provision {node.nick}", dim=True))
+
+
+def _warn_node_windows_will_not_reconnect(plat: Platform) -> None:
+    """``attach_client.spawn_attach_window`` degrades a supervisor missing
+    from PATH to a bare-ssh pane silently; the batch caller says so once.
+    Mirrors ``magent attach``'s ``_spawn_windows`` warning. Nothing to say
+    where no window can open at all."""
+    if not plat.supports_attach_windows() or attach_client.client_exe() is not None:
+        return
+    click.echo(
+        f"  {style('!', fg='yellow')} {style(attach_client.CLIENT_EXE_NAME, bold=True)}"
+        f" {style('is not on PATH -- node windows will not auto-reconnect.', fg='yellow')}"
+    )
+    click.echo(
+        f"  {style('Reinstall with', dim=True)}"
+        f" {style('pip install -U magent-multi-ai-agents-manager', bold=True)}"
+        f"{style('.', dim=True)}"
+    )
+
+
+def _node_window_target(target: _Target, title: str) -> _Target:
+    """``target`` re-keyed on the title its window really opened under. A
+    ``magent:`` title matches by parsed name, so a state badge the attention
+    daemon adds before the tile pass cannot hide it; anything else (never
+    produced today) matches exactly."""
+    parsed = parse_title(title)
+    if parsed is None:
+        return replace(target, key=title, mode="exact")
+    return replace(target, key=parsed[0], mode="magent-name")
+
+
+def _bring_up_node_windows(
+    plat: Platform, config: MagentConfig, opts: RunOpts, result: _LaunchResult
+) -> _LaunchResult:
+    """Bring the queued node projects up with their windows, then point each
+    one's tiling target at the title ``NodeBringUpOutcome.title`` carries back
+    from the spawn -- never one rebuilt from the sid, so tiling cannot drift
+    from the window. A project with no window coming (a failed bring-up, a
+    platform without attach windows, a spawn that raised) has its target
+    dropped rather than polled for and reported "not found" -- and where a
+    window WAS meant to open, that is said here instead, since tiling no
+    longer will."""
+    # A clone is minutes of network: say what is running before it runs. The
+    # caller only gets here with a non-empty queue, so N is never 0.
+    count = len(result.node_projects)
+    click.echo(
+        f"\n  {style('#', fg='blue')} Bringing up "
+        f"{style(str(count), fg='blue', bold=True)} node project(s)..."
+    )
+    _warn_node_windows_will_not_reconnect(plat)
+    outcomes = _run_node_bring_ups(
+        config, list(result.node_projects), allow_dirty=opts.allow_dirty, window=True
+    )
+    _echo_node_outcomes(outcomes)
+    if any(o.ok for o in outcomes):
+        # RunOpts spells "no config file" as "".
+        _keep_node_sync(config, opts.config_path or None)
+    windows_expected = plat.supports_attach_windows()
+    by_sid = {o.sid: o for o in outcomes}
+    targets: list[_Target] = []
+    for target in result.targets:
+        outcome = by_sid.get(target.key)
+        if outcome is None:
+            targets.append(target)
+        elif outcome.ok and outcome.title is not None:
+            targets.append(_node_window_target(target, outcome.title))
+        elif outcome.ok and windows_expected:
+            # The session is up; only the window failed (the spawn's reason is
+            # in nodes.log). A re-run re-queues it and attaches to the session.
+            click.echo(
+                f"  {style('!', fg='yellow')} {outcome.sid}"
+                f" {style('@' + outcome.node, fg='blue')}: window did not open"
+                f" {style('(see ~/.magent/logs/nodes.log) -- re-run magent --go to open it', dim=True)}"
+            )
+    return replace(result, targets=targets)
+
+
 def _start_psmux_and_upload(
     plat: Platform, config: MagentConfig, opts: RunOpts, result: _LaunchResult
 ) -> None:
@@ -1167,14 +1941,20 @@ def _start_psmux_and_upload(
             f" {style('or', dim=True)} {style('magent sessions', fg='cyan')}"
         )
 
-        if config.settings.upload_server:
+        # The sessions above were refused at the psmux choke point in Session
+        # 0; the server and listener below would be refused at theirs, so say
+        # it once here instead of advertising a URL nothing will answer.
+        serve_refusal = config.settings.upload_server and session0_block(
+            SESSION0_SERVE_REFUSAL, plat
+        )
+        if serve_refusal:
+            click.echo(f"\n  {style(serve_refusal, dim=True)}")
+        elif config.settings.upload_server:
             port = config.settings.upload_port
-            python = sys.executable
-            serve_args = [python, "-m", "magent"]
-            if opts.config_path:
-                serve_args.extend(["--config", opts.config_path])
-            serve_args.extend(["serve", "-p", str(port)])
-            spawn_detached(serve_args)
+            # Probe first, like every other spawner: this used to spawn a
+            # serve on EVERY bring-up, and on a machine whose server was
+            # already up that second one could only die of "port in use".
+            ensure_upload_server(port, opts.config_path)
             ip = tailnet.ip4()
             url = f"http://{ip}:{port}" if ip else f"http://localhost:{port}"
             click.echo(
@@ -1276,6 +2056,7 @@ def _log_project(
     host: str | None,
     happy: bool = False,
     psmux: bool = False,
+    node: str | None = None,
 ) -> None:
     if running:
         icon = style("*", fg="green")
@@ -1290,6 +2071,8 @@ def _log_project(
         extras += style(" [happy]", fg="magenta")
     if psmux:
         extras += style(" [psmux]", fg="yellow")
+    if node:
+        extras += style(f" [@{node}]", fg="blue")
     click.echo(f"  {icon} {name:<30} {label}  {tool_badge}{extras}{loc}")
 
 
@@ -1318,22 +2101,50 @@ def psmux_status(
 
 
 def bring_up_psmux(
-    config: MagentConfig, only: list[str] | None = None, group: str | None = None
+    config: MagentConfig,
+    only: list[str] | None = None,
+    group: str | None = None,
+    *,
+    allow_dirty: bool = False,
+    config_path: str | None = None,
 ) -> tuple[list[str], dict[str, str]]:
-    """Delegate to ``psmux.bring_up``. Returns ``(created, failed)``, where
-    ``failed`` maps each session that stayed down to why ("" = see the log)."""
+    """Delegate to ``psmux.bring_up``, then bring the pool-node projects up
+    too (PR-D; no windows -- this is the host side of attach). Returns
+    ``(created, failed)`` over both, where ``failed`` maps each session that
+    stayed down to why ("" = see the log). A node casualty maps to "": its
+    reason is printed with the node outcomes, the only place it appears, and
+    ``report_bring_up_casualties`` must not print it twice. A node session
+    that came up gets the node sync daemon started on ``config_path``, the
+    file this bring-up read."""
     from magent import psmux
 
-    return psmux.bring_up(config, only, group)
+    created, failed = psmux.bring_up(config, only, group)
+    outcomes = bring_up_node_projects(
+        config, only=only, group=group, allow_dirty=allow_dirty
+    )
+    _echo_node_outcomes(outcomes)
+    if any(o.ok for o in outcomes):
+        # The sync daemon reads the same file this bring-up did (E).
+        _keep_node_sync(config, config_path)
+    return (
+        [*created, *(o.sid for o in outcomes if o.ok)],
+        {**failed, **{o.sid: "" for o in outcomes if not o.ok}},
+    )
 
 
 def revive_psmux(
-    config: MagentConfig, only: list[str] | None = None, group: str | None = None
+    config: MagentConfig,
+    only: list[str] | None = None,
+    group: str | None = None,
+    *,
+    resume_parked: bool = False,
 ) -> list[str]:
-    """Delegate to ``psmux.revive_sessions``."""
+    """Delegate to ``psmux.revive_sessions``. Every bulk caller (``up``,
+    attach's ``up --json --revive``) takes the default, so a parked session
+    stays parked."""
     from magent import psmux
 
-    return psmux.revive_sessions(config, only, group)
+    return psmux.revive_sessions(config, only, group, resume_parked=resume_parked)
 
 
 def decorate_psmux_sessions(
@@ -1374,3 +2185,1000 @@ def stop_psmux(names: list[str]) -> tuple[list[str], list[str]]:
     from magent.psmux import stop_sessions
 
     return stop_sessions(names)
+
+
+# ---------------------------------------------------------------------------
+# Pool nodes (PR-D): a project with "node" set runs in tmux on that machine.
+# Everything that dials a node is remote_mux; this block is the policy -- the
+# D7 refusals, one bring-up per node at a time, the map write, the window.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NodeBringUpOutcome:
+    """One node project's bring-up, for the shells to print. ``error`` is the
+    whole user-facing reason when ``ok`` is False; ``warnings`` are true but
+    non-fatal (an unshippable ``push`` entry, a refusal that was moot because
+    the session was already running). ``title`` is the one the attach window
+    opened under -- what tiling places it by -- or None when none opened."""
+
+    ok: bool
+    sid: str
+    node: str = ""
+    error: str | None = None
+    attached_existing: bool = False
+    warnings: tuple[str, ...] = ()
+    title: str | None = None
+
+
+# One bring-up per node at a time, within this process: two sessions' first
+# `new-session` racing to start the node's one tmux server, or two clones into
+# the same root, is not a failure anyone should have to diagnose. Different
+# nodes run in parallel. A threading.Lock does not reach a second magent
+# process; two `magent up`s at once can still race on one node.
+_BRING_UP_LOCKS: dict[str, threading.Lock] = {}
+_BRING_UP_LOCKS_GUARD = threading.Lock()
+
+
+def _bring_up_lock(nick: str) -> threading.Lock:
+    with _BRING_UP_LOCKS_GUARD:
+        return _BRING_UP_LOCKS.setdefault(nick, threading.Lock())
+
+
+_PROVISIONED: set[str] = set()
+
+
+def _provision_once(node: Node, config: MagentConfig) -> None:
+    """Make ``node`` able to run a project, at most once per process. Runs
+    ``remote_mux.provision_node`` (DECISION-24) and records the node once that
+    call returns. A ``RemoteError`` is logged and re-raised, failing this
+    project: an unreachable node is left unrecorded so the next project on it
+    retries, but one whose outcome is unknown (a timeout, an over-cap reply)
+    is recorded, because a retry would start a second applier beside the
+    first.
+    ``config`` is here from day one so K needs no signature change.
+    Called under the node's lock, after every refusal -- a refused project
+    never provisions anything, and ``--dry-run`` never calls it."""
+    if node.nick in _PROVISIONED:
+        return
+    # heavy subsystem: in-body per policy (remote_mux: ssh + tar)
+    from magent import remote_mux
+
+    log = get_logger("nodes")
+    try:
+        report = remote_mux.provision_node(
+            node, config, home=Path.home(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+    except remote_mux.RemoteError as exc:
+        if exc.outcome_unknown:
+            # A killed ssh -- at the timeout or past the reply cap -- does not
+            # stop the apply on the node (RemoteError): this run never
+            # provisions the node again.
+            _PROVISIONED.add(node.nick)
+            log.warning(
+                "provision @%s: outcome unknown (%s); not retrying this run",
+                node.nick,
+                exc,
+            )
+        else:
+            log.warning(
+                "provision @%s: failed (%s); the next project retries", node.nick, exc
+            )
+        raise
+    _PROVISIONED.add(node.nick)
+    for line in report.lines:
+        if line.status in ("warn", "fail"):
+            # A fail row never blocks the session (F3), and neither row
+            # reaches the screen -- node doctor shows the node's; nodes.log
+            # keeps both, this PC's gh row included.
+            log.warning(
+                "provision %s: %s %s: %s",
+                node.nick,
+                line.status,
+                line.item,
+                line.detail,
+            )
+
+
+def _node_project_dir(config: MagentConfig, proj: ProjectConfig) -> Path | None:
+    """``proj``'s folder on this PC; None when it is not there. A folder this
+    user may not read RAISES OSError instead (``nodes.path_is_dir``): from
+    Python 3.14 ``Path.is_dir`` answers False for every OSError, which would
+    call an unreadable folder "not found on this PC" there and raise on
+    3.10-3.13. Unknown is never absent, on any version."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    base_dir = _expand_base_dir(config.base_dir) if config.base_dir else None
+    candidate = _candidate_path(proj.path, base_dir)
+    if candidate is None:
+        return None
+    path = Path(candidate)
+    return path if nodes.path_is_dir(path) else None
+
+
+def node_git_states(config: MagentConfig, proj: ProjectConfig) -> list[LocalGitState]:
+    """The LOCAL git state of every repo ``proj`` is made of; ``[]`` when its
+    folder is missing or holds no repo. Raises RemoteError when git fails."""
+    # heavy subsystem: in-body per policy (remote_mux is the ssh + git layer)
+    from magent import remote_mux
+
+    project_dir = _node_project_dir(config, proj)
+    if project_dir is None:
+        return []
+    return [remote_mux.git_state(path) for path in remote_mux.repo_paths(project_dir)]
+
+
+def node_recipe(
+    config: MagentConfig, proj: ProjectConfig, node: Node, states: list[LocalGitState]
+) -> Recipe:
+    """``nodes.recipe_for`` plus what only the config knows: the tool, its
+    command, and the command's fresh form (C1). Raises NodeConfigError."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    project_dir = _node_project_dir(config, proj)
+    if project_dir is None:
+        raise nodes.NodeConfigError(f"{proj.path}: not found on this PC")
+    tool = proj.tool or config.settings.default_tool
+    command = config.settings.tools.get(tool)
+    if not command:
+        raise nodes.NodeConfigError(
+            f"{proj.path}: unknown tool '{tool}' (add under settings.tools)"
+        )
+    recipe = nodes.recipe_for(
+        proj, node, states, home=Path.home(), project_dir=project_dir
+    )
+    return replace(
+        recipe,
+        tool=tool,
+        command=command,
+        fresh_command=fresh_start_command(tool, command),
+    )
+
+
+def _node_error_text(exc: Exception) -> str:
+    """The one line a user sees for a failed node bring-up: a RemoteError's
+    last line of ``row_text`` (bring_up.sh writes its reason last, prefixed
+    ``magent:``; over the cap it is magent's own ``reply exceeded N bytes``,
+    and the child's words are nodes.log's), an OSError's class (its message
+    names a path on this PC; ``nodes.log`` has it), anything else's message
+    -- nodes' own words."""
+    # heavy subsystem: in-body per policy
+    from magent.remote_mux import RemoteError
+
+    if isinstance(exc, RemoteError):
+        lines = exc.row_text.strip().splitlines()
+        return lines[-1].removeprefix("magent: ") if lines else f"exit {exc.rc}"
+    if isinstance(exc, OSError):
+        return _local_error_text(exc)
+    return str(exc)
+
+
+def _local_error_text(exc: OSError) -> str:
+    """A node row's words for an OSError raised on this PC: its class only."""
+    return f"local error: {type(exc).__name__}; see nodes.log"
+
+
+def _node_busy_text(nick: str, waited_s: float) -> str:
+    """A node whose ``node-pull-<nick>`` another magent process (a sync tick,
+    a bring-up, a ``down``) held past ``waited_s`` -- pass the constant the
+    wait itself used, so the figure is the wait that ran out. The bring-up's
+    outcome and ``down``'s not-pulled line both say it this way."""
+    return (
+        f"node {nick} is busy: another magent process held its pull lock"
+        f" past {waited_s:.0f}s"
+    )
+
+
+def _pull_error_text(exc: Exception) -> str:
+    """``_node_error_text`` for ``down``'s not-pulled line, but an OSError is
+    its class only: its message can name a local path, and its ``strerror`` is
+    the OS's words (localized, per platform), not ours. ``nodes.log`` has the
+    whole error."""
+    if isinstance(exc, OSError):
+        return type(exc).__name__
+    return _node_error_text(exc)
+
+
+def _open_node_window(node: Node, sid: str) -> str | None:
+    """The attach window for ``sid`` on ``node`` -- C's one wt spawn, running
+    the reconnecting supervisor -- and the title it opened under (tiling
+    matches on that, never a rebuilt one). None when this platform has no
+    attach windows, or the spawn failed: a window that cannot open is logged,
+    never a failed bring-up, because the session is up either way."""
+    if not get_platform().supports_attach_windows():
+        return None
+    try:
+        # remote_mux.MUX, spelled here so this stays import-free; the pane's
+        # remote command is derived from it inside spawn_attach_window.
+        return attach_client.spawn_attach_window(node.target, sid, mux="tmux")
+    except OSError as exc:
+        get_logger("nodes").warning(
+            "attach window for %s on %s: %s", sid, node.nick, exc
+        )
+        return None
+
+
+def bring_up_node_project(
+    config: MagentConfig,
+    proj: ProjectConfig,
+    *,
+    allow_dirty: bool = False,
+    window: bool = False,
+    resume_id: str | None = None,
+) -> NodeBringUpOutcome:
+    """Bring ``proj`` up on its node. ``resume_id`` names the conversation to
+    resume (only G's ``recall --to`` passes one, after shipping that
+    conversation to the node -- DECISION-23); None lets the NODE pick --
+    ``--continue`` over its own transcripts for this folder, else the tool's
+    fresh form, so a fresh clone never starts a dead ``claude --continue``
+    (DECISION-11c). Then: resolve the node (the map's placement for
+    ``"auto"``), refuse a tree the node could not reproduce (D7) -- unless its
+    session is already running there, which is attached instead -- then,
+    under that node's lock, provision once, build the recipe, run
+    ``remote_mux.bring_up`` -- inside the node sync daemon's lock for that
+    node too, so no pull reads a half-made session -- record the placement and
+    open the window. Never raises for a node, git or config failure: every one
+    is an outcome, a node the sync daemon kept busy past one pull included."""
+    # heavy subsystem: in-body per policy (nodes + remote_mux: ssh/git/tar)
+    from magent import node_sync, nodes, remote_mux
+    from magent.env import local_username
+
+    log = get_logger("nodes")
+    name = nodes.project_name(proj)
+    sid = nodes.node_sid(proj)
+    nick = ""
+    entries, unreadable = _node_map_for_placement()
+    if unreadable is not None and proj.node == NODE_AUTO:
+        log.warning("node ?: %s refused, node map unreadable: %s", sid, unreadable)
+        return NodeBringUpOutcome(
+            ok=False, sid=sid, node="", error=_map_unreadable_text(unreadable)
+        )
+    try:
+        # Unreadable, a pinned project goes to its pin: resolve ignores the
+        # map for it, and the node attaches to a session already running.
+        held = entries.get(name)
+        node = nodes.resolve(
+            config,
+            proj,
+            local_user=local_username(),
+            placed=held.nick if held else None,
+        )
+        nick = node.nick
+        if _node_project_dir(config, proj) is None:
+            raise nodes.NodeConfigError(f"{proj.path}: not found on this PC")
+        states = node_git_states(config, proj)
+        if not states:
+            raise nodes.NodeConfigError(
+                f"{proj.path}: no git repository; a node clones the project "
+                "from its origin"
+            )
+        refusals = [
+            text
+            for state in states
+            if (text := nodes.refusal_for(state, allow_dirty=allow_dirty))
+        ]
+        if refusals:
+            if unreadable is not None:
+                # Nothing records where it runs, which is not "nowhere": ask
+                # its pin, under its own session id. The whole error goes to
+                # nodes.log once here; either outcome names only its class.
+                log.warning(
+                    "node %s: %s looked up on its pin, node map unreadable: %s",
+                    nick,
+                    sid,
+                    unreadable,
+                )
+                running = sid if remote_mux.has_session(node, sid) else None
+            elif (
+                held is not None
+                and held.nick == nick
+                and remote_mux.has_session(node, held.sid)
+            ):
+                running = held.sid
+            else:
+                running = None
+            if running is not None:
+                # What is uncommitted HERE does not touch a session already
+                # running there: attach to it, and keep the refusal as a warning.
+                remote_mux.decorate(node, running, nick)
+                title = _open_node_window(node, running) if window else None
+                log.info(
+                    "node %s: %s already running; attached despite: %s",
+                    nick,
+                    running,
+                    refusals,
+                )
+                return NodeBringUpOutcome(
+                    ok=True,
+                    sid=sid,
+                    node=nick,
+                    attached_existing=True,
+                    warnings=(
+                        *refusals,
+                        *(
+                            (
+                                (
+                                    f"{nodes.map_unread_text(unreadable)};"
+                                    f" attached to {sid} on its pin @{nick}"
+                                ),
+                            )
+                            if unreadable is not None
+                            else ()
+                        ),
+                    ),
+                    title=title,
+                )
+            log.info("node %s: refused %s: %s", nick, sid, refusals)
+            error = "; ".join(refusals)
+            if unreadable is not None:
+                error += (
+                    f"; {nodes.map_unread_text(unreadable)},"
+                    f" and {sid} was not found running on @{nick}"
+                )
+            return NodeBringUpOutcome(ok=False, sid=sid, node=nick, error=error)
+        with _bring_up_lock(nick):
+            try:
+                _provision_once(node, config)
+            except remote_mux.RemoteError as exc:
+                # _provision_once logged it; the row names the step that failed.
+                return NodeBringUpOutcome(
+                    ok=False,
+                    sid=sid,
+                    node=nick,
+                    error=f"provisioning: {_node_error_text(exc)}",
+                )
+            recipe = node_recipe(config, proj, node, states)
+            # Spec section 13: a sync tick holds this same per-node lock for
+            # its pull, across PROCESSES, which _bring_up_lock cannot reach.
+            # DECISION-19: wait out one pull and no longer -- a node still
+            # held past that is hung, and saying so beats stalling the `up`.
+            with node_sync.node_lock(nick, wait_s=remote_mux.PULL_TIMEOUT_S):
+                result = remote_mux.bring_up(
+                    node, recipe, allow_dirty=allow_dirty, resume_id=resume_id
+                )
+                # What the node's repos were at this bring-up, for a later
+                # recall from a node that no longer answers. Clean or dirty
+                # only where bring_up.sh read the tree (repo_status.sh's rule,
+                # untracked files included); an attach and --allow-dirty read
+                # nothing, and a tree it could not read is missing from
+                # result.dirty -- all unknown, never clean. A record that
+                # cannot be written is logged and keeps the old one
+                # (write_repo_record).
+                nodes.write_repo_record(
+                    nick,
+                    result.sid,
+                    nodes.RepoRecord(
+                        ts=time.time(),
+                        source="bring-up",
+                        repos=tuple(
+                            nodes.RepoStatus(
+                                remote_dir=repo,
+                                head=sha,
+                                branch="",
+                                dirty=(
+                                    None
+                                    if result.attached_existing or allow_dirty
+                                    else result.dirty.get(repo)
+                                ),
+                                unpushed=None,
+                            )
+                            for repo, sha in sorted(result.commits.items())
+                        ),
+                    ),
+                )
+            warnings = recipe.warnings
+            try:
+                nodes.update_node_map(
+                    name,
+                    nodes.NodeMapEntry(
+                        nick=nick,
+                        sid=result.sid,
+                        placed_ts=time.time(),
+                        attached_existing=result.attached_existing,
+                        remote_root=recipe.remote_root,
+                        target=node.target,
+                        cwd=result.cwd,
+                    ),
+                )
+            except (ValueError, OSError) as exc:
+                # The node said yes: the session IS running there. A failed
+                # record (LockHeld past its wait, an unreadable map) is not a
+                # failed bring-up -- reporting one would invite a second. A
+                # re-run attaches to the live session and records it then.
+                log.warning(
+                    "node %s: %s up but not recorded in the node map: %s",
+                    nick,
+                    result.sid,
+                    exc,
+                )
+                # The class only: the error itself (the map's path, the
+                # parser's words) is in nodes.log, logged just above.
+                warnings = (
+                    *warnings,
+                    (
+                        f"up on @{nick} but not recorded ({type(exc).__name__});"
+                        " re-run magent"
+                        " up from a clean tree or --allow-dirty"
+                    ),
+                )
+        title = _open_node_window(node, result.sid) if window else None
+        log.info(
+            "node %s: %s up (attached_existing=%s)",
+            nick,
+            result.sid,
+            result.attached_existing,
+        )
+        return NodeBringUpOutcome(
+            ok=True,
+            sid=sid,
+            node=nick,
+            attached_existing=result.attached_existing,
+            warnings=warnings,
+            title=title,
+        )
+    except node_sync.NodeLockHeld as exc:
+        log.warning("node %s: bring-up of %s: node busy: %s", nick, sid, exc)
+        return NodeBringUpOutcome(
+            ok=False,
+            sid=sid,
+            node=nick,
+            error=(
+                f"{_node_busy_text(nick, remote_mux.PULL_TIMEOUT_S)};"
+                " re-run to try again"
+            ),
+        )
+    except (ValueError, remote_mux.RemoteError, OSError) as exc:
+        # ValueError covers NodeConfigError (its subclass) and a recipe that
+        # cannot be framed; OSError a local file that vanished mid-read, and
+        # LockHeld (the map held past its wait). A plain ValueError may also be
+        # a bug wearing an outcome, so it keeps its traceback in the log.
+        # A NodeConfigError names the OS error under it by class alone.
+        said = str(exc) if exc.__cause__ is None else f"{exc}: {exc.__cause__}"
+        log.warning(
+            "node %s: bring-up of %s failed: %s",
+            nick or "?",
+            sid,
+            # A RemoteError carries the node's own words, whatever their bytes.
+            node_sync.escaped(said)
+            if isinstance(exc, remote_mux.RemoteError)
+            else said,
+            exc_info=isinstance(exc, ValueError)
+            and not isinstance(exc, nodes.NodeConfigError),
+        )
+        return NodeBringUpOutcome(
+            ok=False, sid=sid, node=nick, error=_node_error_text(exc)
+        )
+
+
+def _placement_recipes(
+    config: MagentConfig,
+    projects: list[ProjectConfig],
+    held: dict[str, NodeMapEntry],
+    *,
+    map_known: bool,
+) -> dict[str, tuple[str, Recipe, bool]]:
+    """``{sid: (nick, recipe, holder)}`` for every project in ``projects``
+    whose node folder is already known, from config and the map alone -- no
+    ssh, no git. The recipe carries only what ``nodes.remote_root_collisions``
+    reads (its project, sid and remote_root); ``holder`` is whether the map
+    records the project in that very folder on that very node -- a project
+    re-pinned elsewhere is a newcomer there. A project that cannot be placed
+    yet (no folder here or none this user may read, an unplaced ``auto``, a
+    folder with no usable name) is left out: its own bring-up names that
+    reason.
+
+    ``held`` is the map read strictly; ``map_known`` False means it could
+    not be read. Then an ``auto`` project is not "unplaced" but UNKNOWN: it
+    may hold its folder on any node, so it stays in, under
+    ``nodes.UNKNOWN_NODE_ROOT`` and with no nick, and nobody is its folder's
+    holder."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+    from magent.env import local_username
+
+    out: dict[str, tuple[str, Recipe, bool]] = {}
+    for proj in projects:
+        name = nodes.project_name(proj)
+        entry = held.get(name)
+        try:
+            project_dir = _node_project_dir(config, proj)
+            if project_dir is None:
+                continue
+            if not map_known and proj.node == NODE_AUTO:
+                nick, remote_root = "", nodes.unknown_node_remote_root(project_dir)
+            else:
+                node = nodes.resolve(
+                    config,
+                    proj,
+                    local_user=local_username(),
+                    placed=entry.nick if entry else None,
+                )
+                nick, remote_root = node.nick, nodes.remote_root_for(node, project_dir)
+        except (nodes.NodeConfigError, OSError):
+            continue
+        out[nodes.node_sid(proj)] = (
+            nick,
+            nodes.Recipe(
+                project=name,
+                sid=nodes.node_sid(proj),
+                repos=(),
+                push_files=(),
+                memory_dir=None,
+                remote_root=remote_root,
+            ),
+            entry is not None
+            and entry.nick == nick
+            and entry.remote_root == remote_root,
+        )
+    return out
+
+
+def _folder_clashes(
+    placed: dict[str, tuple[str, Recipe, bool]],
+    unreadable: OSError | ValueError | None,
+) -> dict[str, str]:
+    """``{sid: why}`` for every member of a group ``placed`` (from
+    ``_placement_recipes``) would share a node folder name in: the X3 text,
+    or -- the map ``unreadable`` -- the map's own reason for a member whose
+    only rivals are auto projects of unknown node. Pure."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    clash: dict[str, str] = {}
+    for group in nodes.remote_root_collisions([r for _, r, _ in placed.values()]):
+        text = nodes.remote_root_collision_text(group)
+        for recipe in group:
+            clash[recipe.sid] = text
+            if (
+                unreadable is not None
+                and not nodes.on_unknown_node(recipe)
+                and all(
+                    nodes.on_unknown_node(other)
+                    for other in group
+                    if other is not recipe
+                )
+            ):
+                # Its only rivals are auto projects whose node the map would
+                # name: no rename is owed, the map is -- a holder is refused
+                # only because it cannot prove it holds the folder.
+                clash[recipe.sid] = _folder_unknown_text(
+                    unreadable, nodes.folder_leaf(recipe), placed[recipe.sid][0]
+                )
+    return clash
+
+
+def _fleet_folder_clashes(
+    config: MagentConfig, projects: list[ProjectConfig]
+) -> tuple[dict[str, tuple[str, Recipe, bool]], dict[str, str]]:
+    """X3 over the WHOLE fleet with ``projects`` in it: ``(placed, clash)``,
+    ``_placement_recipes``' ``{sid: (nick, recipe, holder)}`` and
+    ``_folder_clashes``' ``{sid: why}``, read from config and the map alone."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    # A copy in ``projects`` wins over config's: the placement phase hands
+    # over an auto project already turned into a nick, and writes nothing to
+    # the map until it is up -- config's "auto" copy would place nowhere, and
+    # the folder it is about to be cloned into would go unchecked.
+    batch = {nodes.node_sid(proj): proj for proj in projects}
+    listed = nodes.node_projects(config)
+    known = {nodes.node_sid(proj) for proj in listed}
+    fleet = [batch.get(nodes.node_sid(proj), proj) for proj in listed]
+    fleet += [proj for proj in projects if nodes.node_sid(proj) not in known]
+    held, unreadable = _node_map_for_placement()
+    placed = _placement_recipes(config, fleet, held, map_known=unreadable is None)
+    return placed, _folder_clashes(placed, unreadable)
+
+
+def node_folder_refusal(config: MagentConfig, proj: ProjectConfig) -> str | None:
+    """X3 for ONE project about to be placed (``recall --to``'s moved copy):
+    the refusal ``up`` would give it -- a newcomer to a node folder name
+    another project would share -- or None. Config and the map only: no ssh,
+    no git, so a caller can ask before it touches anything."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    placed, clash = _fleet_folder_clashes(config, [proj])
+    sid = nodes.node_sid(proj)
+    if sid in clash and not placed[sid][2]:
+        return clash[sid]
+    return None
+
+
+def _run_node_bring_ups(
+    config: MagentConfig,
+    projects: list[ProjectConfig],
+    *,
+    allow_dirty: bool,
+    window: bool,
+) -> list[NodeBringUpOutcome]:
+    """Each project's bring-up on a pool thread (a clone is minutes of
+    network, not CPU), at most eight at once. The per-node lock that keeps one
+    node serial is taken INSIDE a pool slot, so a bring-up waiting on its
+    node's lock still holds its slot: with more than eight queued for one node
+    ahead of another node's projects, that other node waits for a slot however
+    idle it is (head-of-line blocking). Outcomes in the order given.
+
+    First, ONCE and before anything is dialed, the WHOLE fleet's node folders
+    are checked (X3, ``nodes.remote_root_collisions``): a batch project whose
+    folder name another project -- in this batch or not -- would share is
+    refused, naming the other. Fanned out, two clones would race for one
+    folder; a batch of one today and another tomorrow would overwrite it.
+    A collision among projects outside the batch refuses nothing here. Only
+    newcomers are refused: the member the map already records in that folder
+    is brought up as usual -- attached if its session runs, restarted in its
+    own folder if not, neither overwriting anyone -- with the collision as a
+    warning, so a healthy session is never reported failed because a newcomer
+    arrived.
+
+    Every project arrives placed: ``place_node_projects`` turns each ``auto``
+    one into a nick or leaves it out (an unreadable map included), so none
+    reaches here still ``auto``."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    if not projects:
+        return []
+    placed, clash = _fleet_folder_clashes(config, projects)
+    outcomes: dict[str, NodeBringUpOutcome] = {}
+    for proj in projects:
+        sid = nodes.node_sid(proj)
+        if sid in clash and not placed[sid][2]:
+            get_logger("nodes").warning("node project %s refused: %s", sid, clash[sid])
+            outcomes[sid] = NodeBringUpOutcome(
+                ok=False, sid=sid, node=placed[sid][0], error=clash[sid]
+            )
+    go = [proj for proj in projects if nodes.node_sid(proj) not in outcomes]
+    if go:
+        with ThreadPoolExecutor(max_workers=min(8, len(go))) as pool:
+            futures = [
+                pool.submit(
+                    bring_up_node_project,
+                    config,
+                    proj,
+                    allow_dirty=allow_dirty,
+                    window=window,
+                )
+                for proj in go
+            ]
+            for proj, future in zip(go, futures, strict=True):
+                sid = nodes.node_sid(proj)
+                outcome = future.result()
+                if sid in clash:  # the folder's recorded holder
+                    outcome = replace(outcome, warnings=(*outcome.warnings, clash[sid]))
+                outcomes[sid] = outcome
+    return [outcomes[nodes.node_sid(proj)] for proj in projects]
+
+
+def bring_up_node_projects(
+    config: MagentConfig,
+    *,
+    only: list[str] | None = None,
+    group: str | None = None,
+    allow_dirty: bool = False,
+    window: bool = False,
+) -> list[NodeBringUpOutcome]:
+    """Bring up every node project in scope. ``only`` holds session ids, the
+    same currency as ``psmux.bring_up``'s -- a local id in it is ignored.
+
+    Every ``"auto"`` project becomes a nick first, as ONE batch, so a
+    single ``up`` spreads across equal nodes exactly as ``--go`` does
+    (G-C12). An auto project that cannot be placed is a failed outcome
+    saying why (``place_node_projects``' own words), never a silent
+    drop; what the placement said about a project rides on its outcome
+    as warnings, which the callers print."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    projects = [
+        proj
+        for proj in nodes.node_projects(config, group)
+        if only is None or nodes.node_sid(proj) in only
+    ]
+    placed = place_node_projects(config, projects)
+    # node_projects keeps one project per session id, and the placer keeps
+    # their order: the fan-out's outcomes line up with `chosen`'s.
+    chosen = {nodes.node_sid(proj): proj for proj in placed.projects}
+    ready = iter(
+        _run_node_bring_ups(
+            config, list(chosen.values()), allow_dirty=allow_dirty, window=window
+        )
+    )
+    outcomes: list[NodeBringUpOutcome] = []
+    for proj in projects:
+        name, sid = nodes.project_name(proj), nodes.node_sid(proj)
+        placement = placed.placements.get(name)
+        said: tuple[str, ...] = ()
+        if placement is not None:
+            # A kept project was not scored: the load history is not why
+            # it runs where it does.
+            if placement.reason != "kept":
+                said = placed.history_notes
+            if placement.note:
+                said = (*said, placement.note)
+        if sid not in chosen:
+            outcomes.append(
+                NodeBringUpOutcome(
+                    ok=False, sid=sid, error=placed.unplaced[name], warnings=said
+                )
+            )
+            continue
+        outcome = next(ready)
+        if said:
+            outcome = replace(outcome, warnings=(*said, *outcome.warnings))
+        outcomes.append(outcome)
+    return outcomes
+
+
+def node_session_ids(config: MagentConfig, group: str | None = None) -> list[str]:
+    """The session ids of the node projects in scope, config order."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    return [nodes.node_sid(proj) for proj in nodes.node_projects(config, group)]
+
+
+_KEPT = "kept in the node map for `magent node sync --once`"
+
+
+def _say_not_pulled(sid: str, reason: str, then: str = _KEPT) -> None:
+    """The one line a session whose last turn did not come home gets:
+    ``reason`` is why, ``then`` what is left to fetch it with."""
+    click.echo(
+        f"  {style('!', fg='yellow')} {sid}: last turn not pulled ({reason}); {then}"
+    )
+
+
+def _final_pull(
+    config: MagentConfig, key: str, sid: str, nick: str, no_pull: dict[str, str]
+) -> bool:
+    """Bring map entry ``key``'s last turn home before session ``sid`` is
+    killed (R-D6). False when it could not be pulled -- said on one line; the
+    caller still kills, but keeps the map entry, so ``magent node sync
+    --once`` can fetch the transcript, which outlives the tmux session on the
+    node's disk.
+
+    ``key`` is the map key ``placement_of`` found, never the project's current
+    name: ``final_pull`` looks the entry up by it, and a retitled project's
+    name would find nothing and read as "never placed" -- pulled.
+
+    A node that did not answer a pull (``timed_out``, or ssh's own rc 255:
+    node_sync's UNREACHABLE), and one whose pull lock another magent process
+    held past ``FINAL_PULL_WAIT_S`` (``NodeLockHeld``), joins ``no_pull`` --
+    nick to the reason its later sessions print -- and is not pulled again in
+    this call, so ``down --all`` against a hung or held node costs one wait,
+    not one per project on it. Its sessions are still killed. Every other
+    failure -- a reply over the cap is a node that answered -- is this
+    session's.
+
+    ``final_pull`` re-reads the map strictly. Busy or torn there, it raises
+    NodeMapUnreadable, said with the shared sentence and the map error's class
+    (the whole error goes to nodes.log). Its None ("never placed") after the
+    caller read ``key`` out of the map strictly is the entry vanishing between
+    the two reads -- a concurrent ``down``/``up`` that moved it -- said as "its
+    node map entry was not found again": a pull that did not happen, never
+    one that did."""
+    # heavy subsystem: in-body per policy (node_sync dials the node)
+    from magent import node_sync, remote_mux
+
+    if nick in no_pull:
+        reason = no_pull[nick]
+    else:
+        try:
+            result = node_sync.final_pull(
+                config, key, wait_s=node_sync.FINAL_PULL_WAIT_S
+            )
+        except (OSError, ValueError, remote_mux.RemoteError) as exc:
+            # OSError covers NodeLockHeld (another magent process -- a sync
+            # tick, a bring-up, another down -- held the node past
+            # FINAL_PULL_WAIT_S), NodeMapUnreadable, and a pulled file this PC
+            # could not write; ValueError covers NodeConfigError. None of them
+            # may abort the down.
+            detail, reason = str(exc), _pull_error_text(exc)
+            if isinstance(exc, remote_mux.RemoteError):
+                # The node's own words, whatever their bytes -- over the cap,
+                # this line is the only place they go.
+                detail = node_sync.escaped(detail)
+                # The pull's ssh call is quiet: a local ssh that would not
+                # start is its class alone, so this line adds the OS's words.
+                words = remote_mux.os_detail(exc)
+                if words:
+                    detail = f"{detail}: {words}"
+            if isinstance(exc, node_sync.NodeMapUnreadable):
+                # Its own text is the shared sentence plus the MAP error's
+                # class (final_pull built it with nodes.map_unread_text): the
+                # screen's. The error it chains names the path and the
+                # parser's words: the log's. Never _pull_error_text's words
+                # (the wrapper's class, not the map error's), and never the
+                # None branch's: the map, not the entry, went unread.
+                detail, reason = f"{exc}: {exc.__cause__}", str(exc)
+            get_logger("nodes").warning(
+                "down: final pull of %s failed: %s", sid, detail
+            )
+            if isinstance(exc, remote_mux.RemoteError) and (
+                exc.timed_out or exc.rc == attach_client.SSH_TRANSPORT_RC
+            ):
+                # The first line keeps ssh's own reason (rc 255 is also a
+                # refused key); the node's later sessions just skip.
+                no_pull[nick] = f"node {nick} did not answer the pull"
+            elif isinstance(exc, node_sync.NodeLockHeld):
+                # Our words, not the lock's name, on every session of the node.
+                reason = no_pull[nick] = _node_busy_text(
+                    nick, node_sync.FINAL_PULL_WAIT_S
+                )
+            # Printable ASCII: the reason may be the node's words or a path.
+            reason = node_sync.printable(reason)
+        else:
+            if result is not None:
+                return True
+            get_logger("nodes").warning(
+                "down: final pull of %s found no map entry for %r", sid, key
+            )
+            # The entry the strict read found, missing from final_pull's own
+            # strict re-read: no exception, so no class.
+            reason = "its node map entry was not found again"
+    _say_not_pulled(sid, reason)
+    return False
+
+
+def stop_node_sessions(
+    config: MagentConfig, sids: list[str]
+) -> tuple[list[str], list[str]]:
+    """Kill each node session in ``sids`` ON ITS NODE: where the node map
+    placed it, else where its project is pinned. Returns ``(stopped,
+    still_running)`` like ``stop_psmux``, in config order.
+
+    A session the node confirmed killed is stopped; one that was not there is
+    neither. Either way its map entry is cleared. One whose node could not be
+    asked (unreachable, or a placement the config no longer names) is a
+    survivor, and its entry stays for the next ``down`` to find. A node that
+    failed once is not dialed again in this call: its other sessions are
+    survivors too, so ``down --all`` against a powered-off node costs one
+    probe timeout, not one per project. An ``auto`` project the map never
+    placed runs nowhere this PC knows of and is skipped.
+
+    The map is read STRICTLY: this answer becomes a report, and a torn or
+    busy map read as ``{}`` would hide every placed session behind "No
+    running sessions to stop.". Unreadable, nothing it might hold is claimed:
+    an ``auto`` project is a survivor, and a pinned one that is "not there"
+    on its pin is a survivor too -- it may run where the lost map said.
+    Likewise one unmap that fails stops the rest from queueing on the same
+    map lock; their entries stay, which the next bring-up records over.
+
+    Each placed session's last turn is pulled home first (``_final_pull``);
+    one that could not be pulled is still killed, but keeps its map entry. A
+    pinned session behind an unreadable map is killed on its pin with no pull
+    -- there is no entry to pull from -- and says so, since the lost map may
+    have placed it.
+
+    The node half only. The LOCAL session a node project may have left here
+    (D9) is ``stop_psmux``'s, and the ``down`` shell folds the two halves
+    into one report."""
+    # heavy subsystem: in-body per policy (nodes + remote_mux: ssh)
+    from magent import nodes, remote_mux
+    from magent.config import NODE_AUTO
+    from magent.env import local_username
+
+    log = get_logger("nodes")
+    entries, unreadable = _node_map_for_placement()
+    map_known = unreadable is None
+    if unreadable is not None:
+        log.warning(
+            "down: node map unreadable, no placement is trusted: %s", unreadable
+        )
+    # A pull can wait out a held lock and then a slow node, one session after
+    # another: minutes. Say so before the first (the fan-out rule).
+    due = sum(
+        1
+        for proj in nodes.node_projects(config)
+        if nodes.node_sid(proj) in sids and nodes.placement_of(proj, entries)
+    )
+    if due:
+        click.echo(
+            f"  {style('-', dim=True)} Pulling the last turn of {due} node"
+            " session(s) home..."
+        )
+    map_writable = True
+    unreachable: set[str] = set()
+    no_pull: dict[str, str] = {}
+    stopped: list[str] = []
+    still: list[str] = []
+    for proj in nodes.node_projects(config):
+        sid = nodes.node_sid(proj)
+        if sid not in sids:
+            continue
+        key, entry = nodes.placement_of(proj, entries) or (None, None)
+        if entry is None and proj.node == NODE_AUTO:
+            if not map_known:
+                still.append(sid)
+            continue
+        try:
+            # The map wins over the pin: a project re-pinned since its
+            # bring-up still runs where it was started.
+            node = nodes.resolve(
+                config,
+                replace(proj, node=entry.nick) if entry else proj,
+                local_user=local_username(),
+            )
+        except nodes.NodeConfigError as exc:
+            log.warning("down: %s not stopped: %s", sid, exc)
+            still.append(sid)
+            continue
+        if node.nick in unreachable:
+            still.append(sid)
+            continue
+        # While the entry still names it. No entry in a map that was read is
+        # nothing to pull; no entry in a map that was not is a pull not made.
+        pulled = key is not None and _final_pull(config, key, sid, node.nick, no_pull)
+        if key is None and not map_known:
+            _say_not_pulled(
+                sid,
+                nodes.MAP_UNREAD,
+                then=(
+                    "if the map placed it, `magent node sync --once` fetches it"
+                    " once the map reads again"
+                ),
+            )
+        killed = remote_mux.kill_session(node, entry.sid if entry else sid)
+        if killed is None:
+            log.warning("down: %s not stopped: node %s did not answer", sid, node.nick)
+            unreachable.add(node.nick)
+            still.append(sid)
+            continue
+        if killed:
+            stopped.append(sid)
+        elif not map_known:
+            log.warning(
+                "down: %s not stopped: not on %s, map unreadable", sid, node.nick
+            )
+            still.append(sid)
+        if not pulled:
+            continue
+        if not map_writable:
+            log.warning("down: %s map entry stays: the map could not be written", sid)
+            continue
+        try:
+            # Compare-and-delete: an `up` that re-placed this project while
+            # the kill was in flight keeps its fresh entry.
+            nodes.update_node_map(key, None, expect=entry)
+        except (ValueError, OSError) as exc:
+            # The kill is proved. A stale entry is harmless: the next bring-up
+            # of this project records its placement over it.
+            log.warning("down: %s stopped, but its map entry stays: %s", sid, exc)
+            map_writable = False
+    return stopped, still
+
+
+def _keep_node_sync(config: MagentConfig, config_path: str | None) -> None:
+    """``ensure_node_sync`` after a bring-up put a node session up. Best
+    effort: the sessions are up either way, and a daemon that cannot start
+    (its lock dir, the spawn) must not cost the bring-up its report or its exit
+    code -- ``status`` shows the daemon off, and serve's supervisor retries."""
+    try:
+        ensure_node_sync(config, config_path=config_path)
+    except OSError as exc:
+        get_logger("nodes").warning(
+            "node sync daemon not started after the bring-up: %s", exc
+        )
+
+
+def _echo_node_outcomes(outcomes: list[NodeBringUpOutcome]) -> None:
+    # heavy subsystem: in-body per policy
+    from magent.node_sync import printable
+
+    for o in outcomes:
+        if o.ok:
+            verb = "attached" if o.attached_existing else "started"
+            click.echo(
+                f"  {style('+', fg='green')} {o.sid} "
+                f"{style('@' + o.node, fg='blue')} {verb}"
+            )
+        else:
+            # The node's last stderr line and names read off disk: one row.
+            click.echo(f"  {style('x', fg='red')} {o.sid}: {printable(o.error or '')}")
+        for warning in o.warnings:
+            click.echo(
+                f"    {style('!', fg='yellow')} {style(printable(warning), dim=True)}"
+            )

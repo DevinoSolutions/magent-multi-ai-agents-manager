@@ -92,6 +92,20 @@ class MagentEnv(BaseSettings):
     # settable -- the e2e tier drives a real revive twice and would otherwise
     # have to sit out the production default to prove the second one.
     upload_respawn_cooldown_s: float | None = None
+    # Whether `magent serve` keeps the attention daemon alive (see
+    # cli/attention_cmd.AttentionDaemonSupervisor) -- the other half of the
+    # mutual supervision above. On by default: after a restart the bring-up
+    # brings serve and the Alt+V listener back, and nothing else ever brought
+    # the attention daemon back. It only revives a daemon that was running and
+    # did not stop cleanly; a daemon never started or stopped on purpose is
+    # left alone.
+    #
+    # The fourth member of the same test-isolation law: a test that starts a
+    # real `magent serve` would otherwise start a real attention daemon behind
+    # it, badging and flashing the developer's own windows. tests/conftest.py
+    # pins it to 0 for every tier, and every fixture that builds a child env
+    # sets it alongside upload_supervisor.
+    attention_supervisor: bool = True
     # Whether magent raises every live psmux process to ABOVE_NORMAL priority
     # (see psmux.boost_priority). On by default -- psmux processes are the
     # keystroke path for every agent pane, they are I/O-bound (blocked on a
@@ -140,6 +154,30 @@ class MagentEnv(BaseSettings):
     # 42 agents alive in Session 0, unkillable from the desktop and holding
     # every session name the user's own bring-up wanted.
     session0_policy: Literal["handoff", "allow", "refuse"] = "handoff"
+    # Should `magent serve` keep the node sync daemon (a detached
+    # `magent node sync`) alive? (default: 1 / on.) The daemon pulls every node session's
+    # transcripts and agent state home each settings.nodeSync.pullIntervalS,
+    # which is what makes a session on a pool machine durable and resumable
+    # anywhere; it is only ever started when some project has `node` set. Set
+    # to 0 to run the daemon yourself. Like hotkey_supervisor, upload_supervisor
+    # and psmux_boost, 0 is also a TEST-ISOLATION law: a test that starts a real
+    # serve would otherwise start a daemon that dials real machines over ssh.
+    node_sync: bool = True
+    # Should magent PARK idle agents? (default: 1 / on.) When on, `magent serve`
+    # runs a sweep that hard-kills the agent process tree of any local psmux
+    # session whose finished agent has been idle past settings.idleReap.after-
+    # Minutes, keeps the pane, and types a resume notice into it.
+    #
+    # The opt-out is the SHARPEST member of the test-isolation law
+    # (hotkey_supervisor / upload_supervisor / psmux_boost / node_sync are the
+    # others): the reaper is the ONLY code in the product that TERMINATES
+    # processes it did not spawn, reaching them through psmux session names and
+    # ~/.claude session files that no HOME redirect contains. tests/conftest.py pins it to 0 for
+    # every tier; a test that starts a real serve/attention on a developer's box
+    # with it on would kill that box's live fleet. Unlike psmux_boost, an env
+    # that FAILS to validate turns reaping OFF, not on (reap.env_enabled):
+    # the one supervisor whose verb is destructive fails closed.
+    idle_reap: bool = True
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:
@@ -260,6 +298,17 @@ def localappdata_dir() -> Path:
 
 def editor_command() -> str:
     return os.environ.get("EDITOR", "xdg-open")
+
+
+def local_username() -> str:
+    """The login name of the user running magent: USERNAME on Windows, USER on
+    POSIX, "" when neither is set.
+
+    Host-infrastructure, like ``is_ssh_login``: the OS sets it, nobody
+    configures it. A node's ``user`` falls back to it at use time
+    (``nodes.resolve``) and it is never written back into the config.
+    """
+    return os.environ.get("USERNAME") or os.environ.get("USER") or ""
 
 
 # The variables OpenSSH exports into every login it serves. SSH_CONNECTION and
@@ -450,6 +499,27 @@ def spawn_child_env() -> dict[str, str]:
     }
 
 
+# Every credential that would stand in for, or outrank, a Claude SUBSCRIPTION
+# login: an API key, a gateway's bearer token, and an OAuth token already in
+# the environment. A node never runs on any of them but its own subscription
+# token (node_auth.py), so none of them may reach the one child that mints it.
+CLAUDE_CREDENTIAL_VARS = frozenset(
+    {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
+)
+
+
+def claude_mint_env() -> dict[str, str]:
+    """``spawn_child_env()`` minus ``CLAUDE_CREDENTIAL_VARS``: THE seam for
+    ``claude setup-token`` on this PC (``node_auth.mint_token``). A key in the
+    launching shell would make setup-token warn that another credential is in
+    use -- and must never be what a node ends up signed in with."""
+    return {
+        key: value
+        for key, value in spawn_child_env().items()
+        if key.upper() not in CLAUDE_CREDENTIAL_VARS
+    }
+
+
 def _has_agent_session_marker() -> bool:
     """True when this process was spawned by an agent harness's tool shell."""
     return any(key.upper() in _AGENT_SESSION_VARS for key in os.environ)
@@ -503,6 +573,50 @@ def attach_client_env() -> dict[str, str] | None:
         key: value
         for key, value in os.environ.items()
         if key.upper() not in _PRESENTATION_VARS
+    }
+
+
+# Git's repo-LOCATING variables: exactly what `git rev-parse --local-env-vars`
+# prints (git 2.52; pinned against the installed git by test_env_schema.py).
+# A git hook exports GIT_DIR -- an ABSOLUTE path inside a worktree -- and every
+# git child of that hook inherits it. A local read aimed by ``-C <path>`` must
+# not be silently answered by the repo the hook was fired in instead.
+GIT_LOCAL_ENV_VARS = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+)
+
+
+def git_child_env() -> dict[str, str]:
+    """The process environment minus ``GIT_LOCAL_ENV_VARS``: THE seam for a
+    local git child that names its repo with ``-C``.
+
+    The incident this closes: magent's launch path (and its test suite, via
+    the husky pre-push gate) can run inside a git hook or an agent's tool
+    shell. With the hook's GIT_DIR inherited, ``git -C <project> status``
+    reads the HOOK's repo, and a test fixture's ``git init --bare`` rewrote a
+    real repo's shared config to ``core.bare=true``. Everything else --
+    PATH, HOME, GIT_CEILING_DIRECTORIES, the user's config -- survives: those
+    bound or configure a search, they do not aim one. (GIT_CONFIG_KEY_<n> /
+    GIT_CONFIG_VALUE_<n> are inert once GIT_CONFIG_COUNT is gone.) Matched on
+    the upper-cased name, as Windows env keys are case-insensitive."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in GIT_LOCAL_ENV_VARS
     }
 
 

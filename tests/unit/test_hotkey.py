@@ -290,6 +290,109 @@ class TestListenerLifecycle:
         assert hotkey.listener_pid() is None
         assert not p.exists()  # stale pid file is cleaned up
 
+    def test_a_pid_file_from_before_the_boot_is_not_a_listener(
+        self, tmp_path, monkeypatch
+    ):
+        # A restart kills the listener without letting it remove its pid file,
+        # and Windows hands pid numbers out again. Believed, the recycled pid
+        # is a "running" listener: serve's supervisor never starts a real one
+        # (Alt+V dead after every such reboot) and status calls it STALE.
+        import os
+
+        from magent import hotkey
+
+        p = tmp_path / "hotkey.pid"
+        p.write_text("4321")
+        os.utime(p, (1000.0, 1000.0))
+        monkeypatch.setattr(hotkey, "_PID_PATH", p)
+        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)  # recycled
+        monkeypatch.setattr("magent.procs.boot_time", lambda: 5000.0)
+
+        assert hotkey.listener_pid() is None
+        assert not p.exists()
+
+    def test_a_pid_file_written_since_the_boot_is_read_as_before(
+        self, tmp_path, monkeypatch
+    ):
+        from magent import hotkey
+
+        p = tmp_path / "hotkey.pid"
+        p.write_text("4321")
+        monkeypatch.setattr(hotkey, "_PID_PATH", p)
+        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)
+        monkeypatch.setattr("magent.procs.boot_time", lambda: 1000.0)
+
+        assert hotkey.listener_pid() == 4321
+
+    def test_an_unknown_boot_time_changes_nothing(self, tmp_path, monkeypatch):
+        import os
+
+        from magent import hotkey
+
+        p = tmp_path / "hotkey.pid"
+        p.write_text("4321")
+        os.utime(p, (1000.0, 1000.0))
+        monkeypatch.setattr(hotkey, "_PID_PATH", p)
+        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)
+        monkeypatch.setattr("magent.procs.boot_time", lambda: None)
+
+        assert hotkey.listener_pid() == 4321
+
+    def test_stop_never_kills_a_pid_recorded_before_the_boot(
+        self, tmp_path, monkeypatch
+    ):
+        # `down --all` after a restart must not taskkill whatever process now
+        # wears the old listener's pid number.
+        import os
+        import subprocess
+
+        from magent import hotkey
+
+        p = tmp_path / "hotkey.pid"
+        p.write_text("4321")
+        os.utime(p, (1000.0, 1000.0))
+        monkeypatch.setattr(hotkey, "_PID_PATH", p)
+        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)
+        monkeypatch.setattr("magent.procs.boot_time", lambda: 5000.0)
+        calls = []
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: calls.append(a))
+
+        assert hotkey.stop_listener() is False
+        assert calls == []
+
+    def test_the_supervisor_starts_a_listener_past_a_pre_boot_pid_file(
+        self, tmp_path, monkeypatch
+    ):
+        # The consequence that matters: serve's supervision entry point spawns
+        # a listener instead of keeping a recycled pid it thinks is one.
+        import os
+
+        from magent import hotkey, launch
+
+        p = tmp_path / "hotkey.pid"
+        p.write_text("4321")
+        os.utime(p, (1000.0, 1000.0))
+        monkeypatch.setattr(hotkey, "_PID_PATH", p)
+        monkeypatch.setattr(hotkey, "_MANIFEST_PATH", tmp_path / "hotkey.json")
+        # A manifest that matches exactly, as the dead listener left it: on its
+        # own it would make the supervisor keep the recorded pid.
+        hotkey._write_manifest("http://127.0.0.1:8034", None)
+        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)
+        monkeypatch.setattr("magent.procs.boot_time", lambda: 5000.0)
+        stopped = []
+        monkeypatch.setattr(hotkey, "stop_listener", lambda: stopped.append(1))
+        spawned = []
+        monkeypatch.setattr(
+            "magent.launch.spawn_detached",
+            lambda args, **k: spawned.append(args) or _StillStarting(rc=1),
+        )
+
+        launch.ensure_hotkey_listener("http://127.0.0.1:8034")
+
+        assert len(spawned) == 1
+        assert "hotkey" in spawned[0]
+        assert stopped == []  # nothing of ours to stop: the pid is not ours
+
     def test_stop_kills_and_removes(self, tmp_path, monkeypatch):
         import subprocess
 
@@ -312,6 +415,35 @@ class TestListenerLifecycle:
         assert hotkey.stop_listener() is True
         assert calls and calls[0][0] == "taskkill" and "4321" in calls[0]
         assert not p.exists()
+
+    def test_forget_drops_every_trace_without_signalling_anything(
+        self, tmp_path, monkeypatch
+    ):
+        # The wedge replacement kills through procs.terminate_verified and then
+        # calls this; it must never itself reach for taskkill.
+        import subprocess
+
+        from magent import hotkey, log
+
+        pid_file = tmp_path / "hotkey.pid"
+        manifest = tmp_path / "hotkey.json"
+        pid_file.write_text("4321")
+        manifest.write_text("{}")
+        log.write_heartbeat("hotkey")
+        monkeypatch.setattr(hotkey, "_PID_PATH", pid_file)
+        monkeypatch.setattr(hotkey, "_MANIFEST_PATH", manifest)
+
+        def _no_subprocess(*a, **k):
+            raise AssertionError("forget_listener must not spawn a process")
+
+        monkeypatch.setattr(subprocess, "run", _no_subprocess)
+
+        hotkey.forget_listener()
+
+        assert not pid_file.exists()
+        assert not manifest.exists()
+        assert log.heartbeat_age("hotkey") is None
+        hotkey.forget_listener()  # and it is idempotent
 
     def test_stop_noop_when_not_running(self, tmp_path, monkeypatch):
         from magent import hotkey
@@ -473,6 +605,24 @@ class TestListenerManifest:
         assert not hotkey._PID_PATH.exists()
 
 
+def _pump_idle() -> bool:
+    """Wait for the shared flash pump to finish everything it was handed.
+
+    A condition, not a guess at how long a delivery takes on a loaded box:
+    bounded only by the pump's own worst case, every flash still pending
+    running to its full ``FLASH_HTTP_TIMEOUT_S``.
+    """
+    from magent import altv
+
+    pending = max(altv._flash_queue.unfinished_tasks, 1)
+    deadline = time.monotonic() + pending * altv.FLASH_HTTP_TIMEOUT_S + 5.0
+    while altv._flash_queue.unfinished_tasks:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
 class _OpenCodeHarness:
     """Shared fake for the F2 handler's two round trips (see `_patch`)."""
 
@@ -486,6 +636,7 @@ class _OpenCodeHarness:
         self.spawn_envs: list[object] = []
         self.spawn_kwargs: list[dict[str, object]] = []
         self.flashed: list[str] = []
+        self.flash_tints: list[object] = []
         monkeypatch.setattr(hotkey.shutil, "which", lambda _n: code_bin)
 
         def _popen(argv, **kwargs):
@@ -510,7 +661,8 @@ class _OpenCodeHarness:
             hotkey,
             "flash_async",
             lambda url, project, message, duration_ms=None, tint=None: (
-                self.flashed.append(message)
+                self.flashed.append(message),
+                self.flash_tints.append(tint),
             ),
         )
         return spawned
@@ -578,7 +730,7 @@ class TestDoOpenCode(_OpenCodeHarness):
                 ],
             },
         )
-        hotkey._do_open_code("http://x:8034", "caly", "amin@deck")
+        hotkey._do_open_code("http://x:8034", "caly", "demo@deck")
         assert spawned == [["code", "--remote", "ssh-remote+deck", "/base/caly"]]
 
     def test_the_editor_gets_a_scrubbed_environment(self, monkeypatch):
@@ -631,7 +783,11 @@ class TestDoOpenCode(_OpenCodeHarness):
 
         from magent import hotkey
 
-        monkeypatch.setattr(hotkey.shutil, "which", lambda _n: "code")
+        # The harness, for its recorded flashes: left real, this test's two
+        # flashes went to the process-wide pump addressed to host `x` -- a real
+        # DNS lookup each, ~2.7s on Windows, still in flight when later tests
+        # ran and holding the pump the flash-URL pin below waits on.
+        self._patch(monkeypatch)
 
         def _down(url, timeout=None):
             raise URLError("connection refused")
@@ -640,6 +796,7 @@ class TestDoOpenCode(_OpenCodeHarness):
         with caplog.at_level("ERROR", logger="magent.hotkey"):
             hotkey._do_open_code("http://x:8034", "caly", None)  # must not raise
         assert "F2: open project=caly failed" in caplog.text
+        assert self.flashed[-1] == "F2: failed - see hotkey.log"
 
 
 class TestDoOpenCodeFeedback(_OpenCodeHarness):
@@ -712,7 +869,7 @@ class TestDoOpenCodeFeedback(_OpenCodeHarness):
         import contextlib
         import io
 
-        from magent import hotkey
+        from magent import altv, hotkey
 
         spawned: list[list[str]] = []
         monkeypatch.setattr(hotkey.shutil, "which", lambda _n: "code")
@@ -731,12 +888,19 @@ class TestDoOpenCodeFeedback(_OpenCodeHarness):
         monkeypatch.setattr(hotkey, "urlopen", _sessions_only)
         hotkey._do_open_code("http://127.0.0.1:1", "caly", None)
         assert spawned == [["code", "/base/caly"]]
+        # ...and the chain really ran to the end, inside this test: both refused
+        # deliveries finished (a refused connect is ~2s on Windows, so returning
+        # without this left them in flight for whichever test ran next), and
+        # the pump that failed them is still there for the next flash.
+        assert _pump_idle(), "the pump never finished the two refused flashes"
+        assert altv._pump is not None
+        assert altv._pump.is_alive()
 
     def test_flash_url_is_the_shared_builder_shape(self, monkeypatch):
         # Pin the client/server contract: the listener must hit the same route
         # upload_server serves, with the project it was invoked for. The flash
-        # leaves on the pump thread now, so this waits for it rather than
-        # assuming it already happened.
+        # leaves on the pump thread, so this waits for the pump to finish it
+        # rather than assuming it already happened.
         from magent import altv, hotkey
 
         seen: list[str] = []
@@ -747,16 +911,19 @@ class TestDoOpenCodeFeedback(_OpenCodeHarness):
 
         monkeypatch.setattr(hotkey.shutil, "which", lambda _n: None)
         monkeypatch.setattr(altv, "urlopen", _capture)
+        # The pump is one process-wide queue: a flash another test left in it
+        # would be delivered through _capture too, or hold the pump while this
+        # test waits. That is a leak in THAT test, and it fails here by name.
+        assert _pump_idle(), (
+            f"{altv._flash_queue.unfinished_tasks} flash(es) from an earlier"
+            " test still queued or in flight on the shared pump"
+        )
         hotkey._do_open_code("http://127.0.0.1:8033", "caly", None)
+        assert _pump_idle()
 
         def _ours() -> list[str]:
-            # The pump is one process-wide queue, so a flash another test left
-            # in it can be delivered here too; match on this call's own server.
             return [u for u in seen if u.startswith("http://127.0.0.1:8033/")]
 
-        deadline = time.time() + 5
-        while not _ours() and time.time() < deadline:
-            time.sleep(0.01)
         assert _ours()[0].startswith("http://127.0.0.1:8033/api/flash?")
         assert parse_qs(urlparse(_ours()[0]).query)["project"] == ["caly"]
 
@@ -800,12 +967,12 @@ class TestF2HookDecision:
             HC_ACTION,
             WM_KEYDOWN,
             self._lparam(VK_F2),
-            "amin@deck",
+            "demo@deck",
         )
         # 1 == swallow: the agent pane must never also receive the F2.
         assert result == 1
         assert started[0][0] is hotkey._do_open_code
-        assert started[0][1] == ("http://x:8034", "caly", "amin@deck")
+        assert started[0][1] == ("http://x:8034", "caly", "demo@deck")
 
     def test_f2_outside_a_magent_window_passes_through(self, monkeypatch):
         from magent import hotkey
@@ -834,7 +1001,7 @@ class TestF2HookDecision:
         from magent.hotkey import HC_ACTION, VK_V, WM_KEYDOWN, _hook_decide
 
         monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "magent:caly")
-        monkeypatch.setattr(hotkey, "clipboard_has_image", lambda: True)
+        monkeypatch.setattr(hotkey, "clipboard_kind", lambda: "image")
         started: list[tuple[object, tuple[object, ...]]] = []
         self._fake_thread(monkeypatch, started)
 
@@ -860,7 +1027,7 @@ class TestF2HookDecision:
         from magent.hotkey import HC_ACTION, VK_V, WM_KEYDOWN, _hook_decide
 
         monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "magent:caly")
-        monkeypatch.setattr(hotkey, "clipboard_has_image", lambda: False)
+        monkeypatch.setattr(hotkey, "clipboard_kind", lambda: None)
         monkeypatch.setattr(hotkey.user32, "CallNextHookEx", lambda *a: 0)
         started: list[tuple[object, tuple[object, ...]]] = []
         self._fake_thread(monkeypatch, started)
@@ -877,7 +1044,33 @@ class TestF2HookDecision:
         )
         assert started[0][0] is hotkey._altv_report
         assert started[0][1][:3] == ("http://x:8034", "caly", "no-image")
-        assert "clipboard has no image" in started[0][1][3]
+        assert "clipboard has no image or file" in started[0][1][3]
+
+    def test_alt_v_with_copied_files_routes_to_the_file_press(self, monkeypatch):
+        # Files copied in Explorer are an Alt+V press too: the chord is
+        # swallowed and the press carries the clipboard KIND, so _do_upload
+        # reads the files rather than a bitmap.
+        from magent import hotkey
+        from magent.hotkey import HC_ACTION, VK_V, WM_KEYDOWN, _hook_decide
+
+        monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "magent:caly")
+        monkeypatch.setattr(hotkey, "clipboard_kind", lambda: "files")
+        started: list[tuple[object, tuple[object, ...]]] = []
+        self._fake_thread(monkeypatch, started)
+
+        assert (
+            _hook_decide(
+                {"alt_held": True},
+                "http://x:8034",
+                HC_ACTION,
+                WM_KEYDOWN,
+                self._lparam(VK_V),
+                "deskpc",
+            )
+            == 1
+        )
+        assert started[0][0] is hotkey._do_upload
+        assert started[0][1] == ("http://x:8034", "caly", "deskpc", "files")
 
     def test_alt_v_outside_a_magent_window_stays_a_silent_pass_through(
         self, monkeypatch
@@ -952,6 +1145,140 @@ class TestAltVIsDelegated:
         # rename cannot leave the listener reporting into a void.
         assert hotkey._altv_report is altv.report
         assert hotkey.OUTCOME_REASONS is altv.OUTCOME_REASONS
+
+    def test_copied_files_take_the_file_press_local_or_remote(self, monkeypatch):
+        # A files press never goes near the image pipeline (or native Ctrl+V):
+        # it is handle_file_press with the CF_HDROP reader, and "local" is
+        # decided by the manifest's ssh_host exactly like the native gate.
+        from magent import hotkey
+
+        seen: list[tuple[str, str, object, bool]] = []
+        monkeypatch.setattr(
+            hotkey,
+            "handle_file_press",
+            lambda url, project, capture, *, local: seen.append(
+                (url, project, capture, local)
+            ),
+        )
+        monkeypatch.setattr(
+            hotkey,
+            "handle_press",
+            lambda *a, **k: pytest.fail("a files press reached the image pipeline"),
+        )
+        monkeypatch.setenv("MAGENT_ALTV_NATIVE", "1")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        hotkey._do_upload("http://x:8034", "marka", None, "files")
+        hotkey._do_upload("http://x:8034", "marka", "deskpc", "files")
+        assert seen == [
+            ("http://x:8034", "marka", hotkey.get_clipboard_files, True),
+            ("http://x:8034", "marka", hotkey.get_clipboard_files, False),
+        ]
+
+
+class TestClipboardFiles:
+    """The CF_HDROP half of the win32 capture: which format wins, and reading
+    the paths out of a DROPFILES block.
+
+    Never the real clipboard (it would read -- and a clipboard test would
+    stomp -- the developer's own copy): `_hdrop_paths` is fed a DROPFILES
+    block this test builds in its own GlobalAlloc memory, and `clipboard_kind`
+    is driven through a faked IsClipboardFormatAvailable.
+    """
+
+    @staticmethod
+    def _dropfiles(paths: list[str]) -> tuple[object, int]:
+        import ctypes
+        import struct
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+        k32.GlobalAlloc.restype = ctypes.c_void_p
+        k32.GlobalFree.argtypes = [ctypes.c_void_p]
+        k32.GlobalFree.restype = ctypes.c_void_p
+        # DROPFILES: pFiles, POINT pt, fNC, fWide -- then a double-NUL list.
+        header = struct.pack("<IiiII", 20, 0, 0, 0, 1)
+        body = ("\0".join(paths) + "\0\0").encode("utf-16-le")
+        blob = header + body
+        gmem_fixed = 0x0000
+        hmem = k32.GlobalAlloc(gmem_fixed, len(blob))
+        assert hmem
+        ctypes.memmove(hmem, blob, len(blob))
+        return k32, hmem
+
+    def test_every_path_in_a_drop_list_is_read_in_order(self):
+        from magent import hotkey
+
+        paths = [
+            "C:\\Users\\me\\a.zip",
+            "C:\\Users\\me\\My Docs\\notes (1).txt",
+            "D:\\\N{LATIN SMALL LETTER E WITH ACUTE}t\N{LATIN SMALL LETTER E WITH ACUTE}.py",
+        ]
+        k32, hmem = self._dropfiles(paths)
+        try:
+            assert hotkey._hdrop_paths(hmem) == paths
+        finally:
+            k32.GlobalFree(hmem)
+
+    def test_the_buffer_holds_every_char_the_call_may_write(self, monkeypatch):
+        # DragQueryFileW(h, i, buf, cch) may write cch WCHARs (the name plus its
+        # NUL); a buffer smaller than that is a two-byte heap overrun that
+        # ctypes will not report.
+        import ctypes
+
+        from magent import hotkey
+
+        real = hotkey.shell32.DragQueryFileW
+        overruns: list[tuple[int, int]] = []
+
+        def _spy(hdrop, i, buf, cch):
+            wchar = ctypes.sizeof(ctypes.c_wchar)
+            if buf is not None and ctypes.sizeof(buf) < cch * wchar:
+                overruns.append((ctypes.sizeof(buf), cch))
+            return real(hdrop, i, buf, cch)
+
+        class _Shell:
+            DragQueryFileW = staticmethod(_spy)
+
+        monkeypatch.setattr(hotkey, "shell32", _Shell)
+        paths = ["C:\\a\\b.txt", "D:\\longer name\\c.zip"]
+        k32, hmem = self._dropfiles(paths)
+        try:
+            assert hotkey._hdrop_paths(hmem) == paths
+        finally:
+            k32.GlobalFree(hmem)
+        assert overruns == []
+
+    def test_an_empty_drop_list_reads_as_no_paths(self):
+        from magent import hotkey
+
+        k32, hmem = self._dropfiles([])
+        try:
+            assert hotkey._hdrop_paths(hmem) == []
+        finally:
+            k32.GlobalFree(hmem)
+
+    @pytest.mark.parametrize(
+        ("formats", "kind"),
+        [
+            ({15, 8}, "files"),  # both on the clipboard: files win
+            ({15}, "files"),
+            ({8}, "image"),  # the CF_DIB-only path is unchanged
+            (set(), None),
+        ],
+    )
+    def test_files_win_over_an_image(self, monkeypatch, formats, kind):
+        from magent import hotkey
+
+        monkeypatch.setattr(
+            hotkey.user32, "IsClipboardFormatAvailable", lambda fmt: fmt in formats
+        )
+        assert hotkey.clipboard_kind() == kind
+
+    def test_cf_hdrop_is_the_shell_drop_format(self):
+        from magent.hotkey import CF_HDROP
+
+        assert CF_HDROP == 15
 
 
 class TestHeartbeatWiring:
@@ -1269,7 +1596,7 @@ class TestHookProc:
         lparam = ctypes.cast(ctypes.pointer(kb), ctypes.c_void_p).value
 
         monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "magent:marka")
-        monkeypatch.setattr(hotkey, "clipboard_has_image", lambda: True)
+        monkeypatch.setattr(hotkey, "clipboard_kind", lambda: "image")
 
         started = []
 
@@ -1290,7 +1617,7 @@ class TestHookProc:
         # The third member is the ssh_host the decide call runs with (None =
         # local wiring), threaded through so _do_upload can pick the native
         # path without re-reading the manifest on a keypress.
-        assert started[0][1] == ("http://x:8034", "marka", None)
+        assert started[0][1] == ("http://x:8034", "marka", None, "image")
 
     def test_wrap_calls_callnext_on_exception(self, monkeypatch):
         # The hook callback runs in a ctypes WINFUNCTYPE callback: an
@@ -1688,3 +2015,367 @@ class TestFocusHookLifecycle:
 
         source = inspect.getsource(run_hotkey)
         assert "event_fn = WINEVENTPROC(" in source
+
+
+class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
+    """A node project's folder is on its pool machine, and the node map knows
+    where: no server round trip, and the user magent resolved stays in the
+    authority (C3)."""
+
+    def _map(
+        self, monkeypatch, tmp_path, *, nick="second", cwd="/home/demo/magent/api"
+    ):
+        from magent import nodes
+        from magent.nodes import NodeMapEntry
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_node_map(
+            {
+                "api": NodeMapEntry(
+                    nick=nick,
+                    sid="api",
+                    placed_ts=1.0,
+                    attached_existing=False,
+                    remote_root="~/magent/api",
+                    target="demo@box-second",
+                    cwd=cwd,
+                )
+            }
+        )
+
+    def test_a_node_project_opens_on_its_node(self, monkeypatch, tmp_path):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path)
+        spawned = self._patch(monkeypatch)
+
+        # Recorded as well as raised: the handler's broad `except` swallows the
+        # raise, so a caught-and-ignored round trip would otherwise pass.
+        round_trips: list[object] = []
+
+        def no_server(*a, **_k):
+            round_trips.append(a)
+            raise AssertionError("a node project needs no /api/sessions round trip")
+
+        monkeypatch.setattr(hotkey, "urlopen", no_server)
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [
+            [
+                "code",
+                "--remote",
+                "ssh-remote+demo@box-second",
+                "/home/demo/magent/api",
+            ]
+        ]
+        assert self.flashed[-1] == "F2: VS Code -> /home/demo/magent/api"
+        assert round_trips == []
+
+    def test_a_cloud_placement_falls_through_to_the_server(self, monkeypatch, tmp_path):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, nick="cloud")
+        spawned = self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "api", "session": "api", "resolved": "/base/api"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [["code", "/base/api"]]
+
+    def test_a_local_project_is_byte_for_byte_todays_path(self, monkeypatch, tmp_path):
+        from magent import hotkey, nodes
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        spawned = self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "caly", "session": "caly", "resolved": "/base/caly"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "caly", "me@host")
+        assert spawned == [["code", "--remote", "ssh-remote+host", "/base/caly"]]
+
+    def test_a_torn_node_map_falls_through_to_the_server(self, monkeypatch, tmp_path):
+        """The map is best-effort here: an unreadable one must not cost F2 the
+        server's answer (read_node_map, never load_node_map_strict)."""
+        from magent import hotkey, nodes
+
+        torn = tmp_path / "node-map.json"
+        torn.write_text('{"api": {"nick": "sec', encoding="utf-8")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", torn)
+        spawned = self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "api", "session": "api", "resolved": "/base/api"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [["code", "/base/api"]]
+
+    # --- code.cmd re-parses its command line (cq-D15 I1) ----------------------
+    # CreateProcess runs a .cmd through `cmd.exe /c`, and list2cmdline quotes
+    # only whitespace: `R&D` opens `R` and runs a stray `D`, `%USERNAME%`
+    # expands. F2 refuses such an argv -- on BOTH paths -- instead of opening
+    # the wrong folder and flashing success. Nothing is launched: `_patch`'s
+    # Popen double records the argv it would have run.
+    _SHIM = r"C:\VS Code\bin\code.cmd"
+    _REFUSED = "F2: folder name has a character code.cmd can't pass"
+
+    def _assert_refused(self, spawned):
+        from magent import hotkey
+
+        assert spawned == []
+        assert self.flashed[-1] == self._REFUSED
+        assert self.flash_tints[-1] == hotkey.FLASH_TINT_ERR
+        assert not any(m.startswith("F2: VS Code ->") for m in self.flashed)
+
+    def test_an_ampersand_node_folder_is_refused_through_code_cmd(
+        self, monkeypatch, tmp_path
+    ):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, cwd="/home/demo/magent/R&D")
+        spawned = self._patch(monkeypatch, code_bin=self._SHIM)
+        hotkey._do_open_code("http://x:8034", "api", None)
+        self._assert_refused(spawned)
+
+    def test_a_percent_variable_node_folder_is_refused_through_code_cmd(
+        self, monkeypatch, tmp_path
+    ):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, cwd="/home/demo/magent/%USERNAME%")
+        spawned = self._patch(monkeypatch, code_bin=self._SHIM)
+        hotkey._do_open_code("http://x:8034", "api", None)
+        self._assert_refused(spawned)
+
+    def test_a_local_ampersand_folder_on_the_server_path_is_refused(
+        self, monkeypatch, tmp_path
+    ):
+        from magent import hotkey, nodes
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        spawned = self._patch(
+            monkeypatch,
+            code_bin=self._SHIM,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "rd", "session": "rd", "resolved": r"C:\dev\R&D"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "rd", None)
+        self._assert_refused(spawned)
+
+    @pytest.mark.parametrize("char", sorted('&|<>^%"!'))
+    @pytest.mark.parametrize("shim", ["code.cmd", "CODE.CMD", "code.bat", "Code.Bat"])
+    def test_every_metacharacter_is_refused_through_any_batch_shim(
+        self, monkeypatch, tmp_path, char, shim
+    ):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, cwd=f"/home/demo/magent/a{char}b")
+        spawned = self._patch(monkeypatch, code_bin=rf"C:\VS Code\bin\{shim}")
+        hotkey._do_open_code("http://x:8034", "api", None)
+        self._assert_refused(spawned)
+
+    def test_a_plain_spaced_folder_still_opens_through_code_cmd(
+        self, monkeypatch, tmp_path
+    ):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, cwd="/home/demo/magent/my api")
+        spawned = self._patch(monkeypatch, code_bin=self._SHIM)
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [
+            [
+                self._SHIM,
+                "--remote",
+                "ssh-remote+demo@box-second",
+                "/home/demo/magent/my api",
+            ]
+        ]
+        assert self.flashed[-1] == "F2: VS Code -> /home/demo/magent/my api"
+
+    @pytest.mark.parametrize(
+        "code_bin", [r"C:\VS Code\Code.exe", "/usr/bin/code", "code"]
+    )
+    def test_no_batch_shim_means_no_cmd_exe_and_nothing_refused(
+        self, monkeypatch, tmp_path, code_bin
+    ):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, cwd="/home/demo/magent/R&D")
+        spawned = self._patch(monkeypatch, code_bin=code_bin)
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [
+            [
+                code_bin,
+                "--remote",
+                "ssh-remote+demo@box-second",
+                "/home/demo/magent/R&D",
+            ]
+        ]
+
+    def test_a_map_json_cannot_nest_still_costs_f2_nothing(self, monkeypatch, tmp_path):
+        """json.loads raises RecursionError -- not a ValueError -- past ~1000
+        levels; read_node_map must still read that as no placements."""
+        from magent import hotkey, nodes
+
+        deep = tmp_path / "node-map.json"
+        deep.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", deep)
+        spawned = self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "api", "session": "api", "resolved": "/base/api"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [["code", "/base/api"]]
+
+    def test_an_unvetted_node_folder_falls_through_to_the_server(
+        self, monkeypatch, tmp_path
+    ):
+        """A map value that is no clean absolute path never reaches the argv
+        (it would be a VS Code flag here): F2 asks the server instead."""
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, cwd="--install-extension=evil.vsix")
+        spawned = self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "api", "session": "api", "resolved": "/base/api"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [["code", "/base/api"]]
+
+    def test_the_node_map_wins_over_an_attach_listeners_host(
+        self, monkeypatch, tmp_path
+    ):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path)
+        spawned = self._patch(monkeypatch)
+        hotkey._do_open_code("http://x:8034", "api", "me@desktop")
+        assert spawned == [
+            [
+                "code",
+                "--remote",
+                "ssh-remote+demo@box-second",
+                "/home/demo/magent/api",
+            ]
+        ]
+
+    def test_a_node_open_spawns_the_resolved_code_bin(self, monkeypatch, tmp_path):
+        # A bare "code" handed to CreateProcess never finds the .cmd shim.
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path)
+        shim = r"C:\VS Code\bin\code.cmd"
+        spawned = self._patch(monkeypatch, code_bin=shim)
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert [argv[0] for argv in spawned] == [shim]
+
+    def test_a_failing_node_lookup_is_reported_never_raised(self, monkeypatch):
+        from magent import hotkey, nodes
+
+        spawned = self._patch(monkeypatch)
+
+        def boom(*_a, **_k):
+            raise RuntimeError("map exploded")
+
+        monkeypatch.setattr(nodes, "read_node_map", boom)
+        try:
+            hotkey._do_open_code("http://x:8034", "api", None)
+        except RuntimeError:
+            raise AssertionError("an F2 failure escaped the handler thread") from None
+        assert spawned == []
+        assert self.flashed[-1] == "F2: failed - see hotkey.log"
+
+    # A remote POSIX folder may carry what no Windows name can: cmd.exe ends
+    # the command at a LF (a truncated folder, then a false success flash),
+    # and `!` expands under delayed expansion. Only the server path can
+    # deliver these -- open_target already drops a control-bearing node cwd.
+    _ODD = (
+        "/srv/a\nb",
+        "/srv/a\rb",
+        "/srv/a\tb",
+        "/srv/a\x1fb",  # the top of C0: a `< " "` bound, not `<= "\x1e"`
+        "/srv/a\x7fb",
+        "/srv/a!b",
+    )
+
+    def _serve(self, monkeypatch, tmp_path, folder, code_bin):
+        from magent import nodes
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        return self._patch(
+            monkeypatch,
+            code_bin=code_bin,
+            payload={
+                "ok": True,
+                "sessions": [{"name": "api", "session": "api", "resolved": folder}],
+            },
+        )
+
+    @pytest.mark.parametrize("folder", _ODD)
+    def test_a_control_character_or_bang_is_refused_through_code_cmd(
+        self, monkeypatch, tmp_path, folder
+    ):
+        from magent import hotkey
+
+        spawned = self._serve(monkeypatch, tmp_path, folder, self._SHIM)
+        hotkey._do_open_code("http://x:8034", "api", "me@host")
+        self._assert_refused(spawned)
+
+    @pytest.mark.parametrize("code_bin", [r"C:\VS Code\Code.exe", "/usr/bin/code"])
+    @pytest.mark.parametrize("folder", _ODD)
+    def test_a_control_character_or_bang_passes_without_cmd_exe(
+        self, monkeypatch, tmp_path, folder, code_bin
+    ):
+        from magent import hotkey
+
+        spawned = self._serve(monkeypatch, tmp_path, folder, code_bin)
+        hotkey._do_open_code("http://x:8034", "api", "me@host")
+        assert spawned == [[code_bin, "--remote", "ssh-remote+host", folder]]
+
+    def test_a_shim_path_code_cmd_would_split_is_refused_too(
+        self, monkeypatch, tmp_path
+    ):
+        # The shim's own path is on the re-joined command line too: cmd.exe
+        # splits an unquoted C:\Users\R&D\bin\code.cmd at the `&`.
+        from magent import hotkey, nodes
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        spawned = self._patch(
+            monkeypatch,
+            code_bin=r"C:\Users\R&D\bin\code.cmd",
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "api", "session": "api", "resolved": "/base/api"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == []
+        assert self.flashed[-1] == self._REFUSED

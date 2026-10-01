@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,7 +21,7 @@ from magent.cli.app import main
 from magent.cli.config_io import _load_config_or_exit
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.paths import find_config
-from magent.procs import await_registration, pid_alive
+from magent.procs import await_registration, pid_alive, pid_gone, predates_boot
 from magent.style import style
 from magent.titles import get_leaf_name
 
@@ -41,15 +42,35 @@ _NOTHING_TO_DO = (
 
 
 def daemon_pid() -> int | None:
-    """PID of the running attention daemon, or None. Clears a stale pid file."""
+    """PID of the running attention daemon, or None. Clears a stale pid file.
+
+    Three verdicts (the same ones as ``hotkey.listener_pid``):
+
+    - Written before the last boot: stale whatever its pid is doing now. A
+      restart kills the daemon without letting it remove the file, and the OS
+      hands pid numbers out again, so the recorded one can come back on an
+      unrelated process. Believing it would make `status` report a daemon that
+      is not there and make serve's supervisor leave the real one dead.
+      Ignored and cleared.
+    - Alive but not openable (a Session-0 copy an ssh login started): not ours
+      to use, and not stale either -- the file is the only record that names it
+      for `status`/`doctor`. Ignored and KEPT.
+    - Gone (no process and no session): cleared.
+    """
     try:
         pid = int(_PID_PATH.read_text().strip())
+        written = _PID_PATH.stat().st_mtime
     except (OSError, ValueError):
+        return None
+    if predates_boot(written):
+        with contextlib.suppress(OSError):
+            _PID_PATH.unlink()
         return None
     if pid_alive(pid):
         return pid
-    with contextlib.suppress(OSError):
-        _PID_PATH.unlink()
+    if pid_gone(pid):
+        with contextlib.suppress(OSError):
+            _PID_PATH.unlink()
     return None
 
 
@@ -77,6 +98,11 @@ def stop_daemon() -> bool:
     pid = daemon_pid()
     if not pid:
         return False
+    # Withdraw the heartbeat BEFORE the kill: serve revives a daemon that is
+    # gone while its heartbeat lingers, and a heartbeat that outlived the kill
+    # by one serve tick would turn this deliberate stop into a "crash" serve
+    # undoes. Cleared again after the kill, in case the daemon pulsed between.
+    clear_heartbeat(HEARTBEAT_NAME)
     if sys.platform == "win32":
         result = subprocess.run(
             ["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False
@@ -137,13 +163,18 @@ def engine_from_config(cfg: MagentConfig) -> attention.AttentionEngine:
     config-driven windows as the daemon, not the module defaults. The name_map
     is derived from the enabled projects. Daemon-only concerns (renderers, ntfy
     topic) stay at the daemon call site; this helper covers the config-derived
-    kwargs common to all three surfaces."""
-    from magent import attention  # heavy subsystem: in-body per policy
+    kwargs common to all three surfaces. When a project runs on a node, the
+    engine also reads each placed node session's mirrored state store
+    (node_sync.state_stores)."""
+    from magent import attention, node_sync  # heavy subsystem: in-body per policy
 
     return attention.AttentionEngine(
         attention.name_map_from_projects(name_pairs_from_config(cfg)),
         staleness=staleness_from_config(cfg),
         debounce_s=cfg.settings.attention.debounce_s,
+        # Node sessions' states, pulled home by `magent node sync`, keyed by
+        # the node map (project -> nick, sid) and named by their project.
+        extra_stores=node_sync.state_stores if node_sync.wanted(cfg) else None,
     )
 
 
@@ -313,6 +344,264 @@ def _setup_from_config(
     return engine, renderers, warnings, cfg
 
 
+# --- serve's half of the mutual supervision ---------------------------------
+# `attention -d` keeps `magent serve` alive (_upload_watchdog above); this is
+# the other direction. Measured after a Windows restart: the bring-up brought
+# serve and the Alt+V listener back, and nothing ever brought the attention
+# daemon back -- `status` then called it CRASHED, which it had not. Serve is
+# the process that is effectively always up, so it is the one that looks.
+#
+# The code lives here and not in upload_server.py, which only runs the hook:
+# a src module must not import the cli package (LS-A-001), and this half needs
+# the daemon's own pid/heartbeat/renderer judgement, all of which live here.
+# DESIGN.md section 2 "The attention daemon is supervised by serve".
+
+# Minimum seconds between two revive attempts. It must outlast the launcher's
+# registration window (procs.REGISTRATION_TIMEOUT_S, pinned by test): the `-d`
+# launcher holds the attention lock only until its child registers or that
+# window runs out, and a second launcher started beside a child that is merely
+# slow would end as two daemons.
+ATTENTION_RESPAWN_COOLDOWN_S = 60.0
+
+
+def attention_supervision_enabled() -> bool:
+    """Whether MAGENT_ATTENTION_SUPERVISOR permits serve to keep the attention
+    daemon alive. A serve must never die of an environment variable it does not
+    use, so an env that no longer validates degrades to the default (supervise)
+    with a log line -- the same posture as ``upload_supervision_enabled``."""
+    from pydantic import ValidationError
+
+    from magent.env import get_env  # heavy subsystem: in-body per policy
+    from magent.log import get_logger  # heavy subsystem: in-body per policy
+
+    try:
+        return get_env().attention_supervisor
+    except ValidationError:
+        get_logger("attention").warning(
+            "attention supervisor: environment did not validate; supervising anyway"
+        )
+        return True
+
+
+def attention_daemon_argv(config_path: str | None) -> list[str]:
+    """The argv serve runs to revive the daemon: the SAME `attention -d` a
+    human types. Its lock and live-pid check are what guarantee there is never
+    a second daemon, and its renderer validation is the daemon's own."""
+    args = [sys.executable, "-m", "magent"]
+    if config_path:
+        args += ["--config", config_path]
+    return [*args, "attention", "-d"]
+
+
+class AttentionDaemonSupervisor:
+    """Revives an attention daemon that was running and is gone, at most once
+    per cooldown.
+
+    "Was running" is the heartbeat file. Every clean stop removes it (`attention
+    --stop`, `down --all`, Ctrl+C) and a crash, a kill or a restart leaves it --
+    the same marker `status` already reads to tell "crashed" from "off". So a
+    daemon the user never started, or stopped on purpose, is never started
+    behind their back; one that died, or that a reboot took down, is.
+    """
+
+    def __init__(
+        self,
+        config_path: str | None = None,
+        *,
+        cooldown_s: float = ATTENTION_RESPAWN_COOLDOWN_S,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._config_path = config_path
+        self._cooldown = cooldown_s
+        self._now = now
+        self._last_spawn: float | None = None
+        self._said_no_work = False
+
+    @property
+    def cooldown_s(self) -> float:
+        return self._cooldown
+
+    def _has_work(self) -> bool:
+        """Whether `attention -d` would start at all under the current config.
+
+        Asked on every revive, not once: the config can change under a serve
+        that runs for weeks. A config it cannot read, or one whose every
+        renderer is off or unsupported, is a daemon that would exit 1 -- and
+        spawning that once a cooldown forever is a respawn loop that can only
+        fail. Said once in the log, not once a tick."""
+        from pydantic import ValidationError
+
+        from magent.config import load_config  # heavy subsystem: in-body per policy
+        from magent.env import get_env  # heavy subsystem: in-body per policy
+        from magent.log import get_logger  # heavy subsystem: in-body per policy
+        from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+        try:
+            cfg = load_config(str(find_config(self._config_path)))
+        except (ValueError, OSError) as e:
+            reason = f"config unreadable ({e})"
+        else:
+            try:
+                topic = get_env().ntfy_topic
+            except ValidationError:
+                topic = None
+            renderers, _warnings = _plan_renderers(
+                cfg.settings.attention,
+                get_platform(),
+                engine_from_config(cfg),
+                str(topic) if topic else None,
+            )
+            if renderers:
+                self._said_no_work = False
+                return True
+            reason = _NOTHING_TO_DO
+        if not self._said_no_work:
+            get_logger("attention").warning(
+                "attention supervisor: not restarting the daemon: %s", reason
+            )
+            self._said_no_work = True
+        return False
+
+    def tick(self) -> bool:
+        """One check. True when a revive was issued."""
+        from magent.launch import (  # heavy subsystem: in-body per policy
+            SESSION0_ATTENTION_REFUSAL,
+            session0_block,
+            spawn_detached,
+        )
+        from magent.log import (  # heavy subsystem: in-body per policy
+            HEARTBEAT_MAX_AGE,
+            get_logger,
+            heartbeat_age,
+        )
+        from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+        if daemon_pid() is not None:
+            return False
+        age = heartbeat_age(HEARTBEAT_NAME)
+        if age is None:
+            return False  # never started, or stopped cleanly
+        if age <= HEARTBEAT_MAX_AGE:
+            # Still fresh by status's own window: nothing proves the daemon
+            # dead. Two ways to get here with no visible pid -- a pulse that
+            # beat stop_daemon's kill and is not cleared yet (reviving undoes
+            # `down --all`), and a daemon in Session 0 this desktop cannot open
+            # (reviving starts a second one). A real crash stops pulsing and is
+            # revived once the pulse goes stale.
+            return False
+        now = self._now()
+        if self._last_spawn is not None and (now - self._last_spawn) < self._cooldown:
+            return False
+        # The same Session-0 seam as every other daemon spawn (launch.
+        # session0_block): a daemon revived from a non-interactive logon session
+        # would badge a desktop it cannot see and revive serve out of the
+        # desktop's reach. attention_watchdog already declines to build this
+        # supervisor there; this is the seam itself refusing, so no caller can
+        # route around it. Stamped like a spawn so it is said once a cooldown.
+        refusal = session0_block(SESSION0_ATTENTION_REFUSAL, get_platform())
+        if refusal:
+            self._last_spawn = now
+            get_logger("attention").warning("attention supervisor: %s", refusal)
+            return False
+        if not self._has_work():
+            return False
+        self._last_spawn = now
+        why = (
+            "not running since the last restart"
+            if predates_boot(time.time() - age)
+            else "the daemon died without stopping cleanly"
+        )
+        # ASCII only: this line goes to a rotating logfile that gets read back
+        # through whatever the host console's code page happens to be.
+        get_logger("attention").warning(
+            "attention supervisor: %s; starting magent attention -d", why
+        )
+        spawn_detached(attention_daemon_argv(self._config_path))
+        return True
+
+
+def attention_watchdog(config_path: str | None) -> Callable[[], None] | None:
+    """The per-interval hook ``magent serve`` runs, or None when serve must not
+    supervise the attention daemon.
+
+    Two gates. ``MAGENT_ATTENTION_SUPERVISOR`` is the opt-out -- and the reason
+    a test that starts a real serve can be sure no real daemon starts behind
+    it. The logon-session disposition is the other: a serve in Windows logon
+    Session 0 (a foreground `magent serve` over ssh) would start a daemon that
+    badges a desktop nobody can see and holds the attention.pid the real
+    desktop's daemon needs, so it only supervises where a launch would "run".
+    """
+    from magent.launch import (  # heavy subsystem: in-body per policy
+        SESSION0_ATTENTION_REFUSAL,
+        session0_block,
+    )
+    from magent.log import get_logger  # heavy subsystem: in-body per policy
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    log = get_logger("attention")
+    if not attention_supervision_enabled():
+        log.info("attention supervisor: disabled by MAGENT_ATTENTION_SUPERVISOR")
+        return None
+    refusal = session0_block(SESSION0_ATTENTION_REFUSAL, get_platform())
+    if refusal:
+        log.info("attention supervisor: off: %s", refusal)
+        return None
+    supervisor = AttentionDaemonSupervisor(config_path)
+    log.info(
+        "attention supervisor: watching the daemon (revive cooldown %.0fs)",
+        supervisor.cooldown_s,
+    )
+
+    def _tick() -> None:
+        try:
+            supervisor.tick()
+        except Exception:
+            # Supervision must never be able to take down the server it rides
+            # on -- that is the thing actually serving uploads.
+            log.exception("attention supervisor: check failed")
+
+    return _tick
+
+
+def _handoff_daemon(config_path: str | None, interval: float | None) -> bool:
+    """Hand `attention -d` to the desktop, or refuse, per policy.
+
+    The same shape as `serve --ensure`'s gate (``cli/mobile._handoff_ensure``),
+    because it is the same kind of command: it plants a detached survivor. Run
+    over ssh on Windows that survivor lands in logon Session 0, badging windows
+    on a desktop it cannot see and reviving the upload server out of this
+    desktop's reach. True means this invocation is DONE (the desktop copy ran
+    and this process exits with its code, or the policy refused).
+    """
+    from magent.launch import (  # heavy subsystem: in-body per policy
+        SESSION0_ATTENTION_REFUSAL,
+        SESSION0_ATTENTION_TIMEOUT_S,
+        relay_handoff,
+        session0_disposition,
+        session0_refusal,
+    )
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    plat = get_platform()
+    disposition = session0_disposition(plat)
+    if disposition == "run":
+        return False
+    if disposition == "refuse":
+        reason = session0_refusal(plat, SESSION0_ATTENTION_REFUSAL)
+        click.echo(f"  {style('x', fg='red')} {reason}", err=True)
+        sys.exit(1)
+    argv = [sys.executable, "-m", "magent"]
+    if config_path:
+        argv += ["--config", str(config_path)]
+    argv += ["attention", "-d"]
+    if interval is not None:
+        argv += ["--interval", str(interval)]
+    rc = relay_handoff(plat, argv, timeout_s=SESSION0_ATTENTION_TIMEOUT_S)
+    if rc != 0:
+        sys.exit(rc)
+    return True
+
+
 @main.command("attention")
 @click.option("--daemon", "-d", "as_daemon", is_flag=True, help="Run detached")
 @click.option("--stop", "do_stop", is_flag=True, help="Stop the running daemon")
@@ -349,6 +638,8 @@ def attention_cmd(
     config_file = find_config(config_path)
 
     if as_daemon:
+        if _handoff_daemon(config_path, interval):
+            return
         try:
             with exclusive_lock("attention"):
                 existing = daemon_pid()

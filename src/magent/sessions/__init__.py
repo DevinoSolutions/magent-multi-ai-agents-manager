@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import quote
@@ -8,17 +10,25 @@ from magent.log import get_logger
 from magent.sessions.claude import (
     build_claude_resume,
     claude_fresh_command,
+    claude_fresh_form,
+    claude_idle_probe,
     get_claude_session_ids,
 )
 from magent.sessions.codex import (
     build_codex_resume,
     codex_fresh_command,
+    codex_fresh_form,
     get_codex_session_ids,
 )
+from magent.sessions.live import IdleProbe, LiveSession, SessionScan
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from pathlib import Path
+
+# Re-exported for the reaper and its tests: the probe's value types live in the
+# `live` leaf only so `claude.py` can import them without a cycle.
+__all__ = ["IdleProbe", "LiveSession", "SessionScan"]
 
 
 @dataclass(frozen=True)
@@ -34,13 +44,24 @@ class AgentTool:
     resume_command: Callable[[str, str | None], str] | None = None
     # (base_cmd, project_dir, config_dir) -> the command to run when that
     # directory has NO prior session for this tool to resume in that store, or
-    # None to run base_cmd unchanged. See `build_start_command`.
+    # None to run base_cmd unchanged. See `build_start_command`. Equals
+    # `fresh_form` plus a probe of the local session store.
     fresh_command: Callable[[str, str, Path | None], str | None] | None = None
+    # base_cmd -> the command with its implicit resume dropped (claude's
+    # `--continue`, codex's `resume --last`), WITHOUT asking any store whether
+    # there is something to resume; None when base_cmd carries no implicit
+    # resume to drop. For a session whose store is elsewhere (a pool node: the
+    # nodes feature ships both forms and the node picks). Unset for a tool that
+    # has no implicit-resume form at all.
+    fresh_form: Callable[[str], str | None] | None = None
     happy: bool = False  # can be wrapped with `happy` for mobile access
     # Process image names (no ".exe", any case) a RUNNING instance of this
     # agent carries. `psmux.idle_sessions` never calls a pane idle while one of
     # these -- or an AGENT_RUNTIME_IMAGES host -- runs anywhere under it.
     images: tuple[str, ...] = ()
+    # The reaper's only agent-specific hook: how to read this tool's live
+    # sessions and their transcript activity. Only claude sets one in v1.
+    idle_probe: IdleProbe | None = None
 
     @property
     def multi_window(self) -> bool:
@@ -52,13 +73,16 @@ AGENT_TOOLS: dict[str, AgentTool] = {
         session_ids=get_claude_session_ids,
         resume_command=build_claude_resume,
         fresh_command=claude_fresh_command,
+        fresh_form=claude_fresh_form,
         happy=True,
         images=("claude",),
+        idle_probe=claude_idle_probe,
     ),
     "codex": AgentTool(
         session_ids=get_codex_session_ids,
         resume_command=build_codex_resume,
         fresh_command=codex_fresh_command,
+        fresh_form=codex_fresh_form,
         happy=True,
         images=("codex",),
     ),
@@ -72,13 +96,36 @@ AGENT_TOOLS: dict[str, AgentTool] = {
 AGENT_RUNTIME_IMAGES: frozenset[str] = frozenset({"node"})
 
 
-def agent_image_names() -> frozenset[str]:
+def agent_image_names(
+    tools: Mapping[str, AgentTool] | None = None,
+) -> frozenset[str]:
     """Every image name (lower-case, no ".exe") that may be a running agent:
-    each AGENT_TOOLS entry's ``images`` plus AGENT_RUNTIME_IMAGES. Read at call
-    time, so a registry entry stays the only edit a new agent needs."""
+    each entry's ``images`` plus AGENT_RUNTIME_IMAGES. ``tools`` defaults to the
+    live ``AGENT_TOOLS`` read at call time (so a registry monkeypatch is seen,
+    and the reaper can build the set from an injected stand-in registry)."""
+    registry = AGENT_TOOLS if tools is None else tools
     return AGENT_RUNTIME_IMAGES | {
-        image.lower() for tool in AGENT_TOOLS.values() for image in tool.images
+        image.lower() for tool in registry.values() for image in tool.images
     }
+
+
+# Claude Code's Windows auto-updater renames a RUNNING claude.exe aside to
+# claude.exe.old.<epoch-ms> to drop the new binary in, and the process's image
+# name (QueryFullProcessImageNameW) reads the renamed file for the rest of its
+# life -- the Toolhelp snapshot keeps the name it started under. Measured: 4 of
+# 13 live agents on one box. ASCII digits only: a timestamp, nothing looser.
+_RENAMED_ASIDE = re.compile(r"\.exe(?:\.old(?:\.[0-9]+)?)?\Z")
+
+
+def agent_image_stem(raw: str) -> str:
+    """``C:\\x\\CLAUDE.EXE.OLD.1790669558315`` -> ``claude``: the leaf name,
+    lower-cased, with a trailing ``.exe``, ``.exe.old`` or ``.exe.old.<digits>``
+    dropped -- the spelling an agent process's IDENTITY image is compared to
+    ``agent_image_names`` (and to its own earlier reading) in. For agent
+    identity only: ``psmux.image_stem`` still drops ``.exe`` alone, because a
+    shell reading is matched exactly and a looser rule there is its own risk."""
+    leaf = raw.strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return _RENAMED_ASIDE.sub("", leaf, count=1)
 
 
 def build_resume_command(tool: str, base_cmd: str, session_id: str | None) -> str:
@@ -155,6 +202,18 @@ def build_start_command(
     return fresh
 
 
+def fresh_start_command(tool: str, base_cmd: str) -> str | None:
+    """``tool``'s fresh form of ``base_cmd`` (see ``AgentTool.fresh_form``), or
+    None. Unlike ``build_start_command`` this never probes a store.
+
+    None means base_cmd carries no implicit resume to drop; the caller ships
+    base_cmd alone."""
+    caps = AGENT_TOOLS.get(tool)
+    if caps is None or caps.fresh_form is None:
+        return None
+    return caps.fresh_form(base_cmd)
+
+
 # --- IDE tools (REC-F4) -------------------------------------------------------
 # The IDE mirror of AGENT_TOOLS: tools launched as an IDE window instead of a
 # CLI agent in a terminal. The dict is the single source of truth — adding an
@@ -215,7 +274,7 @@ def folder_for_session(payload: object, project: str) -> str | None:
 
 
 def build_code_open_command(
-    folder: str, ssh_host: str | None, code_bin: str
+    folder: str, ssh_host: str | None, code_bin: str, *, keep_user: bool = False
 ) -> list[str]:
     """argv that opens ``folder`` in VS Code, locally or over Remote-SSH.
 
@@ -226,12 +285,20 @@ def build_code_open_command(
     resolves the login user from the machine's own ssh config (that is also
     what makes a plain ``Host`` alias work), and a target that is only a
     ``user@`` with no host degrades to a local open rather than a broken URI.
+
+    ``keep_user`` keeps a ``user@`` in the authority -- a pool node's user is
+    resolved by magent and may not exist in the ssh config (the nodes
+    feature). A target with no hostname still opens locally either way, and
+    one with an empty user (``@host``) keeps only the hostname.
     """
     args = [code_bin]
     if ssh_host:
-        host = ssh_host.split("@", 1)[1] if "@" in ssh_host else ssh_host
-        if host:
-            args.extend(["--remote", f"ssh-remote+{host}"])
+        user, at, host_part = ssh_host.partition("@")
+        hostname = host_part if at else ssh_host
+        if hostname:
+            # An empty user (`@host`) would build `ssh-remote+@host`.
+            authority = ssh_host if keep_user and user else hostname
+            args.extend(["--remote", f"ssh-remote+{authority}"])
     args.append(folder)
     return args
 
@@ -282,3 +349,76 @@ def build_flash_url(
     if tint:
         url = f"{url}&tint={quote(tint)}"
     return url
+
+
+# Largest upload `magent serve` accepts, per REQUEST (an Alt+V press carrying a
+# whole Explorer selection is one request). Lives here, not in upload_server,
+# because the Alt+V listener pre-checks the same number BEFORE reading a file
+# off disk -- and altv must stay a leaf that never imports the server.
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
+_MIB = 1024 * 1024
+
+
+def upload_limit_text(limit: int) -> str:
+    """The limit as a person reads it: ``"100 MB"``.
+
+    A limit that is not a whole number of megabytes (a test-lowered cap) names
+    its exact byte count rather than rounding to a false ``"0 MB"``.
+    """
+    if limit >= _MIB and limit % _MIB == 0:
+        return f"{limit // _MIB} MB"
+    return f"{limit} bytes"
+
+
+# A path made only of these characters needs no quoting in any shell or prompt
+# it lands in. Backslash is here on purpose: it is the Windows separator, and a
+# bare `C:\x\y.py` is what a user would type.
+_BARE_PATH = re.compile(r"[\w@%+=:,./\\~-]+")
+# What a double-quoted string still interprets in a POSIX shell.
+_DQ_ACTIVE = frozenset('"$`')
+
+
+def _quote_path(path: str) -> str:
+    if _BARE_PATH.fullmatch(path):
+        return path
+    if _DQ_ACTIVE.isdisjoint(path):
+        # Double quotes first: that is what Windows Terminal writes when a file
+        # is dropped on it, and a Windows path cannot contain a `"` anyway.
+        return f'"{path}"'
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+# Unicode categories no paste may carry: control characters (C0 with ESC and
+# TAB, DEL, and C1 with NEL U+0085) and the line and paragraph separators
+# (U+2028, U+2029).
+_UNPASTEABLE_CATEGORIES = frozenset({"Cc", "Zl", "Zp"})
+
+
+def unpasteable_path(path: str) -> bool:
+    """Whether ``path`` holds a character no paste may carry.
+
+    Any of them can end or rewrite the input line it lands in -- and in an
+    agent pane a line break SUBMITS -- so no amount of quoting makes one safe.
+    CF_HDROP cannot carry a C0 control on Windows, but NEL and the Unicode
+    separators are legal NTFS name characters.
+    """
+    return any(unicodedata.category(ch) in _UNPASTEABLE_CATEGORIES for ch in path)
+
+
+def paths_line(paths: list[str]) -> str:
+    """Several file paths as ONE pasteable line: space-separated, each quoted
+    only when it has to be.
+
+    One line because a paste is one attempt (the double-paste law): several
+    files are one paste, not one per file racing into the input line. A single
+    plain path comes back byte-for-byte itself, which is exactly what the
+    one-image inject has always pasted.
+
+    Raises ``ValueError`` for a path ``unpasteable_path`` refuses: a caller
+    that could meet one checks first and says so; reaching here with one is a
+    bug, and the line is never built.
+    """
+    if any(unpasteable_path(p) for p in paths):
+        raise ValueError("a path holds a control or line-break character")
+    return " ".join(_quote_path(p) for p in paths)

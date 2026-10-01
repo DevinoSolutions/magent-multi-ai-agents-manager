@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import shutil
@@ -327,19 +328,51 @@ def hooks_status_cmd(settings_file: Path | None) -> None:
 
 
 def _echo_store_freshness(records: list[dict[str, object]]) -> None:
+    from magent import agent_state  # heavy subsystem: in-body per policy
+
     if not records:
         click.echo(
             f"  {style('State store is empty', fg='yellow')} "
             f"{style('-- run magent hooks install, then start an agent turn.', dim=True)}"
         )
         return
-    newest = 0.0
-    for rec in records:
-        ts = rec.get("ts", 0)
-        if isinstance(ts, (int, float)) and not isinstance(ts, bool):
-            newest = max(newest, float(ts))
-    age_min = int(max(0.0, time.time() - newest) // 60)
-    click.echo(
-        f"  {style(str(len(records)), bold=True)} state record(s), "
-        f"newest {style(f'{age_min}m ago', fg='cyan')}"
-    )
+    count = f"  {style(str(len(records)), bold=True)} state record(s), "
+    # The idle reaper writes `parked` itself, so it is not hook activity:
+    # counting it would call a hook that stopped writing hours ago fresh.
+    hook_records = [r for r in records if r.get("state") != agent_state.PARKED]
+    if not hook_records:
+        # Only the reaper's writes are left, and they say nothing about the
+        # hooks: a hook's last write can be gone from the store (SessionEnd
+        # clears its record, the TTL sweep ages one out), so the newest park's
+        # age is reported as that and nothing more.
+        parked = _newest_ts(records)
+        if parked is None:
+            click.echo(count + style("all parked by the idle reaper", dim=True))
+            return
+        age = style(f"{_age_min(parked)}m ago", fg="cyan")
+        click.echo(
+            count
+            + style("all parked by the idle reaper; ", dim=True)
+            + f"newest park {age}"
+        )
+        return
+    age_min = _age_min(_newest_ts(hook_records) or 0.0)
+    click.echo(count + f"newest hook write {style(f'{age_min}m ago', fg='cyan')}")
+
+
+def _newest_ts(records: list[dict[str, object]]) -> float | None:
+    """The newest readable ``ts`` among ``records``, or None when none has one.
+    A bool, a non-number and a non-finite value are unknown, never a time: an
+    ``Infinity`` would otherwise read as a write that happened just now."""
+    stamps = [
+        float(ts)
+        for ts in (rec.get("ts") for rec in records)
+        if isinstance(ts, (int, float))
+        and not isinstance(ts, bool)
+        and math.isfinite(ts)
+    ]
+    return max(stamps, default=None)
+
+
+def _age_min(ts: float) -> int:
+    return int(max(0.0, time.time() - ts) // 60)

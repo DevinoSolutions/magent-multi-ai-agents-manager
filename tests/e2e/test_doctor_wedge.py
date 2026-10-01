@@ -189,6 +189,9 @@ class _Run:
         env["HOMEDRIVE"] = drive
         env["HOMEPATH"] = tail or "\\"
         env["HOME"] = home_s
+        # The MAGENT_* strip drops conftest's pin: a child born with the idle
+        # reaper on could reach this box's live fleet.
+        env["MAGENT_IDLE_REAP"] = "0"
         # Our fake must win the PATH lookup find_psmux does -- verified after
         # the run by the recorded invocations, never assumed.
         env["PATH"] = str(self.bin_dir) + os.pathsep + env.get("PATH", "")

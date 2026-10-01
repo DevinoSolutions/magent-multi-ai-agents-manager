@@ -69,6 +69,8 @@ def _env() -> dict[str, str]:
         and k.upper() not in ("PYTHONPATH", "PYTHONHOME", "COLUMNS", "LINES")
     }
     env["NO_COLOR"] = "1"
+    # The MAGENT_* strip drops conftest's pin: never a child with reaping on.
+    env["MAGENT_IDLE_REAP"] = "0"
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["TERM"] = env.get("TERM", "xterm")

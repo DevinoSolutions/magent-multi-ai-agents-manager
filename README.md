@@ -144,7 +144,7 @@ Each magent session brands its psmux status bar — `magent` on the left, its wi
 | --- | --- |
 | `F1` | Detach the session — back to the picker. |
 | `F2` | Open the project's folder in VS Code. When you're attached to another machine it opens over Remote-SSH, so you edit the files where they actually live. |
-| `Alt+V` | Paste a clipboard image into the session (Windows — see below). |
+| `Alt+V` | Paste a clipboard image, or files copied in Explorer, into the session (Windows — see below). |
 
 `F2` needs `code` on your PATH; `magent up` refreshes the branding and hints on sessions that were already running. magent sets both halves per session, so they win over a personal `~/.tmux.conf`.
 
@@ -190,29 +190,110 @@ On Windows, magent keeps every psmux process at **above-normal** priority. Your 
 
 It needs no administrator rights, it only ever *raises* a process (anything you or another tool put at high/realtime priority is left alone), and it re-runs periodically so sessions created later are covered too. Set `MAGENT_PSMUX_BOOST=0` to leave every process's priority exactly as it is.
 
-### Mobile image upload (over Tailscale)
+#### Idle reaping: a finished agent is parked to free memory
 
-Send screenshots from your phone straight into a project's agent session:
+An idle Claude Code still holds its memory. On one measured fleet, 31 agents held 57.6 GB, and the four idle for more than two hours could have given back about 9 GB. So on Windows, `magent serve` checks every five minutes for a local session whose agent **finished its turn** and has sat untouched for longer than `settings.idleReap.afterMinutes` (default 120, never less than 30), and *parks* it: it stops the agent's processes, keeps the pane, its shell, the psmux session and the window exactly where they are, and prints one line in the pane:
+
+```
+magent: parked after 120 min idle to free memory. Resume: claude --resume <session id>  (or magent status, r<n>)
+```
+
+Resuming picks up the same conversation: type that command at the pane's prompt, or run `magent status` and choose `r<n>` for the session. A resume is always by that exact id, never `--continue`. A bulk revive (`magent up`, and the `up` that `magent attach` runs on the host) leaves a parked session alone, so attaching does not undo the saving.
+
+It is deliberately hard to park the wrong thing. A session is parked only when every reading agrees it is finished and quiet: Claude Code's own status, magent's state record, the transcripts (subagents included) and the screen. A turn waiting on you (a permission prompt, a question), a background subagent or shell still running, or a draft left in the input box each keep it running. A session that shares its folder with another window, a remote or IDE session, a tool other than Claude Code, and anything that cannot be read are left alone: unknown never reads as idle. Each process's identity is re-checked at the moment it is stopped, and the pane's shell is never touched. `~/.magent/logs/reap.log` records every park (with the memory it freed) and every reason a session was spared.
+
+It needs the state hook (`magent hooks install`, see [Where agent states come from](#where-agent-states-come-from)): without its records nothing is ever parked, and `magent doctor`'s `idle-reap` check says so. A parked session reads `parked` in `magent status`, `watch` and `status --json`, and it loses its `[+]` title badge: a finished turn you had not looked at yet stops being flagged once it is parked, so check `magent status` when you come back.
+
+To turn it off, set `"idleReap": {"enabled": false}` (or just `"idleReap": false`) in `settings`, or `MAGENT_IDLE_REAP=0` in the environment or `~/.magent/.env`.
+
+### Mobile file upload (over Tailscale)
+
+Send screenshots, logs, archives — any file — from your phone straight into a project's agent session:
 
 ```json
 "settings": { "psmux": true, "uploadServer": true, "uploadPort": 8033 }
 ```
 
-`magent serve` (or `uploadServer: true` during launch) starts a small HTTP server on this config's `uploadPort` — the same port `magent status`, `up` and `doctor` watch, so a bare `magent serve` and the rest of the tool can't disagree about where the server is (`-p` still overrides it; with no readable config the port falls back to 8033). `magent mobile` prints the phone URL + a QR code you can install as a home-screen app (the QR code needs the optional `qr` extra: `pip install magent-multi-ai-agents-manager[qr]`). Pick a project on the phone, upload an image, and its path is pasted into that project's session. On a desktop browser you can also **Ctrl+V** an image from the clipboard: the page stages it with a preview showing which project it will go to, waits for you to confirm with **Send**, and shows live upload progress until the "pasted into …" confirmation. The Alt+V hotkey (Windows) does the same for whatever `magent:` session is focused. Setting `MAGENT_ALTV_NATIVE=1` makes a *local* press skip the pipeline and deliver one native Ctrl+V to the pane instead -- opt-in, because the pane's agent must support pasting on an injected Ctrl+V (Claude Code on Windows reacts only to the physical chord, so for it the default upload path is the one that works). Remote-wired listeners (`magent attach`) always keep the upload path.
+`magent serve` (or `uploadServer: true` during launch) starts a small HTTP server on this config's `uploadPort` — the same port `magent status`, `up` and `doctor` watch, so a bare `magent serve` and the rest of the tool can't disagree about where the server is (`-p` still overrides it; with no readable config the port falls back to 8033). `magent mobile` prints the phone URL + a QR code you can install as a home-screen app (the QR code needs the optional `qr` extra: `pip install magent-multi-ai-agents-manager[qr]`). Pick a project on the phone, upload one or several files of any type, and their paths are pasted into that project's session as one line. On a desktop browser you can also **Ctrl+V** copied files or an image: the page stages everything you copied (a single image with its preview, anything else as a tile naming the files, with their total size) alongside which project it will go to, waits for you to confirm with **Send**, and shows live upload progress until the "pasted into …" confirmation. A file keeps its own name on disk (dotfiles such as `.env` included; a very long name is shortened, extension kept); only a nameless clipboard blob gets a generated `paste-<time>` one. Uploads are capped at **100 MB of files** per send (all the files in it together), and a bigger one is refused with a message naming that limit — by the page before anything is sent, and by the server regardless. Folders are refused here too (`folders not supported - copy files`), and one folder in a selection refuses the whole send. A folder can only arrive by paste or drag-and-drop (the file picker can't select one); the page recognises it by the entry the browser attaches to the pasted or dropped item. Only when the browser attaches no entry does the page fall back to the shape a folder arrives as — an empty file the browser has no MIME type for — so in that case an *empty* `.toml`, `.log`, `.gitkeep` or `Makefile` is refused the same way. The Alt+V hotkey (Windows) does the same for whatever `magent:` session is focused: it takes a clipboard image, or files copied in Explorer (several at once become one pasted line, each path quoted when it needs to be). Copied folders are refused rather than guessed at. On the machine that owns the session, Alt+V pastes the copied files' **original paths** — nothing is copied, uploaded or size-limited, because the agent can already read them where they are; only a remote-wired listener (`magent attach`) uploads them. Setting `MAGENT_ALTV_NATIVE=1` makes a *local* press skip the pipeline and deliver one native Ctrl+V to the pane instead -- opt-in, because the pane's agent must support pasting on an injected Ctrl+V (Claude Code on Windows reacts only to the physical chord, so for it the default upload path is the one that works). Remote-wired listeners (`magent attach`) always keep the upload path.
 
 This works **over Tailscale**: the server binds only the loopback and your machine's Tailscale IP — never the LAN wildcard — and `attach`/`mobile`/`termius` shell out to the `tailscale` CLI to resolve hosts. Devices must be on your tailnet; there is deliberately no auth token, since the bind set is the access control. To bind something else (e.g. LAN-wide), use the escape hatch: `magent serve --host 0.0.0.0`.
 
 #### The Alt+V listener stays alive by itself
 
-The upload server owns the Alt+V listener: while `magent serve` runs it makes sure a listener exists, restarts one that died or is running older code after an upgrade, and leaves alone one that `magent attach` pointed at another machine. So Alt+V survives reboots, crashes and upgrades — start the server (directly, or via `magent --go` / `magent attach`) and the hotkey follows.
+The upload server owns the Alt+V listener: while `magent serve` runs it makes sure a listener exists, restarts one that died, one that is alive but wedged (its heartbeat silent for 90 seconds), or one running older code after an upgrade, and leaves alone one that `magent attach` pointed at another machine. So Alt+V survives reboots, crashes and upgrades — start the server (directly, or via `magent --go` / `magent attach`) and the hotkey follows.
 
 If it *isn't* working you will be told, rather than left guessing:
 
 - `magent status` prints `Alt+V listener   DEAD  (upload server is up but no listener — Alt+V does nothing)` in red and **exits 3**, with the repair command underneath. `magent doctor` fails the `hotkey` check with the same hint. A listener that is simply not expected yet (no server running) still reads as a quiet `off`.
-- Every press narrates itself in that project's status line, starting the instant the chord is detected: `Alt+V: capturing...` (before the clipboard is even read) → `Alt+V: uploading...` → `Alt+V: image sent` (a local native press is shorter: `Alt+V: pasting...` → `Alt+V: pasted from clipboard`). A press that can't complete ends in a **specific** reason rather than a generic failure — `clipboard has no image - copy one first`, `cannot reach magent serve (connection refused)`, `serve said HTTP 400: Unknown project`, `saved, but psmux would not paste it`. The narration never delays the press: it is queued and delivered on its own thread, and a dead server costs a paste nothing.
+- Every press narrates itself in that project's status line, starting the instant the chord is detected: `Alt+V: capturing...` (before the clipboard is even read) → `Alt+V: uploading...` → `Alt+V: image sent` (or `2 files sent`; a local press of copied files is `Alt+V: pasting...` → `Alt+V: 2 file paths pasted`, and a local native press is `Alt+V: pasting...` → `Alt+V: pasted from clipboard`). A press that can't complete ends in a **specific** reason rather than a generic failure — `clipboard has no image or file - copy one first`, `folders not supported - copy files`, `too large - 100 MB limit`, `could not read a copied file - is it open elsewhere?`, `a copied path has a control character - not pasted`, `cannot reach magent serve (connection refused)`, `serve said HTTP 400: Unknown project`, `saved, but psmux would not paste it`. The narration never delays the press: it is queued and delivered on its own thread, and a dead server costs a paste nothing.
 - Every press is also recorded in `~/.magent/logs/hotkey.log` as one `ALTV outcome=… project=…` line — so `grep ALTV ~/.magent/logs/hotkey.log` is the whole history of the chord — and `magent serve` logs each status-line message it served (`flash project=… msg=…` in `~/.magent/logs/upload.log`), so "the status didn't show" is answerable after the fact.
 
 To own the listener's lifetime yourself, set `MAGENT_HOTKEY_SUPERVISOR=0`; `status` still reports whether one is running.
+
+#### The attention daemon and the upload server keep each other alive
+
+`magent attention -d` restarts a dead upload server, and `magent serve` restarts the attention daemon. Serve checks as soon as it starts and then every 30 seconds. It restarts a daemon that a reboot took down at its first check, and one that crashed once its heartbeat has gone stale (about a minute), so after a restart the next `magent --go`, `magent up` or `magent attach` brings back badges and flashes along with Alt+V. It never starts a daemon you did not run, or one you stopped with `magent attention --stop` or `magent down --all`. Set `MAGENT_ATTENTION_SUPERVISOR=0` to manage the daemon yourself.
+
+`magent status` tells the cases apart. `CRASHED` (exit 3) means the daemon died while the machine stayed up; the line says when a running upload server will restart it. `not running since the last restart` (exit 0) means a reboot stopped it. A plain `off` means it was never started or was stopped on purpose.
+
+## Nodes
+
+### Three commands
+
+A project can run its Claude session on another Linux machine (a node) instead of this PC. You need two things: ssh access to that machine as root, and one browser Approve on this PC the first time. GitHub access for the node's clones uses this PC's `gh` login; if `gh` is installed but not logged in, `node add` offers to log it in for you (`gh auth login --web`, one more browser Approve). Then:
+
+```bash
+magent node add build-box                   # set the machine up as a node
+magent config add ~/code/api --node auto    # run this project on a node
+magent up                                   # bring it up there
+```
+
+`node add` sets the machine up over ssh: it installs what a session needs, creates your user there, authorizes your key and shares your gh login for git. The first time, it runs `claude setup-token` on this PC and your browser opens for the one Approve. The token that approval creates is what node sessions sign in with. Nothing is typed on the node, and no AI agent is needed to finish anything: when `up` returns, the session is running on the node in the project folder, and Claude Code already trusts that folder.
+
+A node that is not ready when you run `magent up` or `magent --go` (never set up, not answering, or without a Claude token while this PC has none to give it) is set up inline at a terminal. You get one question, `Set up @<nick> now? [Y/n]`, and the bring-up goes on. Without a terminal (a daemon, the `up` that `magent attach` runs on a host, a script), nothing is asked or minted. That project is skipped for this run, in one line that names the command that fixes it.
+
+### A project on a pool machine
+
+`settings.nodes` lists the pool machines a project can run on, keyed by nick:
+
+```json
+"settings": {
+  "nodes": {"second": {"host": "build-box", "user": "alice", "root": "~/magent"}}
+}
+```
+
+A nick is 1-6 characters of `a-z`, `0-9` and `-` (it is drawn in the status bar); `auto` and `cloud` are not nicks. `user` defaults to your local username at use time; `root` is where project clones live on the node.
+
+A project's `"node": "second"` runs its session on that machine. The node holds a git clone at your current branch, so `magent up` refuses a local tree the node could not reproduce: uncommitted or unpushed work (`--allow-dirty` lets it through, and the node gets origin's copy), no origin, a detached HEAD, or a branch with no commits. `node` is exclusive with `host`. The gitignored files a session needs (`.env*`, `.claude/settings.local.json`, `CLAUDE.local.md`, `.mcp.json`, plus a project's `push` list) are shipped at bring-up.
+
+- `magent node add <host> [--nick N] [--user U] [--key F]` adds a machine to `settings.nodes` and sets it up in one step. It creates the config file if there is none. The nick comes from the host (`gpu-server` becomes `server`; a taken nick gets a digit). An ssh alias is kept as written. The same host added again keeps its nick. A step that fails keeps the node in the config and names `magent node setup <nick>` to finish it.
+- `magent node remove <nick> [--local]` takes a machine out of `settings.nodes`. It never touches the machine. A project that would be left with no node (pinned to that nick, or `auto` when it is the last node) runs on this PC instead: at a terminal it lists them and asks `Run them on this PC instead? [Y/n]`, and `--local` does it without asking. Without a terminal and without `--local` it refuses, naming those projects and the one command. It also refuses, with nothing written, while a session still runs there (it names `magent node recall <name> --local`, which brings the conversation home and stops the session; `magent down` would leave the conversation on the node): once the node is removed, magent could no longer reach that session.
+- `magent config add <path> --node <nick|auto>` adds a project straight onto the pool. `magent config set <project> node <nick|auto|none>` pins or unpins one later (`none` runs it on this PC again). Both check the whole config first and write nothing it could not load.
+- `magent node setup <nick> [--user U]... [--key F]` prepares a machine once. Root is used for this one hop only, to install packages, create a per-person user and authorize your key. Nothing is left for you to do by hand on the node:
+  - **Claude runs on your subscription, never an API key.** The first setup runs `claude setup-token` on this PC. You approve once in the browser that opens; the token is kept owner-only in `~/.magent/claude-oauth-token` and reused for every node until it nears the end of its year. Node sessions start with it as `CLAUDE_CODE_OAUTH_TOKEN`, with `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` dropped. Your Claude login (`.credentials.json`) is never copied: its refresh token rotates, and a copy would sign this PC out.
+  - **git reaches GitHub over https with your gh login.** With no gh login on this PC, setup asks `Log this PC's gh in to GitHub now? [Y/n]` at a terminal and runs `gh auth login --web` there, then goes on; without a terminal it says so in one line and asks nothing. Setup runs `gh auth setup-git` on the node and points `git@github.com:` / `ssh://git@github.com/` remotes at https. A per-node GitHub ssh key is optional: it is added only when your gh already has `admin:public_key`, and skipped otherwise.
+  - It is idempotent: every step prints ok/did/skip.
+- `magent node doctor [<nick>]` checks a node: tmux/git/claude/gh on PATH, the Claude subscription token (owner-only, the credential Claude Code would actually use, and a non-billing check that Anthropic accepts it), git's GitHub login, locale, free disk, and the sync daemon's heartbeat and snapshot age.
+- `magent node auth refresh` mints a new subscription token (one browser approval) and pushes it to every configured node. A node that does not answer gets it at its next bring-up. `magent node auth status` says whether this PC has one and until when, never the token.
+  - The token lasts a year. From 30 days before its end, `magent status`, `magent doctor` and the `magent node` commands say so in one line. At a terminal, the node commands then ask `Renew it now?` (one browser Approve, then every node gets it). `magent status --json` carries its state as `claude_token`: `ok`, `soon`, `expired`, `untrusted` or `none`, or `null` when no node is configured. It never changes the exit code.
+- `magent node sync -d [--once] [--stop]` is the daemon that pulls transcripts and agent states home and samples each node's load. `magent serve` starts it while a session is placed on a node. `MAGENT_NODE_SYNC=0` stops serve from doing so (a sync run by hand still runs).
+  - It stops by itself 10 minutes after the last placed session goes, and the next bring-up on a node starts it again.
+  - It also stops once the config file it reads is gone. While it follows a config other than the one `magent status` reads (one started by `magent --config <file> up`), `status` names that file in one line.
+
+### Placement, plan, push and recall
+
+`"node": "auto"` lets magent pick the machine. It reads each node's load over the last 30 minutes, which the sync daemon samples, never a single reading, so a box used in bursts is not mistaken for an idle one. It penalizes load spikes and low free memory, skips a node under 10% free memory while another is above it, and spreads your own sessions out. A node with fewer than five recent samples gets one live reading (none under `--dry-run`); a node that does not answer it is left out. The choice then sticks: a project stays on its node until that node leaves `settings.nodes`, and the choice is kept in `~/.magent/nodes/node-map.json`, never in your config. `magent --go` and `magent up` place the same way, all of one launch's `auto` projects together so they spread out; an `auto` project that cannot be placed is not launched and its row says why.
+
+- `magent node plan <project|--all>` shows each node's score, which one would be chosen and why, and the files that would be shipped. It changes nothing. A project already placed shows its node and no scores.
+- `magent node push <project>` re-ships the gitignored files (`.env*` and the rest) to the project's running session, after you edit `.env` for example.
+- `magent node recall <project> --local` brings a session home. It pulls once more, prints the node's last commit per repo and whether its tree was dirty, stops the session on the node (and prints the command that does when it cannot), installs the conversation and its memory (the memory alone when no conversation was pulled) into this PC's Claude directory under the project's local folder (resolved exactly as `--go` resolves it), and prints what to run: the `git pull`, then `cd "<folder>"` and `claude --resume <id>` as two lines, never joined by `&&` (plain `claude` when no conversation was pulled, and a `cd /d` reminder for cmd.exe when the folder is on another drive letter). The copy follows no links, refuses a pulled folder that is itself a link, skips the pull's unfinished `.part` files, and names every local file the node's copy changed. It ends with: "@<nick> keeps its copy: a later bring-up there continues the node's conversation, not the turns added here."
+  - A node that does not answer at all (unreachable, or timed out) is reported, not fatal: what was already pulled is used, and the command that stops the session there is printed.
+  - A node that answers but whose last pull did not finish (it answered with an error, some files did not land, or its placement was not found again) stops the recall before anything is stopped, installed or cleared: it exits 1, the project stays placed, and it tells you to run the recall again. A pull stuck at its mark (the node keeps answering from the same point) is the one exception: a re-run would get the same answer, so it names nodes.log, where both marks are, instead. A node map another process holds busy exits 1 the same way. A torn or otherwise unreadable one, a malformed entry in it included, exits 1 too, and names the file to fix or move aside before the re-run (no magent command rebuilds it); a sync daemon that keeps pulling from that node past the wait exits 3, also with nothing touched. A folder of pulled conversations this PC cannot list exits 1 the same way and names the folder: it is never read as "nothing was pulled".
+- `magent node recall <project> --to <nick>` moves an `auto` session to another node and resumes the same conversation there; what was pulled is installed there even when it holds no conversation, only memory, and the session then starts fresh. A pinned project moves by changing its `"node"`. Before anything is touched it refuses (exit 2) a move the new node could not take, with the checks `magent up` makes: a node folder name another project shares, or a local tree the node could not reproduce (uncommitted or unpushed work, no origin, a detached HEAD, a branch with no commits). `--allow-dirty` works as it does for `magent up`: it lets uncommitted or unpushed work through (the node gets origin's copy), and the other three are still refused. Once the session runs on the new node, the node sync daemon is started as after any bring-up.
+
+A session brought up again on the same node continues its newest conversation there (`claude --continue`); only a recall picks a conversation by id.
+
+A `node-map.json` magent cannot read, torn or with one malformed entry, pauses the node sync: no node is pulled until the file reads again. `magent status` shows `node sync paused` under Nodes, naming the malformed entry, with the file to fix or move aside, and `status --json` carries it as `node_sync_paused`. It is degraded, as a stale sync daemon is: `magent status` exits 3 until the map is repaired. A map that is only busy (another process is writing it) is not a pause.
 
 ## Usage
 
@@ -265,14 +346,14 @@ Or skip the menu with flags:
 | `magent --init --base-dir <folder>` | Generate config from a folder of git repos. |
 | `magent --edit` | Open config in your default editor. |
 | `magent docs` | Print full config reference (Markdown). |
-| `magent doctor [--json]` | Diagnose the environment: config, env vars, agent tools on PATH, terminal, a wedged psmux control plane (see below), monitors, writable dirs, Tailscale, upload port. Exit 1 on any failure. |
+| `magent doctor [--json]` | Diagnose the environment: config, env vars, agent tools on PATH, terminal, a wedged psmux control plane (see below), monitors, writable dirs, Tailscale, upload port, idle reaper. Exit 1 on any failure. |
 | `magent sessions` | List active psmux sessions, pick one to attach. |
 | `magent sessions <name>` | Attach directly to a psmux session by name. |
 | `magent sessions --json` | Print every configured session as JSON — name, cwd, a live flag, and (for live ones) the model, effort, and state read from the pane. Non-interactive; attaches nothing. |
 | `magent send <session> "<text>" [--file f] [--wait-idle] [--compact] [--timeout s]` | Type a prompt into one running agent by name and submit it. Resolves the name case-insensitively (exact, then unique substring/prefix); refuses if it is not live. Exit codes: 0 sent, 2 not found, 3 psmux error, 4 not confirmed. See [below](#driving-a-session-from-another-shell). |
 | `magent model <session\|--all> <model> [--effort low\|medium\|high\|xhigh\|max]` | Switch a session's model (and optionally effort) while it is idle, retrying busy sessions until `--max-minutes`; prints a per-session before/after table. |
 | `magent peek <session> [-n <lines>]` | Print the last N pane lines of a session — a read-only glance. |
-| `magent up [--json] [-g <group>] [--revive]` | Host side: ensure a persistent psmux session per project, and re-launch the agent in any live session whose pane fell back to a bare shell (e.g. after a Ctrl-C). Reviving is automatic except under `--json`, which stays a pure read unless `--revive` is passed. |
+| `magent up [--json] [-g <group>] [--revive]` | Host side: ensure a persistent psmux session per project, and re-launch the agent in any live session whose pane fell back to a bare shell (e.g. after a Ctrl-C). Reviving is automatic except under `--json`, which stays a pure read unless `--revive` is passed. A session the idle reaper parked is never revived in bulk (see [Idle reaping](#idle-reaping-a-finished-agent-is-parked-to-free-memory)). |
 | `magent attach <host> [--no-reconnect]` | From another PC: bring host sessions up over SSH, tile locally, Alt+V uploads, F2 opens the project in VS Code over Remote-SSH. Panes reconnect themselves after a dropped connection (see below); `--no-reconnect` opts out. |
 | `magent watch` | Live table of every agent session, most-urgent first; press a row number to focus that window. |
 | `magent attention [-d] [--stop]` | Attention daemon: badges window titles with agent state, flashes the taskbar on needs-input/error, optional toast/ntfy push (`settings.attention`). Badges/flash/toast are Windows-only; ntfy push is cross-platform — see [Platform support](#platform-support). |
@@ -416,7 +497,8 @@ Launching, tiling, and the mobile/notification plumbing run on all three OSes. A
 | Desktop toast (`settings.attention.toast`) | Yes | No | No |
 | ntfy phone push (`settings.attention.ntfy`) | Yes | Yes | Yes |
 | Persistent psmux sessions (`up` / `sessions` / `attach`) | Yes | No | No |
-| Global Alt+V clipboard-image hotkey | Yes | No | No |
+| Idle reaping (`settings.idleReap`) | Yes | No | No |
+| Global Alt+V clipboard image/file hotkey | Yes | No | No |
 | psmux-safe keybindings (`terminal install`) | Yes | No | No |
 | Mobile upload server (`serve` / `mobile`) | Yes | Yes | Yes |
 
@@ -425,12 +507,13 @@ Notes:
 - **Badges, flash, and toast** are gated on `Platform.supports_attention_signals()`, which returns `True` only in `platform/windows.py`. On macOS/Linux the daemon prints `window badges/flash aren't supported on this OS` and those renderers stay off. Toast additionally uses the Windows-only `winotify` (`[toast]` extra). **ntfy push is cross-platform** — it is stdlib `urllib` over HTTP — so phone notifications work on every OS.
 - **The `magent:` title prefix** can be turned off with `settings.windowTitlePrefix: false` — window titles then become the bare project name (e.g. `api` instead of `magent:api`). Launch-path tiling still places windows (it matches the exact title it set), but the features that read the `magent:` grammar degrade to a safe no-op while the prefix is off: the attention daemon's title **badges**, the **Alt+V** clipboard hotkey (which only fires in `magent:`-titled windows), and `magent-name` title matching all stop recognizing your windows. One deliberate exception: `magent attach` windows always keep the prefix — there the title carries the psmux session id that the hotkey chain resolves, so it is load-bearing rather than cosmetic. Leave the setting on unless you specifically want prefix-free titles.
 - **Persistent psmux sessions and the Alt+V hotkey** are gated on `supports_psmux()` / `supports_hotkey()` (also Windows-only). Off Windows the psmux entry points raise `NotImplementedError` and importing `hotkey` raises `ImportError`.
+- **Idle reaping** is gated on `supports_psmux()` and an interactive logon session (`logon_session_is_interactive()`). Off Windows, or in a `serve` running in Session 0, the reaper logs `idle reaper off: <reason>` to `~/.magent/logs/reap.log` once and never sweeps.
 - **`magent terminal install`** is gated on `supports_wt_keybindings()` — it edits Windows Terminal's own `settings.json`, which no other OS has. Elsewhere it says so and does nothing (see [Typing through psmux](#typing-through-psmux)).
-- The **mobile upload server** itself (serving the PWA over loopback + Tailscale and receiving images) runs everywhere; auto-pasting the uploaded path into a *live* agent session uses psmux, so that last hop is Windows-only. Likewise, `watch`'s table renders on every OS but its press-a-number-to-focus action uses the same Windows-only window primitives.
+- The **mobile upload server** itself (serving the PWA over loopback + Tailscale and receiving files) runs everywhere; auto-pasting the uploaded path into a *live* agent session uses psmux, so that last hop is Windows-only. Likewise, `watch`'s table renders on every OS but its press-a-number-to-focus action uses the same Windows-only window primitives.
 
 ## Where agent states come from
 
-`magent sessions`, `magent watch`, `magent attention`, and `magent status --json` do not poll your agents directly. They read per-session **state records** — `working`, `needs-input`, `done`, `error`, `idle` — that your coding agent writes through its lifecycle hooks. Until those hooks are wired, the state store stays empty and the pickers show no status. Wire them once with:
+`magent sessions`, `magent watch`, `magent attention`, and `magent status --json` do not poll your agents directly. They read per-session **state records** — `working`, `needs-input`, `done`, `error`, `idle` — that your coding agent writes through its lifecycle hooks, plus `parked`, which is written by magent's [idle reaper](#idle-reaping-a-finished-agent-is-parked-to-free-memory), not by the hooks. Until those hooks are wired, the state store stays empty and the pickers show no status. Wire them once with:
 
 ```bash
 magent hooks install
