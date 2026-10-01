@@ -95,7 +95,7 @@ Changelog = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/b
 # to PyPI has been proven, so the cap keeps artifacts at Metadata-Version 2.4
 # (what every release from v3.11.1 on shipped). Dependabot #227 lifted it early;
 # lift it only in a change that proves a 2.5 upload.
-requires = ["hatchling<1.32"]
+requires = ["hatchling<1.33"]
 build-backend = "hatchling.build"
 
 # With no sdist table, hatchling ships the whole tree minus gitignored files.
