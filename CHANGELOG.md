@@ -5,6 +5,20 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`magent node doctor` no longer calls an idle node sync stale.** With nothing
+  placed on a node, the sync daemon idle-exits by design, and `magent status`
+  already says `node_sync: off`; the doctor still warned `sync-daemon its
+  heartbeat is stale -- see: magent status` and `snapshot pulled Ns ago, older
+  than 2 x pullIntervalS`, and `magent doctor`'s `nodes` row warned with them.
+  Both rows now follow status's one "is a sync expected" verdict: while it is
+  off they read `not running -- no node sessions to sync` and an informational
+  snapshot age (skip rows, no warning). While a session runs on a node the
+  stale-heartbeat and stale-snapshot warnings are unchanged.
+
 ## [3.20.0] - 2026-10-01
 
 This release rolls up 3.20.0rc1 and rc2 (nodes) and everything since 3.19.4.
