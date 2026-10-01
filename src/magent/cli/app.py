@@ -134,6 +134,11 @@ def _escape_unencodable_output() -> None:
     is_flag=True,
     help="With --attach-to: one plain SSH window per project (no psmux/tmux)",
 )
+@click.option(
+    "--allow-dirty",
+    is_flag=True,
+    help="Node projects: start despite a dirty or unpushed tree",
+)
 # package_name (not a resolved literal) so click reads the distribution
 # metadata inside the --version callback only -- see magent/__init__.py.
 @click.version_option(package_name="magent-multi-ai-agents-manager")
@@ -153,6 +158,7 @@ def main(
     attach_host: str | None,
     attach_port: int,
     attach_no_mux: bool,
+    allow_dirty: bool,
 ) -> None:
     """Open every project in its own terminal and auto-tile across all monitors."""
     _escape_unencodable_output()
@@ -299,6 +305,22 @@ def main(
         run_magent,
     )
 
+    if not (dry_run or tile_only):
+        # A node a project needs that cannot run it yet: set up inline at a
+        # terminal, skipped in one line anywhere else. A dry run or a pure
+        # re-tile never reads a node.
+        from magent import nodes  # heavy subsystem: in-body per policy
+        from magent.cli.node_onboard import ready_gate
+
+        cfg = ready_gate(
+            cfg,
+            [
+                p
+                for p in nodes.node_projects(cfg, group)
+                if only is None or nodes.project_name(p) in only
+            ],
+        )
+
     # Menu option 2 ("Re-tile all open windows") and a bare `--retile-all` both
     # promise tiling, not launching -- re-opening a window the user just closed
     # is what the flag is least expected to do. So `tile_only` means exactly
@@ -318,6 +340,7 @@ def main(
             group=group,
             config_path=str(config_file),
             only=only,
+            allow_dirty=allow_dirty,
         ),
     )
     if rc:

@@ -33,6 +33,32 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "none",
         'List of window objects `{"name", "tool", "command"}` with per-window tool/command overrides. Legacy `int` / `["name1", "name2"]` forms still parse (normalized by `magent config migrate`).',
     ),
+    (
+        "node",
+        "string",
+        "none",
+        (
+            "Run this project's session on a pool machine: a nick from "
+            "`settings.nodes`. A node holds a git clone at your current branch. "
+            'Exclusive with `host`. `"auto"` lets magent choose: the node with '
+            "the lowest load score over the sync daemon's last 30 minutes of "
+            "samples (a node under 10% free memory is skipped while another is "
+            "above it), and the project stays there until that node leaves "
+            '`settings.nodes`; `magent node plan` shows the choice. `"cloud"` is '
+            "reserved in this release and runs as an ordinary local session."
+        ),
+    ),
+    (
+        "push",
+        "list",
+        "none",
+        (
+            "Extra files (relative to the project) shipped to the node at bring-up, "
+            "on top of the auto-detected gitignored `.env*`, "
+            "`.claude/settings.local.json`, `CLAUDE.local.md` and `.mcp.json`. A "
+            "missing file is a warning, not an error."
+        ),
+    ),
 ]
 
 
@@ -169,6 +195,63 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "the sweep deletes it."
         ),
     ),
+    (
+        "nodes",
+        "object",
+        "`{}`",
+        (
+            'Pool machines a project can run on, keyed by nick: `{"second": {"host": '
+            '"build-box", "user": "alice", "root": "~/magent"}}`. A nick is 1-6 '
+            "characters of `a-z`, `0-9` and `-` (it is drawn in the status bar); "
+            "`auto` and `cloud` are not nicks: they are a project's `node` "
+            "placements. `user` defaults to your local username at use time; "
+            "`root` is where project clones live on the node."
+        ),
+    ),
+    (
+        "nodeSync.pullIntervalS",
+        "int",
+        "`30`",
+        (
+            "Seconds between the sync daemon's pulls of node transcripts and agent "
+            "state. Every pull is one ssh connection per node, so a shorter interval "
+            "costs connections, not just freshness."
+        ),
+    ),
+    (
+        "nodeSync.sampleIntervalS",
+        "int",
+        "`60`",
+        'Seconds between node load samples; `"node": "auto"` placement reads this history.',
+    ),
+    (
+        "nodeSync.historyH",
+        "int",
+        "`24`",
+        "Hours of load history kept per node for placement.",
+    ),
+    (
+        "idleReap.enabled",
+        "boolean",
+        "`true`",
+        (
+            "Let `magent serve` park a FINISHED agent that has been idle past "
+            "`afterMinutes`: hard-kill its process tree, keep the pane and "
+            "window, and type a resume notice. Windows only. Set `false` to "
+            'disable (`"idleReap": false` is shorthand for the same); any '
+            "other non-boolean is a config error, never read as on. "
+            "`MAGENT_IDLE_REAP=0` overrides this at runtime."
+        ),
+    ),
+    (
+        "idleReap.afterMinutes",
+        "int",
+        "`120`",
+        (
+            "Minutes a finished agent must sit idle before it is parked. Values "
+            "below 30 are raised to 30 (the floor)."
+        ),
+    ),
 ]
 
 
@@ -288,7 +371,9 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         "magent attention -d",
         (
             "The same, detached, one per machine. Its heartbeat shows in `magent "
-            "status`; `--stop` ends it, and so does `down --all`."
+            "status`; `--stop` ends it, and so does `down --all`. A running "
+            "`magent serve` restarts one that crashed or that a reboot took down "
+            "(never one you stopped); `MAGENT_ATTENTION_SUPERVISOR=0` opts out."
         ),
     ),
     (
@@ -415,17 +500,110 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "`?` rather than crashing."
         ),
     ),
+    (
+        "magent node sync -d [--once] [--stop]",
+        (
+            "The daemon that pulls transcripts and agent states home and samples "
+            "each node's load. `magent serve` starts it while a session is placed "
+            "on a node; it stops by itself 10 minutes after the last one goes, or "
+            "once the config file it reads is gone. `MAGENT_NODE_SYNC=0` stops "
+            "serve from starting it (a sync run by hand still runs)."
+        ),
+    ),
+    (
+        "magent node add <host> [--nick N] [--user U] [--key F]",
+        (
+            "THE way a machine joins the pool: writes `settings.nodes` (creating "
+            "the config when there is none), then runs `node setup` inline and "
+            "ends on one verdict. HOST may be an ssh-config alias; it is kept as "
+            "written, and the real host it resolves to is shown. The nick comes "
+            "from the host (`gpu-server` -> `server`) unless given. A failed "
+            "step leaves the node in the pool: rerun `magent node setup <nick>`."
+        ),
+    ),
+    (
+        "magent node remove <nick> [--local]",
+        (
+            "Take a node out of the pool. Edits the config only -- the machine, "
+            "its user and its files stay as they are. A project left with no "
+            "node (pinned to it, or auto with no node left) runs on this PC "
+            "instead: asked at a terminal, --local elsewhere. Refused while a "
+            "session is placed there, naming the recall that brings it home."
+        ),
+    ),
+    (
+        "magent node setup <nick> [--user U]... [--key F]",
+        (
+            "Prepare a machine once: root is used for this one hop only, to install "
+            "packages, create a per-person user and authorize your key. Then, as "
+            "that user: your gh login, with git reaching GitHub over https through "
+            "it (a GitHub ssh key is optional, added only when gh already may), "
+            "and your Claude SUBSCRIPTION token -- minted on this PC by `claude "
+            "setup-token` the first time (one browser approval), reused after. "
+            "Node sessions start with it as CLAUDE_CODE_OAUTH_TOKEN and never with "
+            "an API key. Idempotent -- every step prints ok/did/skip."
+        ),
+    ),
+    (
+        "magent node doctor [<nick>]",
+        (
+            "Check a node: tmux/git/claude/gh on PATH, the Claude subscription "
+            "token (owner-only, the credential Claude Code would use, and a "
+            "non-billing check that Anthropic accepts it), git's GitHub login, "
+            "locale, free disk, and the sync daemon's heartbeat and snapshot age."
+        ),
+    ),
+    (
+        "magent node auth refresh | status",
+        (
+            "`refresh` mints a new Claude subscription token on this PC (one "
+            "browser approval) -- the repair when the doctor says Anthropic "
+            "rejected it, or inside its last 30 days -- and pushes it to every "
+            "node that answers (the rest get it at their next bring-up). "
+            "`status` says whether there is one and until when, never the token."
+        ),
+    ),
+    (
+        "magent node plan <project|--all>",
+        (
+            "Show where a project would be placed (the load-history score per "
+            "node for `auto`) and which non-git files would be shipped. Writes "
+            "nothing."
+        ),
+    ),
+    (
+        "magent node push <project>",
+        (
+            "Re-ship a project's non-git files (`.env*` etc.) to its running node "
+            "session."
+        ),
+    ),
+    (
+        "magent node recall <project> (--to <nick> | --local)",
+        (
+            "Bring a node session home (`--local` prints the `claude --resume` "
+            "to run after a `git pull`) or move it to another node and resume it "
+            "there. Pulls once more first; a node that does not answer is "
+            "reported, not fatal."
+        ),
+    ),
     ("magent config show", "Display current config."),
     ("magent config layout <cols> <rows>", "Set window grid."),
     ("magent config base-dir <path>", "Set projects folder."),
     ("magent config default-tool <tool>", "Set default AI tool."),
     ("magent config tool <name> <cmd>", "Add/update a tool command."),
     ("magent config remove-tool <name>", "Remove a tool."),
-    ("magent config add <path> [-g GROUP] [-t TOOL]", "Add a project."),
+    (
+        "magent config add <path> [-g GROUP] [-t TOOL] [--node NICK|auto]",
+        "Add a project (`--node` runs it on a pool node).",
+    ),
     ("magent config remove <path>", "Remove a project."),
     ("magent config enable <path>", "Enable a project."),
     ("magent config disable <path>", "Disable a project."),
-    ("magent config set <path> <field> <value>", "Set a project field."),
+    (
+        "magent config set <path> <field> <value>",
+        "Set a project field (`node <nick|auto|none>` pins or unpins it).",
+    ),
     ("magent config open", "Open config in editor."),
     ("magent config path", "Print config file path."),
     (

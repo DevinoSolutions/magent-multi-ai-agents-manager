@@ -109,6 +109,11 @@ class TestWindowsCapabilities:
 
         assert WindowsPlatform().supports_window_nudge() is True
 
+    def test_supports_attach_windows_true(self):
+        from magent.platform.windows import WindowsPlatform
+
+        assert WindowsPlatform().supports_attach_windows() is True
+
 
 @pytest.mark.skipif(
     sys.platform != "win32", reason="WindowsPlatform binds windll at import"
@@ -250,6 +255,8 @@ def _drive_bring_up(
     pane_pids: dict[str, int | None] | None = None,
     snapshot_fails: bool = False,
     snapshots: list[int] | None = None,
+    consoles: dict[int, frozenset[int] | None] | None = None,
+    console_probes: list[list[int]] | None = None,
 ):
     """Drive a real ``launch_psmux_session`` over a fully faked psmux seam.
 
@@ -352,6 +359,7 @@ def _drive_bring_up(
             if pid is not None
             for entry in pane_tree(pid, *trees.get(n, ()))
         ],
+        consoles=consoles,
     )
     # The inter-batch settle pause is real seconds; nothing here waits on
     # a real process, so it only slows the multi-batch case down.
@@ -369,6 +377,8 @@ def _drive_bring_up(
     )
     if snapshots is not None:
         snapshots.extend(pane_side.snapshots)
+    if console_probes is not None:
+        console_probes.extend(pane_side.console_probes)
     return calls, probes
 
 
@@ -551,6 +561,121 @@ class TestWindowsSendKeysVerification:
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any("api" in r.getMessage() for r in warnings)
+
+    def test_a_console_veto_is_not_re_sent_and_is_named_in_the_platform_log(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        # api rests at pwsh with nothing under it, but a process outside its
+        # tree shares its console: typing there is unsafe, so no re-send -- and
+        # unlike a landed send, the bring-up's own log says why.
+        with caplog.at_level(logging.WARNING, logger="magent.platform"):
+            calls, _ = _drive_bring_up(
+                monkeypatch,
+                pane_states={"api": ["pwsh"]},
+                consoles={100: frozenset({100, 7777})},
+            )
+        assert len(_sends_for(calls, "api")) == 1
+        platform_warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.platform" and r.levelno == logging.WARNING
+        ]
+        assert any("api" in m and "7777" in m for m in platform_warnings)
+
+    def test_an_unreadable_console_counts_as_busy_and_is_never_re_sent(
+        self, monkeypatch
+    ):
+        # `procs.console_clients` answering None (the helper could not attach:
+        # a higher integrity level, a timeout, a dead console) is an UNKNOWN,
+        # and an unknown is a veto, deliberately -- the alternative is typing
+        # the agent command into a pane whose console may be an agent's input.
+        calls, _ = _drive_bring_up(
+            monkeypatch,
+            pane_states={"api": ["pwsh"]},
+            consoles={100: None},
+        )
+        assert len(_sends_for(calls, "api")) == 1
+
+    def test_a_vetoed_pane_stays_dropped_for_the_rest_of_the_bring_up(
+        self, monkeypatch
+    ):
+        # `api` keeps reading a bare pwsh forever, so on the foreground reading
+        # alone it would be a re-send candidate every round -- but its console
+        # was unreadable in round one, and a veto leaves the pending set for
+        # good. `web` swallowed its keys once and recovers after the re-send.
+        probed: list[list[str]] = []
+        calls, _ = _drive_bring_up(
+            monkeypatch,
+            windows=["api", "web"],
+            pane_states={"api": ["pwsh"], "web": ["pwsh", "claude"]},
+            consoles={100: None},
+            pane_probes=probed,
+        )
+        assert probed == [["api", "web"], ["web"]]  # api is never asked about again
+        assert len(_sends_for(calls, "api")) == 1
+        assert len(_sends_for(calls, "web")) == 2
+
+    def test_each_round_takes_one_console_probe_for_every_waiting_pane(
+        self, monkeypatch
+    ):
+        from magent.platform.windows import _SEND_MAX_ATTEMPTS
+
+        # `api` is vetoed in round one; `web` and `db` stay bare through every
+        # attempt. One helper spawn per round, carrying every pane still
+        # waiting (pane pids are 100, 200, 300 in window order) -- never one
+        # per pane.
+        console_probes: list[list[int]] = []
+        _drive_bring_up(
+            monkeypatch,
+            windows=["api", "web", "db"],
+            pane_states={"api": ["pwsh"], "web": ["pwsh"], "db": ["pwsh"]},
+            consoles={100: None},
+            console_probes=console_probes,
+        )
+        assert console_probes == [[100, 200, 300]] + [[200, 300]] * (
+            _SEND_MAX_ATTEMPTS - 1
+        )
+
+    def test_an_unreadable_console_is_named_in_both_logs_once(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        # Two loggers, two audiences: `launch` carries the verdict every caller
+        # of idle_sessions shares, `platform` says what THIS bring-up did about
+        # it. `web` is healthy after one re-send and must appear in neither.
+        with caplog.at_level(logging.WARNING):
+            _drive_bring_up(
+                monkeypatch,
+                windows=["api", "web"],
+                pane_states={"api": ["pwsh"], "web": ["pwsh", "claude"]},
+                consoles={100: None},
+            )
+
+        def said(logger: str) -> list[str]:
+            return [
+                r.getMessage()
+                for r in caplog.records
+                if r.name == logger and r.levelno == logging.WARNING
+            ]
+
+        assert (
+            said("magent.platform").count(
+                "not re-sending into api: console clients unreadable"
+            )
+            == 1
+        )
+        assert (
+            said("magent.launch").count(
+                "pane api is not proven idle: console clients unreadable"
+            )
+            == 1
+        )
+        for logger in ("magent.platform", "magent.launch"):
+            assert not any("not re-sending into web" in m for m in said(logger))
+            assert not any("pane web is not proven idle" in m for m in said(logger))
 
     def test_a_pane_running_the_agent_is_never_re_sent(self, monkeypatch):
         # THE dangerous edge: a re-send into a live agent types the command
@@ -1010,6 +1135,68 @@ class TestLaunchPathSpawnsScrubTheInheritedMarkers:
         _assert_scrubbed(envs[0])
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+)
+def test_a_windows_ssh_project_terminal_dials_the_panes_client(monkeypatch):
+    # An ssh-host terminal dials through attach_client's rule, the same client
+    # (and agent) the attach panes use -- never whatever PATH offers first.
+    from magent import attach_client
+    from magent.platform import TerminalLaunchOpts
+    from magent.platform.windows import WindowsPlatform
+
+    client = r"C:\Windows\System32\OpenSSH\ssh.exe"
+    argvs: list[list[str]] = []
+    monkeypatch.setattr(attach_client, "find_ssh", lambda: client)
+    monkeypatch.setattr(
+        "magent.platform.windows.subprocess.Popen", lambda a, **k: argvs.append(a)
+    )
+    WindowsPlatform().launch_terminal(
+        TerminalLaunchOpts(
+            title="magent:api", cwd="C:/p", command="claude", ssh_host="u@host"
+        )
+    )
+    (argv,) = argvs
+    assert argv[argv.index("/k") + 1] == client
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+)
+@pytest.mark.parametrize(
+    "client",
+    [
+        r"C:\Program Files\OpenSSH\ssh.exe",
+        r"C:\Program Files\Git\usr\bin\ssh.exe",
+        r"C:\Tools&Co\ssh.exe",
+    ],
+)
+def test_a_client_path_cmd_would_reparse_reaches_it_as_the_bare_name(
+    monkeypatch, client
+):
+    # `cmd /k` strips the first and last quote of a line that starts with one,
+    # so a quoted C:\Program Files\... argv[0] would eat the remote command's
+    # closing quote, and an unquoted `&` would split the line in two. Only the
+    # PATH fallback yields such a path, and the bare name resolves through that
+    # same PATH to the same client.
+    from magent import attach_client
+    from magent.platform import TerminalLaunchOpts
+    from magent.platform.windows import WindowsPlatform
+
+    argvs: list[list[str]] = []
+    monkeypatch.setattr(attach_client, "find_ssh", lambda: client)
+    monkeypatch.setattr(
+        "magent.platform.windows.subprocess.Popen", lambda a, **k: argvs.append(a)
+    )
+    WindowsPlatform().launch_terminal(
+        TerminalLaunchOpts(
+            title="magent:api", cwd="C:/p", command="claude", ssh_host="u@host"
+        )
+    )
+    (argv,) = argvs
+    assert argv[argv.index("/k") + 1] == "ssh"
+
+
 # --- the ATTACH client is the OTHER rule ------------------------------------
 # `attach_psmux` opens a window that RENDERS an existing session; it hosts no
 # agent and creates nothing. So it keeps the inherited environment -- nesting
@@ -1063,3 +1250,17 @@ class TestAttachClientKeepsNestingMarkersButNotALeakedNoColor:
                 monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("NO_COLOR", "1")
         assert self._env(monkeypatch) is None
+
+
+@pytest.mark.parametrize("platform_cls", _DEFAULT_BACKENDS)
+def test_default_supports_attach_windows_false(platform_cls):
+    # A node project's window is a wt window (attach_client); a POSIX desktop
+    # has no launcher for it yet, so --go must not try.
+    assert platform_cls().supports_attach_windows() is False
+
+
+def test_the_fake_platform_reports_what_it_was_given():
+    from tests.conftest import FakePlatform
+
+    assert FakePlatform().supports_attach_windows() is False
+    assert FakePlatform(supports_attach_windows=True).supports_attach_windows() is True

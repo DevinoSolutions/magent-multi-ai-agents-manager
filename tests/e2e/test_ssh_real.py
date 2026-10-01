@@ -80,7 +80,6 @@ import ctypes
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -89,6 +88,13 @@ from contextlib import suppress
 from pathlib import Path
 
 import pytest
+
+from tests.e2e._ssh_helpers import (
+    UNROUTABLE,
+    emit_ci_warning,
+    free_port,
+    kill_ssh_carrying,
+)
 
 # real_home: this tier is the one place that MUST keep the machine's own home.
 # It drives magent over a loopback sshd as the SAME user, and `attach` cannot
@@ -148,12 +154,6 @@ def _wait_until(check, timeout: float, interval: float = 0.25):
         time.sleep(interval)
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _health_ok(port: int) -> bool:
     import http.client
 
@@ -198,18 +198,6 @@ def _run_to_files(
         out_path.read_text(encoding="utf-8", errors="replace"),
         err_path.read_text(encoding="utf-8", errors="replace"),
     )
-
-
-def _real_stdout(capsys, line: str) -> None:
-    """Write to the real step stdout with pytest capture suspended, so GitHub
-    ``::warning`` annotations reach the CI log's parser."""
-    with capsys.disabled():
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
-
-
-def _emit_ci_warning(capsys, title: str, message: str) -> None:
-    _real_stdout(capsys, f"::warning title={title}::{message}")
 
 
 def _ssh_target(host: str) -> str:
@@ -406,7 +394,7 @@ class TestAttachOverRealSsh:
         proj_b = tmp_path / name_b
         proj_a.mkdir()
         proj_b.mkdir()
-        upload_port = _free_port()
+        upload_port = free_port()
 
         config_body = json.dumps(
             {
@@ -912,6 +900,8 @@ class TestRemoteLaunchOverRealSshLinux:
         }
         env["HOME"] = str(home)
         env["XDG_CONFIG_HOME"] = str(home / ".config")
+        # The MAGENT_* strip drops conftest's pin: never a child with reaping on.
+        env["MAGENT_IDLE_REAP"] = "0"
 
         try:
             rc, out, err = _run_to_files(
@@ -1030,15 +1020,6 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         proc.wait(timeout=30)
 
 
-# TEST-NET-1 (RFC 5737): guaranteed never routed, so a dial at it always fails
-# in connect() and the local ssh CLIENT emits the real exit 255. That is the
-# faithful reproduction of the reported bug -- a laptop that slept, a wi-fi
-# change, a host that rebooted all surface as a client-side 255, generated
-# here rather than reported by a server. Deliberately NOT simulated with a
-# remote command that exits 255: see the Windows note on the sshd legs below.
-_UNROUTABLE = "192.0.2.1"
-
-
 def _connect_timeout_s() -> int:
     """The product's own ConnectTimeout, so this file's waiting budget tracks
     it instead of hard-coding a number that would silently go too tight."""
@@ -1078,7 +1059,7 @@ class TestReconnectSupervisorOverRealSsh:
                 [
                     exe,
                     "--target",
-                    f"probe@{_UNROUTABLE}",
+                    f"probe@{UNROUTABLE}",
                     "--session",
                     "reconnect-probe",
                     "--remote",
@@ -1333,7 +1314,7 @@ def _typed_text_win32_gap_or_skip(capsys) -> None:
     """
     if sys.platform != "win32":
         return
-    _emit_ci_warning(
+    emit_ci_warning(
         capsys,
         "typed-text-over-real-ssh leg skipped (nested ConPTY)",
         "Enter reaches the remote as a win32-input-mode key record "
@@ -1355,48 +1336,6 @@ def _pty_backend_or_skip() -> None:
         pytest.importorskip("winpty", reason="pywinpty needed to drive a real pty")
     else:
         pytest.importorskip("pexpect", reason="pexpect needed to drive a real pty")
-
-
-def _kill_ssh_carrying(token: str) -> None:
-    """Kill the ssh CLIENT whose command line carries ``token``, and only it.
-
-    Out-of-band on purpose: the drop has to look to the supervisor exactly like
-    a wi-fi failure -- something outside the process killing the connection --
-    rather than a remote command choosing to exit. Narrowed to processes
-    actually named ``ssh`` so the supervisor itself, whose argv carries the same
-    token in ``--remote``, is never the one that dies.
-    """
-    if sys.platform == "win32":
-        subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                (
-                    "Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" | "
-                    f"Where-Object {{ $_.CommandLine -like '*{token}*' }} | "
-                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
-                ),
-            ],
-            capture_output=True,
-            timeout=60,
-            check=False,
-        )
-        return
-    found = subprocess.run(
-        ["pgrep", "-f", token], capture_output=True, text=True, timeout=30, check=False
-    )
-    for pid in found.stdout.split():
-        comm = subprocess.run(
-            ["ps", "-o", "comm=", "-p", pid],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        if os.path.basename(comm.stdout.strip()) == "ssh":
-            with suppress(OSError, ValueError):
-                os.kill(int(pid), 9)
 
 
 class TestTypedTextSurvivesARealDrop:
@@ -1489,7 +1428,7 @@ class TestTypedTextSurvivesARealDrop:
             ), "the typed text never reached the host"
 
             # 3. The wi-fi "drops": something outside the pane kills the client.
-            _kill_ssh_carrying(token)
+            kill_ssh_carrying(token)
 
             # 4. The pane heals itself, and while it does, the status line is
             #    on screen -- this is the moment the old code erased the frame.
@@ -1502,7 +1441,7 @@ class TestTypedTextSurvivesARealDrop:
         finally:
             with suppress(Exception):
                 pty.close()
-            _kill_ssh_carrying(token)
+            kill_ssh_carrying(token)
 
         mid_report = f"\n--- mid-outage screen ---\n{mid_outage.text}"
         # The status line owns the bottom row and nothing else -- so whatever
@@ -1559,7 +1498,7 @@ class TestRemoteWindowLegMacos:
         )
         automation_ok = probe.returncode == 0 and probe.stdout.strip().isdigit()
         if not automation_ok:
-            _emit_ci_warning(
+            emit_ci_warning(
                 capsys,
                 "macOS SSH window leg skipped (TCC)",
                 "UI automation is TCC-blocked on this runner; the remote-launch "
@@ -1567,7 +1506,7 @@ class TestRemoteWindowLegMacos:
                 "coverage in TestSshControlChannel does). Not a green pass.",
             )
             pytest.skip("macOS UI automation TCC-blocked: window-over-ssh leg unrun")
-        _emit_ci_warning(
+        emit_ci_warning(
             capsys,
             "macOS SSH window leg not implemented",
             "UI automation is permitted here, but the macOS ssh+Terminal.app "

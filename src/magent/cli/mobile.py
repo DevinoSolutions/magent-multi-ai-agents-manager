@@ -235,8 +235,16 @@ def serve_cmd(
     click.echo(f"  {style('Ctrl+C to stop.', dim=True)}")
     click.echo()
 
+    # serve keeps the attention daemon alive, as `attention -d` keeps serve
+    # alive. Built here and handed down, not built in run_server: it is cli
+    # code, and upload_server must not import the cli package (LS-A-001).
+    from magent.cli import attention_cmd  # in-body: a sibling command module
+
+    attention_hook = attention_cmd.attention_watchdog(config_path)
+    watchdogs = [attention_hook] if attention_hook is not None else []
+
     try:
-        run_server(port=port, config_path=config_path, host=host)
+        run_server(port=port, config_path=config_path, host=host, watchdogs=watchdogs)
     except KeyboardInterrupt:
         click.echo(f"\n  {style('Server stopped.', dim=True)}")
     except BindFailed as e:

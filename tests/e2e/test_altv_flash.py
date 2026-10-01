@@ -248,10 +248,13 @@ class _Fleet:
         # ...and `attention -d` now supervises `magent serve` the same way, so a
         # test daemon would otherwise start a REAL upload server on this machine.
         env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+        env["MAGENT_ATTENTION_SUPERVISOR"] = "0"
         # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
         # no HOME redirect contains: a test-spawned serve/daemon must never
         # re-prioritise the developer's real psmux fleet.
         env["MAGENT_PSMUX_BOOST"] = "0"
+        env["MAGENT_NODE_SYNC"] = "0"
+        env["MAGENT_IDLE_REAP"] = "0"
         # ...and the Session-0 hand-off must never fire from a test: a runner
         # (or an ssh-driven leg) is legitimately non-interactive, and the
         # default policy would create a REAL scheduled task on somebody's
@@ -774,3 +777,108 @@ class TestNativeLocalPress:
         pasting = next(i for i, m in enumerate(messages) if "pasting..." in m)
         pasted = next(i for i, m in enumerate(messages) if "pasted from clipboard" in m)
         assert pasting < pasted
+
+
+class TestFilePress:
+    """Alt+V with files copied in Explorer, through the real spawn path.
+
+    REMOTE: every file travels in one upload to the real serve, and the pane
+    gets ONE paste naming all of them. LOCAL: the original paths are pasted by
+    the listener itself -- nothing is uploaded, nothing lands in uploads/.
+    """
+
+    def test_a_remote_press_uploads_every_file_and_pastes_them_in_one_send(
+        self, fleet, tmp_path
+    ):
+        from magent.sessions import paths_line
+
+        src = tmp_path / "copied"
+        src.mkdir()
+        archive = src / "bundle.zip"
+        archive.write_bytes(bytes(range(256)) * 8)
+        script = src / "tool.py"
+        script.write_bytes(b"print('hi')\r\n")
+
+        outcome = altv.handle_file_press(
+            fleet.url, fleet.project, lambda: [str(archive), str(script)], local=False
+        )
+        # `inject-pending` is the product answering correctly on a loaded box
+        # (the paste spawn outlived INJECT_GRACE_S), not a failed press -- the
+        # files are on disk either way, and the one send is waited for below.
+        assert outcome in ("ok", "inject-pending"), outcome
+
+        uploads = fleet.home / ".magent" / "uploads"
+        written = {p.name.split("_", 1)[1]: p for p in uploads.iterdir()}
+        assert written["bundle.zip"].read_bytes() == archive.read_bytes()
+        assert written["tool.py"].read_bytes() == script.read_bytes()
+
+        # ONE paste for the whole selection, carrying both saved paths in the
+        # order they were copied.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            sends = [c["argv"] for c in fleet.calls() if "send-keys" in c["argv"]]
+            if sends:
+                break
+            time.sleep(0.05)
+        assert len(sends) == 1, sends
+        saved = [
+            str(written["bundle.zip"].resolve()),
+            str(written["tool.py"].resolve()),
+        ]
+        assert sends[0][-1].casefold() == paths_line(saved).casefold()
+        fleet.wait_for_flash("2 files sent" if outcome == "ok" else "2 files saved")
+
+    def test_a_local_press_pastes_the_original_paths_and_uploads_nothing(
+        self, native_fleet, tmp_path
+    ):
+        from magent.sessions import paths_line
+
+        fleet = native_fleet
+        src = tmp_path / "copied"
+        src.mkdir()
+        plain = src / "a.py"
+        plain.write_bytes(b"x")
+        spaced = src / "my notes.txt"
+        spaced.write_bytes(b"y")
+        paths = [str(plain), str(spaced)]
+
+        outcome = altv.handle_file_press(
+            fleet.url, fleet.project, lambda: paths, local=True
+        )
+        assert outcome == "ok-paths"
+
+        # One literal send of the ORIGINAL paths, the spaced one quoted.
+        sends = [c["argv"] for c in fleet.calls() if "send-keys" in c["argv"]]
+        assert sends == [
+            [
+                "-L",
+                fleet.project,
+                "send-keys",
+                "-t",
+                fleet.project,
+                "-l",
+                "--",
+                paths_line(paths),
+            ]
+        ]
+        assert f'"{spaced}"' in sends[0][-1]
+        # Nothing moved: the serve's upload dir was never even created.
+        uploads = fleet.home / ".magent" / "uploads"
+        assert not uploads.exists() or not any(uploads.iterdir())
+        fleet.wait_for_flash("2 file paths pasted")
+
+    def test_a_copied_folder_moves_nothing_and_says_why(self, native_fleet, tmp_path):
+        fleet = native_fleet
+        folder = tmp_path / "a folder"
+        folder.mkdir()
+        loose = tmp_path / "loose.txt"
+        loose.write_bytes(b"z")
+
+        outcome = altv.handle_file_press(
+            fleet.url, fleet.project, lambda: [str(loose), str(folder)], local=False
+        )
+        assert outcome == "folder-refused"
+        assert not any("send-keys" in c["argv"] for c in fleet.calls())
+        uploads = fleet.home / ".magent" / "uploads"
+        assert not uploads.exists() or not any(uploads.iterdir())
+        fleet.wait_for_flash("folders not supported - copy files")

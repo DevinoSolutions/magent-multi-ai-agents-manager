@@ -1,10 +1,12 @@
 import json
+import re
 import sys
 import tracemalloc
 from pathlib import Path
 
 import pytest
 
+from magent import config as config_module
 from magent.config import SCHEMA_VERSION, ConfigError, MagentConfig, load_config
 from magent.init_config import generate_config, scan_for_projects
 
@@ -694,3 +696,177 @@ class TestGenerateConfig:
         assert len(config["projects"]) == 2
         assert config["layout"]["columns"] == 2
         assert config["settings"]["defaultTool"] == "claude"
+
+
+class TestTheOneNodeSkipPredicate:
+    """DECISION-15/22: cloud projects are LOCAL panes, so "runs on a node"
+    is never a bare truthiness test on ``node``."""
+
+    @pytest.mark.parametrize(
+        ("node", "cloud", "on_node"),
+        [
+            (None, False, False),
+            ("cloud", True, False),
+            ("second", False, True),
+            ("auto", False, True),
+        ],
+    )
+    def test_is_cloud_and_runs_on_node(self, node, cloud, on_node):
+        from magent.config import ProjectConfig, is_cloud, runs_on_node
+
+        proj = ProjectConfig(path="C:/a/api", node=node)
+        assert (is_cloud(proj), runs_on_node(proj)) == (cloud, on_node)
+
+
+class TestNobodyHandRollsTheNodePredicate:
+    """DECISION-15 / 26 ix: typed config asks ``runs_on_node`` / ``is_cloud``,
+    and only config.py spells the comparison. The raw-dict form
+    ``p.get("node") not in (None, "cloud")`` (DECISION-22) does not match."""
+
+    HAND_ROLLED = re.compile(
+        r"""\.node\s*(?:!=|==)\s*(?:NODE_CLOUD|["']cloud["'])|\.node\s+(?:not\s+)?in\s*\(\s*None"""
+    )
+
+    def test_only_config_py_compares_a_node_to_cloud(self):
+        src = Path(config_module.__file__).parent
+        offenders = [
+            f"{path.relative_to(src)}:{n}"
+            for path in sorted(src.rglob("*.py"))
+            if path != src / "config.py"
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if self.HAND_ROLLED.search(line)
+        ]
+        assert offenders == []
+
+
+class TestIdleReapSettings:
+    def test_defaults(self):
+        from magent.config import Settings
+
+        s = Settings()
+        assert s.idle_reap.enabled is True
+        assert s.idle_reap.after_minutes == 120
+
+    def test_round_trips(self, tmp_config):
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"idleReap": {"enabled": False, "afterMinutes": 45}},
+                "projects": [{"path": "api"}],
+            }
+        )
+        cfg = load_config(path)
+        assert cfg.settings.idle_reap.enabled is False
+        assert cfg.settings.idle_reap.after_minutes == 45
+
+    def test_a_settings_block_without_idle_reap_parses_it_on(self, tmp_config):
+        # The PARSER's default, not the dataclass's: a non-empty settings block
+        # skips _parse_settings's `Settings()` shortcut, so only
+        # _parse_idle_reap's own defaults can answer here.
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"defaultTool": "claude"},
+                "projects": [{"path": "api"}],
+            }
+        )
+        cfg = load_config(path)
+        assert cfg.settings.idle_reap.enabled is True
+        assert cfg.settings.idle_reap.after_minutes == 120
+
+    def test_a_block_naming_only_after_minutes_stays_on(self, tmp_config):
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"idleReap": {"afterMinutes": 45}},
+                "projects": [{"path": "api"}],
+            }
+        )
+        cfg = load_config(path)
+        assert cfg.settings.idle_reap.enabled is True
+        assert cfg.settings.idle_reap.after_minutes == 45
+
+    @pytest.mark.parametrize("flag", [False, True])
+    def test_a_bare_boolean_block_is_the_enabled_flag(self, tmp_config, capsys, flag):
+        # `"idleReap": false` is how every other feature toggle in settings
+        # reads ("psmux": false, "uploadServer": false), so it must mean OFF.
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"idleReap": flag},
+                "projects": [{"path": "api"}],
+            }
+        )
+        cfg = load_config(path)
+        assert cfg.settings.idle_reap.enabled is flag
+        assert cfg.settings.idle_reap.after_minutes == 120
+        assert capsys.readouterr().err == ""
+
+    @pytest.mark.parametrize(
+        ("idle_reap", "label"),
+        [
+            (None, "settings.idleReap must be an object or a boolean"),
+            ("off", "settings.idleReap must be an object or a boolean"),
+            ({"enabled": "false"}, "settings.idleReap.enabled must be a boolean"),
+            ({"enabled": 0}, "settings.idleReap.enabled must be a boolean"),
+            ({"enabled": None}, "settings.idleReap.enabled must be a boolean"),
+            (
+                {"afterMinutes": 600.0},
+                "settings.idleReap.afterMinutes must be an integer",
+            ),
+            (
+                {"afterMinutes": "600"},
+                "settings.idleReap.afterMinutes must be an integer",
+            ),
+            (
+                {"afterMinutes": True},
+                "settings.idleReap.afterMinutes must be an integer",
+            ),
+        ],
+        ids=[
+            "block-null",
+            "block-string",
+            "enabled-string",
+            "enabled-zero",
+            "enabled-null",
+            "minutes-float",
+            "minutes-string",
+            "minutes-bool",
+        ],
+    )
+    def test_a_wrong_type_is_an_error_never_reaping_on(
+        self, tmp_config, idle_reap, label
+    ):
+        # The reaper's default is destructive, so a value it cannot read fails
+        # CLOSED: an error naming the dotted key, not a silent fall back to
+        # enabled=True / 120 minutes.
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"idleReap": idle_reap},
+                "projects": [{"path": "api"}],
+            }
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value).startswith(label)
+
+    def test_an_unknown_idle_reap_key_warns(self, tmp_config, capsys):
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"idleReap": {"enabled": True, "bogus": 1}},
+                "projects": [{"path": "api"}],
+            }
+        )
+        load_config(path)
+        err_lines = capsys.readouterr().err.splitlines()
+        # The nested key is named; the idleReap block itself is a known key.
+        assert "Warning: unknown config key: settings.idleReap.bogus" in err_lines
+        assert "Warning: unknown config key: settings.idleReap" not in err_lines
+
+    def test_serializes(self):
+        from magent.config import Settings, settings_to_dict
+
+        d = settings_to_dict(Settings())
+        assert d["idleReap"] == {"enabled": True, "afterMinutes": 120}

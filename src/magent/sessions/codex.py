@@ -13,6 +13,22 @@ def build_codex_resume(base_cmd: str, session_id: str | None) -> str:
     return base_cmd
 
 
+def codex_fresh_form(base_cmd: str) -> str | None:
+    """``base_cmd`` with its implicit ``resume --last`` dropped, or None when it
+    carries no implicit resume (a bare ``codex``, or ``resume <id>`` naming a
+    session explicitly). No store is read: whether there is a last session to
+    resume is the caller's question -- on this PC ``codex_fresh_command`` asks
+    it, and on a pool node the node asks its own store."""
+    tokens = base_cmd.split()
+    if "resume" not in tokens:
+        return None
+    at = tokens.index("resume")
+    rest = tokens[at + 1 :]
+    if rest[:1] != ["--last"]:
+        return None
+    return " ".join(tokens[:at] + rest[1:])
+
+
 def codex_fresh_command(
     base_cmd: str,
     project_dir: str,
@@ -31,8 +47,9 @@ def codex_fresh_command(
     The one hand-configured shape that carries the same hazard is
     ``codex resume --last``: in a directory codex has never run in there is no
     last session to resume. That form (and only that form) drops back to the
-    bare binary. ``resume <id>`` is the user naming a session explicitly and is
-    left alone, exactly like claude's ``--resume <id>``.
+    bare binary (``codex_fresh_form``). ``resume <id>`` is the user naming a
+    session explicitly and is left alone, exactly like claude's
+    ``--resume <id>``.
 
     ``config_dir`` is accepted and ignored, on purpose -- see
     ``get_codex_session_ids``. ``home_override`` is codex's own store seam and
@@ -40,19 +57,14 @@ def codex_fresh_command(
     land in it by accident.
     """
     del config_dir  # deliberately ignored: codex's store is not account-scoped
-    tokens = base_cmd.split()
-    if "resume" not in tokens:
-        return None
-    at = tokens.index("resume")
-    rest = tokens[at + 1 :]
-    if rest[:1] != ["--last"]:
-        return None
+    fresh = codex_fresh_form(base_cmd)
     if (
-        get_codex_session_ids(project_dir, 1, home_override=home_override)[0]
+        fresh is None
+        or get_codex_session_ids(project_dir, 1, home_override=home_override)[0]
         is not None
     ):
         return None
-    return " ".join(tokens[:at] + rest[1:])
+    return fresh
 
 
 def get_codex_session_ids(

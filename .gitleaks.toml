@@ -1,3 +1,10 @@
+# Canary convention: every fake secret a test or plan needs (token, key,
+# password) carries the literal marker DECOY in its value, e.g. ghp_DECOY....
+# The one allowlist below honours the marker only under tests/ and
+# docs/superpowers/, and only when the flagged secret itself carries it: both
+# must hold. A real-looking secret without DECOY is caught everywhere, and so is
+# a DECOY value anywhere else. Canaries committed before this convention are
+# pinned one by one, by fingerprint, in .gitleaksignore.
 title = "magent gitleaks config"
 
 [extend]
@@ -9,7 +16,57 @@ description = "Tailscale MagicDNS hostname (contains the tailnet name)"
 regex = '''[a-z0-9-]+\.tail[a-z0-9-]+\.ts\.net'''
 tags = ["tailscale", "infra"]
 
-# The synthetic sentinel test_hooks_cmd.py plants as a fake API key; a rename cannot help, the scan reads every commit's patch.
-[allowlist]
+[[allowlists]]
+description = "Test/plan canaries: the secret carries DECOY AND lives under tests/ or docs/superpowers/"
+condition = "AND"
+paths = [
+  '''^tests/''',
+  '''^docs/superpowers/''',
+]
+# "secret" = the captured value, not the whole match: a DECOY in a key NAME
+# next to a real value must not pass.
+regexTarget = "secret"
+regexes = ['''DECOY''']
+
+# The synthetic sentinel test_hooks_cmd.py plants as a fake API key (main's
+# #251, which predates the DECOY convention here); a rename cannot help, the
+# scan reads every commit's patch.
+[[allowlists]]
 description = "synthetic test sentinels"
 regexes = ['''sentinel-secret-9d2a''']
+
+# Two values in tests/unit/test_node_provision.py that no DECOY can be written
+# into, each pinned by shape AND file so a real secret anywhere else (or a
+# different shape in this file) still fires. Content-based on purpose: the old
+# .gitleaksignore fingerprints are keyed on commit SHAs, which a squash or
+# merge re-keys.
+[[allowlists]]
+description = "node-provision test data: a sha256 hex digest of fixture bytes (scope.digests()), not a credential"
+condition = "AND"
+paths = ['''^tests/unit/test_node_provision\.py$''']
+regexTarget = "secret"
+regexes = ['''^[0-9a-f]{64}$''']
+
+[[allowlists]]
+description = "node-provision test data: the generic rule matching the code text stdout=legacy (a 0-9a-f fixture variable), not a credential"
+condition = "AND"
+paths = ['''^tests/unit/test_node_provision\.py$''']
+regexTarget = "secret"
+regexes = ['''^stdout=legacy$''']
+
+# The key-refusal tests wrap a PLACEHOLDER in a real OPENSSH armor, because the
+# product refuses on the armor: the f-string is `{secret}`, a reference, so no
+# DECOY can sit inside the block and the private-key rule reads the armor alone
+# as a key. Allowed only for that exact shape (armor around the literal
+# placeholder, no key body) and only in the files that carry the pattern.
+[[allowlists]]
+description = "key-refusal tests/plan: OPENSSH armor wrapped around the literal {secret} placeholder, no key body"
+condition = "AND"
+targetRules = ["private-key"]
+paths = [
+  '''^tests/unit/test_node_cmd\.py$''',
+  '''^tests/unit/test_node_provision\.py$''',
+  '''^docs/superpowers/plans/2026-09-24-nodes-F\.md$''',
+]
+regexTarget = "secret"
+regexes = ['''^-----BEGIN OPENSSH PRIVATE KEY-----\x5cn"\s*f"\{secret\}\x5cn"\s*"-----END OPENSSH PRIVATE KEY-----$''']

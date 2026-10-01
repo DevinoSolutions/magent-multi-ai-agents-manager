@@ -5,6 +5,373 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.20.0] - 2026-10-01
+
+This release rolls up 3.20.0rc1 and rc2 (nodes) and everything since 3.19.4.
+Headlines: nodes (run a project's whole agent session on another machine, git as
+the source of truth, now set up end to end by `magent node setup`), uploading and
+pasting any file type, an idle reaper that parks finished agents to free memory,
+and a set of daemon-lifecycle fixes. The rc1 and rc2 entries below carry the
+detail for the nodes work.
+
+### Added
+
+- **An idle reaper parks finished agents to free memory (Windows).**
+  `magent serve` watches the local psmux sessions and, when an agent has
+  FINISHED its turn and then sat idle for `settings.idleReap.afterMinutes`
+  (default 120, never below 30), ends that agent's process tree, keeps the
+  pane and window, and types a resume notice so `--resume` brings the
+  conversation back. Only a session whose last turn ended and that is waiting
+  on nothing is a candidate; a long list of vetoes (a working or
+  needs-input agent, a running subagent or shell, an unsent draft, an unknown
+  signal) spares it. It is on by default; `"idleReap": false` or
+  `MAGENT_IDLE_REAP=0` turns it off, and `magent doctor` has an `idle-reap`
+  check that says whether it is on and why not.
+
+- **Upload any files, not just an image.** The mobile page's picker takes any
+  file type and several files at once, and Ctrl+V on the page takes every
+  copied file: a single image still shows its preview, anything else stages as
+  a tile naming the files. Several files go up together and are pasted into
+  the session as one line. A file keeps its own name on disk; only a nameless
+  clipboard blob gets a generated `paste-<time>` one. Folders are refused
+  (`folders not supported - copy files`), as is a selection containing one.
+- **Alt+V pastes files copied in Explorer.** Copy one or several files and
+  press Alt+V: on the machine that owns the session, their original paths are
+  pasted as one line (each quoted only when it needs to be) — nothing is
+  copied or uploaded, and there is no size limit, because the agent can read
+  them where they are. Through `magent attach` the files are uploaded to the
+  host first and their saved paths pasted, again as one line. When the
+  clipboard holds both files and an image, the files win. Copied folders are
+  refused (`folders not supported - copy files`) and nothing is sent.
+- **`magent node auth refresh`** mints a new subscription token (the
+  doctor's repair when Anthropic rejects one). **`magent node auth status`**
+  says whether this PC has a token and until when; it never prints the
+  token.
+
+- **`magent doctor` reports magent's own daemons stranded in Session 0
+  (Windows).** This is the `daemons-session0` check. It names each upload
+  server, Alt+V listener or attention daemon an ssh login left there, with
+  the elevated `taskkill` and the command to restart it on the desktop.
+  `magent status` prints the same line on stderr, and `status --json` gains a
+  `daemons_session0` count. The check only warns and never changes the exit
+  code.
+
+- **A wedged Alt+V listener is replaced automatically.** When the listener
+  process was alive but its heartbeat had stopped, `magent serve` left it in
+  place, so Alt+V and F2 stayed dead until you ended the process by hand.
+  `serve` now replaces it: after the heartbeat has been silent for 90 seconds,
+  seen twice in a row, it ends that process and starts a fresh listener aimed
+  at the same target, so a listener that `magent attach` pointed at another
+  machine stays pointed there. It only ends a process it can prove is the
+  listener (same image and creation time; a reused pid is never touched), and
+  replaces at most one listener every 5 minutes. Each replacement is logged
+  to `~/.magent/logs/hotkey.log`. `MAGENT_HOTKEY_SUPERVISOR=0` still turns
+  supervision off.
+
+- **The Alt+V repair hint no longer sends you through `magent down`.**
+  `magent status` and `magent doctor` used to tell you to run `magent down
+  --all`, which stops the agent in every session. The hint now says that
+  `serve` restores a dead or wedged listener itself, and that the one manual
+  step is starting `serve` if it is not running. `magent hotkey` no longer
+  suggests `magent down --all` either.
+
+### Changed
+
+- **The upload limit rises from 25 MB to 100 MB** of files per send (every
+  file in it together), and a bigger upload is now refused with a message
+  naming the limit (`too large - 100 MB limit`) — by the page before it sends,
+  by Alt+V before it reads the files, and by the server regardless. The server
+  counts the files, not the request: a selection at the limit is no longer
+  refused for its multipart framing.
+- Alt+V uploads through `magent attach` are streamed from disk rather than
+  built in memory, so a large selection over a slow link no longer times out
+  as `cannot reach magent serve` while it is still moving.
+- The server's paste into the session is sent literally, like the local one.
+- **`magent node setup` hands a node Claude and GitHub access by itself.**
+  The last manual step (`ssh <user>@<host> claude`, once per node) is gone.
+  The first setup runs `claude setup-token` on this PC: one browser
+  approval mints a year-long Claude SUBSCRIPTION token, kept owner-only in
+  `~/.magent/claude-oauth-token` and reused for every node and later setup.
+  Node sessions start with it as `CLAUDE_CODE_OAUTH_TOKEN`, and
+  `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` are dropped, so a stray key can
+  never bill instead. The Claude login and ccswap slots are still never
+  copied, because their refresh token rotates. With the token in place, the
+  node's first-run onboarding is marked done. git on the node now reaches
+  GitHub over https through the shared gh login (`gh auth setup-git`, plus
+  `insteadOf` rewrites for `git@github.com:` and `ssh://git@github.com/`). The
+  node's GitHub ssh key becomes optional: it is added only when this PC's gh
+  already has `admin:public_key`, and otherwise the step is a skip, never a
+  failure or a `gh auth refresh` request.
+- **`magent node doctor`** replaces `claude-login` with `claude-auth`. It
+  checks that the token file is owner-only and holds a subscription token,
+  that Claude Code would use it rather than an API key, and that Anthropic
+  still accepts it (a `count_tokens` call, which bills nothing). It also
+  replaces `github-key` with `github`: git's own github.com credential plus
+  both rewrites, checked against GitHub's API. The doctor writes nothing any
+  more, not even known_hosts.
+
+### Fixed
+
+- An upload cut short (a dropped connection, a stalled client) is refused as
+  `Upload incomplete` and nothing is saved or pasted; before, a truncated file
+  could be saved and announced as uploaded. A client that stalls mid-upload
+  is let go after 60 s of silence instead of holding the server.
+- A file containing the multipart boundary line no longer arrives truncated:
+  every Alt+V upload uses a random boundary.
+- Two uploads of the same name in the same second no longer overwrite each
+  other, a very long file name no longer fails the save, and dotfiles keep
+  their name.
+- A copied file that is locked, deleted or changed during an Alt+V press is
+  named as such (`could not read a copied file - is it open elsewhere?`)
+  rather than reported as `cannot reach magent serve`, and a copied path
+  holding a control character is refused rather than typed into the session.
+- The Alt+V empty-clipboard message now reads
+  `clipboard has no image or file - copy one first`. A phone upload of one
+  image is still announced in the status line as `image uploaded`; anything
+  else reads `file uploaded` / `N files uploaded`.
+
+- **The attention daemon comes back by itself after a restart.** After a
+  reboot, the next bring-up restarted the upload server and the Alt+V
+  listener, but nothing restarted the attention daemon, so title badges,
+  taskbar flashes and pushes stayed off until you ran `magent attention -d`
+  again. `magent serve` now watches the daemon, just as the daemon already
+  watches serve. It restarts a daemon that a restart took down at its next
+  check, and one that crashed once its heartbeat has gone stale, within
+  about a minute. It never starts a daemon you did not run, or one you
+  stopped with `magent attention --stop` or `magent down --all`, even when
+  its check lands in the middle of that `down`. It never starts a second
+  daemon beside one that is still running where this desktop cannot see it
+  (Session 0), and a `serve` in Session 0 never starts one at all. It also
+  skips a config whose attention signals are all turned off. Set
+  `MAGENT_ATTENTION_SUPERVISOR=0` to manage the daemon yourself.
+
+- **`magent status` no longer calls a daemon that a restart stopped
+  "CRASHED".** A reboot leaves behind the same heartbeat file a crash does,
+  so `status` sent you to the logs for a crash that never happened. It now
+  says "not running since the last restart" and exits 0, because nothing
+  failed. `status --json` reports `"attention": "off-since-restart"`. A
+  daemon that dies while the machine stays up is still CRASHED, with exit 3;
+  when a running upload server will restart it, the line now says so.
+  `magent doctor` has a new `attention` check that uses the same states and
+  wording. It warns at worst.
+
+- **Alt+V comes back after a restart even when Windows reuses the old
+  listener's process id.** A reboot leaves the listener's pid file behind.
+  When Windows handed that pid to an unrelated process, magent read it as a
+  running listener: the upload server never started a real one, `status`
+  said STALE, and `magent doctor` reported a wedged listener. The same
+  leftover file for the upload server made `status` report it DEAD. magent
+  now ignores a pid file written before the last boot. So `status` reads
+  off, the upload server starts a fresh listener, and `magent down --all`
+  never kills an unrelated process that happens to have the old pid.
+
+- **`magent down --all` stops the attention daemon first.** It used to stop
+  the upload server first, and the attention daemon, which restarts the
+  upload server, could bring it back (and with it the Alt+V listener) before
+  it was stopped itself. The daemon now goes first, then the upload server,
+  then the listener.
+
+- **An ssh login no longer leaves an upload server, Alt+V listener or
+  attention daemon behind in Session 0 (Windows).** Only `magent up` and
+  `magent serve --ensure` used to hand off to the desktop. Now
+  `magent attention -d` hands off too. `--go`, the menu's `u`, a foreground
+  `magent serve` and the attention daemon's watchdog refuse to start a daemon
+  there, and they name the reason instead of printing an upload URL nothing
+  will answer. So do the upload server's own supervisors: it neither starts
+  nor replaces an Alt+V listener, nor restarts the attention daemon, from
+  Session 0. A Session-0 server held the port the desktop's own Alt+V
+  needed. `MAGENT_SESSION0_POLICY=allow` still runs everything in place on a
+  headless host.
+
+- **`--go` and the menu no longer start a second upload server on every
+  bring-up.** They now check the port first, like every other spawner. The
+  extra server could only fail with "port in use", which left a warning in
+  `upload.log` each time.
+
+- **`/health` no longer reports zero sessions on a fresh upload server.**
+  `session_count` came from a cache that stayed empty until the first
+  `/sessions` request. It is now `null` until the server has actually
+  counted, with a new `sessions_age_s` saying how old a known count is, and
+  the server counts once at startup so the unknown is brief. `/health` still
+  never waits on a session sweep.
+
+- **A psmux client that crashes while `magent up` checks for a session can no
+  longer get that session killed.** The bring-up read every non-zero
+  `has-session` exit code as "no such session", so a client that died
+  abnormally (Windows `0xC0000142`, an access violation, a signal) looked like
+  a missing session, and the bring-up cleared its socket and created it afresh.
+  Only exit code 1 now means absent. Any other code is reported as "could not
+  tell whether <name> is running" and the session is left alone, with the exit
+  code written to `launch.log`.
+
+## [3.20.0rc2] - 2026-09-29
+
+### Added
+
+- **magent places `auto` node projects by their load history, and `magent node
+  plan`/`push`/`recall` manage them.** `"node": "auto"` picks the node with the
+  lowest 30-minute load score (spikes and low memory count against a node, and
+  a node under 10% free memory is skipped while another is above it) and keeps
+  it there. `magent node` shows the pool; `node plan` shows where a project
+  would go and what it would ship, changing nothing; `node push` re-ships a
+  project's `.env*` files; `node recall
+  --local` brings a session and its conversation home and prints the `cd` and
+  the `claude --resume` to run; `node recall --to <nick>` moves it to
+  another node and resumes it there. A node that does not answer
+  is only a note, but a recall whose last pull did not finish stops before it
+  changes anything (exit 1, or 3 while the sync daemon holds the node), so
+  running it again loses no work.
+
+### Fixed
+
+- **Stopping the node sync daemon while it is starting stops it.** The daemon
+  takes its lock and then writes its pid; a stop that landed between the two
+  found no pid, killed nothing and said "Could not stop the node sync daemon".
+  It now waits up to two seconds for the pid, and stops the daemon once it
+  appears.
+
+- **A node reply cut at the output cap shows the cap as its reason.** When a
+  node's reply ran past magent's output cap, the bring-up, `down` or sync row
+  showed the last stderr line from before the cap. That could be half a line,
+  or the node's complaint at the pipe the cap closed. The row now reads `reply
+  exceeded N bytes`, and the node's own words go to
+  `~/.magent/logs/nodes.log`, escaped onto one line per record.
+
+- **A node session's agent state no longer freezes on a record it cannot
+  read.** A state record on the node nested too deeply for python to parse made
+  the node's state hook fail on every tool call, so `magent attention` and
+  `magent watch` showed that session's state unchanged until the file was
+  removed. The next tool call now overwrites the record.
+
+- **`magent node setup` refuses a dangling `id_ed25519.pub` link.** A `.pub`
+  link whose target is missing read as no `.pub` at all, so setup wrote the
+  public key, and ssh-keygen its own, through the link to wherever it pointed.
+  Setup now stops on that key with a `fail` row and exit 1 before writing
+  anything. A `.pub` link to a real file is still only read.
+
+- **`magent node recall` reports a commit record nested too deeply instead of
+  crashing.** When the node was unreachable and its saved commit record was
+  nested past magent's depth limit, recall stopped with a Python traceback. It
+  now prints the usual "the commit record ... is unreadable" note, as for any
+  other damaged record.
+
+### Known issues
+
+- rc1's two known issues, the output-cap reason and `"node": "auto"` not being
+  placed, are fixed in this release candidate.
+- `"node": "cloud"` is reserved, and in this release it runs as an ordinary
+  local session.
+
+## [3.20.0rc1] - 2026-09-28
+
+### Added
+
+- **Nodes: run a project's whole agent session on another machine, with git as
+  the source of truth.** List a pool machine (a *node*) once under
+  `settings.nodes` -- `{"<nick>": {"host": "...", "user": "...", "root":
+  "~/magent"}}`, a nick being up to six of `a-z`, `0-9` and `-` -- and pin a
+  project to it with `"node": "<nick>"` (exclusive with `host`). `magent --go`
+  and `magent up` then bring that project up ON the node over ssh: the node
+  holds a `git clone` of it at your current branch under `root`, your folder is
+  never mirrored, and work comes home the way it already does, by the agent
+  committing and pushing. A bring-up refuses a repo with no `origin`, a
+  detached HEAD or a branch with no commits, and a dirty or unpushed tree
+  unless you pass `--allow-dirty` (the node then gets origin's copy, without
+  those edits). The session runs under tmux on the node (`tmux -L magent`,
+  tmux 3.2 or newer), and its window here is the same reconnecting
+  `magent-attach-client` pane `magent attach` opens.
+
+  Every bring-up ships, one way: the project's gitignored `.env*`,
+  `.claude/settings.local.json`, `CLAUDE.local.md` and `.mcp.json`, its Claude
+  auto-memory, anything in the project's new `push` list, and your user scope
+  -- the `gh` token, Claude `settings.json` less what only works on this PC,
+  the user MCP servers the node can reach or run and their OAuth entries,
+  plugins and skills. The Claude login itself is never copied (its refresh
+  token is single-holder): log in once per node with `ssh <user>@<host>
+  claude`.
+
+- **`magent node setup <nick>`, `magent node doctor` and `magent node sync`.**
+  `node setup` prepares a machine once -- packages, a per-person Unix user
+  (`--user`, repeatable), your ssh key, Claude Code and the node's own GitHub
+  key, then the user scope and a check -- logging in as `root@<host>` for that
+  one hop only; every step prints `ok`, `did` or `skip`, so it is safe to
+  re-run. Registering the node's GitHub key needs this PC's `gh` to hold
+  `admin:public_key` (`gh auth refresh -h github.com -s admin:public_key`).
+  `node doctor [<nick>] [--json]` checks a node without changing it: tools, the
+  Claude login, the GitHub key, locale, disk, and this PC's sync daemon (exit 0
+  healthy, 1 when a check failed, 2 for a nick not in `settings.nodes`), and
+  `magent doctor` gains a `nodes` row that is a warning at worst. `node sync`
+  mirrors every node's session list, a load sample, and the Claude transcripts
+  and agent state of the sessions this PC placed there into `~/.magent/nodes/`,
+  one ssh per node every `settings.nodeSync.pullIntervalS` (30 s); `magent
+  serve` keeps it running whenever a project has a node (`-d` detaches it by
+  hand, `--once` runs one tick, `--stop` stops it).
+
+- **Node sessions show up where local ones do.** `magent status` and `magent
+  sessions --json` list each node session with its node, `magent attention`
+  and `magent watch` read node agents' states, and a node session's status bar
+  wears `magent @<nick>`. `magent down` pulls a node session one last time
+  before it stops it, and `down --all` includes node sessions and stops the
+  sync daemon.
+
+- **Config schema v4**: `settings.nodes`, `settings.nodeSync`
+  (`pullIntervalS`, `sampleIntervalS`, `historyH`) and a project's `node` and
+  `push`. A version 3 config still loads, with the usual warning until `magent
+  config migrate` stamps it.
+
+### Fixed
+
+- **Projects whose path has a `.` or `_` in it continue their Claude
+  conversation again.** magent named the directory Claude Code files a
+  project's sessions under by a rule that kept `.` and `_`; Claude replaces
+  every character outside `A-Z`, `a-z` and `0-9` (the drive colon included) and
+  cuts a name over 200 characters with a hash suffix. For every such project
+  magent looked in the wrong directory, so the fresh-start probe dropped
+  `--continue` and the agent opened a new conversation instead of continuing,
+  and project discovery did not match its sessions to it. The rule is now
+  Claude Code's own, checked against a real session store (295 of 297
+  directories; the other two were sessions that changed directory mid-run).
+
+- **On Windows, every ssh magent opens uses one client: Windows' own OpenSSH
+  first, `ssh` on PATH only as the fallback.** That covers a `host` project's
+  terminal, `magent attach`'s panes, its host status poll and bring-up hop, and
+  `--no-mux` panes. Each used to run whatever `ssh` PATH offered first, so
+  under Git Bash one connection could go through MSYS ssh and the next through
+  Windows' OpenSSH -- which share `~/.ssh` but not the ssh agent -- and a PC
+  with Windows' OpenSSH but no `ssh` on PATH was warned at launch that it had
+  no ssh client. If you relied on a different ssh earlier on PATH, magent now
+  uses Windows' own whenever it is installed.
+
+- **F2 no longer opens the wrong folder for a project whose path holds a
+  cmd.exe metacharacter.** On Windows `code` is `code.cmd`, which runs through
+  `cmd.exe` and re-parses its command line, so a folder named with `&`, `|`,
+  `<`, `>`, `^`, `%`, `"` or `!` (or a control character) could open something
+  else while the status line flashed success. F2 now refuses such a folder and
+  flashes `F2: folder name has a character code.cmd can't pass`. An `.exe`
+  editor, or `code` off Windows, is unaffected.
+
+- **On Linux and macOS, two `magent attention -d` daemons can no longer run at
+  once.** A second daemon, refused because one was already running, deleted the
+  running one's lock file on its way out, so a third could take a fresh lock
+  beside it; and a lock taken on a file its holder had just deleted is now
+  taken again rather than kept.
+
+- **Sentry reports no longer carry local variables.** With
+  `MAGENT_SENTRY_DSN` set, sentry-sdk 2.x attached every frame's local
+  variables to an error report, scrubbing them by key name only. magent now
+  turns that off (`include_local_variables=False`).
+
+### Known issues
+
+- A node reply cut at the output cap can show a half-written last stderr line
+  as its reason, when the node-side writer dies at the closed pipe after the
+  cap. Fixed in the next release candidate.
+- `"node": "auto"` is accepted but not placed yet: a fresh `auto` project's
+  bring-up refuses it ("needs a placement"), so pin the project to a nick in
+  this release. The next release candidate places it by each node's load
+  history.
+- `"node": "cloud"` is reserved, and in this release it runs as an ordinary
+  local session.
 ## [3.19.4] - 2026-09-29
 
 ### Fixed
@@ -1586,6 +1953,9 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.20.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.4...v3.20.0
+[3.20.0rc2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.20.0rc1...v3.20.0rc2
+[3.20.0rc1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.2...v3.20.0rc1
 [3.19.4]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.3...v3.19.4
 [3.19.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.2...v3.19.3
 [3.19.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.1...v3.19.2

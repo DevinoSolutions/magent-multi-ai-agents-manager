@@ -35,6 +35,7 @@ from magent.altv import (
     ALTV_LOG_PREFIX,
     OUTCOME_REASONS,
     flash_async,
+    handle_file_press,
     handle_press,
     native_enabled,
 )
@@ -45,7 +46,7 @@ from magent.log import (
     get_logger,
     write_heartbeat,
 )
-from magent.procs import pid_alive
+from magent.procs import pid_alive, pid_gone, predates_boot
 from magent.sessions import (
     FLASH_TINT_ERR,
     build_code_open_command,
@@ -61,6 +62,7 @@ if sys.platform != "win32":
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+shell32 = ctypes.windll.shell32
 
 user32.GetClipboardData.restype = ctypes.c_void_p
 kernel32.GlobalLock.restype = ctypes.c_void_p
@@ -68,6 +70,13 @@ kernel32.GlobalSize.restype = ctypes.c_size_t
 kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
 kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
 kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+shell32.DragQueryFileW.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_uint,
+    ctypes.c_wchar_p,
+    ctypes.c_uint,
+]
+shell32.DragQueryFileW.restype = ctypes.c_uint
 
 user32.CallNextHookEx.argtypes = [
     ctypes.c_void_p,
@@ -135,6 +144,10 @@ VK_RBUTTON = 0x02
 _MOUSE_BUTTONS = (VK_LBUTTON, VK_RBUTTON)
 _KEY_DOWN_MASK = 0x8000
 CF_DIB = 8
+# Files copied in Explorer: a DROPFILES block listing their absolute paths.
+CF_HDROP = 15
+# DragQueryFileW's index that asks for the file COUNT instead of a name.
+_DRAG_QUERY_COUNT = 0xFFFFFFFF
 BI_RGB = 0
 BI_BITFIELDS = 3
 WH_KEYBOARD_LL = 13
@@ -202,11 +215,46 @@ def get_active_window_title() -> str:
     return window_title(hwnd)
 
 
-def clipboard_has_image() -> bool:
+def clipboard_kind() -> str | None:
+    """What an Alt+V press would send: ``"files"``, ``"image"``, or ``None``.
+
+    Files win when both are present: Explorer can put a thumbnail bitmap
+    beside the file list, and the user copied FILES. No OpenClipboard here --
+    IsClipboardFormatAvailable does not need it, and this runs inside the
+    keyboard hook, where holding the clipboard even briefly is contention
+    with whatever app the user just copied from.
+    """
+    if user32.IsClipboardFormatAvailable(CF_HDROP):
+        return "files"
+    if user32.IsClipboardFormatAvailable(CF_DIB):
+        return "image"
+    return None
+
+
+def _hdrop_paths(hdrop: int) -> list[str]:
+    """Every path in a DROPFILES block, in order.
+
+    The handle belongs to the clipboard: it is only READ here, never
+    DragFinish'd (that would free memory the clipboard still owns).
+    """
+    paths: list[str] = []
+    for i in range(shell32.DragQueryFileW(hdrop, _DRAG_QUERY_COUNT, None, 0)):
+        length = shell32.DragQueryFileW(hdrop, i, None, 0)
+        buf = ctypes.create_unicode_buffer(length + 1)
+        if shell32.DragQueryFileW(hdrop, i, buf, length + 1):
+            paths.append(buf.value)
+    return paths
+
+
+def get_clipboard_files() -> list[str] | None:
+    """The absolute paths of the files copied in Explorer, or ``None``."""
     if not user32.OpenClipboard(None):
-        return False
+        return None
     try:
-        return bool(user32.IsClipboardFormatAvailable(CF_DIB))
+        handle = user32.GetClipboardData(CF_HDROP)
+        if not handle:
+            return None
+        return _hdrop_paths(handle)
     finally:
         user32.CloseClipboard()
 
@@ -395,15 +443,36 @@ _MANIFEST_PATH = Path.home() / ".magent" / "hotkey.json"
 
 
 def listener_pid() -> int | None:
-    """PID of the running Alt+V listener, or None. Clears a stale pid file."""
+    """PID of the running Alt+V listener, or None. Clears a stale pid file.
+
+    Three verdicts, and every liveness and kill decision about the listener
+    reads through them:
+
+    - Written before the last boot: stale whatever its pid is doing now. A
+      restart kills the listener without letting it remove the file, and
+      Windows hands pid numbers out again. Believed, the recycled pid is a
+      "running" listener -- serve's supervisor never starts a real one, status
+      calls it STALE, and `down --all` or the wedged-listener replacement would
+      end whatever wears the number. Ignored and cleared.
+    - Alive but not openable (a Session-0 copy an ssh login started): not ours
+      to use, and not stale either -- the file is the only record that names it
+      for `status`/`doctor`. Ignored and KEPT.
+    - Gone (no process and no session): cleared.
+    """
     try:
         pid = int(_PID_PATH.read_text().strip())
+        written = _PID_PATH.stat().st_mtime
     except (OSError, ValueError):
+        return None
+    if predates_boot(written):
+        with contextlib.suppress(OSError):
+            _PID_PATH.unlink()
         return None
     if pid_alive(pid):
         return pid
-    with contextlib.suppress(OSError):
-        _PID_PATH.unlink()
+    if pid_gone(pid):
+        with contextlib.suppress(OSError):
+            _PID_PATH.unlink()
     return None
 
 
@@ -421,14 +490,26 @@ def stop_listener() -> bool:
     if result.returncode != 0:
         log.warning("taskkill pid %d failed rc=%d", pid, result.returncode)
         return False
+    forget_listener()
+    return True
+
+
+def forget_listener() -> None:
+    """Drop every on-disk trace of the listener (pid file, manifest, heartbeat)
+    WITHOUT signalling anything.
+
+    ``stop_listener`` calls it after a kill it made itself, and ``launch``'s
+    wedge replacement calls it after an identity-verified kill of its own. A
+    hard kill gives the listener no chance to run ``run_hotkey``'s finally, so
+    its heartbeat would otherwise outlive it and read as a listener that
+    crashed rather than one that was deliberately ended -- and a pid file left
+    behind can still read as live for the instant before Windows finishes
+    tearing the process down, which is exactly when a replacement is spawned.
+    """
     with contextlib.suppress(OSError):
         _PID_PATH.unlink()
     _clear_manifest()
-    # taskkill /F gives the listener no chance to run run_hotkey's finally, so
-    # its heartbeat file would otherwise outlive it and read as a listener that
-    # crashed rather than one that was deliberately stopped.
     clear_heartbeat("hotkey")
-    return True
 
 
 def listener_manifest() -> dict[str, str | None] | None:
@@ -501,7 +582,12 @@ def _clear_manifest() -> None:
         _MANIFEST_PATH.unlink()
 
 
-def _do_upload(server_url: str, project: str, ssh_host: str | None = None) -> None:
+def _do_upload(
+    server_url: str,
+    project: str,
+    ssh_host: str | None = None,
+    kind: str = "image",
+) -> None:
     """Run one press off the hook callback, on a thread.
 
     The whole pipeline -- press acknowledgement, capture, upload, outcome -- is
@@ -517,12 +603,45 @@ def _do_upload(server_url: str, project: str, ssh_host: str | None = None) -> No
     replace the whole capture/upload/inject pipeline. That fork is OPT-IN via
     ``MAGENT_ALTV_NATIVE=1`` -- Claude Code ignores an injected 0x16 (see
     ``altv.native_enabled``), so the default stays the upload path.
+
+    ``kind`` is what the hook saw on the clipboard (``clipboard_kind``). Copied
+    FILES take ``altv.handle_file_press`` with the CF_HDROP reader, and there
+    the same ssh-host test decides local (paste the original paths) versus
+    remote (upload them) -- with no opt-in, because a path is text every
+    agent accepts.
     """
+    if kind == "files":
+        handle_file_press(
+            server_url, project, get_clipboard_files, local=ssh_host is None
+        )
+        return
     handle_press(
         server_url,
         project,
         get_clipboard_image,
         native=ssh_host is None and native_enabled(),
+    )
+
+
+# What cmd.exe treats as syntax on a batch file's command line. list2cmdline
+# quotes an argument only for whitespace, so `&|<>^` outside quotes split or
+# redirect the command, `%VAR%` expands even inside quotes, and `\"` is not an
+# escape to cmd.exe. `!` expands under delayed expansion. A Windows folder may
+# legitimately be named `R&D`; a remote POSIX one may even carry a control
+# character, and cmd.exe ends the command at a LF (_cmd_would_mangle).
+_CMD_METACHARS = frozenset('&|<>^%"!')
+
+
+def _cmd_would_mangle(argv: list[str]) -> bool:
+    """True when ``argv`` names a batch file (``code.cmd``) and any element --
+    the shim's own path included -- carries a cmd.exe metacharacter or a
+    control character (below 0x20, or DEL). There is no quoting that makes such an
+    argv safe through ``cmd.exe /c``, so F2 refuses it; an ``.exe`` (or a
+    POSIX ``code``) takes its argv verbatim and is never refused."""
+    if not argv[0].lower().endswith((".cmd", ".bat")):
+        return False
+    return any(
+        ch in _CMD_METACHARS or ch < " " or ch == "\x7f" for arg in argv for ch in arg
     )
 
 
@@ -532,8 +651,8 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
     Threaded for the same reason as ``_do_upload``: the /api/sessions round
     trip must never block a system-wide keyboard hook. Every failure mode --
     server down, project absent from the payload, no folder on the entry, no
-    ``code`` on PATH -- is a log line, a status-line flash, and a no-op; the
-    listener has to outlive all of them.
+    ``code`` on PATH, a folder ``code.cmd`` cannot pass -- is a log line, a
+    status-line flash, and a no-op; the listener has to outlive all of them.
     """
     log = get_logger("hotkey")
     try:
@@ -545,21 +664,49 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
                 server_url, project, "F2: 'code' not found on PATH", tint=FLASH_TINT_ERR
             )
             return
-        with urlopen(f"{server_url}/api/sessions", timeout=10) as resp:
-            payload = json.loads(resp.read())
-        folder = folder_for_session(payload, project)
-        if not folder:
-            log.warning("F2: no folder for project=%s in /api/sessions", project)
+        # A pool-node project (PR-D): its folder is on the node, and the node
+        # map says which one and where -- no server round trip. The user stays
+        # in the authority: magent resolved it and the ssh config may not know
+        # it (D4). A cloud placement has no ssh target and falls through.
+        # heavy subsystem: in-body per policy
+        from magent import nodes
+
+        hit = nodes.open_target(project, nodes.read_node_map())
+        if hit is not None:
+            ssh_host, folder = hit
+            argv = build_code_open_command(folder, ssh_host, code_bin, keep_user=True)
+        else:
+            with urlopen(f"{server_url}/api/sessions", timeout=10) as resp:
+                payload = json.loads(resp.read())
+            folder = folder_for_session(payload, project)
+            if not folder:
+                log.warning("F2: no folder for project=%s in /api/sessions", project)
+                flash_async(
+                    server_url,
+                    project,
+                    f"F2: no folder known for {project} (host magent too old?)",
+                    tint=FLASH_TINT_ERR,
+                )
+                return
+            argv = build_code_open_command(folder, ssh_host, code_bin)
+        # code is code.cmd on Windows; shutil.which resolves the .cmd, and
+        # CreateProcess runs a .cmd through `cmd.exe /c`, which re-parses the
+        # command line. Refuse an argv it would mangle rather than open the
+        # wrong folder and flash success (_cmd_would_mangle).
+        if _cmd_would_mangle(argv):
+            log.warning(
+                "F2: not opening project=%s: argv %r has a character %s cannot pass",
+                project,
+                argv,
+                code_bin,
+            )
             flash_async(
                 server_url,
                 project,
-                f"F2: no folder known for {project} (host magent too old?)",
+                "F2: folder name has a character code.cmd can't pass",
                 tint=FLASH_TINT_ERR,
             )
             return
-        # code is code.cmd on Windows; shutil.which resolves the .cmd and
-        # Popen on that resolved path runs it without a shell.
-        #
         # `env=`: same reason as the platform backends' launch_vscode. This
         # listener is a long-lived descendant of whatever shell started magent,
         # so it carries that shell's agent-session markers for days; the editor
@@ -575,7 +722,7 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
         # psmux._SPAWN_FLAGS; this module is win32-only, so the stdlib
         # constant is always present.
         subprocess.Popen(
-            build_code_open_command(folder, ssh_host, code_bin),
+            argv,
             env=spawn_child_env(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -776,7 +923,8 @@ def _hook_decide(
             )
             return int(user32.CallNextHookEx(None, nCode, wParam, lParam))
 
-        if not clipboard_has_image():
+        kind = clipboard_kind()
+        if kind is None:
             # Pass the chord through (the pane may want a plain Alt+V), but say
             # why nothing was uploaded. Pressing it in the right window and
             # getting silence is the exact complaint this exists to answer.
@@ -795,7 +943,9 @@ def _hook_decide(
             return int(user32.CallNextHookEx(None, nCode, wParam, lParam))
 
         threading.Thread(
-            target=_do_upload, args=(server_url, project, ssh_host), daemon=True
+            target=_do_upload,
+            args=(server_url, project, ssh_host, kind),
+            daemon=True,
         ).start()
         return 1
 

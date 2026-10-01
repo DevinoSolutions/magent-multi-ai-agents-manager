@@ -158,6 +158,15 @@ class Platform(ABC):
         """
         raise NotImplementedError("desktop hand-off is only supported on Windows")
 
+    def pane_reset_command(self, shell_image: str, notice: str) -> str | None:
+        """The line to type into a parked pane so it shows a clean prompt again:
+        the input modes the agent left on turned off, the alternate screen
+        popped, the screen cleared, then ``notice`` printed. ``shell_image`` is
+        the pane shell's image name. None when this platform has no scripted
+        reset for that shell -- the pane then keeps the dead frame, which costs
+        looks only (``--resume`` repaints the whole frame anyway)."""
+        return None
+
     def supports_attention_signals(self) -> bool:
         """True if this platform can badge titles / flash / focus windows."""
         return False
@@ -165,6 +174,13 @@ class Platform(ABC):
     def supports_wt_keybindings(self) -> bool:
         """True if this platform has a Windows Terminal settings.json whose
         ``sendInput`` keybindings magent can install (see ``magent.wt_keys``)."""
+        return False
+
+    def supports_attach_windows(self) -> bool:
+        """True if this platform can open a remote attach window
+        (``attach_client.spawn_attach_window`` -- a Windows Terminal window
+        running the reconnecting ssh supervisor). Gates the window a node
+        project's ``--go`` bring-up opens."""
         return False
 
     def set_window_title(self, handle: object, title: str) -> bool:

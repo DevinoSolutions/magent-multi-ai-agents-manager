@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from magent.launch import HAPPY_AGENTS
 from magent.sessions import (
     AGENT_TOOLS,
@@ -15,8 +17,10 @@ from magent.sessions import (
     IDE_TOOLS,
     AgentTool,
     agent_image_names,
+    agent_image_stem,
     build_resume_command,
     build_start_command,
+    fresh_start_command,
     ide_command,
     is_ide_tool,
 )
@@ -46,6 +50,52 @@ class TestRegistryShape:
         assert {"claude", "codex", "node"} <= agent_image_names()
 
 
+class TestTheAgentImageStem:
+    """The spelling a process's identity image is compared to
+    ``agent_image_names`` in. Claude Code's Windows auto-updater renames a
+    RUNNING claude.exe aside to ``claude.exe.old.<epoch-ms>``, and the
+    process's image name reads that way for the rest of its life."""
+
+    @pytest.mark.parametrize(
+        ("raw", "stem"),
+        [
+            ("claude.exe", "claude"),
+            ("claude", "claude"),
+            ("claude.exe.old.1790669558315", "claude"),
+            ("CLAUDE.EXE.OLD.1", "claude"),
+            ("claude.exe.old", "claude"),
+            ("C:\\bin\\Claude.exe.old.42", "claude"),
+            ("C:/nvm4w/nodejs/claude.exe.old.1790669558315", "claude"),
+            (" codex.exe.old.7 ", "codex"),
+        ],
+    )
+    def test_the_rename_aside_suffix_is_dropped(self, raw, stem):
+        assert agent_image_stem(raw) == stem
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "notclaude.exe.old.1",
+            "claude.exe.older",
+            "claude.exe.old.12a",
+            "claude.old.exe",
+            "claude.exe.bak",
+            "claude.exe.old.",
+            "claude.exe.old.\u0661",  # a non-ASCII digit is not a timestamp
+        ],
+    )
+    def test_a_look_alike_is_never_an_agent(self, raw):
+        assert agent_image_stem(raw) not in agent_image_names()
+
+    def test_the_shell_stem_stays_exact(self):
+        # The loose spelling is the reaper's identity check only: a pane's
+        # shell reading is still compared exactly.
+        from magent import psmux
+
+        assert psmux.image_stem("pwsh.exe.old.1") == "pwsh.exe.old.1"
+        assert not psmux.is_idle_command("pwsh.exe.old.1")
+
+
 class TestOneEditExtensionProof:
     def test_adding_a_tool_is_one_dict_entry(self, monkeypatch):
         """Adding tool support is one new AGENT_TOOLS entry -- the dispatcher
@@ -71,6 +121,14 @@ class TestOneEditExtensionProof:
         )
         assert "mytool" in agent_image_names()
 
+    def test_agent_image_names_reads_a_supplied_registry(self):
+        from dataclasses import replace
+
+        tools = {"claude": replace(AGENT_TOOLS["claude"], images=("onlyclaude",))}
+        names = agent_image_names(tools)
+        assert "onlyclaude" in names and "node" in names
+        assert "codex" not in names  # the supplied registry has no codex entry
+
     def test_new_entry_defaults_are_unset(self):
         """A minimal AgentTool (no session_ids/happy) is a valid, inert entry --
         confirms the dataclass's defaults, not just the fields this repo's two
@@ -79,9 +137,23 @@ class TestOneEditExtensionProof:
         assert minimal.session_ids is None
         assert minimal.resume_command is None
         assert minimal.fresh_command is None
+        assert minimal.fresh_form is None
         assert minimal.happy is False
         assert minimal.multi_window is False
         assert minimal.images == ()
+        assert minimal.idle_probe is None
+
+    def test_only_claude_carries_an_idle_probe(self):
+        """The reaper reads live sessions through this field alone, and a tool
+        without one is out of scope -- so a dropped probe would silently stop
+        every claude park, with nothing logged."""
+        from magent.sessions import claude
+
+        probe = AGENT_TOOLS["claude"].idle_probe
+        assert probe is claude.claude_idle_probe
+        assert probe.sessions_by_pid is claude.read_session_files
+        assert probe.last_activity is claude.last_activity
+        assert AGENT_TOOLS["codex"].idle_probe is None
 
     def test_fresh_start_is_one_dict_entry_too(self, monkeypatch):
         """A tool teaches the fresh-start dispatcher about its own
@@ -102,6 +174,23 @@ class TestOneEditExtensionProof:
             build_start_command("mytool", "mytool --pickup", "/old")
             == "mytool --pickup"
         )
+
+    def test_the_fresh_form_is_one_dict_entry_too(self, monkeypatch):
+        """A tool teaches the store-free fresh form (what a pool node is
+        shipped) with one more field on its registry entry --
+        fresh_start_command needs no code change to honor it."""
+        extended = dict(
+            AGENT_TOOLS,
+            mytool=AgentTool(
+                fresh_form=lambda base: (
+                    base.replace(" --pickup", "") if " --pickup" in base else None
+                ),
+            ),
+        )
+        monkeypatch.setattr("magent.sessions.AGENT_TOOLS", extended)
+
+        assert fresh_start_command("mytool", "mytool --pickup") == "mytool"
+        assert fresh_start_command("mytool", "mytool") is None
 
     def test_a_tool_decides_for_itself_what_a_config_dir_means(self, monkeypatch):
         """The registry asks each tool WHICH store answers for a project; the

@@ -24,9 +24,10 @@ import os
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
+    import ctypes  # for the ctypes.CDLL annotation on the win32 helpers below
     from collections.abc import Callable, Iterable
 
 # CreateProcess flag: the new process is NOT assigned to its parent's job
@@ -68,6 +69,23 @@ _RAISABLE_FROM = frozenset(
     {NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, IDLE_PRIORITY_CLASS}
 )
 
+# CreateProcess flag: the child gets NO console of its own, so the console
+# helper can AttachConsole to each pane in turn without a console to detach
+# from first. How long the whole probe may take before it is killed and every
+# pid answers None.
+DETACHED_PROCESS = 0x00000008
+CONSOLE_PROBE_TIMEOUT_S = 5.0
+
+# OpenProcess rights and exit-code sentinel for the identity/kill primitives.
+PROCESS_TERMINATE = 0x0001
+PROCESS_VM_READ = 0x0010
+STILL_ACTIVE = 259  # GetExitCodeProcess for a process that has not exited
+
+# FILETIME is 100 ns ticks since 1601-01-01; the unix epoch is this many
+# seconds later. QueryFullProcessImageNameW's buffer size, in wide chars.
+_FILETIME_EPOCH_OFFSET_S = 11_644_473_600
+_IMAGE_BUFFER_CHARS = 32_768
+
 
 def pid_alive(pid: int | None) -> bool:
     """Portable best-effort liveness check for a pid (None/0/negative: dead)."""
@@ -92,6 +110,91 @@ def pid_alive(pid: int | None) -> bool:
         return False
     else:
         return True
+
+
+def _btime_from_proc_stat(text: str) -> float | None:
+    """The ``btime`` line of Linux's ``/proc/stat`` (epoch seconds), or None."""
+    for line in text.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "btime":
+            try:
+                return float(value.strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _probe_boot_time() -> float | None:
+    """The per-OS read behind ``boot_time``; may raise."""
+    if sys.platform == "win32":
+        import ctypes  # win-only: ctypes.windll doesn't exist off Windows
+
+        k = ctypes.windll.kernel32
+        k.GetTickCount64.restype = ctypes.c_ulonglong
+        return time.time() - k.GetTickCount64() / 1000.0
+    if sys.platform == "darwin":
+        import ctypes
+        import ctypes.util
+
+        class _Timeval(ctypes.Structure):
+            _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_int32)]
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        tv = _Timeval()
+        size = ctypes.c_size_t(ctypes.sizeof(tv))
+        if libc.sysctlbyname(
+            b"kern.boottime", ctypes.byref(tv), ctypes.byref(size), None, 0
+        ):
+            return None
+        return float(tv.tv_sec) + tv.tv_usec / 1e6
+    with open("/proc/stat", encoding="ascii", errors="replace") as fh:
+        return _btime_from_proc_stat(fh.read())
+
+
+def boot_time() -> float | None:
+    """When this machine last booted, in epoch seconds, or None when unknown.
+
+    The fact that separates two things every daemon surface used to call one:
+    a daemon that died while the machine was up (a crash -- something to look
+    into) and a daemon whose last sign of life predates the boot (nothing
+    crashed; the machine went down under it). Windows reads the uptime counter
+    (``GetTickCount64``, which keeps counting through sleep), Linux the
+    ``btime`` line of ``/proc/stat``, macOS ``kern.boottime``.
+
+    Never raises: None is "we could not tell", and every caller treats it as
+    exactly today's behaviour -- a status line must not die of a probe.
+
+    One honest gap, on Windows: Fast Startup makes "Shut down" a hibernation
+    of the kernel, so the uptime counter does not reset and a daemon that was
+    running before a shut-down-then-power-on still reads as newer than the
+    boot. A Restart (which is what the incident was) always resets it.
+    """
+    try:
+        return _probe_boot_time()
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+# How far before the boot a timestamp must be to count as "before the boot".
+# The boot time is derived, not recorded -- Windows computes it as now minus the
+# uptime, so a wall-clock correction after the boot moves it, and Linux's btime
+# is rounded -- and the two ways of being wrong are not the same size. A pid
+# file a LIVE listener or daemon wrote just after the boot, read as pre-boot,
+# is discarded and a supervisor starts a second one beside it. A heartbeat from
+# just before a very fast restart, read as newer than the boot, only gets the
+# wording it had before boot_time existed.
+BOOT_CLOCK_SLACK_S = 30.0
+
+
+def predates_boot(timestamp: float) -> bool:
+    """True when ``timestamp`` (epoch seconds) is older than the last boot by
+    more than ``BOOT_CLOCK_SLACK_S``.
+
+    False when it is not -- and False when the boot time is unknown, so an
+    unknown boot never re-labels anything.
+    """
+    boot = boot_time()
+    return boot is not None and timestamp < boot - BOOT_CLOCK_SLACK_S
 
 
 def current_session_id() -> int | None:
@@ -177,6 +280,51 @@ def session_id_of(pid: int) -> int | None:
     except (OSError, AttributeError):
         return None
     return int(sid.value) if ok else None
+
+
+def pid_gone(pid: int) -> bool:
+    """True only when ``pid`` names no process at all -- the one answer that
+    licenses deleting a pid file.
+
+    ``pid_alive`` needs a process HANDLE, so it answers False for a live
+    process this user cannot open -- and a daemon an ssh login started in
+    logon Session 0 is exactly that (Windows OpenSSH hands an admin a full
+    token). Deleting its pid file erased the only record of which process that
+    daemon is. ``session_id_of`` needs no handle, so a live-but-unopenable pid
+    still has a session; off Windows it is always None and this is plain
+    ``not pid_alive``.
+    """
+    return not pid_alive(pid) and session_id_of(pid) is None
+
+
+def session0_residents(pids: Iterable[int]) -> dict[int, str]:
+    """``{pid: image name}`` for those of ``pids`` alive in logon Session 0.
+
+    Asked only while a desktop exists: on a headless host (no console session)
+    Session 0 is where daemons are SUPPOSED to live
+    (``MAGENT_SESSION0_POLICY=allow``), so there is nothing they are missing
+    from. The console id answers that one question and never picks a session
+    -- see ``active_console_session_id``.
+
+    The image name rides along because a pid file outlives its process and
+    Session 0 is full of services a recycled pid could now name; the caller
+    decides which images are its own. Empty when the snapshot cannot be taken:
+    a diagnostic must never invent a problem.
+    """
+    wanted = set(pids)
+    if not wanted:
+        return {}
+    console = active_console_session_id()
+    if console is None or console in NO_CONSOLE_SESSION:
+        return {}
+    entries = snapshot_processes()
+    if entries is None:
+        return {}
+    return {
+        pid: name
+        for name, pid, _ppid in entries
+        if pid in wanted and session_id_of(pid) == 0
+    }
 
 
 def snapshot_processes() -> list[tuple[str, int, int]] | None:
@@ -481,3 +629,305 @@ def await_registration(
             return pid
         if child.poll() is not None or clock() >= deadline:
             return None
+
+
+# The console-probe helper, run as its own DETACHED_PROCESS python so it has no
+# console of its own to disturb. For each pid it AttachConsoles, lists that
+# console's process ids, and FreeConsoles, writing one JSON object {pid: [ids]}
+# to argv[1]. A file, not a pipe: once a process swaps consoles its standard
+# handles are unreliable (the prototype conlist.py learned this). It never
+# touches THIS interpreter's console -- it is a separate process by design.
+_CONSOLE_HELPER = r"""
+import ctypes, json, sys
+from ctypes import wintypes
+
+k = ctypes.WinDLL("kernel32", use_last_error=True)
+k.FreeConsole.restype = wintypes.BOOL
+k.AttachConsole.argtypes = [wintypes.DWORD]
+k.AttachConsole.restype = wintypes.BOOL
+k.GetConsoleProcessList.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+k.GetConsoleProcessList.restype = wintypes.DWORD
+
+out_path = sys.argv[1]
+pids = [int(a) for a in sys.argv[2:]]
+me = k.GetCurrentProcessId()
+# Start from no console at all, whatever we inherited.
+k.FreeConsole()
+result = {}
+for pid in pids:
+    clients = None
+    if k.AttachConsole(pid):
+        try:
+            cap = 4096
+            buf = (wintypes.DWORD * cap)()
+            n = k.GetConsoleProcessList(buf, cap)
+            if 0 < n <= cap:
+                clients = sorted(int(buf[i]) for i in range(n) if int(buf[i]) != me)
+        finally:
+            k.FreeConsole()
+    result[str(pid)] = clients
+with open(out_path, "w", encoding="utf-8") as fh:
+    json.dump(result, fh)
+"""
+
+
+def _helper_python() -> str:
+    """The interpreter to run a detached stdlib helper with -- the base
+    executable, so a venv/launcher shim does not re-exec into a console."""
+    return getattr(sys, "_base_executable", None) or sys.executable
+
+
+def _parse_clients(value: object) -> frozenset[int] | None:
+    """A helper's per-pid answer -> a frozenset of client pids, or None. Only a
+    non-empty list of positive, non-bool ints is trusted."""
+    if not isinstance(value, list) or not value:
+        return None
+    out: set[int] = set()
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            return None
+        out.add(item)
+    return frozenset(out)
+
+
+def console_clients(
+    pids: Iterable[int], *, timeout: float = CONSOLE_PROBE_TIMEOUT_S
+) -> dict[int, frozenset[int] | None]:
+    """For each pid, the set of process ids sharing that pid's CONSOLE, or None
+    when it could not be read (attach failed, no console, the process is gone).
+
+    ONE detached helper does the whole batch (see ``_CONSOLE_HELPER``); this
+    process never AttachConsole/FreeConsole itself. Off Windows, and on any
+    spawn/timeout/parse failure, every pid answers None -- the reading that
+    keeps a keystroke OUT of a pane whose console we could not establish.
+    """
+    ordered = list(dict.fromkeys(pids))
+    if sys.platform != "win32" or not ordered:
+        return dict.fromkeys(ordered, None)
+    import json
+    import shutil
+    import tempfile
+
+    d: str | None = None
+    try:
+        # Inside the try: a full/unwritable/AV-locked TEMP is a failure like
+        # any other, answered None -- never an OSError into idle_sessions.
+        d = tempfile.mkdtemp(prefix="magent-con-")
+        out_path = os.path.join(d, "clients.json")
+        proc = subprocess.Popen(
+            [
+                _helper_python(),
+                "-I",
+                "-S",
+                "-c",
+                _CONSOLE_HELPER,
+                out_path,
+                *(str(p) for p in ordered),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=DETACHED_PROCESS,
+        )
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return dict.fromkeys(ordered, None)
+        try:
+            with open(out_path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, ValueError):
+            return dict.fromkeys(ordered, None)
+        if not isinstance(raw, dict):
+            return dict.fromkeys(ordered, None)
+        return {pid: _parse_clients(raw.get(str(pid))) for pid in ordered}
+    except OSError:
+        return dict.fromkeys(ordered, None)
+    finally:
+        if d is not None:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class ProcessIdentity(NamedTuple):
+    """A pid's identity across a moment: image base name and creation FILETIME.
+    Two reads of the same pid that agree on both are the same process; a reused
+    pid disagrees on ``created``."""
+
+    image: str
+    created: int
+
+
+def filetime_to_epoch(ft: int) -> float:
+    """A Windows FILETIME (100 ns ticks since 1601) as unix epoch seconds."""
+    return ft / 1e7 - _FILETIME_EPOCH_OFFSET_S
+
+
+def precise_filetime() -> int | None:
+    """Now, as a FILETIME comparable with ``ProcessIdentity.created``, or None
+    off Windows (there is no creation FILETIME to compare it with there).
+
+    GetSystemTimePreciseAsFileTime, so a process created before this call always
+    carries a creation time before it, whether the kernel stamped it from the
+    tick clock or the precise one (measured: the precise one, 0.6 ms or more
+    after a read taken just before the spawn). ``time.time_ns()`` is the tick
+    clock before Python 3.13, where a process created earlier in the same tick
+    could read as created AFTER it."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    ft = wintypes.FILETIME()
+    _kernel32().GetSystemTimePreciseAsFileTime(ctypes.byref(ft))
+    return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+
+def _identity_of_handle(k: ctypes.CDLL, handle: int) -> ProcessIdentity | None:
+    """(image, creation FILETIME) read through an already-open handle, or None
+    when the process has exited (exit code != STILL_ACTIVE) or a read failed.
+    Win32-only; every caller is behind a ``sys.platform`` guard."""
+    import ctypes
+    from ctypes import wintypes
+
+    code = wintypes.DWORD()
+    if not k.GetExitCodeProcess(handle, ctypes.byref(code)):
+        return None
+    if code.value != STILL_ACTIVE:
+        return None
+    size = wintypes.DWORD(_IMAGE_BUFFER_CHARS)
+    buf = ctypes.create_unicode_buffer(_IMAGE_BUFFER_CHARS)
+    if not k.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+        return None
+    image = buf.value.replace("\\", "/").rsplit("/", 1)[-1]
+    creation = wintypes.FILETIME()
+    exit_ = wintypes.FILETIME()
+    kernel_ = wintypes.FILETIME()
+    user_ = wintypes.FILETIME()
+    if not k.GetProcessTimes(
+        handle,
+        ctypes.byref(creation),
+        ctypes.byref(exit_),
+        ctypes.byref(kernel_),
+        ctypes.byref(user_),
+    ):
+        return None
+    created = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+    return ProcessIdentity(image=image, created=created)
+
+
+def _kernel32() -> ctypes.CDLL:
+    """A fresh kernel32 handle with the identity/kill argtypes declared. Win32
+    only; every caller is behind a ``sys.platform`` guard. The guard here is
+    never taken -- it narrows ``ctypes.WinDLL`` for the non-win32 type check
+    (the annotation is ``ctypes.CDLL``, the base of ``WinDLL``, which exists
+    on every platform)."""
+    if sys.platform != "win32":
+        raise OSError("kernel32 is win32-only")
+    import ctypes
+    from ctypes import wintypes
+
+    filetime_p = ctypes.POINTER(wintypes.FILETIME)
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    k.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        filetime_p,
+        filetime_p,
+        filetime_p,
+        filetime_p,
+    ]
+    k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k.GetSystemTimePreciseAsFileTime.argtypes = [filetime_p]
+    k.GetSystemTimePreciseAsFileTime.restype = None
+    return k
+
+
+def process_identity(pid: int) -> ProcessIdentity | None:
+    """A pid's (image, creation FILETIME), or None off Windows / on a dead or
+    unopenable pid. Uses PROCESS_QUERY_LIMITED_INFORMATION, which a normal user
+    is granted against their own processes."""
+    if sys.platform != "win32" or not pid or pid < 0:
+        return None
+    k = _kernel32()
+    handle = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        return _identity_of_handle(k, handle)
+    finally:
+        k.CloseHandle(handle)
+
+
+def _private_bytes(k: ctypes.CDLL, handle: int) -> int:
+    """The process's private commit bytes (PrivateUsage), or 0 on failure.
+    ``K32GetProcessMemoryInfo`` lives in kernel32 (the ``k`` handle already
+    open), so no second DLL is loaded. Win32-only; callers are guarded."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _PMCEX(ctypes.Structure):
+        _fields_ = (
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+            ("PrivateUsage", ctypes.c_size_t),
+        )
+
+    k.K32GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_PMCEX),
+        wintypes.DWORD,
+    ]
+    counters = _PMCEX()
+    counters.cb = ctypes.sizeof(_PMCEX)
+    if k.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+        return int(counters.PrivateUsage)
+    return 0
+
+
+def terminate_verified(pid: int, expected: ProcessIdentity) -> int | None:
+    """Terminate ``pid`` iff it is STILL the process ``expected`` names, reading
+    the identity through the same handle used to kill so a reused pid can never
+    be hit. Returns the process's private commit bytes (0 if only that read
+    failed), or None when nothing was killed. None off Windows."""
+    if sys.platform != "win32" or not pid or pid < 0:
+        return None
+    rights = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ
+    k = _kernel32()
+    handle = k.OpenProcess(rights, False, pid)
+    if not handle:
+        # VM_READ is what GetProcessMemoryInfo wants; without it the identity
+        # check + kill still work, only the byte count is lost.
+        handle = k.OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return None
+    try:
+        actual = _identity_of_handle(k, handle)
+        if actual is None or actual != expected:
+            return None
+        freed = _private_bytes(k, handle)
+        if not k.TerminateProcess(handle, 1):
+            return None
+        return freed
+    finally:
+        k.CloseHandle(handle)

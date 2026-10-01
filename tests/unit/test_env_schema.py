@@ -11,6 +11,8 @@ import contextlib
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -890,3 +892,78 @@ class TestIsSshLogin:
         for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
             monkeypatch.setenv(name, "")
         assert env_module.is_ssh_login() is False
+
+
+class TestNodeSync:
+    """MAGENT_NODE_SYNC -- may `magent serve` keep the node sync daemon alive?"""
+
+    def test_the_default_is_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _clear_magent_env(monkeypatch)
+        assert MagentEnv(_env_file=None).node_sync is True
+
+    def test_zero_turns_it_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _clear_magent_env(monkeypatch)
+        monkeypatch.setenv("MAGENT_NODE_SYNC", "0")
+        assert MagentEnv(_env_file=None).node_sync is False
+
+
+class TestLocalUsername:
+    """The login name a node falls back to when settings.nodes.<nick>.user is
+    absent. The OS sets it; nobody configures it."""
+
+    def test_the_windows_name_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("USERNAME", "alice")
+        monkeypatch.setenv("USER", "someone-else")
+        assert env_module.local_username() == "alice"
+
+    def test_the_posix_name_is_the_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("USERNAME", raising=False)
+        monkeypatch.setenv("USER", "demo")
+        assert env_module.local_username() == "demo"
+
+    def test_neither_set_is_an_empty_name_not_a_guess(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("USERNAME", raising=False)
+        monkeypatch.delenv("USER", raising=False)
+        assert env_module.local_username() == ""
+
+
+class TestGitChildEnv:
+    """`git_child_env` -- a local git read locates its repo by ``-C``, never by
+    an inherited GIT_DIR (a git hook exports one; in a worktree it is absolute)."""
+
+    @pytest.mark.parametrize("name", env_module.GIT_LOCAL_ENV_VARS)
+    def test_every_repo_locating_var_is_dropped(
+        self, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        monkeypatch.setenv(name, "/elsewhere/.git")
+        assert name not in env_module.git_child_env()
+
+    def test_everything_else_survives(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # GIT_CEILING_DIRECTORIES bounds a search, it does not aim one; PATH is
+        # how git is found at all.
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", "/tmp/ceiling")
+        monkeypatch.setenv("GIT_DIR", "/elsewhere/.git")
+        child = env_module.git_child_env()
+        assert child["GIT_CEILING_DIRECTORIES"] == "/tmp/ceiling"
+        assert child["PATH"] == os.environ["PATH"]
+        assert child == {k: v for k, v in os.environ.items() if k != "GIT_DIR"}
+
+    def test_the_list_is_the_one_git_itself_publishes(self, tmp_path: Path) -> None:
+        # A newer git that adds a repo-locating variable turns this red, not a
+        # silently misdirected read.
+        if shutil.which("git") is None:
+            pytest.skip("git is not installed")
+        published = subprocess.run(
+            ["git", "rev-parse", "--local-env-vars"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout.split()
+        assert published
+        assert set(published) <= set(env_module.GIT_LOCAL_ENV_VARS)

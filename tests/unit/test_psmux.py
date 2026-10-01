@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import logging
 import os
 import re
@@ -27,7 +28,7 @@ import pytest
 from magent import log, psmux
 from magent.config import DEFAULT_TOOLS, MagentConfig, ProjectConfig, Settings
 from magent.sessions import AGENT_TOOLS
-from tests.unit._fake_panes import fake_panes, pane_tree
+from tests.unit._fake_panes import SERVER_PID, fake_panes, fake_process_side, pane_tree
 
 
 class _FakeCompleted:
@@ -515,7 +516,7 @@ class TestPanePids:
         assert cmd[cmd.index("-t") + 1] == "a"
         assert cmd[-1] == "#{pane_pid}"
 
-    @pytest.mark.parametrize("raw", ["", "AMIN", "0", "-4", "12x"])
+    @pytest.mark.parametrize("raw", ["", "DEMO", "0", "-4", "12x"])
     def test_anything_but_a_positive_pid_is_unreadable(self, monkeypatch, raw):
         # An empty or garbled reading must never become a root to walk from:
         # unreadable is the one answer that keeps the pane out of revive.
@@ -622,6 +623,272 @@ class TestIdleSessions:
             monkeypatch, foreground={"api": "bash"}, pids={"api": 100}, snapshot=None
         )
         assert psmux.idle_sessions(["api"], psmux="psmux") == set()
+
+
+class TestPaneTrees:
+    """One pane_pids fan-out + one snapshot, a tree (root first) per name."""
+
+    def test_empty_names_probes_nothing(self, monkeypatch):
+        probes = fake_process_side(monkeypatch, pids={}, snapshot=[])
+        assert psmux.pane_trees([], psmux="psmux") == {}
+        assert probes.pid_probes == [] and probes.snapshots == []
+
+    def test_a_tree_per_name_root_first(self, monkeypatch):
+        fake_process_side(
+            monkeypatch,
+            pids={"api": 100, "web": 200},
+            snapshot=[*pane_tree(100, "cmd.exe", "claude.exe"), *pane_tree(200)],
+        )
+        trees = psmux.pane_trees(["api", "web"], psmux="psmux")
+        assert trees["api"][0] == ("pwsh.exe", 100, SERVER_PID)
+        assert [img for img, _p, _pp in trees["api"]] == [
+            "pwsh.exe",
+            "cmd.exe",
+            "claude.exe",
+        ]
+        assert trees["web"] == [("pwsh.exe", 200, SERVER_PID)]
+
+    def test_an_unreadable_pid_is_none(self, monkeypatch):
+        fake_process_side(monkeypatch, pids={"api": None}, snapshot=pane_tree(100))
+        assert psmux.pane_trees(["api"], psmux="psmux") == {"api": None}
+
+    def test_a_pid_absent_from_the_snapshot_is_none(self, monkeypatch):
+        fake_process_side(monkeypatch, pids={"api": 999}, snapshot=pane_tree(100))
+        assert psmux.pane_trees(["api"], psmux="psmux") == {"api": None}
+
+    def test_a_failed_snapshot_makes_every_name_none(self, monkeypatch):
+        fake_process_side(monkeypatch, pids={"api": 100, "web": 200}, snapshot=None)
+        assert psmux.pane_trees(["api", "web"], psmux="psmux") == {
+            "api": None,
+            "web": None,
+        }
+
+
+class TestIdleSessionsImages:
+    """The caller-supplied image set: what counts as 'an agent is running'."""
+
+    def test_a_supplied_image_set_adds_to_the_registry(self, monkeypatch):
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(100, "python.exe"),
+        )
+        # python is not a registry agent image, so with the default set the
+        # pane is idle; naming python in `images` makes it not idle.
+        assert psmux.idle_sessions(["api"], psmux="psmux") == {"api"}
+        assert (
+            psmux.idle_sessions(["api"], psmux="psmux", images=frozenset({"python"}))
+            == set()
+        )
+
+    @pytest.mark.parametrize(
+        "images",
+        [
+            frozenset({"claude.exe"}),
+            frozenset({"Claude"}),
+            frozenset({"python"}),
+            frozenset(),
+        ],
+        ids=["exe-spelling", "capitalised", "unrelated", "empty"],
+    )
+    def test_no_supplied_set_can_hide_a_registry_agent(self, monkeypatch, images):
+        # The seam may only make the verdict SAFER: whatever a caller passes,
+        # a live claude under the pane still reads not idle.
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(100, "claude.exe"),
+        )
+        assert psmux.idle_sessions(["api"], psmux="psmux", images=images) == set()
+
+    def test_a_supplied_image_is_compared_in_the_stem_spelling(self, monkeypatch):
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(100, "python.exe"),
+        )
+        assert (
+            psmux.idle_sessions(
+                ["api"], psmux="psmux", images=frozenset({"C:\\Py\\Python.EXE"})
+            )
+            == set()
+        )
+
+    def test_the_launcher_is_always_added_to_a_supplied_set(self, monkeypatch):
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(100, "cmd.exe"),
+        )
+        # `images` is empty, but _LAUNCHER_IMAGES (cmd) is unioned in regardless.
+        assert psmux.idle_sessions(["api"], psmux="psmux", images=frozenset()) == set()
+
+
+class TestIdleSessionsConsoleStage:
+    """The last stage: a pane that passed the tree walk stays idle only if its
+    console clients are exactly its own subtree. One helper call, only when a
+    pane survived the tree stages."""
+
+    def test_an_idle_pane_with_only_its_subtree_on_the_console(self, monkeypatch):
+        probes = fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(100),
+            consoles={100: frozenset({100})},
+        )
+        assert psmux.idle_sessions(["api"], psmux="psmux") == {"api"}
+        assert probes.console_probes == [[100]]
+
+    def test_a_client_outside_the_subtree_makes_it_not_idle(self, monkeypatch, caplog):
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(100),
+            consoles={100: frozenset({100, 7777})},
+        )
+        with caplog.at_level("WARNING", logger="magent.launch"):
+            assert psmux.idle_sessions(["api"], psmux="psmux") == set()
+        assert "7777" in caplog.text
+
+    def test_a_console_without_the_pane_shell_makes_it_not_idle(
+        self, monkeypatch, caplog
+    ):
+        # Every member is inside the subtree, but the root is not among them:
+        # the pwsh the keystrokes would land in is not on the console we read.
+        tree = pane_tree(100, "python.exe")  # a non-agent child passes the tree stage
+        child = tree[1][1]
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=tree,
+            consoles={100: frozenset({child})},
+        )
+        with caplog.at_level("WARNING", logger="magent.launch"):
+            assert psmux.idle_sessions(["api"], psmux="psmux") == set()
+        assert "not on its own console" in caplog.text
+
+    def test_a_repeated_veto_warns_once_per_episode(self, monkeypatch, caplog):
+        # status, revive and every bring-up verify round ask again; a pane whose
+        # console can never be read must not append the same WARNING each time.
+        consoles: dict[int, frozenset[int] | None] = {100: frozenset({100, 7777})}
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(100),
+            consoles=consoles,
+        )
+        with caplog.at_level("WARNING", logger="magent.launch"):
+            for _ in range(3):
+                assert psmux.idle_sessions(["api"], psmux="psmux") == set()
+            assert sum("7777" in r.getMessage() for r in caplog.records) == 1
+            # The pane reads idle once: that episode is over, so the next veto
+            # is news again.
+            consoles[100] = frozenset({100})
+            assert psmux.idle_sessions(["api"], psmux="psmux") == {"api"}
+            consoles[100] = frozenset({100, 7777})
+            assert psmux.idle_sessions(["api"], psmux="psmux") == set()
+        assert sum("7777" in r.getMessage() for r in caplog.records) == 2
+
+    def test_a_changed_veto_reason_is_news(self, monkeypatch, caplog):
+        # A different outside pid is a different orphan: the actionable line.
+        consoles: dict[int, frozenset[int] | None] = {100: frozenset({100, 7777})}
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(100),
+            consoles=consoles,
+        )
+        with caplog.at_level("WARNING", logger="magent.launch"):
+            assert psmux.idle_sessions(["api"], psmux="psmux") == set()
+            consoles[100] = frozenset({100, 8888})
+            for _ in range(2):
+                assert psmux.idle_sessions(["api"], psmux="psmux") == set()
+        assert sum("7777" in r.getMessage() for r in caplog.records) == 1
+        assert sum("8888" in r.getMessage() for r in caplog.records) == 1
+
+    def test_a_pane_recreated_under_its_name_is_a_new_episode(
+        self, monkeypatch, caplog
+    ):
+        # Same name, same pid-less reason, but a new pane process: news.
+        pids: dict[str, int | None] = {"api": 100}
+        snapshot = pane_tree(100)
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids=pids,
+            snapshot=snapshot,
+            consoles={100: None, 200: None},
+        )
+        with caplog.at_level("WARNING", logger="magent.launch"):
+            for _ in range(2):
+                assert psmux.idle_sessions(["api"], psmux="psmux") == set()
+            pids["api"] = 200
+            snapshot[:] = pane_tree(200)
+            for _ in range(2):
+                assert psmux.idle_sessions(["api"], psmux="psmux") == set()
+        unreadable = [r for r in caplog.records if "unreadable" in r.getMessage()]
+        assert len(unreadable) == 2
+
+    def test_the_veto_warning_claims_only_that_idle_was_not_proven(
+        self, monkeypatch, caplog
+    ):
+        # An unreadable console is an unknown, not a busy pane: the log says
+        # what status and revive say.
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(100),
+            consoles={100: None},
+        )
+        with caplog.at_level("WARNING", logger="magent.launch"):
+            assert psmux.idle_sessions(["api"], psmux="psmux") == set()
+        assert [r.getMessage() for r in caplog.records] == [
+            "pane api is not proven idle: console clients unreadable"
+        ]
+
+    def test_the_vetoed_mapping_names_each_vetoed_pane(self, monkeypatch):
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh", "web": "pwsh"},
+            pids={"api": 100, "web": 200},
+            snapshot=[*pane_tree(100), *pane_tree(200)],
+            consoles={100: None},
+        )
+        vetoed: dict[str, str] = {}
+        assert psmux.idle_sessions(["api", "web"], psmux="psmux", vetoed=vetoed) == {
+            "web"
+        }
+        assert vetoed == {"api": "console clients unreadable"}
+
+    def test_unreadable_console_clients_make_it_not_idle(self, monkeypatch):
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(100),
+            consoles={100: None},
+        )
+        assert psmux.idle_sessions(["api"], psmux="psmux") == set()
+
+    def test_no_pane_that_survived_the_tree_means_no_helper_call(self, monkeypatch):
+        probes = fake_panes(
+            monkeypatch,
+            foreground={"api": "claude"},  # not a shell reading -> filtered early
+            pids={"api": 100},
+            snapshot=pane_tree(100),
+        )
+        assert psmux.idle_sessions(["api"], psmux="psmux") == set()
+        assert probes.console_probes == []
 
 
 def _cfg(projects, **settings):
@@ -785,10 +1052,23 @@ class TestReviveSessions:
     so up/attach reuse it and hand back a window at a bare prompt. Revive
     re-sends the agent command to exactly those panes."""
 
-    def _run(self, monkeypatch, *, idle, only=None, sent_ok=True):
+    def _run(
+        self,
+        monkeypatch,
+        *,
+        idle,
+        only=None,
+        sent_ok=True,
+        why=None,
+        answers=("api", "web"),
+        consoles=None,
+        tool="claude",
+    ):
         sent: list[tuple] = []
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
-        monkeypatch.setattr(psmux, "has_session", lambda name, psmux=None: True)
+        monkeypatch.setattr(
+            psmux, "has_session", lambda name, psmux=None: name in answers
+        )
         # An idle pane is a pwsh with nothing under it; a busy one runs claude.
         pids = {"api": 100, "web": 200}
         fake_panes(
@@ -800,6 +1080,7 @@ class TestReviveSessions:
                 for n, pid in pids.items()
                 for e in pane_tree(pid, *(() if n in idle else ("claude.exe",)))
             ],
+            consoles=consoles,
         )
 
         def _fake_send(name, *keys, target=None, psmux=None):
@@ -809,11 +1090,11 @@ class TestReviveSessions:
         monkeypatch.setattr(psmux, "send_keys", _fake_send)
         cfg = _cfg(
             [
-                ProjectConfig(path="/a/api", tool="claude"),
-                ProjectConfig(path="/a/web", tool="claude"),
+                ProjectConfig(path="/a/api", tool=tool),
+                ProjectConfig(path="/a/web", tool=tool),
             ]
         )
-        return psmux.revive_sessions(cfg, only=only), sent
+        return psmux.revive_sessions(cfg, only=only, vetoed=why), sent
 
     def test_only_the_idle_pane_is_revived(self, monkeypatch):
         revived, sent = self._run(monkeypatch, idle={"api"})
@@ -848,6 +1129,93 @@ class TestReviveSessions:
         monkeypatch.setattr(psmux, "find_psmux", lambda: None)
         cfg = _cfg([ProjectConfig(path="/a/api", tool="claude")])
         assert psmux.revive_sessions(cfg) == []
+
+
+class TestReviveSaysWhyNot:
+    """``vetoed`` gets one reason per session not revived, in the words of the
+    check that stopped it: status prints it for ``r<n>``, so a reason that
+    names the wrong check sends the user after the wrong thing."""
+
+    _run = TestReviveSessions._run
+
+    def test_a_pane_not_proven_idle_is_not_claimed_as_a_running_agent(
+        self, monkeypatch
+    ):
+        why: dict[str, str] = {}
+        revived, _ = self._run(monkeypatch, idle={"api"}, why=why)
+        assert revived == ["api"]
+        assert why == {
+            "web": "its agent is still running, or its pane could not be read"
+        }
+
+    def test_a_console_veto_names_itself(self, monkeypatch):
+        why: dict[str, str] = {}
+        consoles = {100: frozenset({100, 9999})}
+        self._run(monkeypatch, idle={"api"}, only=["api"], why=why, consoles=consoles)
+        assert why == {
+            "api": "its pane is not proven idle: process(es) 9999 outside the"
+            " pane's tree share its console"
+        }
+
+    def test_an_unreadable_console_is_not_claimed_as_not_idle(
+        self, monkeypatch, capsys
+    ):
+        # Unreadable is an unknown: the pane may well be idle, so the words
+        # claim only that idle was not proven -- here and on status's screen.
+        from pathlib import Path
+
+        from magent.cli import status as status_mod
+
+        why: dict[str, str] = {}
+        consoles = {100: None}
+        revived, sent = self._run(
+            monkeypatch, idle={"api"}, only=["api"], why=why, consoles=consoles
+        )
+        assert (revived, sent) == ([], [])
+        said = "its pane is not proven idle: console clients unreadable"
+        assert why == {"api": said}
+        cfg = _cfg([ProjectConfig(path="/a/api", tool="claude")])
+        monkeypatch.setattr(status_mod, "_load_config_or_exit", lambda path: cfg)
+        status_mod._revive_session(Path("unused.json"), "api")
+        out = capsys.readouterr().out
+        assert f"Did not revive api: {said}." in out
+        assert "is not idle" not in out
+
+    def test_a_failed_send(self, monkeypatch):
+        why: dict[str, str] = {}
+        self._run(monkeypatch, idle={"api"}, only=["api"], sent_ok=False, why=why)
+        assert why == {"api": "the relaunch could not be sent (see launch.log)"}
+
+    def test_a_session_that_did_not_answer(self, monkeypatch):
+        why: dict[str, str] = {}
+        self._run(monkeypatch, idle={"api", "web"}, why=why, answers=("api",))
+        assert why == {"web": "its psmux session did not answer"}
+
+    def test_a_tool_with_no_command(self, monkeypatch):
+        why: dict[str, str] = {}
+        self._run(monkeypatch, idle={"api"}, only=["api"], why=why, tool="nosuch")
+        assert why == {"api": "its tool has no command configured"}
+
+    def test_a_name_not_in_the_config(self, monkeypatch):
+        why: dict[str, str] = {}
+        revived, sent = self._run(monkeypatch, idle={"api"}, only=["gone"], why=why)
+        assert (revived, sent) == ([], [])
+        assert why == {"gone": "not an enabled local agent session in the config"}
+
+    def test_no_psmux_binary(self, monkeypatch):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        why: dict[str, str] = {}
+        cfg = _cfg([ProjectConfig(path="/a/api", tool="claude")])
+        assert psmux.revive_sessions(cfg, only=["api"], vetoed=why) == []
+        assert why == {"api": "psmux not found"}
+
+    def test_no_psmux_binary_and_no_only_names_nothing(self, monkeypatch):
+        # Nothing was read, so there is no session list to give reasons for.
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        why: dict[str, str] = {}
+        cfg = _cfg([ProjectConfig(path="/a/api", tool="claude")])
+        assert psmux.revive_sessions(cfg, vetoed=why) == []
+        assert why == {}
 
 
 # Shipped in DEFAULT_TOOLS (and the README) with no AGENT_TOOLS entry, so no
@@ -1663,6 +2031,102 @@ def _visible_cells(status: str) -> int:
     )
 
 
+class TestTodaysDecorationIsPinned:
+    """Characterization, written green BEFORE the brand grows a node suffix: the
+    ten decoration argvs of a LOCAL session, restated literally. The node work
+    builds the same vocabulary for tmux; a diff here means it changed psmux."""
+
+    @pytest.mark.parametrize("code_hint", [True, False])
+    def test_the_ten_argvs_are_byte_identical(self, code_hint):
+        fallback = (
+            "F2 opens VS Code only from a magent window on Windows"
+            " (hotkey listener not running in this client)"
+        )
+        f2 = (
+            ["psmux", "-L", "api", "bind", "-n", "F2", "display-message", fallback]
+            if code_hint
+            else ["psmux", "-L", "api", "unbind-key", "-n", "F2"]
+        )
+        hint = _EXPECTED_HINT if code_hint else _EXPECTED_HINT_F1_ONLY
+        assert psmux.decoration_argv("api", "psmux", code_hint) == [
+            ["psmux", "-L", "api", "bind", "-n", "F1", "detach-client"],
+            ["psmux", "-L", "api", "set", "-g", "status-right", hint],
+            [
+                "psmux",
+                "-L",
+                "api",
+                "set",
+                "-g",
+                "status-right-length",
+                "40" if code_hint else "22",
+            ],
+            [
+                "psmux",
+                "-L",
+                "api",
+                "set",
+                "-g",
+                "status-left",
+                "#[bold,fg=green] magent #[default]",
+            ],
+            ["psmux", "-L", "api", "set", "-g", "status-left-length", "10"],
+            f2,
+            ["psmux", "-L", "api", "rename-window", "-t", "api", "api"],
+            ["psmux", "-L", "api", "set", "-g", "automatic-rename", "off"],
+            ["psmux", "-L", "api", "set", "-g", "window-status-format", "#W"],
+            ["psmux", "-L", "api", "set", "-g", "window-status-current-format", "#W"],
+        ]
+
+
+_BRAND = "#[bold,fg=green] magent #[default]"
+
+
+class TestTheBrandNamesTheNode:
+    """A node session's status line says where it runs: `magent @second`.
+    A local session's brand is today's, byte for byte."""
+
+    def test_a_local_session_keeps_todays_brand(self):
+        assert psmux.status_brand(None) == (_BRAND, "8")
+
+    def test_a_node_session_says_which_node_it_runs_on(self):
+        assert psmux.status_brand("second") == (_BRAND + "@second ", "16")
+
+    @pytest.mark.parametrize("nick", [None, "second", "cloud", "a", "a b"])
+    def test_the_cell_count_is_exactly_the_visible_width(self, nick):
+        text, cells = psmux.status_brand(nick)
+        assert int(cells) == _visible_cells(text)
+
+    @pytest.mark.parametrize("nick", [None, "second", "cloud", "a"])
+    def test_the_brand_is_pure_ascii(self, nick):
+        assert psmux.status_brand(nick)[0].isascii()
+
+    @pytest.mark.parametrize("nick", ["#(x)", "é", "", "x\ny", "\t"])
+    def test_a_nick_tmux_would_expand_or_mis_measure_is_refused(self, nick):
+        # `#(x)` would run `x` on every redraw, `é` breaks cells == len, an
+        # empty nick brands the bar with a bare `@`, and a raw newline or tab
+        # is ASCII but not printable, so it also breaks cells == len.
+        with pytest.raises(ValueError, match="status brand nick"):
+            psmux.status_brand(nick)
+        with pytest.raises(ValueError, match="status brand nick"):
+            psmux.status_left(nick)
+
+    @pytest.mark.parametrize(
+        ("nick", "length"), [(None, "10"), ("second", "18"), ("cloud", "17")]
+    )
+    def test_status_left_is_the_brand_plus_two_cells_of_headroom(self, nick, length):
+        text, cells = psmux.status_brand(nick)
+        assert psmux.status_left(nick) == (text, length)
+        assert int(length) == int(cells) + 2
+
+    @pytest.mark.parametrize("code_hint", [True, False])
+    def test_the_f2_binding_is_the_decorations_sixth_command(self, code_hint):
+        local = psmux.decoration_argv("api", "psmux", code_hint)[5]
+        assert psmux.f2_binding_argv(["psmux", "-L", "api"], code_hint) == local
+        tmux = psmux.f2_binding_argv(["tmux", "-L", "magent"], code_hint)
+        assert tmux[:3] == ["tmux", "-L", "magent"]
+        assert tmux[3:] == local[3:]
+
+
 class TestDecorateSession:
     """The status-line hints (badged `F1`/`F2` keys with spelled-out labels),
     the product-owned `bind -n F1 detach-client`, and the product-owned
@@ -1798,7 +2262,8 @@ class TestDecorateSession:
     def test_status_left_length_fits_the_brand(self):
         # The number is only correct relative to the brand text; pin the
         # relationship, not just the two literals.
-        assert int(psmux._STATUS_BRAND_LEN) >= len(" magent ")
+        text, length = psmux.status_left(None)
+        assert int(length) >= _visible_cells(text)
 
     @pytest.mark.parametrize("code_hint", [True, False])
     def test_status_right_length_fits_the_hint(self, code_hint):
@@ -2673,3 +3138,108 @@ class TestEveryOneShotSpawnHidesItsConsole:
             assert psmux._SPAWN_FLAGS == subprocess.CREATE_NO_WINDOW
         else:
             assert psmux._SPAWN_FLAGS == 0
+
+
+class TestANodeProjectIsNotALocalSession:
+    """A project pinned to a pool node runs THERE; every local psmux path
+    (bring-up, status, revive, the upload server's session list) skips it.
+    Cloud projects are not pool projects and stay local (DECISION-15)."""
+
+    def _config(self, tmp_path):
+        for name in ("api", "web", "sky", "auto"):
+            (tmp_path / name).mkdir()
+        return MagentConfig(
+            projects=[
+                ProjectConfig(path=str(tmp_path / "api")),
+                ProjectConfig(path=str(tmp_path / "web"), node="second"),
+                ProjectConfig(path=str(tmp_path / "sky"), node="cloud"),
+                ProjectConfig(path=str(tmp_path / "auto"), node="auto"),
+            ]
+        )
+
+    def test_eligible_projects_skips_pinned_and_auto_node_projects(self, tmp_path):
+        names = [p["name"] for p in psmux.eligible_projects(self._config(tmp_path))]
+        assert names == ["api", "sky"]
+
+    def test_config_sessions_skips_them_too(self, tmp_path):
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "projects": [
+                        {"path": str(tmp_path / "api")},
+                        {"path": str(tmp_path / "web"), "node": "second"},
+                        {"path": str(tmp_path / "sky"), "node": "cloud"},
+                        {"path": str(tmp_path / "auto"), "node": "auto"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert [s["name"] for s in psmux.config_sessions(str(cfg))] == ["api", "sky"]
+
+    @pytest.mark.parametrize(
+        ("node", "local"),
+        [(None, True), ("cloud", True), ("auto", False), ("second", False)],
+    )
+    def test_the_typed_and_raw_paths_agree(self, tmp_path, node, local):
+        """``eligible_projects`` (typed) and ``config_sessions`` (raw dict)
+        spell the skip twice; ONE config file read both ways must list the
+        same projects, or the upload server and `status` disagree."""
+        from magent.config import SCHEMA_VERSION, load_config
+
+        for name in ("api", "web"):
+            (tmp_path / name).mkdir()
+        web: dict[str, object] = {"path": str(tmp_path / "web")}
+        if node is not None:
+            web["node"] = node
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "settings": {"nodes": {"second": {"host": "box-second"}}},
+                    "projects": [{"path": str(tmp_path / "api")}, web],
+                }
+            ),
+            encoding="utf-8",
+        )
+        typed = [p["name"] for p in psmux.eligible_projects(load_config(str(cfg)))]
+        raw = [s["name"] for s in psmux.config_sessions(str(cfg))]
+        assert typed == raw
+        assert typed == (["api", "web"] if local else ["api"])
+
+    def test_the_node_skip_runs_before_the_first_wins_dedupe(self, tmp_path):
+        """A node project listed FIRST must not claim the session id and hide
+        the local project that shares it. ``load_config`` refuses that pair
+        (config.py's session-name check); a config built in code skips it, and
+        so does the raw path below."""
+        for name in ("a", "b"):
+            (tmp_path / name / "api").mkdir(parents=True)
+        cfg = MagentConfig(
+            projects=[
+                ProjectConfig(path=str(tmp_path / "a" / "api"), node="second"),
+                ProjectConfig(path=str(tmp_path / "b" / "api")),
+            ]
+        )
+        [entry] = psmux.eligible_projects(cfg)
+        assert entry["path"] == str(tmp_path / "b" / "api")
+
+    def test_the_raw_path_keeps_the_local_twin_of_a_node_project(self, tmp_path):
+        # config_sessions skips validation, so the refused pair can reach it.
+        for name in ("a", "b"):
+            (tmp_path / name / "api").mkdir(parents=True)
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "projects": [
+                        {"path": str(tmp_path / "a" / "api"), "node": "second"},
+                        {"path": str(tmp_path / "b" / "api")},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        [entry] = psmux.config_sessions(str(cfg))
+        assert entry["path"] == str(tmp_path / "b" / "api")

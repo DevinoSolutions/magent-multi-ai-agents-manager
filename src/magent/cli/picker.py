@@ -15,9 +15,9 @@ two identical keystrokes is a picker you cannot pin, and this one is pinned
 exhaustively in ``tests/unit/test_picker.py``.
 
 **The raw-key mode is gated on a REAL terminal.** ``raw_mode_available``
-answers the same ``sys.stdin.isatty()`` question the rest of the CLI already
-asks -- plus, on Windows, whether that "tty" is a real console and not the NUL
-device, which ``isatty()`` cannot tell apart. Off a terminal -- a pipe, a script, Click's ``CliRunner`` -- callers keep
+asks ``console.human_at_console()`` -- the one "a person is typing here" check,
+which on Windows also tells a real console from the NUL device that
+``isatty()`` cannot. Off a terminal -- a pipe, a script, Click's ``CliRunner`` -- callers keep
 their existing line-based ``click.prompt`` untouched, byte for byte. That is
 not politeness: the whole non-interactive surface of this product (and most of
 its test suite) types lines, and a raw-mode read there would block on a
@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING
 
 import click
 
+from magent import console
 from magent.cli.ui import _menu_item
 from magent.style import style
 
@@ -318,26 +319,6 @@ def read_key() -> str:
     return _read_key_posix()
 
 
-def _stdin_is_console() -> bool:
-    """On Windows, ``isatty()`` is not enough: it answers True for the NUL
-    device (a character device, not a console), so ``magent --go < NUL`` --
-    and every child spawned with ``stdin=DEVNULL`` -- would reach the raw
-    ``getwch`` loop and block forever on a console nobody types into
-    (measured: v3.19.0's ``--go`` checklist hung every Windows CI launch).
-    ``GetConsoleMode`` succeeds only on a real console input handle."""
-    if sys.platform != "win32":
-        return True
-    import ctypes
-    import msvcrt
-
-    try:
-        handle = msvcrt.get_osfhandle(sys.stdin.fileno())
-        mode = ctypes.c_uint32()
-        return bool(ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
-    except (OSError, ValueError, AttributeError):
-        return False
-
-
 def raw_mode_available() -> bool:
     """True when a real terminal is on stdin AND on stdout AND this OS's
     raw-read module exists. Everything else -- pipes, NUL, ``CliRunner``,
@@ -345,9 +326,11 @@ def raw_mode_available() -> bool:
     always had. stdout matters as much as stdin: with it captured, the list
     paints into a pipe nobody reads while the loop waits on a console key
     (measured: a pytest parent that owned a console hung every child
-    ``--go --dry-run`` it captured)."""
+    ``--go --dry-run`` it captured). stdin is ``console.human_at_console``:
+    on Windows NUL is a "tty", and the raw ``getwch`` loop would block
+    forever on it (v3.19.0's ``--go`` checklist hung every Windows CI launch)."""
     try:
-        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        if not sys.stdout.isatty():
             return False
     except (OSError, ValueError):
         return False
@@ -357,7 +340,7 @@ def raw_mode_available() -> bool:
             return False
     except (ImportError, ValueError):
         return False
-    return _stdin_is_console()
+    return console.human_at_console()
 
 
 # -- state --------------------------------------------------------------------

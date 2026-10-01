@@ -65,19 +65,23 @@ MD002_ALLOW = {
     "src/magent/launch.py": "Windows job-object breakaway in spawn_detached",
     "src/magent/upload_server.py": "taskkill vs os.kill process termination",
     "src/magent/cli/attention_cmd.py": "taskkill vs os.kill process termination",
+    "src/magent/node_sync.py": "taskkill vs os.kill process termination (stop_daemon, the attention_cmd shape)",
     "src/magent/cli/watch.py": "non-blocking keypress polling is per-OS (msvcrt vs select)",
     "src/magent/cli/doctor.py": "terminal-emulator candidates are per-OS (wt vs POSIX list)",
     "src/magent/hotkey.py": "module is Windows-only by construction (raises off-win32)",
     "src/magent/sessions/codex.py": "FS case-insensitivity for session-path matching",
     "src/magent/cli/ui.py": "OS-specific editor command + Windows console UTF-8 fix",
     "src/magent/procs.py": "OpenProcess vs os.kill pid-liveness primitive",
+    "src/magent/node_auth.py": "an owner-only token file is a protected DACL at CreateFileW (ctypes, Windows) vs O_EXCL 0600 + owner check (POSIX)",
     "src/magent/cli/session_picker.py": "terminal reset (cls vs stty/tput) is per-OS",
+    "src/magent/console.py": "whether stdin is a person's console: GetConsoleMode (ctypes, Windows; NUL is a 'tty' there) vs isatty (POSIX)",
     "src/magent/cli/picker.py": "raw single-key console reads are per-OS (msvcrt vs termios/tty), same split as cli/watch.py",
     "src/magent/cli/attach.py": "reports the sys.platform value in JSON status (data, not a gate)",
     "src/magent/env.py": "host-env readers (config_base, vscode_storage_base) select per-OS default directories",
     "src/magent/lockfile.py": "msvcrt.locking (Windows) vs fcntl.flock (Unix) — each OS has a different locking API",
     "src/magent/log.py": "msvcrt.locking (Windows) vs fcntl.flock (Unix) for the shared-log interlock — same per-OS locking API split as lockfile.py",
     "src/magent/psmux.py": "psmux binary fallback path is per-OS (LOCALAPPDATA on Windows)",
+    "src/magent/attach_client.py": "Windows' own OpenSSH is found via GetSystemDirectoryW (ctypes.windll exists only on win32), same primitive split as procs.py",
 }
 
 # MD003: the only two src files allowed to hold a literal "magent:".

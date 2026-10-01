@@ -9,7 +9,6 @@ from __future__ import annotations
 import contextlib
 import getpass
 import json
-import shutil
 import subprocess
 import sys
 import time
@@ -19,10 +18,12 @@ from typing import TYPE_CHECKING
 
 import click
 
+from magent import attach_client
 from magent.attach_client import (
     CLIENT_EXE_NAME,
-    SSH_CONNECTION_OPTS,
-    remote_attach_command,
+    MUXES,
+    TMUX_SOCKET,
+    spawn_attach_window,
 )
 from magent.cli.app import main
 from magent.cli.background import _maybe_start_hotkey, _maybe_start_upload_server
@@ -111,7 +112,7 @@ def _ssh_capture(
     try:
         r = subprocess.run(
             [
-                "ssh",
+                attach_client.ssh_program(),
                 "-o",
                 "BatchMode=yes",
                 "-o",
@@ -445,7 +446,7 @@ def _echo_already_open(title: str) -> None:
 _CLIENT_PROCESS_NAMES = ["ssh.exe", "psmux.exe", f"{CLIENT_EXE_NAME}.exe"]
 
 
-def _attach_markers(sid: str) -> tuple[str, ...]:
+def _attach_markers(sid: str, mux: str = "psmux") -> tuple[str, ...]:
     """Every spelling of "this process is attached to ``sid``" magent can spawn.
 
     The binary NAME is deliberately not part of the marker. The remote path
@@ -459,23 +460,42 @@ def _attach_markers(sid: str) -> tuple[str, ...]:
     processes, so ``-L <sid> attach`` is signal enough on its own.
 
     Not naming the binary is also what let the reconnect supervisor join the
-    scan for free: ``_spawn_windows`` passes the remote command it would have
-    given ssh as the supervisor's ``--remote`` argument, so the same marker
-    string appears in the supervisor's own command line -- including while it
-    is between connections and no ssh process exists at all. The one rule that
-    keeps this honest is stated at ``attach_client.remote_attach_command``: the
-    remote command has exactly one spelling, and these markers match it.
+    scan for free: ``attach_client.spawn_attach_window`` passes the remote
+    command it would have given ssh as the supervisor's ``--remote`` argument,
+    so the same marker string appears in the supervisor's own command line --
+    including while it is between connections and no ssh process exists at
+    all. The one rule that keeps this honest is stated at
+    ``attach_client.remote_attach_command``: the remote command has exactly one
+    spelling, and these markers match it.
 
     The quoted variants cover a session id that a shell (or a future call site)
     chose to quote, so a quoting change cannot silently turn every live window
     into a corpse. They also cover the supervisor argv on any platform whose
     process table re-quotes arguments.
+
+    A node pane (``mux="tmux"``) attaches on ONE shared socket, so the sid
+    moves from the socket slot to the ``-t`` slot, in tmux's exact-match form:
+    ``-L magent attach -t =<sid>``, quoted the same three ways. magent spawns
+    the single-quoted one (``-t '=<sid>'``, see ``remote_attach_command``), and
+    its closing quote ends the name, so ``api``'s marker is NOT found inside a
+    live ``api2`` pane's command line. Only the bare variant could overlap that
+    way (``-t =api`` inside ``-t =api2``), and an overlap can only ever make a
+    dead window look ALIVE (left open), never the reverse: the conservative
+    direction ``_corpses`` is built around. One cross-multiplexer overlap
+    exists too -- the psmux marker for a sid named ``magent`` (any case:
+    matching is case-insensitive) is a prefix of every tmux marker -- and it
+    points the same conservative way.
     """
-    return (
-        f"-L {sid} attach",
-        f'-L "{sid}" attach',
-        f"-L '{sid}' attach",
-    )
+    if mux == "psmux":
+        return (
+            f"-L {sid} attach",
+            f'-L "{sid}" attach',
+            f"-L '{sid}' attach",
+        )
+    if mux == "tmux":
+        head = f"-L {TMUX_SOCKET} attach -t"
+        return (f"{head} ={sid}", f'{head} "={sid}"', f"{head} '={sid}'")
+    raise ValueError(f"unknown multiplexer {mux!r}")
 
 
 def _corpses(open_sids: set[str], live_cmdlines: list[str]) -> set[str]:
@@ -494,6 +514,11 @@ def _corpses(open_sids: set[str], live_cmdlines: list[str]) -> set[str]:
     That conservatism is what makes the supervisor safe to add here: widening
     ``_CLIENT_PROCESS_NAMES`` can only ever make FEWER windows look dead, never
     more, so the risky direction of this decision was never widened.
+
+    Every multiplexer's markers count, for the same reason: a window is known
+    here only by its sid, and a node pane (tmux) shares the desktop with the
+    psmux ones -- the sweep judges them all. More markers can only rescue a
+    window, never condemn one.
     """
     haystack = [c.lower() for c in live_cmdlines if c]
     return {
@@ -502,7 +527,8 @@ def _corpses(open_sids: set[str], live_cmdlines: list[str]) -> set[str]:
         if not any(
             marker.lower() in cmdline
             for cmdline in haystack
-            for marker in _attach_markers(sid)
+            for mux in MUXES
+            for marker in _attach_markers(sid, mux)
         )
     }
 
@@ -728,38 +754,6 @@ def _annotate_dead_windows(up: Sequence[dict[str, object]]) -> None:
         )
 
 
-def _attach_client_exe() -> str | None:
-    """The local ``magent-attach-client`` binary, or None if it is not on PATH.
-
-    Never assumed present: an editable checkout that predates the console
-    script, a PATH that exposes ``magent`` from somewhere its siblings are not,
-    or a partially-upgraded install all reach here. The caller degrades to a
-    bare ssh pane (today's historical behavior) and says so once, rather than
-    spawning forty windows that fail to start.
-    """
-    return shutil.which(CLIENT_EXE_NAME)
-
-
-def _pane_command(target: str, sid: str, supervisor: str | None) -> list[str]:
-    """What one attach pane runs: the reconnect supervisor, or bare ssh.
-
-    Both spellings drive the SAME ssh options and the SAME remote command
-    (``attach_client`` owns both), so the only difference between them is who
-    is left standing when the connection drops: with the supervisor the pane
-    reconnects itself, without it the pane becomes a corpse for the next
-    ``magent attach`` to sweep.
-
-    The supervisor form passes ``--remote`` explicitly rather than letting the
-    supervisor derive it: that argument is what puts the ``-L <sid> attach``
-    marker into the supervisor's own command line, which is how
-    ``_dead_sids`` can tell a pane mid-reconnect from a dead one.
-    """
-    remote = remote_attach_command(sid)
-    if supervisor is None:
-        return ["ssh", *SSH_CONNECTION_OPTS, "-t", target, remote]
-    return [supervisor, "--target", target, "--session", sid, "--remote", remote]
-
-
 def _spawn_windows(
     target: str,
     sids: Sequence[str],
@@ -772,14 +766,15 @@ def _spawn_windows(
 
     Split out of ``_attach_flow`` so the post-tiling verification pass can call
     it a second time for the windows that died at the SSH handshake -- the
-    retry needs the same spawn, only staggered further apart. Both the initial
-    and the retry batch therefore get the same pane command from here.
+    retry needs the same spawn, only staggered further apart. Every window,
+    initial or retry, comes from ``attach_client.spawn_attach_window``.
 
     ``reconnect=False`` (``magent attach --no-reconnect``) reproduces the
     historical bare-ssh pane exactly.
     """
-    supervisor = _attach_client_exe() if reconnect else None
-    if reconnect and supervisor is None:
+    # Through the module, not a bound name: the same seam spawn_attach_window
+    # reads, so a test (or a stale install) can't make the two disagree.
+    if reconnect and attach_client.client_exe() is None:
         click.echo(
             f"  {style('!', fg='yellow')} {style(CLIENT_EXE_NAME, bold=True)}"
             f" {style('is not on PATH -- panes will not auto-reconnect.', fg='yellow')}"
@@ -789,37 +784,23 @@ def _spawn_windows(
             f" {style('pip install -U magent-multi-ai-agents-manager', bold=True)}"
             f"{style('.', dim=True)}"
         )
-    # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
-    from magent.env import attach_client_env
 
     titles: list[str] = []
     for sid in sids:
-        title = make_title(sid)
         if sid in open_already:
             # Still tiled with everything else -- an already-open window belongs
             # in the grid; it just must not be opened a second time, and costs
             # no stagger since no SSH handshake follows.
+            title = make_title(sid)
             _echo_already_open(title)
             titles.append(title)
             continue
+        # No `remote=`: the leaf derives the attach command from `mux`, so the
+        # multiplexer is named once and cannot disagree with its own marker.
+        # The title tiled below is the one the window was opened with, not a
+        # second make_title that could disagree with it.
+        title = spawn_attach_window(target, sid, mux="psmux", reconnect=reconnect)
         click.echo(f"  {style('o', fg='cyan')} {title}")
-        # `env=`: an attach pane is a RENDERER, not an agent host -- everything
-        # survives (nesting markers included) except a colour override an agent
-        # harness leaked into us, which would paint this pane monochrome. None
-        # when no harness marker is present, i.e. plain inheritance.
-        subprocess.Popen(
-            [
-                "wt",
-                "-w",
-                "new",
-                "--title",
-                title,
-                "--suppressApplicationTitle",
-                "--",
-                *_pane_command(target, sid, supervisor),
-            ],
-            env=attach_client_env(),
-        )
         titles.append(title)
         time.sleep(stagger)
     return titles
@@ -1234,7 +1215,7 @@ def _attach_flow(
     # instead of adding its own 2-3s afterwards.
     ensure = subprocess.Popen(
         [
-            "ssh",
+            attach_client.ssh_program(),
             "-o",
             "BatchMode=yes",
             "-o",
@@ -1339,7 +1320,7 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
                 title,
                 "--suppressApplicationTitle",
                 "--",
-                "ssh",
+                attach_client.ssh_program(),
                 "-t",
                 target,
                 f"cd {remote_dir} && {cmd}",
@@ -1385,6 +1366,8 @@ def _up_handoff_argv(ctx: click.Context) -> list[str]:
         argv.append("--all")
     if ctx.params.get("revive"):
         argv.append("--revive")
+    if ctx.params.get("allow_dirty"):
+        argv.append("--allow-dirty")
     return argv
 
 
@@ -1409,9 +1392,19 @@ def _up_handoff_argv(ctx: click.Context) -> list[str]:
     is_flag=True,
     help="Re-launch the agent in live sessions whose pane fell back to a bare shell",
 )
+@click.option(
+    "--allow-dirty",
+    is_flag=True,
+    help="Bring node projects up despite a dirty or unpushed tree",
+)
 @click.pass_context
 def up_cmd(
-    ctx: click.Context, as_json: bool, do_all: bool, group: str | None, revive: bool
+    ctx: click.Context,
+    as_json: bool,
+    do_all: bool,
+    group: str | None,
+    revive: bool,
+    allow_dirty: bool,
 ) -> None:
     """Ensure a persistent psmux session per project (host side of `attach`)."""
     config_file = find_config(ctx.obj.get("config_path"))
@@ -1424,6 +1417,7 @@ def up_cmd(
         bring_up_psmux,
         decorate_psmux_sessions,
         decorate_psmux_sessions_async,
+        node_session_ids,
         psmux_status,
         relay_handoff,
         report_bring_up_casualties,
@@ -1542,14 +1536,30 @@ def up_cmd(
         if do_all
         else [_as_str(d.get("session")) or _as_str(d.get("name")) for d in down]
     )
+    # A node a project needs that cannot run it yet: set up inline at a
+    # terminal, that project skipped in one line anywhere else (`attach`).
+    from magent import nodes  # heavy subsystem: in-body per policy
+    from magent.cli.node_onboard import ready_gate
+
+    cfg = ready_gate(cfg, nodes.node_projects(cfg, group))
+    # Node projects (PR-D) are not psmux sessions: psmux_status never lists
+    # them, so they are always offered to the bring-up, which attaches to a
+    # session already running on its node instead of starting a second one.
+    node_sids = node_session_ids(cfg, group)
     created: list[str] = []
-    if not projects:
+    if not projects and not node_sids:
         where = f" in group '{group}'" if group else ""
         click.echo(f"  {style('!', fg='yellow')} No eligible projects{where}.")
-    elif not do_all and not down:
+    elif not do_all and not down and not node_sids:
         click.echo(f"  {style('+', fg='green')} All {len(up)} session(s) already up.")
     else:
-        created, failed = bring_up_psmux(cfg, only=targets, group=group)
+        created, failed = bring_up_psmux(
+            cfg,
+            only=None if targets is None else [*targets, *node_sids],
+            group=group,
+            allow_dirty=allow_dirty,
+            config_path=str(config_file),
+        )
         click.echo(
             f"  {style('+', fg='green')} Brought up {style(str(len(created)), fg='green', bold=True)}"
             f" session(s): {style(', '.join(created) or '(none)', dim=True)}"
@@ -1559,9 +1569,16 @@ def up_cmd(
         # relays from the host, and a silent casualty there reads as success.
         # Its Session-0 note is only ever set when the choke point refused: the
         # hand-off and refusal above have already returned on every other
-        # Session-0 path.
+        # Session-0 path. A node casualty's reason is logged by the "nodes"
+        # logger, not "launch" -- point at whichever log(s) actually hold this set.
+        node_failed = [s for s in failed if s in node_sids]
+        logs: list[str] = []
+        if len(node_failed) < len(failed):
+            logs.append("~/.magent/logs/launch.log")
+        if node_failed:
+            logs.append("~/.magent/logs/nodes.log")
         report_bring_up_casualties(
-            failed, log_hint="(see ~/.magent/logs/launch.log on the host)"
+            failed, log_hint="(see " + " and ".join(logs) + " on the host)"
         )
 
     # Unconditional on the interactive path: a session that is up but parked at
@@ -1580,8 +1597,9 @@ def up_cmd(
     # here is what gives a PRE-EXISTING session (made before this feature, or
     # by an older magent) the hints without forcing a recreate. The `--json`
     # branch above does the same for its live sessions. Same host-side `code`
-    # probe as there: one for the batch, not one per session.
-    decorate_psmux_sessions([*live_ids, *created])
+    # probe as there: one for the batch, not one per session. Node sessions
+    # are left out: they live on their node and were decorated there at birth.
+    decorate_psmux_sessions([*live_ids, *(s for s in created if s not in node_sids)])
 
     if cfg.settings.upload_server:
         _maybe_start_upload_server(cfg.settings.upload_port, str(config_file))
@@ -1668,7 +1686,8 @@ def hotkey_cmd(ctx: click.Context, server: str | None, ssh_host: str | None) -> 
             f"{style(f'(pid {existing})', dim=True)}."
         )
         click.echo(
-            f"  {style('Stop it first with', dim=True)} {style('magent down --all', bold=True)}{style('.', dim=True)}"
+            f"  {style('`magent serve` supervises it and replaces it if it wedges;', dim=True)} "
+            f"{style('nothing to start here.', dim=True)}"
         )
         return
 

@@ -341,6 +341,8 @@ def _linux_child_env(home: Path, restricted_bin: Path) -> dict[str, str]:
     env["XDG_CONFIG_HOME"] = str(home / ".config")
     env["XDG_DATA_HOME"] = str(home / ".local" / "share")
     env["XDG_CACHE_HOME"] = str(home / ".cache")
+    # The MAGENT_* strip drops conftest's pin: never a child with reaping on.
+    env["MAGENT_IDLE_REAP"] = "0"
     # Software rasteriser for the GPU terminals under a GL-less Xvfb.
     env["LIBGL_ALWAYS_SOFTWARE"] = "1"
     env["GALLIUM_DRIVER"] = "llvmpipe"
@@ -653,10 +655,13 @@ def _win_child_env(home: Path, shim_dir: Path, base_path: str) -> dict[str, str]
     # ...and `attention -d` now supervises `magent serve` the same way, so a
     # test daemon would otherwise start a REAL upload server on this machine.
     env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+    env["MAGENT_ATTENTION_SUPERVISOR"] = "0"
     # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
     # no HOME redirect contains: a test-spawned serve/daemon must never
     # re-prioritise the developer's real psmux fleet.
     env["MAGENT_PSMUX_BOOST"] = "0"
+    env["MAGENT_NODE_SYNC"] = "0"
+    env["MAGENT_IDLE_REAP"] = "0"
     # ...and the Session-0 hand-off must never fire from a test: a runner
     # (or an ssh-driven leg) is legitimately non-interactive, and the
     # default policy would create a REAL scheduled task on somebody's

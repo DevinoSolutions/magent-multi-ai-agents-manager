@@ -5,12 +5,13 @@ from __future__ import annotations
 import contextlib
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from magent import lockfile
-from magent.lockfile import LockHeld, exclusive_lock
+from magent.lockfile import LockHeld, exclusive_lock, lock_path, persistent_lock
 
 _real_open = open
 
@@ -246,7 +247,7 @@ class TestExclusiveLockAcrossARelease:
             assert not _enter(contender, "race"), "the contender got in beside it"
             assert took == [True]
             # The contender left the third taker's file where it was.
-            assert (Path.home() / ".magent" / "race.lock").exists()
+            assert lock_path("race").exists()
             assert not _enter(fourth, "race")
             # Only the third taker keeps a handle; every refused attempt closed.
             assert opens.still_open() == [opens.handles[2]]
@@ -278,7 +279,7 @@ class TestExclusiveLockAcrossARelease:
         """Each attempt's file is deleted between its open and its lock: a
         holder leaving every time. Three attempts, then LockHeld -- never a
         spin, never a lock on a file no path names."""
-        path = Path.home() / ".magent" / "race.lock"
+        path = lock_path("race")
         for n in range(10):
             opens.after[n] = path.unlink
         with contextlib.ExitStack() as taker:
@@ -289,7 +290,7 @@ class TestExclusiveLockAcrossARelease:
 
     @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX order")
     def test_on_posix_the_holder_deletes_the_file_before_it_lets_go(self, opens):
-        path = Path.home() / ".magent" / "race.lock"
+        path = lock_path("race")
         seen = []
         with contextlib.ExitStack() as holder:
             assert _enter(holder, "race")
@@ -300,10 +301,49 @@ class TestExclusiveLockAcrossARelease:
     def test_on_windows_the_holder_still_lets_go_before_it_deletes(self, opens):
         """Unchanged on Windows: an open file cannot be deleted there, so the
         holder lets go first, deletes after, and the file is gone once out."""
-        path = Path.home() / ".magent" / "race.lock"
+        path = lock_path("race")
         seen = []
         with contextlib.ExitStack() as holder:
             assert _enter(holder, "race")
             opens.handles[0].after_close = lambda: seen.append(path.exists())
         assert seen == [True]
         assert not path.exists()
+
+
+class TestPersistentLock:
+    """The waiting lock: bounded by ``wait_s``, and its file is never deleted."""
+
+    def test_the_file_outlives_the_holder(self):
+        with persistent_lock("test", wait_s=1):
+            assert lock_path("test").exists()
+        assert lock_path("test").exists()
+        assert lock_path("test") == Path.home() / ".magent" / "test.lock"
+
+    def test_a_contender_gives_up_after_its_wait_with_lock_held(self):
+        with persistent_lock("test", wait_s=1):
+            with pytest.raises(LockHeld), persistent_lock("test", wait_s=0.1):
+                pass
+            assert lock_path("test").exists()
+
+    def test_a_contender_gets_the_lock_once_the_holder_lets_go(self):
+        order: list[str] = []
+        held = threading.Event()
+
+        def holder():
+            with persistent_lock("test", wait_s=1):
+                order.append("holder in")
+                held.set()
+                time.sleep(0.2)
+                order.append("holder out")
+
+        t = threading.Thread(target=holder)
+        t.start()
+        assert held.wait(timeout=5)
+        with persistent_lock("test", wait_s=5):
+            order.append("waiter in")
+        t.join(timeout=5)
+        assert order == ["holder in", "holder out", "waiter in"]
+
+    def test_it_never_conflicts_with_a_different_name(self):
+        with persistent_lock("alpha", wait_s=0), persistent_lock("beta", wait_s=0):
+            pass

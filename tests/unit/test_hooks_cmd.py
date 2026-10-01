@@ -31,6 +31,19 @@ def _isolate_state(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_state, "_warned_files", set())
 
 
+def _set_ts(cwd, ts):
+    """Rewrite one record's ``ts`` in place (the write stamped it now)."""
+    path = agent_state._path_for(cwd)
+    rec = json.loads(path.read_text(encoding="utf-8"))
+    rec["ts"] = ts
+    path.write_text(json.dumps(rec), encoding="utf-8")
+
+
+def _age(cwd, minutes):
+    path = agent_state._path_for(cwd)
+    _set_ts(cwd, json.loads(path.read_text(encoding="utf-8"))["ts"] - minutes * 60)
+
+
 def _install(runner, settings_file):
     return runner.invoke(
         cli.main, ["hooks", "install", "--settings-file", str(settings_file)]
@@ -84,7 +97,7 @@ class TestInstall:
 
     def test_command_is_bash_safe_forward_slashes(self, monkeypatch):
         # Claude Code runs hook commands through a POSIX shell even on Windows:
-        # a backslash path is eaten as escapes ("c:usersamind..." -> not found).
+        # a backslash path is eaten as escapes ("c:usersalice..." -> not found).
         monkeypatch.setattr(
             hooks_cmd.shutil,
             "which",
@@ -793,6 +806,135 @@ class TestStatus:
         assert result.exit_code == 0
         assert "state record(s)" in result.output
         assert "State store is empty" not in result.output
+
+    def test_a_parked_record_is_not_hook_activity(self, runner, tmp_path):
+        # A hook's last write was 2h ago; the reaper parked another session a
+        # moment ago. Freshness is the hooks' health readout, so it must still
+        # say 2h -- the reaper's write says nothing about the hooks.
+        settings = tmp_path / "settings.json"
+        _install(runner, settings)
+        agent_state.write_state("/projects/foo", agent_state.DONE)
+        path = agent_state._path_for("/projects/foo")
+        rec = json.loads(path.read_text(encoding="utf-8"))
+        rec["ts"] -= 2 * 3600
+        path.write_text(json.dumps(rec), encoding="utf-8")
+        agent_state.write_state("/projects/bar", agent_state.PARKED)
+        result = runner.invoke(
+            cli.main, ["hooks", "status", "--settings-file", str(settings)]
+        )
+        assert result.exit_code == 0
+        assert "2 state record(s), newest hook write 120m ago" in result.output
+
+    def test_an_all_parked_store_names_no_hook_write(self, runner, tmp_path):
+        settings = tmp_path / "settings.json"
+        _install(runner, settings)
+        agent_state.write_state("/projects/bar", agent_state.PARKED)
+        result = runner.invoke(
+            cli.main, ["hooks", "status", "--settings-file", str(settings)]
+        )
+        assert result.exit_code == 0
+        assert (
+            "1 state record(s), all parked by the idle reaper; newest park 0m ago\n"
+        ) in result.output
+        assert "hook write" not in result.output
+
+    def test_an_all_parked_store_claims_nothing_about_the_hooks(self, runner, tmp_path):
+        # A hook wrote a moment ago and its record is gone: SessionEnd cleared
+        # it (the TTL sweep ages one out the same way). The store is all parked
+        # and 90 minutes old, and the hooks were not silent for 90 minutes.
+        settings = tmp_path / "settings.json"
+        _install(runner, settings)
+        agent_state.write_state("/projects/parked", agent_state.PARKED)
+        _age("/projects/parked", 90)
+        agent_state.write_state("/projects/ended", agent_state.WORKING)
+        agent_state.clear_state("/projects/ended")
+        result = runner.invoke(
+            cli.main, ["hooks", "status", "--settings-file", str(settings)]
+        )
+        assert result.exit_code == 0
+        assert "newest park 90m ago\n" in result.output
+        assert "hook write" not in result.output
+
+    # The store is read in path order; both orders, so "the first record"
+    # can never pass for "the newest".
+    @pytest.mark.parametrize(
+        ("old", "newer"),
+        [("/projects/a", "/projects/b"), ("/projects/b", "/projects/a")],
+    )
+    def test_an_all_parked_store_reports_the_newest_park(
+        self, runner, tmp_path, old, newer
+    ):
+        # A hook that stopped writing leaves an all-parked store behind once the
+        # reaper has parked every session, and a 2-day-old park must not read
+        # like a fleet parked a moment ago.
+        settings = tmp_path / "settings.json"
+        _install(runner, settings)
+        agent_state.write_state(old, agent_state.PARKED)
+        agent_state.write_state(newer, agent_state.PARKED)
+        _age(old, 3000)
+        _age(newer, 2880)
+        result = runner.invoke(
+            cli.main, ["hooks", "status", "--settings-file", str(settings)]
+        )
+        assert result.exit_code == 0
+        assert (
+            "2 state record(s), all parked by the idle reaper; newest park 2880m ago\n"
+        ) in result.output
+
+    @pytest.mark.parametrize(
+        "bad", ["soon", True, float("inf"), float("nan"), None], ids=repr
+    )
+    def test_an_unreadable_park_time_is_no_age(
+        self, runner, tmp_path, monkeypatch, bad
+    ):
+        # Unknown is never a readable time: alone it prints no age at all, and
+        # beside a readable park it neither wins nor shortens that park's age.
+        # The once-per-process TTL sweep would delete every one of these but
+        # Infinity first; the reader must not lean on that, so it has run.
+        monkeypatch.setattr(agent_state, "_swept_this_process", True)
+        settings = tmp_path / "settings.json"
+        _install(runner, settings)
+        agent_state.write_state("/projects/bad", agent_state.PARKED)
+        _set_ts("/projects/bad", bad)
+        alone = runner.invoke(
+            cli.main, ["hooks", "status", "--settings-file", str(settings)]
+        )
+        assert alone.exit_code == 0
+        assert "1 state record(s), all parked by the idle reaper\n" in alone.output
+        agent_state.write_state("/projects/good", agent_state.PARKED)
+        _age("/projects/good", 90)
+        both = runner.invoke(
+            cli.main, ["hooks", "status", "--settings-file", str(settings)]
+        )
+        assert both.exit_code == 0
+        assert (
+            "2 state record(s), all parked by the idle reaper; newest park 90m ago\n"
+        ) in both.output
+
+    def test_a_park_stamped_in_the_future_is_zero_minutes_old(self, runner, tmp_path):
+        # Clock skew between writer and reader: never a negative age.
+        settings = tmp_path / "settings.json"
+        _install(runner, settings)
+        agent_state.write_state("/projects/skew", agent_state.PARKED)
+        _age("/projects/skew", -5)
+        result = runner.invoke(
+            cli.main, ["hooks", "status", "--settings-file", str(settings)]
+        )
+        assert result.exit_code == 0
+        assert "newest park 0m ago\n" in result.output
+
+    def test_an_infinite_hook_time_does_not_read_as_fresh(self, runner, tmp_path):
+        settings = tmp_path / "settings.json"
+        _install(runner, settings)
+        agent_state.write_state("/projects/inf", agent_state.DONE)
+        agent_state.write_state("/projects/real", agent_state.DONE)
+        _set_ts("/projects/inf", float("inf"))
+        _age("/projects/real", 120)
+        result = runner.invoke(
+            cli.main, ["hooks", "status", "--settings-file", str(settings)]
+        )
+        assert result.exit_code == 0
+        assert "2 state record(s), newest hook write 120m ago" in result.output
 
     def test_module_form_reports_wired(self, runner, tmp_path):
         settings = tmp_path / "settings.json"

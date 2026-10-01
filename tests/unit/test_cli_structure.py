@@ -35,13 +35,13 @@ def _normalize_help(output: str) -> str:
 
 
 HELP_SNAPSHOTS = {
-    (): "Usage: main [OPTIONS] [COMMAND] [ARGS]...\n\n  Open every project in its own terminal and auto-tile across all monitors.\n\nOptions:\n  --go              Skip interactive menu, launch + tile\n  --retile-all      Re-tile every matching window\n  -a, --all         Launch every enabled project -- skip the project checklist\n  -g, --group TEXT  Launch only projects in this group\n  --init            Re-scan and regenerate config\n  --base-dir PATH   Folder to scan with --init\n  --config PATH     Path to config file\n  --force           With --init, overwrite existing config\n  --edit            Open config in your default editor\n  --attach-to TEXT  Attach to remote psmux sessions (host or user@host)\n  --no-mux          With --attach-to: one plain SSH window per project (no\n                    psmux/tmux)\n  --version         Show the version and exit.\n  --help            Show this message and exit.\n\nCommands:\n  attach     Attach to another machine's magent sessions over SSH.\n  attention  Ambient attention signals for your agent fleet.\n  config     View and modify your magent configuration.\n  docs       Print the full configuration reference (Markdown).\n  doctor     Diagnose the environment: config, env vars, tools, display, dirs.\n  down       Shut down psmux sessions (and optionally the upload server).\n  hooks      Wire agent lifecycle hooks that feed the session-state store.\n  hotkey     Listen for Alt+V to upload clipboard images to psmux sessions.\n  mobile     Show the phone URL + QR for the image-upload app.\n  model      Switch a session's model (and optionally effort), only while...\n  peek       Print the last LINES of a session's pane -- a read-only glance.\n  send       Deliver a prompt to one running agent by name.\n  serve      Start upload server for mobile image transfer.\n  sessions   List psmux sessions or attach to one.\n  status     Show which psmux sessions and services are currently running.\n  terminal   Keyboard fixes for the terminal your psmux sessions run in.\n  termius    Generate SSH config for Termius — one host that opens all...\n  up         Ensure a persistent psmux session per project (host side of...\n  watch      Live view of every agent session — who needs you, sorted first.\n",
+    (): "Usage: main [OPTIONS] [COMMAND] [ARGS]...\n\n  Open every project in its own terminal and auto-tile across all monitors.\n\nOptions:\n  --go              Skip interactive menu, launch + tile\n  --retile-all      Re-tile every matching window\n  -a, --all         Launch every enabled project -- skip the project checklist\n  -g, --group TEXT  Launch only projects in this group\n  --init            Re-scan and regenerate config\n  --base-dir PATH   Folder to scan with --init\n  --config PATH     Path to config file\n  --force           With --init, overwrite existing config\n  --edit            Open config in your default editor\n  --attach-to TEXT  Attach to remote psmux sessions (host or user@host)\n  --no-mux          With --attach-to: one plain SSH window per project (no\n                    psmux/tmux)\n  --allow-dirty     Node projects: start despite a dirty or unpushed tree\n  --version         Show the version and exit.\n  --help            Show this message and exit.\n\nCommands:\n  attach     Attach to another machine's magent sessions over SSH.\n  attention  Ambient attention signals for your agent fleet.\n  config     View and modify your magent configuration.\n  docs       Print the full configuration reference (Markdown).\n  doctor     Diagnose the environment: config, env vars, tools, display, dirs.\n  down       Shut down psmux sessions (and optionally the upload server).\n  hooks      Wire agent lifecycle hooks that feed the session-state store.\n  hotkey     Listen for Alt+V to upload clipboard images to psmux sessions.\n  mobile     Show the phone URL + QR for the image-upload app.\n  model      Switch a session's model (and optionally effort), only while...\n  node       Run projects on a pool of Linux machines over ssh.\n  peek       Print the last LINES of a session's pane -- a read-only glance.\n  send       Deliver a prompt to one running agent by name.\n  serve      Start upload server for mobile image transfer.\n  sessions   List psmux sessions or attach to one.\n  status     Show which psmux sessions and services are currently running.\n  terminal   Keyboard fixes for the terminal your psmux sessions run in.\n  termius    Generate SSH config for Termius — one host that opens all...\n  up         Ensure a persistent psmux session per project (host side of...\n  watch      Live view of every agent session — who needs you, sorted first.\n",
     (
         "attention",
     ): "Usage: main attention [OPTIONS]\n\n  Ambient attention signals for your agent fleet.\n\n  Badges every magent: window title with its session state, flashes the taskbar\n  when an agent needs input or errors, and (when enabled in config) sends a\n  Windows toast and/or an ntfy push. States come from the agent-state store that\n  Claude Code hooks / Codex notify already write.\n\nOptions:\n  -d, --daemon      Run detached\n  --stop            Stop the running daemon\n  --interval FLOAT  Seconds between polls (default: attention.pollIntervalS from\n                    config)\n  --help            Show this message and exit.\n",
     (
         "up",
-    ): "Usage: main up [OPTIONS]\n\n  Ensure a persistent psmux session per project (host side of `attach`).\n\nOptions:\n  --json            Print session status as JSON without changing anything\n  --all             Recreate every session, not just the ones that are down\n  -g, --group TEXT  Only projects tagged with this group\n  --revive          Re-launch the agent in live sessions whose pane fell back to\n                    a bare shell\n  --help            Show this message and exit.\n",
+    ): "Usage: main up [OPTIONS]\n\n  Ensure a persistent psmux session per project (host side of `attach`).\n\nOptions:\n  --json            Print session status as JSON without changing anything\n  --all             Recreate every session, not just the ones that are down\n  -g, --group TEXT  Only projects tagged with this group\n  --revive          Re-launch the agent in live sessions whose pane fell back to\n                    a bare shell\n  --allow-dirty     Bring node projects up despite a dirty or unpushed tree\n  --help            Show this message and exit.\n",
     (
         "attach",
     ): "Usage: main attach [OPTIONS] [HOST]\n\n  Attach to another machine's magent sessions over SSH.\n\n  HOST is user@host (omit to be prompted; the prompt defaults to the last host\n  you attached to, falling back to your local config). Default tiles one window\n  per remote psmux session with Alt+V image paste; --no-mux opens a direct SSH\n  window per project instead. -g limits the flow to one project group on the\n  host; -y skips the bring-up prompt.\n\n  Each pane survives a dropped connection and reattaches on its own once the\n  host is reachable again; --no-reconnect restores the old one-shot ssh pane.\n\nOptions:\n  --no-mux          One plain SSH window per project (no psmux/tmux)\n  -g, --group TEXT  Only attach/bring up projects in this group\n  -y, --yes         Skip the bring-up prompt (bring up everything that's down)\n  --no-reconnect    Don't auto-reconnect attach panes when the SSH connection\n                    drops\n  --help            Show this message and exit.\n",
@@ -131,7 +131,7 @@ HELP_SNAPSHOTS = {
     (
         "config",
         "add",
-    ): "Usage: main config add [OPTIONS] PATH\n\n  Add a project. Usage: magent config add ./myapp -g INTERNAL -t claude\n\nOptions:\n  -g, --group TEXT       Group name\n  -t, --tool TEXT        Tool (claude, codex, vscode, ...)\n  -c, --color TEXT       Tab color (#rrggbb)\n  --title TEXT           Custom window title\n  --host TEXT            SSH host for remote projects\n  -w, --windows INTEGER  Number of windows\n  --help                 Show this message and exit.\n",
+    ): "Usage: main config add [OPTIONS] PATH\n\n  Add a project. Usage: magent config add ./myapp -g INTERNAL -t claude\n\nOptions:\n  -g, --group TEXT       Group name\n  -t, --tool TEXT        Tool (claude, codex, vscode, ...)\n  -c, --color TEXT       Tab color (#rrggbb)\n  --title TEXT           Custom window title\n  --host TEXT            SSH host for remote projects\n  -w, --windows INTEGER  Number of windows\n  --node TEXT            Run it on a node: a nick, or auto\n  --help                 Show this message and exit.\n",
     (
         "config",
         "remove",
@@ -147,7 +147,7 @@ HELP_SNAPSHOTS = {
     (
         "config",
         "set",
-    ): "Usage: main config set [OPTIONS] PATH FIELD VALUE\n\n  Set a field on a project. Usage: magent config set myapp group INTERNAL\n\nOptions:\n  --help  Show this message and exit.\n",
+    ): "Usage: main config set [OPTIONS] PATH FIELD VALUE\n\n  Set a field on a project. Usage: magent config set myapp group INTERNAL\n\n  ``node`` takes a nick under settings.nodes, ``auto`` (placed at bring-up) or\n  ``none`` (run it here again).\n\nOptions:\n  --help  Show this message and exit.\n",
     (
         "config",
         "open",
@@ -156,6 +156,55 @@ HELP_SNAPSHOTS = {
         "config",
         "path",
     ): "Usage: main config path [OPTIONS]\n\n  Print the config file path.\n\nOptions:\n  --help  Show this message and exit.\n",
+    (
+        "node",
+    ): "Usage: main node [OPTIONS] [COMMAND] [ARGS]...\n\n  Run projects on a pool of Linux machines over ssh.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  add     Add a machine to the node pool and set it up, in one go.\n  auth    The Claude subscription token node sessions sign in with.\n  doctor  Check a node, or every node: tools, the Claude subscription...\n  plan    Show where a node project would run and what it would ship.\n  push    Re-ship a project's non-git files (.env* etc.) to its node.\n  recall  Bring a node session home, or move it to another node.\n  remove  Take a node out of the pool.\n  setup   Prepare a machine once: packages, a per-person user, your key,...\n  sync    Mirror every node's sessions, load and agent state onto this PC.\n",
+    (
+        "node",
+        "doctor",
+    ): "Usage: main node doctor [OPTIONS] [NICK]\n\n  Check a node, or every node: tools, the Claude subscription token, git's\n  GitHub access, locale, disk, and this PC's sync daemon and snapshot.\n\n  Exit 0 when nothing failed (warnings allowed), 1 when a check failed, 2 when\n  NICK is not in settings.nodes.\n\nOptions:\n  --json  Print the rows as JSON\n  --help  Show this message and exit.\n",
+    (
+        "node",
+        "auth",
+    ): "Usage: main node auth [OPTIONS] COMMAND [ARGS]...\n\n  The Claude subscription token node sessions sign in with.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  refresh  Mint a new Claude subscription token on this PC (`claude...\n  status   Show whether this PC holds a Claude subscription token, and...\n",
+    (
+        "node",
+        "auth",
+        "refresh",
+    ): "Usage: main node auth refresh [OPTIONS]\n\n  Mint a new Claude subscription token on this PC (`claude setup-token`: one\n  browser approval) and push it to every configured node.\n\n  Run it when `magent node doctor` says Anthropic rejected a node's token, or\n  when magent says the token is near its year's end. A node that does not answer\n  gets it at its next bring-up, and a session there picks it up when it next\n  starts. Exit 0 when a token was minted, 1 when none was, 2 without a terminal\n  to approve it in.\n\nOptions:\n  --help  Show this message and exit.\n",
+    (
+        "node",
+        "auth",
+        "status",
+    ): "Usage: main node auth status [OPTIONS]\n\n  Show whether this PC holds a Claude subscription token, and until when. Never\n  shows the token. Exit 0 for a usable token, 1 otherwise.\n\nOptions:\n  --help  Show this message and exit.\n",
+    (
+        "node",
+        "setup",
+    ): "Usage: main node setup [OPTIONS] NICK\n\n  Prepare a machine once: packages, a per-person user, your key, Claude Code,\n  the Claude subscription token and GitHub access, then the user scope and a\n  check.\n\n  Logs in as root@<host> for this one hop. Idempotent: every step prints\n  ok/did/skip. The first setup mints this PC's Claude subscription token\n  (`claude setup-token`: one browser approval) and every later one reuses it;\n  the Claude login itself is never copied. Git reaches GitHub over https with\n  your gh login. Exit 0 when nothing failed, 1 when a step failed, 2 when\n  nothing was sent (unknown nick, bad user name, no public key).\n\nOptions:\n  --user TEXT  A Unix user to create on the node (repeatable; default: the\n               node's user).\n  --key FILE   This PC's ssh PUBLIC key to authorize (default:\n               ~/.ssh/id_ed25519.pub, then id_ecdsa, id_rsa).\n  --help       Show this message and exit.\n",
+    (
+        "node",
+        "add",
+    ): "Usage: main node add [OPTIONS] HOST\n\n  Add a machine to the node pool and set it up, in one go.\n\n  HOST is a name or an alias from your ssh config; setup logs in as root@HOST\n  once. Writes settings.nodes (creating the config if there is none), then runs\n  `magent node setup` inline and checks the node. The first node asks for one\n  browser approval (the Claude subscription token). Adding a host already in the\n  pool sets it up again. Exit 0 when the node is ready, 1 when a step failed\n  (the node stays in the pool: rerun `magent node setup <nick>`), 2 when nothing\n  was written.\n\nOptions:\n  --nick TEXT  The node's short name (1-6 of a-z 0-9 -; default: from HOST).\n  --user TEXT  The Unix user sessions run as there (default: your login).\n  --key FILE   This PC's ssh PUBLIC key to authorize (default:\n               ~/.ssh/id_ed25519.pub, ...).\n  --help       Show this message and exit.\n",
+    (
+        "node",
+        "remove",
+    ): "Usage: main node remove [OPTIONS] NICK\n\n  Take a node out of the pool. Edits the config only: the machine, its users and\n  its files are left as they are.\n\n  A project that would be left with no node -- pinned to NICK, or auto with NICK\n  the last node -- runs on this PC instead: at a terminal you are asked (default\n  yes), elsewhere pass --local. Refused while a session is placed there (bring\n  it home first: magent node recall <name> --local). Exit 0 when removed, 1 when\n  refused, 2 when NICK is not a node.\n\nOptions:\n  --local  Run the projects that would be left without a node (pinned to NICK,\n           or auto with no node left) on this PC, in the same save.\n  --help   Show this message and exit.\n",
+    (
+        "node",
+        "plan",
+    ): "Usage: main node plan [OPTIONS] [PROJECT]\n\n  Show where a node project would run and what it would ship. Writes nothing.\n\n  The same placement a launch makes -- the node-map, the load history and, for a\n  node with too few recent samples, one live reading -- but nothing is recorded\n  and nothing is started.\n\nOptions:\n  --all   Every enabled node project.\n  --help  Show this message and exit.\n",
+    (
+        "node",
+        "push",
+    ): "Usage: main node push [OPTIONS] PROJECT\n\n  Re-ship a project's non-git files (.env* etc.) to its node.\n\nOptions:\n  --help  Show this message and exit.\n",
+    (
+        "node",
+        "recall",
+    ): "Usage: main node recall [OPTIONS] PROJECT\n\n  Bring a node session home, or move it to another node.\n\n  Pulls once more, reports the node's last commit per repo, stops the session,\n  installs its conversation and memory where the destination's Claude looks, and\n  clears the placement. A node that does not answer is reported, never fatal:\n  what was already pulled is used.\n\nOptions:\n  --to NICK      Move the session to this node and resume it there.\n  --local        Bring the session home and print the command that resumes it.\n  --allow-dirty  Bring node projects up despite a dirty or unpushed tree\n  --help         Show this message and exit.\n",
+    (
+        "node",
+        "sync",
+    ): "Usage: main node sync [OPTIONS]\n\n  Mirror every node's sessions, load and agent state onto this PC.\n\n  Each tick makes one ssh per node, running pull.sh: the node's tmux session\n  list, a load sample, and the transcript and state files that changed since the\n  last pull for the sessions this PC placed there. `magent serve` keeps it\n  running whenever a project has a node; run it by hand to debug.\n\nOptions:\n  -d, --daemon  Run detached\n  --once        Run one tick in the foreground, then exit\n  --stop        Stop the running daemon\n  --help        Show this message and exit.\n",
 }
 
 TOP_LEVEL_COMMANDS = [
@@ -169,6 +218,7 @@ TOP_LEVEL_COMMANDS = [
     "hotkey",
     "mobile",
     "model",
+    "node",
     "peek",
     "send",
     "serve",
@@ -180,6 +230,17 @@ TOP_LEVEL_COMMANDS = [
     "watch",
 ]
 TERMINAL_SUBCOMMANDS = ["install", "status"]
+NODE_SUBCOMMANDS = [
+    "add",
+    "auth",
+    "doctor",
+    "plan",
+    "push",
+    "recall",
+    "remove",
+    "setup",
+    "sync",
+]
 CONFIG_SUBCOMMANDS = [
     "add",
     "base-dir",
@@ -228,6 +289,10 @@ def test_registration_set_config_subcommands():
 
 def test_registration_set_terminal_subcommands():
     assert sorted(cli.main.commands["terminal"].commands) == TERMINAL_SUBCOMMANDS
+
+
+def test_registration_set_node_subcommands():
+    assert sorted(cli.main.commands["node"].commands) == NODE_SUBCOMMANDS
 
 
 def test_acyclic_imports():

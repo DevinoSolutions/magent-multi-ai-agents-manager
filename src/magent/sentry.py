@@ -4,7 +4,7 @@ sentry-sdk is a base dependency (see pyproject.toml), so a healthy install
 always has it; reporting itself stays opt-in via MAGENT_SENTRY_DSN.
 When the DSN is unset: zero work, zero imports (the SDK loads only inside
 init_sentry, keeping `--help` startup lean). When set: init with
-errors-only (no traces), no PII, logging integration at ERROR level
+errors-only (no traces), no PII, no frame locals, logging integration at ERROR level
 (captures every logger.exception), excepthook, and threading integrations.
 
 If the SDK is somehow missing anyway (a broken/partial install), init
@@ -88,6 +88,12 @@ def init_sentry(dsn: str) -> None:
         # context wanted, and send_default_pii=False is the actual PII gate.
         traces_sample_rate=0,
         send_default_pii=False,
+        # Never ship frame locals. sentry-sdk 2.x defaults this to True and
+        # its scrubber redacts by key NAME only (token/secret/auth...), so a
+        # node payload in a local named `stdin`/`input_bytes` -- a GitHub
+        # token, say -- rode along verbatim in every RemoteError's event.
+        # Errors-only reporting never needed locals; the traceback stays.
+        include_local_variables=False,
         integrations=[
             LoggingIntegration(level=None, event_level=logging.ERROR),
             ThreadingIntegration(propagate_hub=True),

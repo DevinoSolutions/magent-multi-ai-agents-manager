@@ -13,6 +13,11 @@ same phases through it::
     Alt+V: uploading...      the clipboard image is in hand, the POST starts
     Alt+V: image sent        (or a SPECIFIC reason it did not land)
 
+Files copied in Explorer (CF_HDROP) are a press too -- ``handle_file_press``.
+Where the pane lives decides what moves: a LOCAL pane shares this disk, so
+the original paths are pasted and nothing is copied; a REMOTE pane gets every
+file in one upload and the server pastes their saved paths in one line.
+
 Two rules hold the design together:
 
 * **Never block the press.** Flashes are queued to one pump thread
@@ -31,9 +36,13 @@ ambiguous-width glyph has corrupted this bar before -- see psmux.py's
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import queue
+import secrets
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -44,11 +53,16 @@ from magent.sessions import (
     FLASH_MSG_MAX,
     FLASH_TINT_ERR,
     FLASH_TINT_OK,
+    MAX_UPLOAD_BYTES,
     build_flash_url,
+    paths_line,
+    unpasteable_path,
+    upload_limit_text,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import BinaryIO
 
 # Every Alt+V press ends in exactly one line carrying this prefix, so the whole
 # history of the chord is one grep:
@@ -62,14 +76,21 @@ ALTV_LOG_PREFIX = "ALTV"
 ALTV_OUTCOMES = (
     "ok",  # image uploaded and injected into the pane
     "ok-native",  # local press: one Ctrl+V delivered, the agent pastes natively
+    "ok-paths",  # local files press: the original paths pasted, nothing copied
     "not-a-magent-window",  # pass-through: the chord was not ours to handle
-    "no-image",  # magent window focused, but the clipboard holds no image
-    "clipboard-unreadable",  # CF_DIB said yes, the read came back empty
+    "no-image",  # magent window focused, but the clipboard holds no image or file
+    "clipboard-unreadable",  # CF_DIB/CF_HDROP said yes, the read came back empty
     "serve-unreachable",  # nothing answered on server_url
     "upload-rejected",  # the server answered, and said no
     "inject-failed",  # the server stored it, psmux would not paste it
     "inject-pending",  # the server stored it, psmux is still being asked
     "native-failed",  # local press: the paste key never reached the pane
+    "paths-failed",  # local files press: the paths never reached the pane
+    "path-unpasteable",  # local files press: a path holds a control character
+    "folder-refused",  # a folder was copied; the whole press is refused
+    "file-missing",  # a copied file is gone (or is not a regular file)
+    "file-unreadable",  # a copied file is there but would not be read (locked?)
+    "too-large",  # remote files press past MAX_UPLOAD_BYTES; nothing was read
     "error",  # anything unforeseen, with a traceback in the log
 )
 
@@ -78,8 +99,9 @@ ALTV_OUTCOMES = (
 # screenshot is gone", and saying that about a file sitting in ~/.magent/uploads
 # is the same lie as the "upload failed" this vocabulary exists to retire.
 # (`ok-native` is safe for the simpler reason: nothing was consumed -- the
-# image is still on the clipboard either way.)
-ALTV_SAFE_OUTCOMES = ("ok", "ok-native", "inject-pending")
+# image is still on the clipboard either way; `ok-paths` pasted paths to files
+# that never moved.)
+ALTV_SAFE_OUTCOMES = ("ok", "ok-native", "ok-paths", "inject-pending")
 
 # What each outcome says on the status bar. Split from the log vocabulary so a
 # reason can be reworded without breaking `grep ALTV outcome=...`, and kept
@@ -90,14 +112,28 @@ OUTCOME_REASONS: dict[str, str] = {
     "ok": "image sent",
     "ok-native": "pasted from clipboard",
     "native-failed": "paste key not delivered - clipboard still has the image",
-    "no-image": "clipboard has no image - copy one first",
+    "ok-paths": "file path pasted",
+    "no-image": "clipboard has no image or file - copy one first",
     "clipboard-unreadable": "could not read the image from the clipboard",
     "serve-unreachable": "cannot reach magent serve",
     "upload-rejected": "magent serve refused it",
     "inject-failed": "saved, but psmux would not paste it",
     "inject-pending": "image saved - psmux is slow, paste still pending",
+    "paths-failed": "file paths not pasted - psmux did not deliver them",
+    "path-unpasteable": "a copied path has a control character - not pasted",
+    "folder-refused": "folders not supported - copy files",
+    "file-missing": "a copied file no longer exists",
+    "file-unreadable": "could not read a copied file - is it open elsewhere?",
+    "too-large": f"too large - {upload_limit_text(MAX_UPLOAD_BYTES)} limit",
     "error": "unexpected error - see hotkey.log",
 }
+
+# The two upload reasons that name WHAT was sent. For a clipboard image they
+# read exactly as OUTCOME_REASONS["ok"] / ["inject-pending"] (the phone page's
+# pending wording is pinned to the latter); a files press says "file" or
+# "3 files" instead.
+_SENT_REASON = "{} sent"
+_PENDING_REASON = "{} saved - psmux is slow, paste still pending"
 
 PHASE_CAPTURING = "capturing..."
 PHASE_UPLOADING = "uploading..."
@@ -140,6 +176,11 @@ PHASE_FLASH_MS = 20000
 # no bound of its own, so a 74 s psmux stall hit this timeout at 20 s and the
 # bar said "upload failed - is `magent serve` running?" about an image that was
 # already on disk and that psmux went on to paste a minute later.
+#
+# It bounds each socket operation, never the whole request: the body is
+# streamed a block at a time (`_StreamedBody`), so a 100 MB selection over a
+# slow link takes as long as it takes, and only a link that stops moving for
+# this long gives up.
 UPLOAD_HTTP_TIMEOUT_S = 20.0
 
 _flash_queue: queue.Queue[tuple[str, str, str, int | None, str]] = queue.Queue(
@@ -239,7 +280,7 @@ def report(server_url: str, project: str, outcome: str, detail: str = "") -> Non
     """
     log = get_logger("hotkey")
     reason = detail or OUTCOME_REASONS.get(outcome, outcome)
-    if outcome == "ok":
+    if outcome in ("ok", "ok-paths"):
         log.info("%s outcome=%s project=%s", ALTV_LOG_PREFIX, outcome, project)
     else:
         log.warning(
@@ -292,37 +333,191 @@ def upload_image(
         if image_data.startswith(b"\x89PNG\r\n\x1a\n")
         else ("bmp", "image/bmp")
     )
-    boundary = "----MagentUpload"
-    delim = f"--{boundary}"
-    body = (
-        (
-            f"{delim}\r\n"
-            f'Content-Disposition: form-data; name="project"\r\n'
-            f"\r\n"
-            f"{project}\r\n"
-            f"{delim}\r\n"
-            f'Content-Disposition: form-data; name="inject"\r\n'
-            f"\r\n"
-            f"1\r\n"
-            f"{delim}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="clipboard.{ext}"\r\n'
-            f"Content-Type: {mime}\r\n"
-            f"\r\n"
-        ).encode()
-        + image_data
-        + f"\r\n{delim}--\r\n".encode()
+    return _post_upload(
+        server_url, project, [(f"clipboard.{ext}", mime, image_data)], "image"
     )
 
+
+def upload_files(
+    server_url: str, project: str, files: list[tuple[str, bytes | Path]]
+) -> tuple[str, str, str]:
+    """POST every copied file in ONE request; same return as ``upload_image``.
+
+    One request, not one per file, because the server pastes what it saved as
+    one line -- per-file requests would each paste, which is N paste attempts
+    for one press racing each other into the input line. A ``Path`` is streamed
+    off disk as it is sent, never loaded whole.
+    """
+    noun = "file" if len(files) == 1 else f"{len(files)} files"
+    parts = [(name, "application/octet-stream", data) for name, data in files]
+    return _post_upload(server_url, project, parts, noun)
+
+
+def _header_safe(filename: str) -> str:
+    """A filename that cannot break out of its multipart header: a ``"`` would
+    end the quoted value and a CR/LF would end the header itself."""
+    return "".join("_" if ch in '"\r\n' else ch for ch in filename)
+
+
+# One read's worth of the body. http.client asks for its own block size; this
+# only bounds a read that names none.
+_BODY_BLOCK_BYTES = 64 * 1024
+
+# A copied file that shrank under the send: the server gets a short body and
+# saves nothing, so the bar says what happened to the FILE.
+_CHANGED_MID_SEND = "a copied file changed while it was sent"
+
+
+class _SourceFileError(OSError):
+    """A copied file failed while its bytes were being sent.
+
+    Its own type because urllib wraps whatever the body raises mid-send in a
+    ``URLError``, and that must not read as "cannot reach magent serve": the
+    server was fine, the file was not. ``bar`` is the status-line reason.
+    """
+
+    def __init__(self, bar: str, detail: str) -> None:
+        super().__init__(detail)
+        self.bar = bar
+
+
+def _source_failure(exc: OSError) -> tuple[str, str, str]:
+    """``(outcome, reason, log_detail)`` for a copied file that could not be
+    opened or sized: gone since the refusal check, or there but held by
+    another app (a locked file on Windows is a ``PermissionError``)."""
+    get_logger("hotkey").warning("a copied file could not be read: %s", exc)
+    if isinstance(exc, FileNotFoundError):
+        return ("file-missing", OUTCOME_REASONS["file-missing"], str(exc))
+    return ("file-unreadable", OUTCOME_REASONS["file-unreadable"], str(exc))
+
+
+class _StreamedBody:
+    """A multipart body produced as it is sent, with its length known up front.
+
+    Handed to urllib as a file-like object, so http.client sends it a block at
+    a time and the socket timeout bounds each block, not the whole send: as a
+    single ``bytes`` it went out in one ``sendall`` whose timeout is a TOTAL
+    budget, and a large selection over a slow link failed as "cannot reach
+    magent serve" while still moving. It also means the listener -- a
+    long-lived process -- never holds the files, let alone a joined copy.
+
+    A segment is ``bytes`` or an open file with the size it declared; exactly
+    that many bytes are sent from it.
+    """
+
+    def __init__(self, segments: list[bytes | tuple[BinaryIO, int]]) -> None:
+        self._segments = segments
+        self._index = 0
+        self._offset = 0
+        self.length = sum(
+            len(seg) if isinstance(seg, bytes) else seg[1] for seg in segments
+        )
+
+    def _advance(self) -> None:
+        self._index += 1
+        self._offset = 0
+
+    def read(self, size: int = -1) -> bytes:
+        size = size if size > 0 else _BODY_BLOCK_BYTES
+        while self._index < len(self._segments):
+            seg = self._segments[self._index]
+            if isinstance(seg, bytes):
+                chunk = seg[self._offset : self._offset + size]
+                total = len(seg)
+            else:
+                handle, total = seg
+                want = min(size, total - self._offset)
+                try:
+                    chunk = handle.read(want) if want > 0 else b""
+                except OSError as exc:
+                    raise _SourceFileError(
+                        OUTCOME_REASONS["file-unreadable"], str(exc)
+                    ) from exc
+                if want > 0 and not chunk:
+                    raise _SourceFileError(
+                        _CHANGED_MID_SEND, "a copied file shrank while it was sent"
+                    )
+            self._offset += len(chunk)
+            if self._offset >= total:
+                self._advance()
+            if chunk:
+                return chunk
+        return b""
+
+
+def _post_upload(
+    server_url: str,
+    project: str,
+    parts: list[tuple[str, str, bytes | Path]],
+    noun: str,
+) -> tuple[str, str, str]:
+    """The one POST behind both presses. ``parts`` is ``(filename, mime,
+    data)`` per file, the data in memory or a file to stream; ``noun``
+    ("image", "file", "3 files") names them on the bar."""
+    with contextlib.ExitStack() as files:
+        # A random boundary per request, as every browser draws one: any file
+        # goes now, and a fixed one cut short every file that contained it.
+        boundary = "----MagentUpload" + secrets.token_hex(16)
+        delim = f"--{boundary}"
+        segments: list[bytes | tuple[BinaryIO, int]] = [
+            (
+                f"{delim}\r\n"
+                f'Content-Disposition: form-data; name="project"\r\n'
+                f"\r\n"
+                f"{project}\r\n"
+                f"{delim}\r\n"
+                f'Content-Disposition: form-data; name="inject"\r\n'
+                f"\r\n"
+                f"1\r\n"
+            ).encode()
+        ]
+        for filename, mime, data in parts:
+            segments.append(
+                (
+                    f"{delim}\r\n"
+                    f'Content-Disposition: form-data; name="file"; '
+                    f'filename="{_header_safe(filename)}"\r\n'
+                    f"Content-Type: {mime}\r\n"
+                    f"\r\n"
+                ).encode()
+            )
+            if isinstance(data, Path):
+                try:
+                    handle = files.enter_context(data.open("rb"))
+                    size = os.fstat(handle.fileno()).st_size
+                except OSError as exc:
+                    return _source_failure(exc)
+                segments.append((handle, size))
+            else:
+                segments.append(data)
+            segments.append(b"\r\n")
+        segments.append(f"{delim}--\r\n".encode())
+        body = _StreamedBody(segments)
+        return _send_upload(server_url, project, body, boundary, noun)
+
+
+def _send_upload(
+    server_url: str, project: str, body: _StreamedBody, boundary: str, noun: str
+) -> tuple[str, str, str]:
+    """Send one streamed multipart body; same return as ``upload_image``."""
     # ?project= tells the server this upload has a narrator of its own, so it
     # keeps its hands off the status line (see upload_server._handle_post).
     req = Request(
         f"{server_url}/upload?project={quote(project)}",
         data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            # Explicit: the server reads exactly this many bytes and speaks no
+            # chunked encoding, which urllib would otherwise pick for a stream.
+            "Content-Length": str(body.length),
+        },
         method="POST",
     )
     log = get_logger("hotkey")
     try:
+        # The wait for the reply is one operation, and it also covers the link
+        # draining whatever the kernel's send buffer still holds -- which only
+        # outlasts the budget when that buffer / link rate exceeds ~20 s.
         with urlopen(req, timeout=UPLOAD_HTTP_TIMEOUT_S) as resp:
             payload = json.loads(resp.read())
     except HTTPError as exc:
@@ -339,6 +534,10 @@ def upload_image(
         tail = f": {detail}" if detail else ""
         return ("upload-rejected", f"serve said HTTP {exc.code}{tail}", detail)
     except (URLError, OSError) as exc:
+        cause = getattr(exc, "reason", exc)
+        if isinstance(cause, _SourceFileError):
+            log.warning("upload abandoned, a copied file failed mid-send: %s", cause)
+            return ("file-unreadable", cause.bar, str(cause))
         reason = _transport_reason(exc)
         log.warning("upload transport error (%s): %s", type(exc).__name__, exc)
         return ("serve-unreachable", f"cannot reach magent serve ({reason})", str(exc))
@@ -360,13 +559,13 @@ def upload_image(
             # the screenshot pasted twice.
             return (
                 "inject-pending",
-                OUTCOME_REASONS["inject-pending"],
+                _PENDING_REASON.format(noun),
                 "inject_pending=true",
             )
         # The bytes are safe on disk; only the paste failed. Saying "upload
         # failed" here would send the user hunting for a lost screenshot.
         return ("inject-failed", OUTCOME_REASONS["inject-failed"], "injected=false")
-    return ("ok", OUTCOME_REASONS["ok"], "")
+    return ("ok", _SENT_REASON.format(noun), "")
 
 
 def native_enabled() -> bool:
@@ -475,7 +674,7 @@ def handle_press(
     try:
         image_data = capture()
         if not image_data:
-            # clipboard_has_image() said yes at the hook, so this is a real read
+            # clipboard_kind() said image at the hook, so this is a real read
             # failure (a format we cannot decode, or a race with another app
             # taking the clipboard), not an empty clipboard.
             report(server_url, project, "clipboard-unreadable")
@@ -494,6 +693,130 @@ def handle_press(
     except Exception:
         # This runs on a detached background thread with no console: anything
         # that escapes here would vanish, so everything is logged AND shown.
+        log.exception("%s outcome=error project=%s", ALTV_LOG_PREFIX, project)
+        flash_async(
+            server_url,
+            project,
+            FLASH_PREFIX + OUTCOME_REASONS["error"],
+            tint=FLASH_TINT_ERR,
+        )
+        return "error"
+    else:
+        return outcome
+
+
+# CF_HDROP said files were there and the read came back with none -- a real
+# read failure, worded for files rather than for an image.
+_FILES_UNREADABLE = "could not read the copied files from the clipboard"
+
+
+def paste_paths(project: str, paths: list[str]) -> tuple[str, str]:
+    """Paste the ORIGINAL paths of locally copied files into the pane, as ONE
+    line. Returns ``(outcome, reason)`` -- ``ok-paths`` or ``paths-failed``.
+
+    Exactly one attempt, like every other paste here: ``send_keys`` is bounded,
+    and a send that timed out may still have landed, so a retry is how a path
+    list gets pasted twice. ``literal`` because this is TEXT: a path must never
+    be read back as a psmux key name.
+    """
+    from magent import psmux  # leaf over `log`; in-body as in native_paste
+
+    if psmux.send_keys(project, paths_line(paths), target=project, literal=True):
+        noun = "file path" if len(paths) == 1 else f"{len(paths)} file paths"
+        return ("ok-paths", f"{noun} pasted")
+    return ("paths-failed", OUTCOME_REASONS["paths-failed"])
+
+
+def _refusal(paths: list[str]) -> str | None:
+    """Why a copied selection cannot be sent at all, or ``None`` if it can.
+
+    Checked for EVERY path before anything moves: a folder anywhere refuses
+    the whole press, so a mixed selection is never half-sent.
+    """
+    if any(Path(p).is_dir() for p in paths):
+        return "folder-refused"
+    if not all(Path(p).is_file() for p in paths):
+        return "file-missing"
+    return None
+
+
+def handle_file_press(
+    server_url: str,
+    project: str,
+    capture: Callable[[], list[str] | None],
+    *,
+    local: bool,
+) -> str:
+    """Run one Alt+V press whose clipboard holds copied FILES; return its outcome.
+
+    ``local`` is decided by the listener's manifest (no ssh host = the pane is
+    on this machine). A LOCAL pane shares this filesystem, so the original
+    absolute paths are pasted as they are: no upload, no copy into
+    ~/.magent/uploads, and no size cap -- nothing travels. A REMOTE pane gets
+    every file in one upload request, pre-checked against the server's limit
+    BEFORE a byte is read, and the server pastes their saved paths in one line.
+
+    Same phases and the same never-silent, never-raise contract as
+    ``handle_press``.
+    """
+    log = get_logger("hotkey")
+    flash_async(server_url, project, FLASH_PREFIX + PHASE_CAPTURING, PHASE_FLASH_MS)
+    try:
+        paths = capture()
+        if not paths:
+            report(server_url, project, "clipboard-unreadable", _FILES_UNREADABLE)
+            return "clipboard-unreadable"
+        refusal = _refusal(paths)
+        if refusal:
+            report(server_url, project, refusal)
+            return refusal
+        if local:
+            if any(unpasteable_path(p) for p in paths):
+                # The original path IS what would be typed, and a line break in
+                # it submits whatever came before. A remote press is safe: the
+                # server pastes names it sanitized itself.
+                report(server_url, project, "path-unpasteable")
+                return "path-unpasteable"
+            flash_async(
+                server_url, project, FLASH_PREFIX + PHASE_PASTING, PHASE_FLASH_MS
+            )
+            outcome, reason = paste_paths(project, paths)
+            report(server_url, project, outcome, reason)
+            return outcome
+        # Read at call time, so the refusal names the limit actually enforced.
+        limit = MAX_UPLOAD_BYTES
+        try:
+            total = sum(Path(p).stat().st_size for p in paths)
+        except OSError as exc:
+            # Gone or held since the refusal check: named, never "error".
+            outcome, reason, detail = _source_failure(exc)
+        else:
+            if total > limit:
+                report(
+                    server_url,
+                    project,
+                    "too-large",
+                    f"too large - {upload_limit_text(limit)} limit",
+                )
+                return "too-large"
+            flash_async(
+                server_url, project, FLASH_PREFIX + PHASE_UPLOADING, PHASE_FLASH_MS
+            )
+            files: list[tuple[str, bytes | Path]] = [
+                (Path(p).name, Path(p)) for p in paths
+            ]
+            outcome, reason, detail = upload_files(server_url, project, files)
+        report(server_url, project, outcome, reason)
+        if detail:
+            log.info(
+                "%s outcome=%s project=%s detail=%s",
+                ALTV_LOG_PREFIX,
+                outcome,
+                project,
+                detail,
+            )
+    except Exception:
+        # Detached thread, no console: logged AND shown, as in handle_press.
         log.exception("%s outcome=error project=%s", ALTV_LOG_PREFIX, project)
         flash_async(
             server_url,

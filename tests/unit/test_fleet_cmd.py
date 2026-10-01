@@ -8,6 +8,7 @@ end-to-end, not mocked away.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 
@@ -456,6 +457,488 @@ class TestSessionsJson:
 
         assert result.exit_code == 0
         assert json.loads(result.stdout) == []
+
+    def test_local_rows_carry_node_none(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(
+            tmp_path, pane=f"PS> claude\nFable 5.1 {MID} high", live=["caramel"]
+        )
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel", "upup"])
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        rows = json.loads(result.stdout)
+        # Live and dead alike: the key is on every row, never only some.
+        assert [(r["name"], r.get("node", "absent")) for r in rows] == [
+            ("caramel", None),
+            ("upup", None),
+        ]
+
+    def test_a_config_without_a_node_never_loads_the_typed_config(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The raw-loader fast path stays: no load_config, so no version
+        # warning and no typed-validation exit for a config with no node.
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+
+        def _refuse(*_a, **_k):
+            raise AssertionError("load_config called")
+
+        monkeypatch.setattr("magent.cli.config_io.load_config", _refuse)
+        cfg = tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "caramel"), "title": "caramel"},
+                    {"path": str(tmp_path / "sky"), "title": "sky", "node": "cloud"},
+                ]
+            }
+        )
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        assert result.exit_code == 0
+        assert all(r["node"] is None for r in json.loads(result.stdout))
+
+    def _node_config(self, tmp_config, tmp_path, *extra):
+        return tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "caramel"), "title": "caramel"},
+                    {"path": str(tmp_path / "api"), "title": "api", "node": "second"},
+                    *extra,
+                ],
+                "settings": {
+                    "nodes": {"second": {"host": "box-second", "user": "demo"}}
+                },
+            }
+        )
+
+    def _node_state(self, monkeypatch, tmp_path, *, ts, cwd="/home/demo/magent/api"):
+        from magent import nodes
+        from magent.nodes import NodeMapEntry
+
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": ts, "sessions": ["api"]}
+        )
+        nodes.update_node_map(
+            "api",
+            NodeMapEntry(
+                nick="second",
+                sid="api",
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="~/magent/api",
+                target="demo@box-second",
+                cwd=cwd,
+            ),
+        )
+
+    def test_a_node_row_names_its_node_and_where_it_runs(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        rows = json.loads(result.stdout)
+        assert [r["name"] for r in rows] == ["caramel", "api"]
+        assert rows[1] == {
+            "name": "api",
+            "cwd": "/home/demo/magent/api",
+            "live": True,
+            "state": "live",
+            "model": None,
+            "effort": None,
+            "node": "second",
+        }
+
+    def test_a_live_node_row_reads_its_model_off_the_nodes_pane(
+        self, runner, tmp_config, tmp_path, monkeypatch, fake_ssh
+    ):
+        # Field report: model/effort null for every node row. The pane is
+        # read ON the node, through remote_mux's one ssh path.
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        fake_ssh.set_reply(
+            "capture-pane", stdout=f"{CARET} \n  Haiku 4.5 {MID} medium\n"
+        )
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        row = json.loads(result.stdout)[1]
+        assert (row["state"], row["model"], row["effort"]) == (
+            "live",
+            "Haiku 4.5",
+            "medium",
+        )
+        (call,) = fake_ssh.calls()
+        assert "demo@box-second" in call.argv
+        assert call.argv[-1] == "bash -c 'tmux -L magent capture-pane -p -t =api:'"
+
+    def test_an_unreachable_node_leaves_the_model_null(
+        self, runner, tmp_config, tmp_path, monkeypatch, fake_ssh
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        fake_ssh.set_reply("capture-pane", stderr="ssh: connect refused", rc=255)
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        assert result.exit_code == 0
+        row = json.loads(result.stdout)[1]
+        assert (row["state"], row["model"], row["effort"]) == ("live", None, None)
+
+    def test_a_stale_node_is_not_dialled(
+        self, runner, tmp_config, tmp_path, monkeypatch, fake_ssh
+    ):
+        # Stale is a node this PC has not heard from: a capture there is a
+        # 10s wait for a likely-null answer.
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=0.0)
+
+        runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        assert fake_ssh.calls() == []
+
+    def test_a_node_row_is_named_by_the_session_it_was_started_under(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # A local row's name is its session id; a node row's is the map's
+        # recorded sid, not the project title it may since have drifted from.
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        from magent import nodes
+
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        entry = nodes.read_node_map()["api"]
+        nodes.update_node_map("api", dataclasses.replace(entry, sid="api-old"))
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": time.time(), "sessions": ["api-old"]}
+        )
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        row = json.loads(result.stdout)[1]
+        assert (row["name"], row["state"]) == ("api-old", "live")
+        # The map is keyed by PROJECT, so the folder survives the sid drift.
+        assert row["cwd"] == "/home/demo/magent/api"
+
+    def test_a_node_config_that_fails_validation_answers_the_json_envelope(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The one path where sessions --json is not an array: the typed load a
+        # node config needs. stdout must still be ONE JSON document (NF-S3-005).
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        cfg = tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "api"), "title": "api", "node": "nope"}
+                ],
+                "settings": {
+                    "nodes": {"second": {"host": "box-second", "user": "demo"}}
+                },
+            }
+        )
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        assert result.exit_code == 1
+        # Empty stdout is the failure this pins: the error went to stderr.
+        assert result.stdout.strip().startswith("{")
+        body = json.loads(result.stdout)
+        assert isinstance(body, dict)
+        assert body["ok"] is False
+        assert isinstance(body["error"], str)
+        assert body["error"]
+        assert set(body) == {"ok", "error"}
+
+    def test_a_missing_config_is_an_empty_array(self, runner, tmp_path, monkeypatch):
+        fake = make_fake_psmux(tmp_path)
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", str(tmp_path / "missing.json"), "sessions", "--json"],
+        )
+
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == []
+
+    def test_a_fresh_pull_without_the_session_reads_dead(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        from magent import nodes
+
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": time.time(), "sessions": []}
+        )
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        row = json.loads(result.stdout)[1]
+        assert (row["live"], row["state"]) == (False, "dead")
+
+    def test_a_stale_node_row_is_live_none_never_false(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=0.0)
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        row = json.loads(result.stdout)[1]
+        assert (row["live"], row["state"]) == (None, "stale")
+
+    def test_a_node_row_without_an_absolute_folder_reports_the_remote_root(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time(), cwd="")
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        assert json.loads(result.stdout)[1]["cwd"] == "~/magent/api"
+
+    def test_an_unplaced_auto_project_is_a_dead_row_with_no_node(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        auto = {"path": str(tmp_path / "web"), "title": "web", "node": "auto"}
+
+        result = runner.invoke(
+            cli.main,
+            [
+                "--config",
+                self._node_config(tmp_config, tmp_path, auto),
+                "sessions",
+                "--json",
+            ],
+        )
+
+        assert json.loads(result.stdout)[2] == {
+            "name": "web",
+            "cwd": "",
+            "live": False,
+            "state": "dead",
+            "model": None,
+            "effort": None,
+            "node": None,
+        }
+
+    @pytest.mark.parametrize("damage", ["torn", "busy"])
+    def test_an_unreadable_node_map_reads_stale_and_never_raises(
+        self, runner, tmp_config, tmp_path, monkeypatch, damage
+    ):
+        # Both map reads meet the damage: session_rows' strict one (every row
+        # stale, the node known only where the config pins it) and the
+        # cwd-only tolerant one (no folder). Neither may fail the listing.
+        from magent import nodes
+
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        entry = nodes.read_node_map()["api"]
+        nodes.update_node_map("web", dataclasses.replace(entry, sid="web"))
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"),
+            {"ts": time.time(), "sessions": ["api", "web"]},
+        )
+        auto = {"path": str(tmp_path / "web"), "title": "web", "node": "auto"}
+        cfg = self._node_config(tmp_config, tmp_path, auto)
+        if damage == "torn":
+            text = nodes.NODE_MAP_PATH.read_text(encoding="utf-8")
+            nodes.NODE_MAP_PATH.write_text(text[: len(text) // 2], encoding="utf-8")
+        else:
+            monkeypatch.setattr(nodes, "NODE_MAP_PATH", _BusyMap())
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        assert result.exit_code == 0
+        stale = {"cwd": "", "live": None, "state": "stale"}
+        stale |= {"model": None, "effort": None}
+        assert json.loads(result.stdout)[1:] == [
+            {"name": "api", **stale, "node": "second"},
+            {"name": "web", **stale, "node": None},
+        ]
+
+
+class TestTheFleetCommandsKnowNodeSessions:
+    """Field report: ``magent peek <node project>`` said "no live session
+    matches". A node session is named like a local one: ``peek`` reads its
+    pane on the node (one bounded ssh capture), and ``send``/``model`` say
+    they do not reach node sessions yet instead of claiming it is not there."""
+
+    _node_config = TestSessionsJson._node_config
+    _node_state = TestSessionsJson._node_state
+
+    def _invoke(self, runner, tmp_config, tmp_path, *args):
+        return runner.invoke(
+            cli.main, ["--config", self._node_config(tmp_config, tmp_path), *args]
+        )
+
+    def test_peek_prints_the_node_panes_tail(
+        self, runner, tmp_config, tmp_path, monkeypatch, fake_ssh
+    ):
+        fake = make_fake_psmux(tmp_path, live=["caramel"])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        fake_ssh.set_reply("capture-pane", stdout="one\ntwo\nthree\n")
+
+        result = self._invoke(runner, tmp_config, tmp_path, "peek", "API", "-n", "2")
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == "two\nthree\n"
+        (call,) = fake_ssh.calls()
+        assert call.argv[-1] == "bash -c 'tmux -L magent capture-pane -p -t =api:'"
+
+    def test_peek_needs_no_local_psmux_for_a_node_session(
+        self, runner, tmp_config, tmp_path, monkeypatch, fake_ssh
+    ):
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        fake_ssh.set_reply("capture-pane", stdout="pane\n")
+
+        result = self._invoke(runner, tmp_config, tmp_path, "peek", "api")
+
+        assert result.exit_code == 0
+        assert result.stdout == "pane\n"
+
+    def test_without_psmux_a_name_no_node_carries_is_still_a_psmux_error(
+        self, runner, tmp_config, tmp_path, monkeypatch, fake_ssh
+    ):
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+
+        result = self._invoke(runner, tmp_config, tmp_path, "peek", "caramel")
+
+        assert result.exit_code == 3
+        assert "psmux not found" in result.stderr
+        assert fake_ssh.calls() == []
+
+    def test_peek_on_an_unreachable_node_is_exit_3_not_a_crash(
+        self, runner, tmp_config, tmp_path, monkeypatch, fake_ssh
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        fake_ssh.set_reply("capture-pane", stderr="ssh: connect refused", rc=255)
+
+        result = self._invoke(runner, tmp_config, tmp_path, "peek", "api")
+
+        assert result.exit_code == 3
+        assert "could not read api's pane on node second" in result.stderr
+
+    def test_a_stale_node_session_is_still_worth_a_peek(
+        self, runner, tmp_config, tmp_path, monkeypatch, fake_ssh
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=0.0)
+        fake_ssh.set_reply("capture-pane", stdout="still here\n")
+
+        result = self._invoke(runner, tmp_config, tmp_path, "peek", "api")
+
+        assert (result.exit_code, result.stdout) == (0, "still here\n")
+
+    def test_a_node_session_the_last_pull_saw_gone_is_not_found(
+        self, runner, tmp_config, tmp_path, monkeypatch, fake_ssh
+    ):
+        from magent import nodes
+
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": time.time(), "sessions": []}
+        )
+
+        result = self._invoke(runner, tmp_config, tmp_path, "peek", "api")
+
+        assert result.exit_code == 2
+        assert "no live session matches 'api'" in result.stderr
+        assert fake_ssh.calls() == []
+
+    def test_no_match_lists_node_sessions_with_the_local_ones(
+        self, runner, tmp_config, tmp_path, monkeypatch, fake_ssh
+    ):
+        fake = make_fake_psmux(tmp_path, live=["caramel"])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+
+        result = self._invoke(runner, tmp_config, tmp_path, "peek", "zzz")
+
+        assert result.exit_code == 2
+        assert "live: caramel, api" in result.stderr
+
+    @pytest.mark.parametrize(
+        ("command", "args"), [("send", ["hello"]), ("model", ["opus"])]
+    )
+    def test_send_and_model_refuse_a_node_session_by_name(
+        self, runner, tmp_config, tmp_path, monkeypatch, fake_ssh, command, args
+    ):
+        fake = make_fake_psmux(tmp_path, live=["caramel"])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+
+        result = self._invoke(runner, tmp_config, tmp_path, command, "api", *args)
+
+        assert result.exit_code == 2
+        assert "api runs on node second" in result.stderr
+        assert "not supported for node sessions yet" in result.stderr
+        assert "no live session matches" not in result.stderr
+        # Nothing was typed anywhere: not on the node, not into a local pane.
+        assert fake_ssh.calls() == []
+        assert not [c for c in fake.calls() if "send-keys" in c]
+
+
+class _BusyMap:
+    """A stand-in NODE_MAP_PATH that stays busy: every read is the Windows
+    PermissionError of a reader racing an os.replace, past every retry."""
+
+    def read_text(self, encoding: str) -> str:
+        raise PermissionError(13, "busy")
 
 
 if __name__ == "__main__":  # pragma: no cover

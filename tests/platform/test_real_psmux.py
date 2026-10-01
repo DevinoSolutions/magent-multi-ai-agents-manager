@@ -12,7 +12,8 @@ What this proves (against a live psmux server, zero stubs):
   its 3s subprocess-timeout guard) and ``has_session`` is false -- the exact
   degradation the guard promises callers that fan this across sessions;
 * ``psmux.idle_sessions`` reads a real pane as idle only while nothing magent
-  typed into it is running -- see the section above its test.
+  typed into it is running -- see the section above its test -- and never
+  while an orphan outside the pane's tree shares the pane's console.
 
 Skips cleanly when psmux is not installed or the platform has no psmux
 support (macOS/Linux, and CI runners without the binary).
@@ -327,6 +328,130 @@ def test_real_pane_reads_idle_only_while_nothing_it_launched_runs(tmp_path):
     assert _wait_until(lambda: not psmux.has_session(name), timeout=5), (
         f"cleanup left psmux session {name!r} alive"
     )
+
+
+# --- idle_sessions' console stage against a REAL orphan ------------------------
+#
+# The tree walk above cannot see a process that left the pane's process tree
+# but still shares the pane's CONSOLE (`start /b` from a batch that then
+# exits). Anything typed into the pane can land in such an orphan, so
+# idle_sessions' last stage reads the console's client list. This proves the
+# reading against a real pane: at rest the console holds only the pane's
+# subtree; with a detached orphan on it the pane is NOT idle (either way the
+# foreground reads); with the orphan gone it is idle again. Same posture as the
+# test above: a private -L socket, tmp_path only, and the only process killed
+# is the orphan, found by its unique image name.
+
+
+def test_real_pane_with_an_orphan_on_its_console_is_not_idle(tmp_path):
+    from magent import log
+    from magent.platform.windows import _ps_quote
+    from magent.procs import console_clients, process_tree, snapshot_processes
+
+    binary = psmux.find_psmux()
+    assert binary is not None
+    ping = shutil.which("ping")
+    assert ping is not None
+
+    unique = uuid.uuid4().hex[:12]
+    name = f"mdrl-con-{unique}"
+    workdir = tmp_path / f"cwd-{unique}"
+    workdir.mkdir()
+    orphan = tmp_path / f"orphan{unique}.exe"
+    shutil.copyfile(ping, orphan)
+    spawn = tmp_path / "spawn.cmd"
+    spawn.write_text(
+        f'@start "" /b "%~dp0orphan{unique}.exe" -n 40 127.0.0.1 >nul\n',
+        encoding="utf-8",
+    )
+
+    def run(*args: str, env: dict[str, str] | None = None):
+        return subprocess.run(
+            [binary, "-L", name, *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+
+    def pane_pid() -> int | None:
+        return psmux.pane_pids([name], psmux=binary).get(name)
+
+    def pane_images() -> list[str]:
+        # Image STEMS (lower-case, no ".exe") via the public image_stem, so the
+        # shell reads "pwsh"/"powershell", not "pwsh.exe" -- the spelling the
+        # rest of the codebase compares image names in.
+        pid = pane_pid()
+        tree = process_tree(pid, snapshot_processes() or []) if pid else None
+        return [psmux.image_stem(image) for image, _pid, _ppid in tree or []]
+
+    def idle(forced: bool = False) -> bool:
+        fg = {name: "pwsh"} if forced else None
+        return name in psmux.idle_sessions([name], psmux=binary, foreground=fg)
+
+    def orphan_pid() -> int | None:
+        for image, pid, _ppid in snapshot_processes() or []:
+            if image.lower() == orphan.name.lower():
+                return pid
+        return None
+
+    def kill_orphan() -> None:
+        op = orphan_pid()
+        if op:
+            subprocess.run(
+                ["taskkill", "/PID", str(op), "/F"], capture_output=True, check=False
+            )
+
+    try:
+        new = run(
+            "new-session", "-d", "-s", name, "-c", str(workdir), env=psmux.child_env()
+        )
+        assert new.returncode == 0, f"new-session failed: {new.stderr!r}"
+        assert _wait_until(lambda: psmux.has_session(name), timeout=10)
+
+        # At rest the console holds only the pane's own subtree.
+        assert _wait_until(idle, timeout=30), "a resting pane never read idle"
+        pid = pane_pid()
+        assert pid is not None
+        clients = console_clients([pid])[pid]
+        assert clients is not None and pid in clients
+
+        # Spawn a detached orphan that shares the pane's CONSOLE but sits
+        # OUTSIDE its process tree (start /b through a batch).
+        typed = run("send-keys", "-t", name, f"& {_ps_quote(str(spawn))}", "Enter")
+        assert typed.returncode == 0, f"send-keys failed: {typed.stderr!r}"
+        assert _wait_until(lambda: orphan_pid() is not None, timeout=30), (
+            "the orphan never started"
+        )
+        assert _wait_until(
+            lambda: (
+                pane_images() in (["pwsh"], ["powershell"]) and orphan_pid() is not None
+            ),
+            timeout=15,
+        ), "the batch never returned the pane to its shell"
+
+        # The pane's TREE is just its shell, but the console has the orphan:
+        # not idle either way, and the orphan pid is among the clients.
+        assert not idle(), "a pane whose console holds an orphan read idle"
+        assert not idle(forced=True), "the forced read ignored the console orphan"
+        op = orphan_pid()
+        assert op is not None and op in (console_clients([pid])[pid] or frozenset())
+        # ...and it was the CONSOLE stage that said no, naming the orphan (its
+        # warning lands in conftest's tmp_path LOG_DIR, never the real one).
+        veto_log = log.LOG_DIR / "launch.log"
+        assert str(op) in veto_log.read_text(encoding="utf-8")
+
+        # Kill the orphan and the pane returns to idle.
+        kill_orphan()
+        assert _wait_until(idle, timeout=30), (
+            "the pane never read idle after the orphan died"
+        )
+    finally:
+        kill_orphan()
+        psmux.kill_server(name, psmux=binary)
+
+    assert _wait_until(lambda: not psmux.has_session(name), timeout=5)
 
 
 # --- full chain: create -> attach in a REAL wt window -> teardown -------------

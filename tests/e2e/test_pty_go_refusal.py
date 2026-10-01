@@ -58,7 +58,10 @@ def _child_env(home: Path) -> dict[str, str]:
     # server, no priority sweep over the real fleet, no Session-0 hand-off.
     env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
     env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+    env["MAGENT_ATTENTION_SUPERVISOR"] = "0"
     env["MAGENT_PSMUX_BOOST"] = "0"
+    env["MAGENT_NODE_SYNC"] = "0"
+    env["MAGENT_IDLE_REAP"] = "0"
     env["MAGENT_SESSION0_POLICY"] = "allow"
     env["APPDATA"] = home_s
     env["LOCALAPPDATA"] = home_s

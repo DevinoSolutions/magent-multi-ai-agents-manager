@@ -238,6 +238,31 @@ class TestCodex:
         assert agent_state.all_states() == []
 
 
+class TestStateHookNeverWritesParked:
+    def test_the_event_table_never_maps_to_parked(self):
+        assert agent_state.PARKED not in state_hook._CLAUDE_EVENT_STATES.values()
+
+    def test_no_claude_event_produces_parked(self):
+        from magent.cli import hooks_cmd
+
+        # Every event install wires AND every event the table knows, so a new
+        # table entry is driven here without anyone editing this list.
+        events = sorted(set(hooks_cmd._EVENTS) | set(state_hook._CLAUDE_EVENT_STATES))
+        for event in events:
+            state_hook.handle_claude(_claude_event(event))
+            rec = agent_state.state_for("/projects/foo")
+            assert rec is None or rec["state"] != agent_state.PARKED, event
+
+    def test_codex_notify_never_produces_parked(self):
+        state_hook.handle_codex(
+            json.dumps(
+                {"type": "agent-turn-complete", "cwd": "/projects/foo", "turn-id": "t1"}
+            )
+        )
+        rec = agent_state.state_for("/projects/foo")
+        assert rec is not None and rec["state"] != "parked"
+
+
 class TestMain:
     def test_claude_source_reads_stdin(self, monkeypatch):
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_claude_event("Stop"))))
@@ -289,7 +314,10 @@ class TestModuleForm:
             "HOMEPATH": tail or os.sep,
             "MAGENT_HOTKEY_SUPERVISOR": "0",
             "MAGENT_UPLOAD_SUPERVISOR": "0",
+            "MAGENT_ATTENTION_SUPERVISOR": "0",
             "MAGENT_PSMUX_BOOST": "0",
+            "MAGENT_NODE_SYNC": "0",
+            "MAGENT_IDLE_REAP": "0",
             "MAGENT_SESSION0_POLICY": "allow",
         }
         cwd = str(tmp_path / "proj")

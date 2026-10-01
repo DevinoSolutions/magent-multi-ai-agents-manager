@@ -90,6 +90,12 @@ class TestCapturabilityContract:
         assert call["traces_sample_rate"] == 0
         assert call["send_default_pii"] is False
 
+        # sentry-sdk 2.x defaults this to True, and its scrubber redacts by key
+        # NAME only: a local called `stdin`/`input_bytes` holding a node
+        # payload would ship verbatim. The reproduction lives in
+        # test_remote_mux.py::TestASecretNeverReachesSentry.
+        assert call["include_local_variables"] is False
+
         assert len(registered) == 1, "init_sentry must register an atexit callback"
         registered[0]()  # invoke the registered callback directly
         assert fake_sdk.flush_calls == [2]

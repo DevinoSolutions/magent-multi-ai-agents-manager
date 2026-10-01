@@ -38,6 +38,8 @@ _MIDDOT = "\u00b7"
 # (a dialog -- see ``_DIALOG_RE``) and at the head of the INPUT line (see
 # ``input_line``). Spelled as an escape for the same reason as ``_MIDDOT``.
 _CARET = "\u276f"
+# U+2500, the box-drawing line Claude Code draws above and below the input box.
+_RULE_CHAR = "\u2500"
 
 EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max", "auto")
 
@@ -62,6 +64,11 @@ _DIALOG_RE = re.compile(
     r"do you want|\(y\)es|esc to cancel|press enter to|" + re.escape(_CARET) + r"\s*\d",
     re.IGNORECASE,
 )
+# A caret line that is a numbered MENU option ("caret 1. Yes"), and a plain
+# numbered option line ("2. No") -- used only to tell a menu apart from a draft
+# that happens to start with a digit.
+_MENU_OPTION_RE = re.compile(r"^\s*" + re.escape(_CARET) + r"\s*\d+[.)]\s")
+_NUMBERED_RE = re.compile(r"^\s*\d+[.)]\s")
 # The account is out of headroom and cannot proceed until a window resets.
 _LIMIT_RE = re.compile(
     r"usage limit|rate limit|limit reached|limit will reset|approaching (?:your )?usage",
@@ -213,6 +220,72 @@ def input_line(pane: str) -> str | None:
     for line in reversed((pane or "").rstrip().splitlines()):
         if line.strip().startswith(_CARET):
             return line
+    return None
+
+
+def _is_menu_option(lines: list[str], i: int) -> bool:
+    """True when ``lines[i]`` is a caret'd menu option: it matches the caret+
+    number shape AND its nearest non-blank neighbour above OR below is itself a
+    numbered option. A lone numbered caret line (a draft "1. fix") is NOT one."""
+    if not _MENU_OPTION_RE.match(lines[i]):
+        return False
+    for step in (-1, 1):
+        j = i + step
+        while 0 <= j < len(lines) and not lines[j].strip():
+            j += step
+        if 0 <= j < len(lines) and _NUMBERED_RE.match(lines[j]):
+            return True
+    return False
+
+
+def _is_rule(line: str) -> bool:
+    body = line.strip()
+    return bool(body) and not body.strip(_RULE_CHAR)
+
+
+def input_draft(pane: str) -> str | None:
+    """What the user has typed into the pane's input box, stripped -- ``""``
+    for an empty box, or None when there is no input box to read (a numbered
+    menu, a bare shell, an empty capture).
+
+    The box holds the last caret line that is NOT a menu option. It is read
+    from its top rule, the nearest rule above that line, whose next line is the
+    caret line of the prompt, to the next rule below; every non-blank line in
+    between is draft text. The rules that count are the ones as wide as the
+    pane's LAST rule, the box's bottom edge: Claude Code draws the box the full
+    width of the pane, so a narrower rule inside it is draft text the user
+    typed or pasted, not an edge. A typed rule exactly that wide cannot be told
+    from an edge, so the closing rule must BE the pane's last rule: one with
+    another rule under it may be draft text, and the lines below it unread. So
+    a multi-line draft under an empty caret line still reads as a draft, and so
+    does one whose last line is a lone caret. A numbered menu's caret lines are
+    all menu options, and a box with no top rule, no caret line under it, or no
+    closing rule, or one that closes before the last rule, cannot be read
+    whole: all read None -- which R9 treats as pane-unreadable, the safe
+    answer."""
+    lines = (pane or "").rstrip().splitlines()
+    rules = [j for j, line in enumerate(lines) if _is_rule(line)]
+    width = len(lines[rules[-1]].strip()) if rules else 0
+
+    def edge(line: str) -> bool:
+        return _is_rule(line) and len(line.strip()) == width
+
+    for i in range(len(lines) - 1, -1, -1):
+        if not lines[i].strip().startswith(_CARET):
+            continue
+        if _is_menu_option(lines, i):
+            continue
+        top = next((j for j in range(i - 1, -1, -1) if edge(lines[j])), None)
+        if top is None or not lines[top + 1].strip().startswith(_CARET):
+            return None
+        parts = [lines[top + 1].strip()[len(_CARET) :].strip()]
+        for k in range(top + 2, len(lines)):
+            if edge(lines[k]):
+                if k != rules[-1]:
+                    return None
+                return "\n".join(part for part in parts if part)
+            parts.append(lines[k].strip())
+        return None
     return None
 
 

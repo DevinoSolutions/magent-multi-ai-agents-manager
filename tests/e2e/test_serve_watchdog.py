@@ -21,6 +21,10 @@ Two facts are pinned, in the order they matter:
      other half: dying once must not be permanent), no sooner than the
      respawn cooldown allows.
 
+The supervision is mutual, so the same file pins the reverse direction
+(TestServeSupervisesTheAttentionDaemon): a REAL serve brings back an attention
+daemon a restart took down, and leaves a cleanly stopped one stopped.
+
 Isolation copies the sibling daemon tiers verbatim. HOME (and on Windows
 USERPROFILE/HOMEDRIVE/HOMEPATH) is redirected into a uuid-namespaced tmp dir,
 so every ~/.magent artifact -- pid files, heartbeats, logs -- lands there and
@@ -236,11 +240,14 @@ class _World:
         # default, so this file still says what it is exercising if the
         # default ever changes.
         env["MAGENT_UPLOAD_SUPERVISOR"] = "1"
+        env["MAGENT_ATTENTION_SUPERVISOR"] = "0"
         env["MAGENT_UPLOAD_RESPAWN_COOLDOWN_S"] = str(_COOLDOWN_S)
         # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
         # no HOME redirect contains: a test-spawned serve/daemon must never
         # re-prioritise the developer's real psmux fleet.
         env["MAGENT_PSMUX_BOOST"] = "0"
+        env["MAGENT_NODE_SYNC"] = "0"
+        env["MAGENT_IDLE_REAP"] = "0"
         # ...and the Session-0 hand-off must never fire from a test: a runner
         # (or an ssh-driven leg) is legitimately non-interactive, and the
         # default policy would create a REAL scheduled task on somebody's
@@ -260,7 +267,7 @@ class _World:
     def diagnostics(self) -> str:
         """Everything the redirected home knows, for a failure message."""
         lines = [f"port={self.port} home={self.home}"]
-        for name in ("att-d.out", "att-d.err"):
+        for name in ("att-d.out", "att-d.err", "serve.out", "serve.err"):
             path = self.workdir / name
             if path.is_file():
                 lines.append(f"--- {name} ---\n{path.read_text(errors='replace')}")
@@ -420,3 +427,107 @@ class TestAttentionDaemonSupervisesTheUploadServer:
             _kill_pid(daemon_pid or _read_pid(w.daemon_pidfile))
             _kill_pid(_read_pid(w.server_pidfile))
             kill_everything_carrying(str(w.cfg))
+
+
+def _start_serve(w: _World, budget: _Budget) -> subprocess.Popen[bytes]:
+    """Start a REAL foreground-style ``magent serve`` on the leased port and
+    wait until it answers /health. Loopback only: nothing here needs Tailscale.
+    stdout/stderr -> files, for the same reason as ``_start_attention``."""
+    with (
+        (w.workdir / "serve.out").open("w", encoding="utf-8") as out,
+        (w.workdir / "serve.err").open("w", encoding="utf-8") as err,
+    ):
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "magent",
+                "--config",
+                str(w.cfg),
+                "serve",
+                "-p",
+                str(w.port),
+                "--host",
+                "127.0.0.1",
+            ],
+            stdout=out,
+            stderr=err,
+            env=w.env,
+        )
+    up = _wait_until(lambda: _health_ok(w.port), budget.allow(_DAEMON_UP_S))
+    assert up, f"magent serve never answered /health:\n{w.diagnostics()}"
+    return proc
+
+
+class TestServeSupervisesTheAttentionDaemon:
+    """The other half of the mutual supervision, and the incident it closes:
+    after a restart the bring-up brought serve back and nothing brought the
+    attention daemon back.
+
+    REAL `magent serve`  ->  its REAL attention watchdog thread  ->  a REAL
+    detached `magent attention -d` launcher  ->  a REAL daemon that registers
+    its pid in the redirected home.
+
+    "The machine restarted under a running daemon" is set up the only way a
+    test can: the heartbeat that daemon left behind, dated long before this
+    machine's boot. Serve's own upload supervisor is off in the daemon it starts
+    (the env is inherited), so nothing here can grow a second serve."""
+
+    def _world(self, tmp_path: Path) -> _World:
+        w = _World(tmp_path)
+        w.env["MAGENT_ATTENTION_SUPERVISOR"] = "1"
+        w.env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+        return w
+
+    def _teardown(self, w: _World, serve: subprocess.Popen[bytes] | None) -> None:
+        # Only pids this test created: the daemon serve started, the server,
+        # then every process carrying this test's uuid-named config path.
+        _kill_pid(_read_pid(w.daemon_pidfile))
+        _kill_pid(_read_pid(w.server_pidfile))
+        if serve is not None:
+            _kill_pid(serve.pid)
+        kill_everything_carrying(str(w.cfg))
+
+    def test_a_daemon_a_restart_took_down_comes_back(self, tmp_path):
+        budget = _Budget(_BUDGET_S)
+        w = self._world(tmp_path)
+        w.md.mkdir(parents=True, exist_ok=True)
+        heartbeat = w.md / "attention.heartbeat"
+        heartbeat.write_text("0", encoding="utf-8")
+        os.utime(heartbeat, (1_000_000.0, 1_000_000.0))  # 1970: before any boot
+        serve: subprocess.Popen[bytes] | None = None
+        try:
+            serve = _start_serve(w, budget)
+
+            def _daemon() -> int | None:
+                pid = _read_pid(w.daemon_pidfile)
+                return pid if pid and pid_alive(pid) else None
+
+            pid = _wait_until(_daemon, budget.allow(_REVIVE_S))
+            assert pid, f"serve did not bring the daemon back:\n{w.diagnostics()}"
+            log = (w.md / "logs" / "attention.log").read_text(errors="replace")
+            assert "not running since the last restart" in log, w.diagnostics()
+            # Exactly one revive: the launcher's lock + live-pid check and the
+            # cooldown are what keep it to one daemon.
+            assert log.count("starting magent attention -d") == 1, w.diagnostics()
+        finally:
+            self._teardown(w, serve)
+
+    def test_a_daemon_that_was_stopped_stays_stopped(self, tmp_path):
+        """No heartbeat is what every clean stop leaves (`--stop`, `down
+        --all`, Ctrl+C): serve must not overrule it."""
+        budget = _Budget(_BUDGET_S)
+        w = self._world(tmp_path)
+        serve: subprocess.Popen[bytes] | None = None
+        try:
+            serve = _start_serve(w, budget)
+            # The watchdog's first look is immediate; give it several seconds
+            # past the bind to do the thing it must not do.
+            time.sleep(budget.allow(5.0))
+
+            # Not vacuous: the watchdog was running and looking.
+            log = (w.md / "logs" / "attention.log").read_text(errors="replace")
+            assert "attention supervisor: watching" in log, w.diagnostics()
+            assert not w.daemon_pidfile.exists(), w.diagnostics()
+        finally:
+            self._teardown(w, serve)

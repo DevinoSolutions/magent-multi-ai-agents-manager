@@ -44,6 +44,17 @@ box against real psmux 3.3.8:
 Every line received on stdin is appended to ``--log`` as one JSON record, so
 the test's ground truth for "the text arrived VERBATIM" is the bytes this
 program read, not a screen scrape.
+
+``--reap-setup`` is the idle-reaper tier's mode (``test_reap_real.py``). It
+names a JSON file, relative to the pane's working directory, because every
+project of that tier runs the SAME configured command and only the directory
+tells them apart. In that mode the stand-in also leaves what a real Claude Code
+leaves for magent to read: its argv as the log's first record, a session file
+under ``<config dir>/sessions/<pid>.json`` carrying its real creation FILETIME,
+and a transcript line. It enters the alternate screen with mouse tracking and
+bracketed paste on, the modes a hard-killed agent leaves behind, and draws its
+input box with U+2500 rules, the only rules ``fleet.input_draft`` reads as a
+box edge.
 """
 
 from __future__ import annotations
@@ -74,6 +85,14 @@ HINTS = (
 WIDTH = 78
 RULE = "-" * 60
 TRANSCRIPT_LINES = 5
+# The reaper tier's rules must be the real character: an ASCII rule is draft
+# text to ``fleet.input_draft``, which would read every pane as unreadable. 36
+# cells, so even a multiplexer that counted U+2500 as double-width could not
+# wrap it in an 80-column pane.
+BOX_RULE = "\u2500" * 36
+# Alternate screen, mouse tracking (1000 + SGR 1006) and bracketed paste: the
+# modes magent's pane reset has to turn back off after a hard kill.
+AGENT_MODES_ON = "\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?2004h"
 
 # Model CLI alias -> the display name its footer shows, mirroring the real
 # thing closely enough for ``fleet.verify_switch`` to check a switch landed.
@@ -133,13 +152,22 @@ class Pane:
     """The stand-in's whole state: what is on screen and what stdin has said."""
 
     def __init__(
-        self, log: Path, model: str, effort: str, name: str, compact_seconds: float
+        self,
+        log: Path,
+        model: str,
+        effort: str,
+        name: str,
+        compact_seconds: float,
+        rule: str = RULE,
+        menu: bool = False,
     ) -> None:
         self.log = log
         self.model = model
         self.effort = effort
         self.name = name
         self.compact_seconds = compact_seconds
+        self.rule = rule
+        self.menu = menu  # a numbered permission menu in place of the input line
         self.transcript: list[str] = ["  stand-in agent ready."]
         self.busy: str | None = None
         self.hold_until = 0.0
@@ -162,10 +190,17 @@ class Pane:
         lines = [_clip(line) for line in self.transcript[-TRANSCRIPT_LINES:]]
         if self.busy:
             lines.append(_clip("  " + self.busy))
-        lines.append(RULE)
-        caret_row = len(lines)
-        lines.append(CARET + " ")
-        lines.append(RULE)
+        lines.append(self.rule)
+        if self.menu:
+            # What Claude Code draws while a turn waits on the user.
+            lines.append(" Do you want to proceed?")
+            caret_row = len(lines)
+            lines.append(CARET + " 1. Yes")
+            lines.append("  2. No")
+        else:
+            caret_row = len(lines)
+            lines.append(CARET + " ")
+        lines.append(self.rule)
         lines.append(
             _clip(f"  {self.model} {MIDDOT} {self.effort} {MIDDOT} {self.name}")
         )
@@ -302,22 +337,95 @@ def _seconds(raw: str, default: float) -> float:
         return default
 
 
+def _own_start_filetime() -> int:
+    """This process's creation FILETIME, read through GetProcessTimes on itself:
+    the value Claude Code writes as ``procStart`` and magent compares with the
+    live process before it believes a session file. 0 off Windows, where magent
+    has no creation time to compare it with."""
+    if os.name != "nt":
+        return 0
+    import ctypes
+    from ctypes import wintypes
+
+    times = [wintypes.FILETIME() for _ in range(4)]
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+        ctypes.POINTER(wintypes.FILETIME)
+    ] * 4
+    if not kernel32.GetProcessTimes(
+        kernel32.GetCurrentProcess(), *(ctypes.byref(t) for t in times)
+    ):
+        return 0
+    return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+
+
+def _enter_reap_mode(setup: dict, session_id: str, argv: list[str]) -> None:
+    """Leave what a live Claude Code leaves for the reaper to read, then turn on
+    the modes a hard kill strands in the pane. The session file goes last and
+    is replaced whole: it is the signal the test waits on."""
+    stamp = time.time()
+    with Path(setup["log"]).open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"argv": argv, "ts": stamp}) + "\n")
+    transcript = Path(setup["transcript"])
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    with transcript.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "stand-in", "sessionId": session_id}) + "\n")
+    sessions = Path(setup["sessions_dir"])
+    sessions.mkdir(parents=True, exist_ok=True)
+    record = {
+        "pid": os.getpid(),
+        "sessionId": session_id,
+        "cwd": os.getcwd(),
+        "procStart": str(_own_start_filetime()),
+        "kind": "interactive",
+        "status": "idle",
+        "statusUpdatedAt": int(stamp * 1000),
+    }
+    final = sessions / f"{os.getpid()}.json"
+    partial = final.with_name(final.name + ".tmp")
+    partial.write_text(json.dumps(record), encoding="utf-8")
+    os.replace(partial, final)
+    sys.stdout.buffer.write(AGENT_MODES_ON.encode("ascii"))
+    sys.stdout.buffer.flush()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="stand-in agent pane")
-    parser.add_argument("--log", required=True)
+    parser.add_argument("--log")
     parser.add_argument("--model", default="Fable 5.1")
     parser.add_argument("--effort", default="high")
     parser.add_argument("--name", default="standin")
     parser.add_argument("--compact-seconds", type=float, default=3.0)
+    parser.add_argument("--reap-setup")
+    # The two resume flags a claude command line carries. The reaper tier's
+    # configured command forwards them, and its argv record reads them back.
+    parser.add_argument("--continue", dest="resume_latest", action="store_true")
+    parser.add_argument("--resume")
     args = parser.parse_args(argv)
 
+    setup: dict = {}
+    if args.reap_setup:
+        setup = json.loads(Path(args.reap_setup).read_text(encoding="utf-8"))
+    log = args.log or setup.get("log")
+    if not log:
+        parser.error("--log is required unless --reap-setup names one")
+
     _own_the_input_line()
+    if setup:
+        _enter_reap_mode(
+            setup,
+            args.resume or setup["session_id"],
+            sys.argv[1:] if argv is None else argv,
+        )
     pane = Pane(
-        log=Path(args.log),
+        log=Path(log),
         model=args.model,
         effort=args.effort,
-        name=args.name,
+        name=setup.get("name", args.name),
         compact_seconds=args.compact_seconds,
+        rule=BOX_RULE if setup else RULE,
+        menu=bool(setup.get("menu")),
     )
     reader = threading.Thread(target=pane.read_forever, daemon=True)
     reader.start()

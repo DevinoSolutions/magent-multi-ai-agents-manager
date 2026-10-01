@@ -17,6 +17,7 @@ import pytest
 
 from magent import cli
 from magent.cli.mobile import _FALLBACK_UPLOAD_PORT, _configured_upload_port
+from magent.config import SCHEMA_VERSION
 from tests.conftest import FakePlatform
 
 
@@ -27,7 +28,7 @@ def _write_config(path, port=None, extra_settings=None):
     if extra_settings:
         settings.update(extra_settings)
     path.write_text(
-        json.dumps({"version": 3, "projects": [], "settings": settings}),
+        json.dumps({"version": SCHEMA_VERSION, "projects": [], "settings": settings}),
         encoding="utf-8",
     )
     return str(path)
@@ -117,7 +118,9 @@ class TestServeBlockingPathUsesConfiguredPort:
         result = runner.invoke(cli.main, ["--config", cfg, "serve"])
 
         assert result.exit_code == 0, result.output
-        assert served == [{"port": 8034, "config_path": cfg, "host": None}]
+        assert served == [
+            {"port": 8034, "config_path": cfg, "host": None, "watchdogs": []}
+        ]
 
     def test_explicit_port_still_wins(self, runner, tmp_path, served):
         cfg = _write_config(tmp_path / "magent.config.json", port=8034)
@@ -125,7 +128,9 @@ class TestServeBlockingPathUsesConfiguredPort:
         result = runner.invoke(cli.main, ["--config", cfg, "serve", "-p", "9099"])
 
         assert result.exit_code == 0, result.output
-        assert served == [{"port": 9099, "config_path": cfg, "host": None}]
+        assert served == [
+            {"port": 9099, "config_path": cfg, "host": None, "watchdogs": []}
+        ]
 
     def test_missing_config_falls_back_to_8033(self, runner, tmp_path, served):
         missing = str(tmp_path / "nope.json")
@@ -134,7 +139,12 @@ class TestServeBlockingPathUsesConfiguredPort:
 
         assert result.exit_code == 0, result.output
         assert served == [
-            {"port": _FALLBACK_UPLOAD_PORT, "config_path": missing, "host": None}
+            {
+                "port": _FALLBACK_UPLOAD_PORT,
+                "config_path": missing,
+                "host": None,
+                "watchdogs": [],
+            }
         ]
 
 

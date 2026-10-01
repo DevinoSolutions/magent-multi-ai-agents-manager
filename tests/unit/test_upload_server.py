@@ -155,7 +155,7 @@ class TestTheProjectPickerFiltersAsYouType:
         assert "psend.disabled = sending || !proj" in html, (
             "Send stopped being gated on a selected project"
         )
-        assert 'id="file" accept=' in html and " disabled>" in html
+        assert '<input type="file" id="file" multiple disabled>' in html
 
     def test_no_sessions_means_no_filter_box_to_type_into(self):
         # An input whose only possible answer is "no match" is noise; the
@@ -209,6 +209,139 @@ class TestThePageReadsAllThreePasteStates:
             assert healthy in html, f"pending lost its healthy tint: {healthy}"
         for wrong in ("drop err pend", "toast err pend"):
             assert wrong not in html, f"pending is styled as a failure: {wrong}"
+
+
+class TestThePageTakesAnyFile:
+    """The phone page uploads ANY file, not just images -- on both of its
+    paths (the file picker and Ctrl+V), under one size limit it checks BEFORE
+    sending.
+
+    Drift pins on the served page, same cheap style as the classes above; the
+    real-browser proof of a non-image paste is the `browser` e2e tier.
+    """
+
+    def _html(self) -> str:
+        return _build_html([{"name": "p", "path": "x"}])
+
+    def test_the_picker_has_no_type_restriction_and_takes_several(self):
+        html = self._html()
+        assert '<input type="file" id="file" multiple disabled>' in html
+        assert "accept=" not in html, "the file picker is filtering types again"
+
+    def test_a_pasted_file_of_any_type_is_staged(self):
+        html = self._html()
+        assert "it.kind !== 'file'" in html
+        assert "it.type.startsWith('image/')" not in html, (
+            "the paste handler still takes images only"
+        )
+
+    def test_every_pasted_file_is_staged_not_just_the_first(self):
+        # Copying three files and pressing Ctrl+V used to stage ONE and drop
+        # the rest in silence. Every file item is collected, then staged as
+        # one selection.
+        html = self._html()
+        assert "files.push(f)" in html
+        assert "stageFiles(files)" in html
+        assert "stageFile(f);\n      return;" not in html, (
+            "the paste handler stops at the first file again"
+        )
+
+    def test_several_files_go_as_one_request_with_one_part_each(self):
+        # One request, one paste: the same shape an Alt+V press sends.
+        html = self._html()
+        assert "for (const f of files) form.append('file', f);" in html
+        assert "for (const s of staged.files) form.append('file', s.file, s.name);" in (
+            html
+        )
+        # ...and the reply's own count of saved files is what the page reports.
+        assert html.count("sentLabel(d, ") >= 2
+        assert "(d.paths || []).length" in html
+
+    def test_a_folder_is_refused_in_the_same_words_as_alt_v(self):
+        from magent.altv import OUTCOME_REASONS
+
+        html = self._html()
+        assert f"const FOLDER = '{OUTCOME_REASONS['folder-refused']}';" in html
+        # The entry is the authority where the browser exposes one; the empty
+        # typeless File is the fallback shape of a folder.
+        assert "isDirectory" in html
+        assert "f.size === 0 && !f.type" in html
+        # Both surfaces refuse: the paste stager and the picker.
+        assert html.count("FOLDER)") >= 2
+
+    def test_the_entry_decides_before_the_size_and_type_guess(self):
+        # The guess (empty + no MIME type) is only a stand-in for an entry the
+        # browser did not give. Where it DID give one, the guess must never
+        # overrule it: an empty .toml dropped in Chrome reports isDirectory
+        # false and used to be refused as a folder anyway.
+        html = self._html()
+        body = html.split("function itemIsFolder(it) {", 1)[1].split("\n}", 1)[0]
+        assert "if (entry) return entry.isDirectory;" in body
+        assert body.index("entry.isDirectory") < body.index("looksLikeFolder(")
+        # Paste and drop both decide through that one function.
+        assert html.count("itemIsFolder(it)") >= 3
+
+    def test_a_plain_pick_is_never_guessed_to_be_a_folder(self):
+        # A picker cannot select a folder, so on a plain pick the guess only
+        # ever refuses real empty files. Only a DROP can bring a folder, and
+        # the drop listener decides that from the drop's own items.
+        html = self._html()
+        change = html.split("input.addEventListener('change'", 1)[1]
+        change = change.split("\n});", 1)[0]
+        assert "looksLikeFolder" not in change
+        assert "const folder = droppedFolder;" in change
+        drop = html.split("input.addEventListener('drop'", 1)[1].split("\n});", 1)[0]
+        assert "itemIsFolder(it)" in drop
+        # Opening the picker forgets a drop that never became a selection, so
+        # it cannot refuse the next plain pick.
+        assert "input.addEventListener('click', () => { droppedFolder = false; });" in (
+            html
+        )
+
+    def test_a_non_image_shows_a_file_tile_not_a_broken_preview(self):
+        html = self._html()
+        for anchor in ('id="paste-file"', 'id="paste-name"', "pfile.className"):
+            assert anchor in html, f"non-image paste tile missing: {anchor}"
+        # Images keep their preview: the <img> is toggled, not deleted.
+        assert 'id="paste-img"' in html
+
+    def test_the_staged_name_keeps_the_original_filename(self):
+        # A pasted file keeps its own name; only a nameless blob falls back
+        # to the generated paste-<ts>.<ext>.
+        html = self._html()
+        assert "f.name || ('paste-' + ts + '.' + extFor(f.type))" in html
+
+    def test_the_page_refuses_an_over_limit_send_before_sending_it(self):
+        from magent.sessions import MAX_UPLOAD_BYTES, upload_limit_text
+
+        html = self._html()
+        assert f"const MAX_BYTES = {MAX_UPLOAD_BYTES};" in html
+        assert f"const MAX_LABEL = '{upload_limit_text(MAX_UPLOAD_BYTES)}';" in html
+        assert "PLACEHOLDER" not in html, "a template placeholder leaked"
+        # The limit is per send, so both paths check the SUM of the selection:
+        # the picker's change handler and the paste stager.
+        assert html.count("files.reduce((n, f) => n + f.size, 0)") >= 2
+        assert html.count("total > MAX_BYTES") >= 2
+        assert "'too large - ' + MAX_LABEL + ' limit'" in html
+
+    def test_the_over_limit_words_are_alt_vs_words(self):
+        # Same binding as the folder and pending wording: the page's refusal,
+        # rendered with the label it is served, is Alt+V's too-large reason.
+        from magent.altv import OUTCOME_REASONS
+
+        html = self._html()
+        assert "const TOO_BIG = 'too large - ' + MAX_LABEL + ' limit';" in html
+        label = html.split("const MAX_LABEL = '", 1)[1].split("';", 1)[0]
+        assert f"too large - {label} limit" == OUTCOME_REASONS["too-large"]
+
+    def test_a_picker_refusal_writes_its_own_toast_text(self):
+        # Turning the toast red without replacing its text would re-colour
+        # whatever stale message it held last as this failure.
+        html = self._html()
+        assert "function pickFail(msg)" in html
+        body = html.split("function pickFail(msg)", 1)[1].split("}", 1)[0]
+        assert "toast.textContent = msg;" in body
+        assert "toast.className = 'toast err';" in body
 
 
 class TestConfigSessions:
@@ -304,9 +437,37 @@ class TestParseMultipart:
         fields, files = _parse_multipart(handler)
 
         assert fields["project"] == "marka"
-        assert "file" in files
-        assert files["file"][0] == "test.png"
-        assert files["file"][1] == b"PNGDATA"
+        # Every same-named file part, in order -- one Alt+V press can carry a
+        # whole Explorer selection in one request.
+        assert files["file"] == [("test.png", b"PNGDATA")]
+
+    def test_several_file_parts_under_one_name_all_survive_in_order(self):
+        body = (
+            b"------TestBoundary\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="a.zip"\r\n'
+            b"\r\n"
+            b"ZIP\r\n"
+            b"------TestBoundary\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="b.py"\r\n'
+            b"\r\n"
+            b"print(1)\r\n"
+            b"------TestBoundary--\r\n"
+        )
+        _fields, files = _parse_multipart(self._make_handler(body, "----TestBoundary"))
+        assert files["file"] == [("a.zip", b"ZIP"), ("b.py", b"print(1)")]
+
+    def test_a_semicolon_in_a_filename_does_not_cut_it_short(self):
+        # Any file uploads now, and `;` is legal in a filename on every OS; the
+        # header's own `;` token split must not truncate the name at it.
+        body = (
+            b"------TestBoundary\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="a;b c.txt"\r\n'
+            b"\r\n"
+            b"X\r\n"
+            b"------TestBoundary--\r\n"
+        )
+        _fields, files = _parse_multipart(self._make_handler(body, "----TestBoundary"))
+        assert files["file"] == [("a;b c.txt", b"X")]
 
     def test_parse_multipart_missing_boundary_returns_empty(self):
         # F-D3-006: Content-Type with no boundary= is treated as "no body".
@@ -331,6 +492,89 @@ class TestParseMultipart:
             rfile = io.BytesIO(b"")
 
         assert _parse_multipart(FakeHandler()) == ({}, {})
+
+    _WHOLE = (
+        b"------TestBoundary\r\n"
+        b'Content-Disposition: form-data; name="project"\r\n'
+        b"\r\n"
+        b"marka\r\n"
+        b"------TestBoundary\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="v.mp4"\r\n'
+        b"\r\n"
+        b"FRAMES\r\n"
+        b"------TestBoundary--\r\n"
+    )
+
+    def test_a_body_shorter_than_it_declared_is_incomplete(self):
+        # The client died mid-upload: what arrived is not the file, and must
+        # never be saved and pasted as if it were.
+        from magent.upload_server import UploadIncomplete
+
+        handler = self._make_handler(self._WHOLE, "----TestBoundary")
+        handler.rfile = io.BytesIO(self._WHOLE[:-30])
+        with pytest.raises(UploadIncomplete):
+            _parse_multipart(handler)
+
+    def test_a_short_body_is_incomplete_even_when_its_closing_delimiter_arrived(
+        self,
+    ):
+        # The ONE cut the delimiter check cannot see: every part closed, only
+        # the final CRLF missing. Only the declared-length check refuses it, so
+        # this is the case that pins it (a 30-byte cut also loses the delimiter).
+        from magent.upload_server import UploadIncomplete
+
+        handler = self._make_handler(self._WHOLE, "----TestBoundary")
+        handler.rfile = io.BytesIO(self._WHOLE[:-2])
+        with pytest.raises(UploadIncomplete):
+            _parse_multipart(handler)
+
+    def test_a_body_without_its_closing_delimiter_is_incomplete(self):
+        # Declared length and delivered length agree, but the last part is
+        # never closed -- a sender that stopped mid-part. Its data cannot be
+        # trusted to be whole.
+        from magent.upload_server import UploadIncomplete
+
+        body = self._WHOLE[: -len(b"------TestBoundary--\r\n")]
+        with pytest.raises(UploadIncomplete):
+            _parse_multipart(self._make_handler(body, "----TestBoundary"))
+
+    def test_a_line_that_only_starts_like_the_delimiter_is_data(self):
+        # A delimiter is the boundary followed by CRLF or `--`; anything else
+        # after it is the file's own bytes.
+        body = (
+            b"------TestBoundary\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="a.log"\r\n'
+            b"\r\n"
+            b"one\r\n------TestBoundaryX two\r\n"
+            b"------TestBoundary--\r\n"
+        )
+        _fields, files = _parse_multipart(self._make_handler(body, "----TestBoundary"))
+        assert files["file"] == [("a.log", b"one\r\n------TestBoundaryX two")]
+
+    def test_parsing_never_copies_the_body(self):
+        # One upload can be 100 MB and serve runs on a memory-starved box: the
+        # parts are views into the one body read off the socket, never copies
+        # of it (the split-based parser held about four bodies at its peak).
+        import tracemalloc
+
+        data = bytes(range(256)) * (32 * 1024)  # 8 MiB
+        body = (
+            b"------TestBoundary\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="big.bin"\r\n'
+            b"\r\n" + data + b"\r\n------TestBoundary--\r\n"
+        )
+        handler = self._make_handler(body, "----TestBoundary")
+        tracemalloc.start()
+        try:
+            _fields, files = _parse_multipart(handler)
+            _now, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        # The one read of the body itself, and nothing on top of it.
+        assert peak < len(body) * 1.25, f"peak {peak} for a {len(body)}-byte body"
+        ((_name, part),) = files["file"]
+        assert isinstance(part, memoryview)
+        assert part == data
 
 
 class _DrainConn:
@@ -566,6 +810,334 @@ class TestUploadServerIntegration:
         assert saved.exists()
         assert saved.read_bytes() == b"FAKEPNG"
 
+    def _post_files(self, *files: tuple[str, bytes]) -> dict:
+        parts = [
+            (
+                b"------B\r\n"
+                b'Content-Disposition: form-data; name="project"\r\n\r\nmarka\r\n'
+                b"------B\r\n"
+                b'Content-Disposition: form-data; name="inject"\r\n\r\n0\r\n'
+            )
+        ]
+        for name, data in files:
+            parts.append(
+                b"------B\r\n"
+                + f'Content-Disposition: form-data; name="file"; filename="{name}"\r\n'.encode()
+                + b"Content-Type: application/octet-stream\r\n\r\n"
+                + data
+                + b"\r\n"
+            )
+        body = b"".join(parts) + b"------B--\r\n"
+        conn = self._conn()
+        conn.request(
+            "POST",
+            "/upload",
+            body=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=----B",
+                "Content-Length": str(len(body)),
+            },
+        )
+        return json.loads(conn.getresponse().read())
+
+    @pytest.mark.parametrize(
+        ("name", "data"),
+        [
+            ("bundle.zip", b"PK\x03\x04" + bytes(range(256)) * 4),
+            ("script.py", b"print('hi')\r\nprint(2)\n"),
+            ("Makefile", b"all:\n\techo ok\n"),
+        ],
+    )
+    def test_any_file_type_lands_byte_identical(self, name, data):
+        reply = self._post_files((name, data))
+        assert reply["ok"] is True
+        saved = Path(reply["path"])
+        assert saved.name.endswith(f"_{name}")
+        assert saved.read_bytes() == data
+
+    def test_several_files_in_one_request_all_land(self):
+        reply = self._post_files(("a.zip", b"ZIP\x00\x01"), ("b.py", b"print(1)"))
+        assert reply["ok"] is True
+        saved = [Path(p) for p in reply["paths"]]
+        assert [p.read_bytes() for p in saved] == [b"ZIP\x00\x01", b"print(1)"]
+        assert saved[0].name.endswith("_a.zip") and saved[1].name.endswith("_b.py")
+        assert reply["path"] == reply["paths"][0]  # the one-file field is kept
+
+    def test_a_name_with_control_characters_is_saved_and_pasted_clean(
+        self, monkeypatch
+    ):
+        # The saved name is what the server pastes, so it must never carry a
+        # control or line-break character -- whatever the sender called it.
+        sent = self._pastes(monkeypatch)
+        body = (
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="project"\r\n\r\nmarka\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="'
+            + "a\u2028b\u0085c\x1bd\u2029e.txt".encode()
+            + b'"\r\nContent-Type: text/plain\r\n\r\nhi\r\n------B--\r\n'
+        )
+        conn = self._conn()
+        conn.request(
+            "POST",
+            "/upload",
+            body=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=----B",
+                "Content-Length": str(len(body)),
+            },
+        )
+        reply = json.loads(conn.getresponse().read())
+        assert reply["ok"] is True
+        saved = Path(reply["path"])
+        assert saved.name.endswith("_a_b_c_d_e.txt")
+        assert saved.read_bytes() == b"hi"
+        assert len(sent) == 1
+        pasted = sent[0][0][1]
+        assert pasted == str(saved)
+        assert not any(ch in pasted for ch in "\u2028\u0085\x1b\u2029\r\n")
+
+    def test_a_failed_write_takes_the_whole_request_back(self, monkeypatch):
+        # Reserved names are real (empty) files; a request that fails part-way
+        # must not leave them -- or the files it did write -- behind.
+        real = Path.write_bytes
+        calls = {"n": 0}
+
+        def _second_fails(self, data):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError(28, "No space left on device")
+            return real(self, data)
+
+        monkeypatch.setattr(Path, "write_bytes", _second_fails)
+        reply = self._post_files(("a.txt", b"first"), ("b.txt", b"second"))
+        assert reply == {"ok": False, "error": "internal"}
+        assert self._saved() == []
+
+    def test_two_files_with_one_name_never_overwrite_each_other(self):
+        reply = self._post_files(("notes.txt", b"first"), ("notes.txt", b"second"))
+        saved = [Path(p) for p in reply["paths"]]
+        assert len(set(saved)) == 2
+        assert [p.read_bytes() for p in saved] == [b"first", b"second"]
+
+    def _pastes(self, monkeypatch) -> list[tuple]:
+        import magent.psmux as psmux_mod
+
+        sent: list[tuple] = []
+        monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux_mod, "send_keys", lambda *a, **k: sent.append((a, k)) or True
+        )
+        return sent
+
+    def _saved(self) -> list[Path]:
+        return list(self.upload_dir.glob("*")) if self.upload_dir.exists() else []
+
+    _CUT = (
+        b"------B\r\n"
+        b'Content-Disposition: form-data; name="project"\r\n\r\nmarka\r\n'
+        b"------B\r\n"
+        b'Content-Disposition: form-data; name="inject"\r\n\r\n1\r\n'
+        b"------B\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="v.mp4"\r\n\r\n'
+        + b"A" * 4096
+        + b"\r\n------B--\r\n"
+    )
+
+    def test_a_body_cut_short_is_refused_and_nothing_is_saved(self, monkeypatch):
+        # The client dies mid-upload (a phone off wifi, a listener giving up on
+        # a slow link). What arrived must not become a file that is announced
+        # "uploaded" and whose path is pasted into the agent.
+        import socket
+
+        sent = self._pastes(monkeypatch)
+        body = self._CUT
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+            s.sendall(
+                b"POST /upload HTTP/1.1\r\nHost: x\r\n"
+                b"Content-Type: multipart/form-data; boundary=----B\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body[: len(body) - 2000]
+            )
+            s.shutdown(socket.SHUT_WR)
+            reply = b""
+            while chunk := s.recv(65536):
+                reply += chunk
+        head, _, payload = reply.partition(b"\r\n\r\n")
+        assert head.startswith(b"HTTP/1.0 400"), head
+        assert json.loads(payload) == {"ok": False, "error": "Upload incomplete"}
+        assert self._saved() == []
+        assert sent == []
+
+    def test_a_client_that_stalls_mid_body_is_let_go(self, monkeypatch):
+        # A client that declares a body and then goes silent used to pin its
+        # handler thread (and the partial buffer) forever. The per-operation
+        # socket timeout ends it: "Upload incomplete", nothing saved, and the
+        # server is free for the next request.
+        import socket
+
+        monkeypatch.setattr(UploadHandler, "timeout", 0.5)
+        sent = self._pastes(monkeypatch)
+        body = self._CUT
+        started = time.monotonic()
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as s:
+            s.sendall(
+                b"POST /upload HTTP/1.1\r\nHost: x\r\n"
+                b"Content-Type: multipart/form-data; boundary=----B\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body[: len(body) // 2]
+            )
+            # No shutdown: the client is still there, just saying nothing.
+            reply = b""
+            while chunk := s.recv(65536):
+                reply += chunk
+        assert time.monotonic() - started < 8, "the stalled client was never let go"
+        head, _, payload = reply.partition(b"\r\n\r\n")
+        assert head.startswith(b"HTTP/1.0 400"), head
+        assert json.loads(payload) == {"ok": False, "error": "Upload incomplete"}
+        assert self._saved() == []
+        assert sent == []
+        # And the (single-threaded) test server is serving again.
+        assert self._post_files(("after.txt", b"ok"))["ok"] is True
+
+    def test_a_slow_but_steady_upload_is_never_cut_off(self, monkeypatch):
+        # The timeout bounds each socket operation, not the request: a large
+        # upload over a slow link takes as long as it takes.
+        import socket
+
+        monkeypatch.setattr(UploadHandler, "timeout", 0.5)
+        data = bytes(range(256)) * 64
+        body = (
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="project"\r\n\r\nmarka\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="inject"\r\n\r\n0\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="s.bin"\r\n\r\n'
+            + data
+            + b"\r\n------B--\r\n"
+        )
+        started = time.monotonic()
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as s:
+            s.sendall(
+                b"POST /upload HTTP/1.1\r\nHost: x\r\n"
+                b"Content-Type: multipart/form-data; boundary=----B\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            )
+            for i in range(0, len(body), 4096):
+                s.sendall(body[i : i + 4096])
+                time.sleep(0.2)
+            reply = b""
+            while chunk := s.recv(65536):
+                reply += chunk
+        assert time.monotonic() - started > 0.5, "the upload was not slow enough"
+        head, _, payload = reply.partition(b"\r\n\r\n")
+        assert head.startswith(b"HTTP/1.0 200"), head
+        saved = Path(json.loads(payload)["path"])
+        assert saved.read_bytes() == data
+
+    def test_a_body_without_its_closing_delimiter_is_refused(self, monkeypatch):
+        sent = self._pastes(monkeypatch)
+        body = self._CUT[: -len(b"------B--\r\n")]
+        conn = self._conn()
+        conn.request(
+            "POST",
+            "/upload",
+            body=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=----B",
+                "Content-Length": str(len(body)),
+            },
+        )
+        resp = conn.getresponse()
+        assert resp.status == 400
+        assert json.loads(resp.read()) == {"ok": False, "error": "Upload incomplete"}
+        assert self._saved() == []
+        assert sent == []
+
+    def test_the_outcome_line_names_every_suffix_and_the_count(self, caplog):
+        with caplog.at_level("INFO", logger="magent.upload"):
+            reply = self._post_files(("a.zip", b"ZIP"), ("b.py", b"PY"))
+            assert reply["ok"] is True
+            assert self._wait_log(caplog, "suffix=")
+        line = next(
+            r.getMessage() for r in caplog.records if "suffix=" in r.getMessage()
+        )
+        assert "files=2" in line
+        assert line.endswith("suffix=.zip,.py")
+        assert "a.zip" not in line  # never the original filename
+
+    def test_an_over_limit_upload_names_the_limit(self, monkeypatch):
+        import magent.upload_server as mod
+
+        # No envelope allowance: this is the early, declared-length refusal.
+        monkeypatch.setattr(mod, "MAX_UPLOAD_BYTES", 10)
+        monkeypatch.setattr(mod, "MULTIPART_ALLOWANCE_BYTES", 0)
+        body = b"x" * 64
+        conn = self._conn()
+        conn.request(
+            "POST",
+            "/upload",
+            body=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=----B",
+                "Content-Length": str(len(body)),
+            },
+        )
+        resp = conn.getresponse()
+        assert resp.status == 413
+        assert json.loads(resp.read()) == {
+            "ok": False,
+            "error": "File too large - 10 bytes limit",
+        }
+
+    def test_every_connection_has_a_per_operation_timeout(self):
+        import magent.upload_server as mod
+
+        # Long enough that only a link which has STOPPED is cut off.
+        assert UploadHandler.timeout == mod.CONNECTION_TIMEOUT_S
+        assert mod.CONNECTION_TIMEOUT_S >= 30
+
+    def test_the_limit_and_the_drain_that_serves_it(self):
+        # 100 MB of files, a request ceiling that allows for the envelope, and
+        # a reject drain PAST that ceiling: the honest just-over-the-limit
+        # client is exactly who the drain exists for (a JSON 413 instead of a
+        # Windows RST), and a drain that stopped AT the ceiling would leave the
+        # tail of that client's body unread.
+        import magent.upload_server as mod
+
+        assert mod.MAX_UPLOAD_BYTES == 100 * 1024 * 1024
+        assert mod._request_limit() == (
+            mod.MAX_UPLOAD_BYTES + mod.MULTIPART_ALLOWANCE_BYTES
+        )
+        # Room for a thousand-file selection's part headers.
+        assert mod.MULTIPART_ALLOWANCE_BYTES >= 1000 * 300
+        assert mod._request_limit() + 1024 * 1024 <= mod._DRAIN_CAP_BYTES
+
+    def test_files_exactly_at_the_limit_land_though_the_request_is_larger(
+        self, monkeypatch
+    ):
+        # The limit is "100 MB of files" -- what the page and the Alt+V
+        # listener pre-check. The multipart envelope on top of it used to push
+        # a selection they passed into a 413.
+        import magent.upload_server as mod
+
+        monkeypatch.setattr(mod, "MAX_UPLOAD_BYTES", 1000)
+        reply = self._post_files(("a.bin", b"a" * 400), ("b.bin", b"b" * 600))
+        assert reply["ok"] is True
+        assert [Path(p).read_bytes() for p in reply["paths"]] == [
+            b"a" * 400,
+            b"b" * 600,
+        ]
+
+    def test_files_one_byte_over_the_limit_are_refused_whole(self, monkeypatch):
+        import magent.upload_server as mod
+
+        monkeypatch.setattr(mod, "MAX_UPLOAD_BYTES", 1000)
+        reply = self._post_files(("a.bin", b"a" * 400), ("b.bin", b"b" * 601))
+        assert reply == {"ok": False, "error": "File too large - 1000 bytes limit"}
+        assert self._saved() == []
+
     def test_no_paste_at_all_is_neither_injected_nor_pending(self):
         # The THIRD state of the reply envelope, on the path a client can reach
         # with no multiplexer installed at all (this fixture's find_psmux is
@@ -751,7 +1323,9 @@ class TestUploadServerIntegration:
         # TCP RST ("connection reset") -- no retries, no flake.
         import magent.upload_server as mod
 
+        # No envelope allowance, so this stays the refusal BEFORE the read.
         monkeypatch.setattr(mod, "MAX_UPLOAD_BYTES", 10)
+        monkeypatch.setattr(mod, "MULTIPART_ALLOWANCE_BYTES", 0)
 
         body = (
             b"------Boundary\r\n"
@@ -908,6 +1482,161 @@ class TestHealth:
         assert data["uptime_s"] >= 0
 
 
+class TestHealthSessionCountIsHonest:
+    """F4: a fresh serve answered ``session_count: 0`` until the first
+    ``/sessions`` request filled the cache -- a false zero for every /health
+    consumer. /health may never sweep (it is a liveness probe: cheap, never
+    blocked on psmux), so before the first sweep it says ``null`` (unknown),
+    and serve warms the cache on a background thread at startup so the unknown
+    is brief."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, tmp_path, monkeypatch):
+        import magent.upload_server as mod
+
+        self.mod = mod
+        monkeypatch.setattr(mod, "_UPLOAD_DIR", tmp_path / "uploads")
+        # A never-swept handler: exactly the state of a freshly started serve.
+        monkeypatch.setattr(UploadHandler, "cached_sessions", [])
+        monkeypatch.setattr(UploadHandler, "sessions_ts", 0)
+        monkeypatch.setattr(UploadHandler, "config_path", None)
+        monkeypatch.setattr(UploadHandler, "port", 8080)
+        monkeypatch.setattr(UploadHandler, "pid", 4321)
+        monkeypatch.setattr(UploadHandler, "started_at", time.time() - 5)
+        self.sweeps: list[str | None] = []
+        self.live = [
+            {"name": "marka", "session": "marka", "path": "INTERNAL/marka"},
+            {"name": "upup", "session": "upup", "path": "INTERNAL/upup"},
+        ]
+
+        def _discover(config_path):
+            self.sweeps.append(config_path)
+            return self.live
+
+        monkeypatch.setattr(mod, "_discover_sessions", _discover)
+
+        from http.server import HTTPServer
+
+        self.server = HTTPServer(("127.0.0.1", 0), UploadHandler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        yield
+        self.server.shutdown()
+
+    def _health(self) -> dict:
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/health")
+        resp = conn.getresponse()
+        assert resp.status == 200
+        return json.loads(resp.read())
+
+    def test_a_never_swept_serve_says_unknown_not_zero(self):
+        data = self._health()
+
+        assert data["ok"] is True  # liveness is unaffected
+        assert data["session_count"] is None
+        assert data["sessions_age_s"] is None
+
+    def test_health_never_sweeps(self):
+        # Probed constantly; a psmux fan-out per probe would be the cost.
+        self._health()
+        self._health()
+
+        assert self.sweeps == []
+
+    def test_warming_makes_health_report_the_real_count(self):
+        self.mod._warm_sessions()
+
+        data = self._health()
+
+        assert data["session_count"] == 2
+        assert 0 <= data["sessions_age_s"] < 5
+        assert len(self.sweeps) == 1  # /health added none of its own
+
+    def test_a_real_empty_fleet_is_zero_not_unknown(self):
+        self.live = []
+        self.mod._warm_sessions()
+
+        assert self._health()["session_count"] == 0
+
+    def test_a_failed_warm_stays_unknown_and_never_raises(self, monkeypatch, caplog):
+        def _boom(config_path):
+            raise OSError("psmux exploded")
+
+        monkeypatch.setattr(self.mod, "_discover_sessions", _boom)
+
+        with caplog.at_level(logging.WARNING, logger="magent.upload"):
+            self.mod._warm_sessions()  # must not propagate: it runs on a daemon thread
+
+        assert self._health()["session_count"] is None
+        assert any("session cache" in r.getMessage() for r in caplog.records)
+
+    def test_health_answers_while_a_sweep_is_stuck_in_psmux(self, monkeypatch):
+        """The sweep holds the sessions lock for as long as psmux takes. /health
+        must not queue behind it."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _slow(config_path):
+            entered.set()
+            release.wait(10)
+            return self.live
+
+        monkeypatch.setattr(self.mod, "_discover_sessions", _slow)
+        warm = threading.Thread(target=self.mod._warm_sessions, daemon=True)
+        warm.start()
+        try:
+            assert entered.wait(5), "the warm-up never started its sweep"
+            started = time.monotonic()
+            data = self._health()
+            assert time.monotonic() - started < 2
+            assert data["session_count"] is None  # nothing landed yet
+        finally:
+            release.set()
+            warm.join(5)
+
+        assert self._health()["session_count"] == 2
+
+    def test_serve_warms_the_cache_at_startup(self, monkeypatch):
+        """End of the wiring: run_server really starts the warm-up."""
+        started: list[object] = []
+        real_thread = threading.Thread
+
+        class _Recording(real_thread):
+            def __init__(self, *args, target=None, **kwargs) -> None:
+                super().__init__(*args, target=target, **kwargs)
+                self.recorded_target = target
+
+            def start(self) -> None:
+                started.append(self.recorded_target)
+
+        monkeypatch.setattr(self.mod.threading, "Thread", _Recording)
+        monkeypatch.setattr(self.mod, "_bind_addresses", lambda _h: ["127.0.0.1"])
+
+        class _FakeServer:
+            def __init__(self, addr, _handler) -> None:
+                self.server_address = addr
+
+            def serve_forever(self) -> None:
+                raise KeyboardInterrupt
+
+            def shutdown(self) -> None:
+                return None
+
+            def server_close(self) -> None:
+                return None
+
+        monkeypatch.setattr(self.mod, "_NoFqdnHTTPServer", _FakeServer)
+        monkeypatch.setattr(
+            self.mod, "_pid_path", lambda port: Path(self.mod._UPLOAD_DIR) / "x.pid"
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            self.mod.run_server(port=0)
+
+        assert self.mod._warm_sessions in started
+
+
 class TestInSessionFeedback:
     """Upload progress is flashed into the magent:<project> psmux status line
     -- for the MOBILE page, which has no other screen in that window.
@@ -957,7 +1686,9 @@ class TestInSessionFeedback:
         yield
         self.server.shutdown()
 
-    def _post(self, path: str, project_field: str = "marka") -> dict:
+    def _post(
+        self, path: str, project_field: str = "marka", filename: str = "c.png"
+    ) -> dict:
         body = (
             f"------B\r\n"
             f'Content-Disposition: form-data; name="project"\r\n\r\n'
@@ -965,7 +1696,7 @@ class TestInSessionFeedback:
             f"------B\r\n"
             f'Content-Disposition: form-data; name="inject"\r\n\r\n0\r\n'
             f"------B\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="c.png"\r\n\r\n'
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n\r\n'
             f"DATA\r\n"
             f"------B--\r\n"
         ).encode()
@@ -1004,6 +1735,18 @@ class TestInSessionFeedback:
             for f in self._flashes()
         )
 
+    @pytest.mark.parametrize("name", ["shot.PNG", "a.jpeg", "b.webp", "c.bmp"])
+    def test_a_single_image_still_says_image(self, name):
+        # The phone-screenshot case reads exactly as it always did.
+        assert self._post("/upload", filename=name)["ok"] is True
+        assert self._wait_flash("image uploaded")
+
+    @pytest.mark.parametrize("name", ["notes.zip", "tool.py", "Makefile"])
+    def test_a_single_non_image_says_file(self, name):
+        assert self._post("/upload", filename=name)["ok"] is True
+        assert self._wait_flash("file uploaded")
+        assert not any("image uploaded" in f for f in self._flashes())
+
     def test_a_mobile_failure_is_shown_too(self):
         assert self._post("/upload", project_field="evil")["ok"] is False
         # An unknown project has no window to flash into; a KNOWN one does.
@@ -1013,8 +1756,81 @@ class TestInSessionFeedback:
         # Regression pin for the "which message won?" race: ?project= means the
         # listener is already narrating this press, so the server says nothing.
         assert self._post("/upload?project=marka")["ok"] is True
-        assert not self._wait_flash("image uploaded", timeout=0.6)
+        assert not self._wait_flash("uploaded", timeout=0.6)
         assert not self._wait_flash("uploading image", timeout=0.1)
+
+    def test_several_files_paste_as_one_line_in_one_send(self):
+        # An Alt+V press with an Explorer selection sends every file in one
+        # request; the pane must get ONE paste carrying all their paths -- not
+        # one paste per file racing each other into the input line.
+        body = (
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="project"\r\n\r\nmarka\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="inject"\r\n\r\n1\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="a.zip"\r\n\r\n'
+            b"ZIP\r\n"
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="b.py"\r\n\r\n'
+            b"PY\r\n"
+            b"------B--\r\n"
+        )
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request(
+            "POST",
+            "/upload?project=marka",
+            body=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=----B",
+                "Content-Length": str(len(body)),
+            },
+        )
+        reply = json.loads(conn.getresponse().read())
+        assert reply["ok"] is True and reply["injected"] is True
+
+        from magent.sessions import paths_line
+
+        sends = [c for c in self.calls if "send-keys" in c]
+        assert len(sends) == 1, sends
+        # Literal (`-l`), like the local paste: the line is text, never a key
+        # name -- and it is the whole paste, with no Enter after it.
+        verb = sends[0].index("send-keys")
+        assert sends[0][verb:] == [
+            "send-keys",
+            "-t",
+            "marka",
+            "-l",
+            "--",
+            paths_line(reply["paths"]),
+        ]
+
+    def test_a_mobile_upload_of_several_files_counts_them(self):
+        body = (
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="project"\r\n\r\nmarka\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="inject"\r\n\r\n0\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="a.zip"\r\n\r\n'
+            b"ZIP\r\n"
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="b.py"\r\n\r\n'
+            b"PY\r\n"
+            b"------B--\r\n"
+        )
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request(
+            "POST",
+            "/upload",
+            body=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=----B",
+                "Content-Length": str(len(body)),
+            },
+        )
+        assert json.loads(conn.getresponse().read())["ok"] is True
+        assert self._wait_flash("2 files uploaded")
 
     def test_an_alt_v_failure_is_left_to_the_listeners_specific_reason(self):
         # The listener's flash says WHICH failure ("serve said HTTP 400:
@@ -1053,7 +1869,7 @@ class TestASlowPasteNeverBecomesAFailedUpload:
         self.worker: threading.Thread | None = None
         self.pastes: list[str] = []
 
-        def _paste(name, *keys, target=None, psmux=None, timeout=None):
+        def _paste(name, *keys, target=None, literal=False, psmux=None, timeout=None):
             # Recorded from INSIDE the worker: the product times its own paste
             # from that thread's clock, and on a loaded runner the thread can
             # start well after the handler's grace has already expired. Tests
@@ -1388,6 +2204,59 @@ class TestStopServer:
 
         assert mod.stop_server(9999) is True
         assert not pid_file.exists()
+
+
+class TestServerPidAcrossARestart:
+    """A restart leaves upload_server-<port>.pid behind and the OS reuses pid
+    numbers. server_pid is what `status` (DEAD vs off), `stop_server` (what to
+    taskkill) and the phone-URL port pick all read, so a recycled pid there was
+    a DEAD upload server after every reboot -- and a `down --all` that killed
+    whatever process now wore the old number."""
+
+    def _pre_boot(self, tmp_path, monkeypatch, *, boot=5000.0):
+        import os
+
+        import magent.upload_server as mod
+
+        pid_file = tmp_path / "upload_server-9999.pid"
+        pid_file.write_text("4321")
+        os.utime(pid_file, (1000.0, 1000.0))
+        monkeypatch.setattr(mod, "_pid_path", lambda port: pid_file)
+        monkeypatch.setattr("magent.procs.boot_time", lambda: boot)
+        return mod, pid_file
+
+    def test_a_pid_file_from_before_the_boot_names_no_server(
+        self, tmp_path, monkeypatch
+    ):
+        mod, pid_file = self._pre_boot(tmp_path, monkeypatch)
+
+        assert mod.server_pid(9999) is None
+        assert not pid_file.exists()  # nothing of ours: cleared, like the others
+
+    def test_a_pid_file_written_since_the_boot_is_read_as_before(
+        self, tmp_path, monkeypatch
+    ):
+        mod, pid_file = self._pre_boot(tmp_path, monkeypatch, boot=500.0)
+
+        assert mod.server_pid(9999) == 4321
+        assert pid_file.exists()
+
+    def test_an_unknown_boot_time_changes_nothing(self, tmp_path, monkeypatch):
+        mod, _pid_file = self._pre_boot(tmp_path, monkeypatch)
+        monkeypatch.setattr("magent.procs.boot_time", lambda: None)
+
+        assert mod.server_pid(9999) == 4321
+
+    def test_stop_never_kills_a_pid_recorded_before_the_boot(
+        self, tmp_path, monkeypatch
+    ):
+        mod, _pid_file = self._pre_boot(tmp_path, monkeypatch)
+        monkeypatch.setattr(mod.sys, "platform", "win32")
+        calls = []
+        monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: calls.append(a))
+
+        assert mod.stop_server(9999) is False
+        assert calls == []
 
 
 class TestBindAddresses:
@@ -2142,9 +3011,11 @@ class TestHotkeySupervisor:
 
     def _ensure(self, monkeypatch, result=4242):
         calls: list[str] = []
+        self.watches: list[object] = []
 
-        def _fake(url):
+        def _fake(url, watch=None):
             calls.append(url)
+            self.watches.append(watch)
             return result
 
         monkeypatch.setattr("magent.launch.ensure_hotkey_listener", _fake)
@@ -2168,6 +3039,23 @@ class TestHotkeySupervisor:
         # started must not leave Alt+V dead for 30 more seconds.
         assert calls == ["http://127.0.0.1:8034"] * 3
         assert waits == [30.0, 30.0, 30.0]
+
+    def test_one_watch_rides_every_pass(self, monkeypatch):
+        # The wedge confirm and the replacement cooldown live on the watch, so
+        # a fresh one per pass would forget both and could never confirm a
+        # wedge across two ticks.
+        from magent.launch import ListenerWatch
+
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        self._ensure(monkeypatch)
+        stop = threading.Event()
+        monkeypatch.setattr(stop, "wait", lambda timeout: len(self.watches) >= 3)
+
+        self._mod()._supervise_hotkey("http://127.0.0.1:8034", stop, interval=1.0)
+
+        assert len(self.watches) == 3
+        assert isinstance(self.watches[0], ListenerWatch)
+        assert self.watches[1] is self.watches[0] is self.watches[2]
 
     def test_the_env_opt_out_stops_it_before_it_touches_anything(self, monkeypatch):
         # MAGENT_HOTKEY_SUPERVISOR=0 is what keeps a test that starts a real
@@ -2225,7 +3113,7 @@ class TestHotkeySupervisor:
         self._fake_platform(monkeypatch, supports_hotkey=True)
         boom: list[int] = []
 
-        def _explode(url):
+        def _explode(url, watch=None):
             boom.append(1)
             raise RuntimeError("pid file on fire")
 
@@ -2263,3 +3151,145 @@ class TestHotkeySupervisor:
 
         assert calls == []  # never spawned behind the other supervisor's back
         assert seen == [1]  # and still slept rather than spinning
+
+
+class TestDestFor:
+    """Where one uploaded file lands, and what it is never allowed to clobber."""
+
+    def test_a_file_from_an_earlier_request_is_never_overwritten(self, tmp_path):
+        from magent.upload_server import _dest_for
+
+        root = tmp_path.resolve()
+        earlier = root / "1790000000_shot.png"
+        earlier.write_bytes(b"earlier upload")
+        dest = _dest_for(root, 1790000000, "shot.png")
+        assert dest is not None
+        assert dest != earlier
+        assert dest.suffix == ".png"
+        assert earlier.read_bytes() == b"earlier upload"
+
+    def test_a_clash_keeps_the_original_extension(self, tmp_path):
+        from magent.upload_server import _dest_for
+
+        root = tmp_path.resolve()
+        first = _dest_for(root, 1790000000, "notes.txt")
+        assert first is not None
+        second = _dest_for(root, 1790000000, "notes.txt")
+        assert second is not None
+        assert second != first
+        assert second.suffix == ".txt"
+
+    @pytest.mark.parametrize("name", ["..", "...", "."])
+    def test_a_dots_only_name_becomes_upload(self, tmp_path, name):
+        from magent.upload_server import _dest_for
+
+        dest = _dest_for(tmp_path.resolve(), 1790000000, name)
+        assert dest is not None
+        assert dest.name == "1790000000_upload"
+
+    def test_a_long_original_name_still_lands(self, tmp_path):
+        # 250 chars is a legal name on every OS; the `<stamp>_` prefix used to
+        # push it past one path component's 255 limit and the upload was a 500.
+        from magent.upload_server import _dest_for
+
+        dest = _dest_for(tmp_path.resolve(), 1790000000, "a" * 250 + ".txt")
+        assert dest is not None
+        dest.write_bytes(b"x")
+        assert dest.suffix == ".txt"
+        assert len(dest.name.encode()) <= 255
+        assert dest.name.startswith("1790000000_aaaa")
+
+    def test_a_long_non_ascii_name_is_cut_on_a_character(self, tmp_path):
+        # Linux counts BYTES, so a non-ASCII name hits the limit sooner -- and
+        # a cut through the middle of a character would be a mangled name.
+        from magent.upload_server import _dest_for
+
+        dest = _dest_for(
+            tmp_path.resolve(),
+            1790000000,
+            "\N{LATIN SMALL LETTER E WITH ACUTE}" * 200 + ".png",
+        )
+        assert dest is not None
+        assert dest.suffix == ".png"
+        assert len(dest.name.encode()) <= 255
+        assert set(dest.stem.removeprefix("1790000000_")) == {
+            "\N{LATIN SMALL LETTER E WITH ACUTE}"
+        }
+
+    def test_a_long_suffix_is_trimmed_like_a_stem(self, tmp_path):
+        from magent.upload_server import _dest_for
+
+        dest = _dest_for(tmp_path.resolve(), 1790000000, "notes." + "x" * 300)
+        assert dest is not None
+        assert len(dest.name.encode()) <= 255
+
+    def test_a_same_second_upload_in_another_request_never_shares_a_name(
+        self, tmp_path
+    ):
+        # Two requests in one second, each choosing its dest before the other
+        # has written: `exists()` could not see a name chosen but unwritten.
+        from magent.upload_server import _dest_for
+
+        root = tmp_path.resolve()
+        first = _dest_for(root, 1790000000, "shot.png")
+        second = _dest_for(root, 1790000000, "shot.png")
+        assert first is not None and second is not None
+        assert first != second
+        assert first.exists() and second.exists()  # both are reserved on disk
+
+    def test_concurrent_reservations_never_collide(self, tmp_path):
+        from magent.upload_server import _dest_for
+
+        root = tmp_path.resolve()
+        got: list[Path | None] = []
+        lock = threading.Lock()
+        gate = threading.Barrier(8)
+
+        def _reserve():
+            gate.wait()
+            dest = _dest_for(root, 1790000000, "shot.png")
+            with lock:
+                got.append(dest)
+
+        threads = [threading.Thread(target=_reserve) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert len(got) == 8
+        assert len(set(got)) == 8
+
+    @pytest.mark.parametrize("name", [".env", ".gitignore", ".bashrc"])
+    def test_a_dotfile_keeps_its_name(self, tmp_path, name):
+        # With any-file uploads a dotfile is a real case; the `<stamp>_`
+        # prefix already stops it being hidden, so it keeps what it is called.
+        from magent.upload_server import _dest_for
+
+        dest = _dest_for(tmp_path.resolve(), 1790000000, name)
+        assert dest is not None
+        assert dest.name == f"1790000000_{name}"
+
+    def test_a_trailing_dot_is_dropped_so_the_path_names_the_file(self, tmp_path):
+        # Windows silently drops a trailing dot on create; the returned (and
+        # pasted) path has to be the file that actually exists.
+        from magent.upload_server import _dest_for
+
+        dest = _dest_for(tmp_path.resolve(), 1790000000, "notes.")
+        assert dest is not None
+        assert dest.name == "1790000000_notes"
+
+
+class TestUploadedWhat:
+    @pytest.mark.parametrize(
+        "suffix", [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".JPG"]
+    )
+    def test_every_image_suffix_says_image(self, suffix):
+        from magent.upload_server import _uploaded_what
+
+        assert _uploaded_what(1, suffix) == "image"
+
+    @pytest.mark.parametrize("suffix", [".svg", ".zip", ""])
+    def test_anything_else_says_file(self, suffix):
+        from magent.upload_server import _uploaded_what
+
+        assert _uploaded_what(1, suffix) == "file"

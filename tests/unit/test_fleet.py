@@ -16,6 +16,7 @@ from tests.unit._fake_psmux import make_fake_psmux
 MID = "\u00b7"  # the footer separator Claude Code paints
 CARET = "\u276f"  # the menu selection caret AND the input-line caret
 RULE = "\u2500" * 62
+TYPED_RULE = "\u2500" * 12  # a rule the user typed: narrower than the box's
 
 
 def real_pane(typed: str = "", *, effort: str = "high") -> str:
@@ -164,6 +165,180 @@ class TestLooksUnsentOnARealClaudeCodePane:
         # magent flattens newlines before pasting, so the pane shows one line.
         multi = "this text stays\n   unsent 4242"
         assert fleet.looks_unsent(real_pane(fleet.flatten(multi)), multi) is True
+
+
+class TestInputDraft:
+    def test_an_empty_input_line_is_empty_string(self):
+        assert fleet.input_draft(real_pane("")) == ""
+
+    def test_a_draft_is_returned_stripped(self):
+        assert fleet.input_draft(real_pane("fix the tests")) == "fix the tests"
+
+    def test_a_lone_numbered_draft_is_a_draft(self):
+        # "1. fix the tests" typed at the prompt, with no sibling options.
+        assert fleet.input_draft(real_pane("1. fix the tests")) == "1. fix the tests"
+
+    def test_a_numbered_menu_has_no_input_line(self):
+        pane = "\n".join(
+            [
+                "  Do you want to proceed?",
+                f"{CARET} 1. Yes",
+                "  2. No",
+                RULE,
+            ]
+        )
+        assert fleet.input_draft(pane) is None
+
+    def test_a_menu_with_the_highlight_on_the_last_option_has_no_input_line(self):
+        pane = "\n".join(
+            [
+                "  1. Yes",
+                f"{CARET} 2. No",
+                RULE,
+            ]
+        )
+        assert fleet.input_draft(pane) is None
+
+    def test_no_caret_at_all_is_none(self):
+        assert fleet.input_draft("just some text\nno caret here") is None
+
+    def test_empty_capture_is_none(self):
+        assert fleet.input_draft("") is None
+
+    def test_a_draft_below_an_empty_caret_line_is_a_draft(self):
+        # A multi-line draft whose first line is empty: the caret line alone
+        # reads "", the box does not.
+        pane = real_pane("").replace(f"{CARET}\n", f"{CARET}\n  fix the tests\n")
+        assert fleet.input_draft(pane) == "fix the tests"
+
+    def test_every_line_of_a_multiline_draft_is_kept(self):
+        pane = real_pane("first line").replace(
+            "first line\n", "first line\n  second line\n"
+        )
+        assert fleet.input_draft(pane) == "first line\nsecond line"
+
+    def test_blank_lines_in_the_box_are_no_draft(self):
+        pane = real_pane("").replace(f"{CARET}\n", f"{CARET}\n   \n")
+        assert fleet.input_draft(pane) == ""
+
+    def test_a_blank_line_does_not_close_the_box(self):
+        pane = real_pane("").replace(f"{CARET}\n", f"{CARET}\n\n  fix the tests\n")
+        assert fleet.input_draft(pane) == "fix the tests"
+
+    def test_a_box_with_no_closing_rule_is_none(self):
+        # Cut off below the caret line: whatever was below it is unknown.
+        assert fleet.input_draft("\n".join([RULE, f"{CARET}"])) is None
+        assert fleet.input_draft("\n".join([RULE, f"{CARET}", "  more"])) is None
+
+    def test_a_line_with_text_inside_the_rule_does_not_close_the_box(self):
+        pane = "\n".join([RULE, f"{CARET}", f"{RULE[:8]} note {RULE[:8]}"])
+        assert fleet.input_draft(pane) is None
+
+    @pytest.mark.parametrize("lone", [CARET, f"  {CARET}"], ids=["col0", "indented"])
+    def test_a_draft_ending_in_a_lone_caret_line_is_a_draft(self, lone):
+        # The last caret line is not the box's first line: the box is read
+        # from its top rule, not from the last caret.
+        pane = real_pane("fix the tests").replace(
+            "fix the tests\n", f"fix the tests\n{lone}\n"
+        )
+        assert fleet.input_draft(pane) == f"fix the tests\n{CARET}"
+
+    @pytest.mark.parametrize(
+        ("box", "draft"),
+        [
+            pytest.param(
+                [f"{CARET} fix the tests", TYPED_RULE, CARET],
+                f"fix the tests\n{TYPED_RULE}\n{CARET}",
+                id="rule-then-lone-caret",
+            ),
+            pytest.param(
+                [CARET, TYPED_RULE, "  fix the tests"],
+                f"{TYPED_RULE}\nfix the tests",
+                id="empty-first-line-then-rule",
+            ),
+            pytest.param(
+                [
+                    f"{CARET} look at this:",
+                    f"  {TYPED_RULE}",
+                    f"  {CARET}",
+                    f"  {TYPED_RULE}",
+                ],
+                f"look at this:\n{TYPED_RULE}\n{CARET}\n{TYPED_RULE}",
+                id="pasted-box-fragment",
+            ),
+            # A typed rule that fills a continuation line: with the line's
+            # two-column indent it is as wide as the box, so only the stripped
+            # width tells it from an edge.
+            pytest.param(
+                [f"{CARET} fix", "  " + "─" * (len(RULE) - 2), "  more"],
+                "fix\n" + "─" * (len(RULE) - 2) + "\nmore",
+                id="rule-filling-an-indented-line",
+            ),
+        ],
+    )
+    def test_a_rule_in_the_draft_is_draft_text(self, box, draft):
+        # Claude Code draws the box's rules the full width of the pane (by
+        # analogy: a read-only capture of a live 50-column pane showed a dialog,
+        # not the input box, and every rule in it was 50 wide), so a narrower
+        # rule inside the box is text the user typed or pasted. Read as a box
+        # edge, it cut the draft short -- to "" in each shape here.
+        pane = "\n".join([RULE, *box, RULE, f"  Fable 5.1 {MID} high"])
+        assert fleet.input_draft(pane) == draft
+
+    @pytest.mark.parametrize(
+        "box",
+        [
+            [CARET, RULE, "  fix the tests"],
+            [f"{CARET} fix", RULE, "  more"],
+            [f"{CARET} fix", RULE],
+        ],
+        ids=["empty-first-line", "after-a-line", "last-line"],
+    )
+    def test_a_pane_wide_rule_typed_into_the_draft_is_none(self, box):
+        # A typed rule exactly as wide as the box cannot be told from its edge.
+        # Closing the box there hides the lines under it (the first shape read
+        # "", no draft at all), so the box must close at the pane's last rule.
+        pane = "\n".join([RULE, *box, RULE, f"  Fable 5.1 {MID} high"])
+        assert fleet.input_draft(pane) is None
+
+    @pytest.mark.parametrize(
+        "above", [TYPED_RULE, f"{RULE}──"], ids=["narrower", "wider"]
+    )
+    def test_the_box_is_as_wide_as_its_bottom_edge_not_the_transcript(self, above):
+        # A rule in the scrollback -- output, or the box as it was drawn before
+        # the pane was resized -- sets no width: the pane's last rule does.
+        pane = "\n".join(["  results:", above, "  a table row", "", real_pane("fix")])
+        assert fleet.input_draft(pane) == "fix"
+
+    def test_a_rule_in_the_transcript_above_the_box_does_not_open_it(self):
+        # The box opens at the NEAREST rule above its caret line.
+        pane = "\n".join(["  results:", RULE, "  a table row", "", real_pane("fix")])
+        assert fleet.input_draft(pane) == "fix"
+
+    def test_a_box_with_no_top_rule_is_none(self):
+        # Cut off above the caret line: whatever was above it is unknown.
+        pane = "\n".join([f"{CARET} fix the tests", RULE, f"  Fable 5.1 {MID} high"])
+        assert fleet.input_draft(pane) is None
+
+    def test_a_box_whose_first_line_is_not_the_caret_line_is_none(self):
+        # The rule above the last caret line is not the input box's top rule.
+        pane = "\n".join([RULE, "  stray text", CARET, RULE])
+        assert fleet.input_draft(pane) is None
+
+    def test_a_busy_pane(self):
+        busy = "\n".join(
+            [
+                "* Working (12s * esc to interrupt)",
+                RULE,
+                f"{CARET} ",
+                RULE,
+                f"  Fable 5.1 {MID} high",
+            ]
+        )
+        assert fleet.classify_state(busy) == "busy"
+        assert fleet.input_draft(busy) == ""
+        typed = busy.replace(f"{CARET} ", f"{CARET} queue this next")
+        assert fleet.input_draft(typed) == "queue this next"
 
 
 class TestVerifySwitch:

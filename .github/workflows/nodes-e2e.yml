@@ -1,0 +1,70 @@
+name: Nodes e2e
+
+# magent nodes end to end against a REAL node over REAL ssh
+# (tests/e2e/test_nodes_real.py, marker nodes_real). The node is this runner
+# itself, reached through the loopback sshd that setup-ssh-server provisions,
+# as a disposable Linux user the test rig creates over a root hop and deletes
+# afterwards. Everything on the node is real (bash, tmux, git, ssh, the
+# product's node scripts) except `claude`: tests/e2e/_claude_stub.sh,
+# installed below as /usr/local/bin/claude, runs the stand-in agent the test
+# repo commits beside its code.
+#
+# NOT a required check by design, like monitor-lab / browser-upload / soak:
+# it creates users and authorizes a key for root on the runner, which is only
+# acceptable on a throwaway hosted VM. MDTEST_NODES_REAL=1 is set here and
+# nowhere else; locally the node journey skips. Never set it on a dev box.
+
+on:
+  pull_request:
+    branches: [main, feat/nodes]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nodes-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nodes-real:
+    name: "Nodes e2e (loopback node)"
+    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: Ensure tmux (the node's multiplexer)
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      # Not continue-on-error: without the sshd there is no node, and the tier
+      # fails loudly rather than reading as coverage.
+      - name: Setup SSH server
+        uses: ./.github/actions/setup-ssh-server
+      - name: Provision the loopback node
+        run: |
+          # The root hop: the rig creates and deletes its node user as root@mdssh.
+          sudo install -d -m 700 /root/.ssh
+          sudo tee -a /root/.ssh/authorized_keys < ~/.ssh/id_test.pub > /dev/null
+          sudo chmod 600 /root/.ssh/authorized_keys
+          # One journey opens many short ssh connections, some concurrently
+          # (the sync daemon's tick beside a test's own reads): keep sshd's
+          # unauthenticated-connection throttle out of the way.
+          echo 'MaxStartups 100:30:200' | sudo tee /etc/ssh/sshd_config.d/01-mdtest-nodes.conf > /dev/null
+          sudo systemctl reload ssh || sudo kill -HUP "$(cat /run/sshd.pid)"
+          # The node's `claude`: the only substitution on the node side.
+          sudo install -m 755 tests/e2e/_claude_stub.sh /usr/local/bin/claude
+          # Fatal smokes: the root hop, and the tools a node user's login sees.
+          ssh -o BatchMode=yes root@mdssh true
+          ssh -o BatchMode=yes root@mdssh 'tmux -V && git --version && python3 --version && claude --version'
+      # An X screen for the launch preview (D6): run_magent plans the monitor
+      # grid before it reads any project, so a headless runner stops at "No
+      # monitors detected" before the node rows.
+      - name: Setup virtual displays
+        uses: ./.github/actions/setup-virtual-displays
+      - name: Nodes e2e
+        env:
+          MDTEST_NODES_REAL: "1"
+        run: pytest tests/e2e/ -v -m nodes_real
