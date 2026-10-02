@@ -3721,21 +3721,30 @@ _DOTENV_NAME = re.compile(
 )
 
 
+def _dotenv_text(path: Path) -> str:
+    """The text of a ``.env`` file, decoded the one way everything that shows
+    or hands off its contents reads it. OSError when it cannot be read.
+
+    A UTF-8 BOM would hide the first name from the line-start match (and land
+    mid-file in a hand-off), and Windows PowerShell 5.1's ``>`` writes UTF-16
+    (a NUL between every character), so both byte-order marks are honoured and
+    neither reaches the text. Undecodable bytes become U+FFFD, never an error.
+    The DIGEST hashes bytes and never decodes, so it needs none of this."""
+    raw = path.read_bytes()
+    codec = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+    return raw.decode(codec, errors="replace")
+
+
 def dotenv_names(path: Path) -> tuple[str, ...]:
     """The variable NAMES a ``.env`` file defines, sorted -- never a value.
 
     Over-listing is the safe direction (a line inside a multi-line quoted value
     that looks like ``K=v`` adds a name the user can ignore); an unreadable
-    file names nothing. A UTF-8 BOM would hide the first name from the
-    line-start match, and Windows PowerShell 5.1's ``>`` writes UTF-16 (a NUL
-    between every character), so both byte-order marks are honoured. The
-    DIGEST hashes bytes and never decodes, so it needs neither."""
+    file names nothing."""
     try:
-        raw = path.read_bytes()
+        text = _dotenv_text(path)
     except OSError:
         return ()
-    codec = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
-    text = raw.decode(codec, errors="replace")
     return tuple(sorted(set(_DOTENV_NAME.findall(text))))
 
 
