@@ -1263,10 +1263,11 @@ class TestTheManualHandOff:
         ps = nodes.cloud_push_set(
             repo, [_state(repo, ignored=_ALL)], home=tmp_path / "home"
         )
+        lines = nodes.masked_lines(ps)
+        # The file's `not a line` is counted, never shown.
+        assert lines[-1] == "(1 line(s) not shown)"
         # The same names `dotenv_names` found, spelled with the same grammar.
-        assert [line.split("  ")[0] for line in nodes.masked_lines(ps)] == list(
-            ps.names
-        )
+        assert [line.split("  ")[0] for line in lines[:-1]] == list(ps.names)
 
     @pytest.mark.parametrize(
         ("bom", "codec"), [(b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")]
@@ -1996,6 +1997,277 @@ class TestTheEnvParserIsQuoteAware:
         ]
 
 
+def _read_env(tmp_path: Path, raw: bytes) -> tuple[tuple[str, ...], list[str]]:
+    """``dotenv_names`` and ``masked_lines`` over one env file's raw bytes."""
+    ps = _env_set(tmp_path, {".env": raw})
+    return nodes.dotenv_names(tmp_path / "api" / ".env"), nodes.masked_lines(ps)
+
+
+# What a continuation line of a secret would print AS a name if it were parsed
+# as a variable: `FRAG=` (an empty value) or `FRAG2==` (a base64 body's padding).
+FRAG = "SENTINELfragment"
+
+
+def _no_fragment(names: tuple[str, ...], lines: list[str]) -> None:
+    shown = "\n".join([*names, *lines])
+    assert "SENTINEL" not in shown and FRAG not in shown
+
+
+class TestAMultiLineSecretNeverPrintsAName:
+    """The names are PRINTED, so a line that is part of a secret must never
+    come back as one. ``TestTheEnvParserIsQuoteAware`` pins the quoted forms;
+    these are the shapes a quote does not cover: an unquoted PEM, a value the
+    shell joins from adjacent quoted runs, and a "name" nobody would pick. The
+    hand-off FILE still carries every byte -- only the screen is guarded."""
+
+    # ---- unquoted armor ----------------------------------------------------
+
+    def test_an_unquoted_pem_is_one_value_to_its_matching_end(self, tmp_path):
+        block = [
+            "-----BEGIN PRIVATE KEY-----",
+            f"{FRAG}=",
+            "MIIEvQIBADANBg",
+            f"{FRAG}2==",
+            "-----END PRIVATE KEY-----",
+        ]
+        raw = ("KEY=" + "\n".join(block) + "\nNEXT=1\n").encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("KEY", "NEXT")
+        assert lines == [
+            f"KEY  ******** ({len(chr(10).join(block))} chars)",
+            "NEXT  ******** (1 chars)",
+        ]
+        _no_fragment(names, lines)
+
+    def test_armor_on_its_own_lines_is_never_parsed_as_variables(self, tmp_path):
+        raw = (
+            f"KEY=\n-----BEGIN CERTIFICATE-----\n{FRAG}=\n{FRAG}2==\n"
+            "-----END CERTIFICATE-----\nNEXT=1\n"
+        ).encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("KEY", "NEXT")
+        # BEGIN, two body lines and END: counted, never shown.
+        assert lines == [
+            "KEY  ******** (0 chars)",
+            "NEXT  ******** (1 chars)",
+            "(4 line(s) not shown)",
+        ]
+        _no_fragment(names, lines)
+
+    def test_a_bundle_of_armored_blocks_is_swallowed_whole(self, tmp_path):
+        raw = (
+            f"CHAIN=-----BEGIN CERTIFICATE-----\n{FRAG}=\n-----END CERTIFICATE-----\n"
+            f"-----BEGIN CERTIFICATE-----\n{FRAG}2=\n-----END CERTIFICATE-----\n"
+            "NEXT=1\n"
+        ).encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("CHAIN", "NEXT")
+        _no_fragment(names, lines)
+
+    def test_only_the_matching_end_closes_a_block(self, tmp_path):
+        raw = (
+            f"KEY=-----BEGIN A-----\n{FRAG}=\n-----END B-----\n{FRAG}2=\n"
+            "-----END A-----\nNEXT=1\n"
+        ).encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("KEY", "NEXT")
+        _no_fragment(names, lines)
+
+    def test_an_opening_line_that_names_no_label_ends_at_any_end(self, tmp_path):
+        raw = f"KEY=-----BEGIN\n{FRAG}=\n-----END X-----\nNEXT=1\n".encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("KEY", "NEXT")
+        _no_fragment(names, lines)
+
+    def test_an_unterminated_block_swallows_the_rest_of_the_file(self, tmp_path):
+        raw = f"KEY=-----BEGIN PRIVATE KEY-----\n{FRAG}=\nNEXT=1\n".encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("KEY",)
+        _no_fragment(names, lines)
+
+    def test_a_block_that_opens_and_closes_on_one_line_ends_there(self, tmp_path):
+        value = "-----BEGIN X-----abc-----END X-----"
+        names, lines = _read_env(tmp_path, f"KEY={value}\nNEXT=1\n".encode())
+        assert names == ("KEY", "NEXT")
+        assert lines[0] == f"KEY  ******** ({len(value)} chars)"
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            "-----BEGIN X-----abc-----END X-----",
+            "-----BEGIN X-----\nabc\n-----END X-----",
+        ],
+        ids=["one-line", "three-lines"],
+    )
+    def test_blanks_after_the_closing_line_are_not_part_of_the_value(
+        self, tmp_path, block
+    ):
+        _, lines = _read_env(tmp_path, f"KEY={block}  \t\nNEXT=1\n".encode())
+        assert lines[0] == f"KEY  ******** ({len(block)} chars)"
+
+    def test_export_and_leading_blanks_do_not_hide_an_opening(self, tmp_path):
+        raw = f"export KEY=  -----BEGIN K-----\n{FRAG}=\n-----END K-----\nNEXT=1\n".encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("KEY", "NEXT")
+        _no_fragment(names, lines)
+
+    def test_dashes_that_are_not_an_opening_are_ordinary_text(self, tmp_path):
+        # Neither inside a value nor at a line start does this open anything.
+        raw = b"A=x-----BEGIN\nB=1\n----- notes\nC=2\n"
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("A", "B", "C")
+        assert lines[-1] == "(1 line(s) not shown)"
+
+    @pytest.mark.parametrize(
+        ("bom", "codec"), [(b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")]
+    )
+    def test_armor_in_a_utf16_file_is_one_value(self, tmp_path, bom, codec):
+        text = f"KEY=-----BEGIN K-----\r\n{FRAG}=\r\n-----END K-----\r\nNEXT=1\r\n"
+        names, lines = _read_env(tmp_path, bom + text.encode(codec))
+        assert names == ("KEY", "NEXT")
+        _no_fragment(names, lines)
+
+    def test_armor_in_a_crlf_file_is_one_value(self, tmp_path):
+        raw = f"KEY=-----BEGIN K-----\r\n{FRAG}=\r\n-----END K-----\r\nNEXT=1\r\n"
+        names, lines = _read_env(tmp_path, raw.encode())
+        assert names == ("KEY", "NEXT")
+        _no_fragment(names, lines)
+
+    # ---- adjacent quoted runs ----------------------------------------------
+
+    @pytest.mark.parametrize(
+        "head",
+        [
+            "A='x''",
+            'A="x""',
+            "A='x'\"",
+            'A="x"\'',
+            "A='x''y'\"",
+            'A="x"y\'',
+            "export A='x''",
+            "A='a # b''",
+        ],
+        ids=[
+            "single-single",
+            "double-double",
+            "single-double",
+            "double-single",
+            "three-runs",
+            "unquoted-between",
+            "export",
+            "hash-inside",
+        ],
+    )
+    def test_adjacent_quoted_runs_are_one_value(self, tmp_path, head):
+        # The shell joins them: the second run opens where the first closed and
+        # keeps going over the next lines, so FRAG= below is part of A.
+        quote = head[-1]
+        raw = f"{head}\n{FRAG}=1\n{quote}\nB=2\n".encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("A", "B")
+        _no_fragment(names, lines)
+
+    def test_adjacent_runs_in_a_crlf_file_count_no_carriage_returns(self, tmp_path):
+        raw = f"A='x''\r\n{FRAG}=1\r\n'\r\nB=2\r\n".encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("A", "B")
+        # x, newline, FRAG=1, newline: both runs counted, the CRs never.
+        assert lines[0] == f"A  ******** ({1 + 1 + len(FRAG) + 2 + 1} chars)"
+        _no_fragment(names, lines)
+
+    @pytest.mark.parametrize(
+        ("line", "length"),
+        [("A='a''b'", 2), ("A='a'\"b\"", 2), ("A=\"a\"'b''c'", 3), ("A='a'b", 1)],
+    )
+    def test_adjacent_runs_measure_the_joined_value(self, tmp_path, line, length):
+        _, lines = _read_env(tmp_path, f"{line}\n".encode())
+        assert lines == [f"A  ******** ({length} chars)"]
+
+    def test_a_blank_ends_the_value_so_a_comment_may_hold_a_quote(self, tmp_path):
+        # `# it's` after a blank is a comment, not an opening: the pin that keeps
+        # the word rule from swallowing the file on every apostrophe.
+        names, lines = _read_env(tmp_path, b'C="x" # it\'s a note\nB=1\n')
+        assert names == ("B", "C")
+        assert lines == ["B  ******** (1 chars)", "C  ******** (1 chars)"]
+
+    # ---- what is allowed to be a name --------------------------------------
+
+    def test_a_name_at_the_cap_is_printed_and_one_past_it_is_not(self, tmp_path):
+        cap = nodes._DOTENV_NAME_MAX
+        fits, over = "A" * cap, "B" * (cap + 1)
+        names, lines = _read_env(tmp_path, f"{fits}=1\n{over}=2\nOK=3\n".encode())
+        assert names == (fits, "OK")
+        assert lines == [
+            f"{fits}  ******** (1 chars)",
+            "OK  ******** (1 chars)",
+            "(1 line(s) not shown)",
+        ]
+        assert over not in "\n".join([*names, *lines])
+
+    def test_a_base64_body_line_is_not_a_name_however_long(self, tmp_path):
+        body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" * 125
+        names, lines = _read_env(tmp_path, f"{body}=\nOK=1\n".encode())
+        assert names == ("OK",)
+        assert body[:40] not in "\n".join(lines)
+
+    @pytest.mark.parametrize(
+        "line",
+        ["my-key=1", "a.b=1", "é=1", "1A=1", "A B=1", "export FOO", "KEY:1"],
+    )
+    def test_only_an_identifier_is_ever_a_name(self, tmp_path, line):
+        names, lines = _read_env(tmp_path, f"{line}\nOK=1\n".encode())
+        assert names == ("OK",)
+        assert lines == ["OK  ******** (1 chars)", "(1 line(s) not shown)"]
+
+    @pytest.mark.parametrize("line", ["abc123==", "A==b", "A = =x"])
+    def test_a_value_that_starts_with_an_equals_sign_is_base64_padding(
+        self, tmp_path, line
+    ):
+        # `abc123==` is what the last line of a base64 body looks like. A real
+        # variable never starts its value with `=`; when in doubt, no name.
+        names, lines = _read_env(tmp_path, f"{line}\nOK=1\n".encode())
+        assert names == ("OK",)
+        assert lines == ["OK  ******** (1 chars)", "(1 line(s) not shown)"]
+
+    def test_an_equals_sign_later_in_a_value_is_ordinary(self, tmp_path):
+        names, _ = _read_env(tmp_path, b"URL=https://x.test/?a=b\nPAD=abc=\nE=\n")
+        assert names == ("E", "PAD", "URL")
+
+    # ---- the count line ----------------------------------------------------
+
+    def test_the_count_sums_every_env_file_and_carries_no_text(self, tmp_path):
+        ps = _env_set(
+            tmp_path,
+            {
+                ".env": f"{FRAG} one\nA=1\n".encode(),
+                ".env.local": (
+                    f"-----BEGIN X-----\n{FRAG}=\n-----END X-----\nB=2\n"
+                ).encode(),
+            },
+        )
+        lines = nodes.masked_lines(ps)
+        assert lines == [
+            "A  ******** (1 chars)",
+            "B  ******** (1 chars)",
+            "(4 line(s) not shown)",
+        ]
+        _no_fragment((), lines)
+
+    def test_comments_and_blank_lines_are_not_counted(self, tmp_path):
+        _, lines = _read_env(tmp_path, b"# a comment\n\n   \n\t# indented\nA=1\n")
+        assert lines == ["A  ******** (1 chars)"]
+
+    def test_a_withheld_names_quoted_value_is_still_consumed(self, tmp_path):
+        # The over-cap line is not shown, but its continuation lines are still
+        # its value: they must not surface as names either.
+        over = "B" * (nodes._DOTENV_NAME_MAX + 1)
+        raw = f'{over}="one\n{FRAG}=\ntwo"\nOK=1\n'.encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("OK",)
+        _no_fragment(names, lines)
+        assert lines[-1] == "(1 line(s) not shown)"
+
+
 class TestTheEnvParserCostIsLinear:
     """The parser reads user files, and ``masked_lines`` runs before anything
     is confirmed: one hostile or merely odd file must not stall it. Each shape
@@ -2051,6 +2323,35 @@ class TestTheEnvParserCostIsLinear:
         text = "".join(f"K{i}=v{i}\n" for i in range(50_000))
         entries, took = self._timed(text)
         assert len(entries) == 50_000
+        assert took < self.BOUND_S
+
+    def test_a_two_hundred_thousand_line_armored_block(self):
+        text = (
+            "K=-----BEGIN X-----\n" + "abcd=\n" * 200_000 + "-----END X-----\nNEXT=1\n"
+        )
+        entries, took = self._timed(text)
+        assert [name for name, _ in entries] == ["K", "NEXT"]
+        assert took < self.BOUND_S
+
+    def test_a_block_that_never_ends_is_one_pass(self):
+        entries, took = self._timed("K=-----BEGIN X-----\n" + "abcd=\n" * 200_000)
+        assert [name for name, _ in entries] == ["K"]
+        assert took < self.BOUND_S
+
+    def test_a_hundred_thousand_armored_blocks_in_a_row(self):
+        text = "-----BEGIN X-----\nabc=\n-----END X-----\n" * 100_000 + "NEXT=1\n"
+        entries, took = self._timed(text)
+        assert entries == [("NEXT", 1)]
+        assert took < self.BOUND_S
+
+    def test_three_hundred_thousand_adjacent_quoted_runs(self):
+        entries, took = self._timed("A=" + "'a'" * 300_000 + "\nB=1\n")
+        assert entries == [("A", 300_000), ("B", 1)]
+        assert took < self.BOUND_S
+
+    def test_a_million_character_name_that_is_not_one(self):
+        entries, took = self._timed("A" * 1_000_000 + "=1\nB=2\n")
+        assert entries == [("B", 1)]
         assert took < self.BOUND_S
 
 
