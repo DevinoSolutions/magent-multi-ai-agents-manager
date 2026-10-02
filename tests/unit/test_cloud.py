@@ -2914,6 +2914,25 @@ class TestReviveNeverRetypesACloudPane:
         assert sent == [] and "Revived" not in result.output
 
 
+def _shared_cwd_cfg(tmp_config, tmp_path: Path, *, same_folder=True) -> str:
+    """A cloud project (session ``api``) and a local one titled ``api-local``.
+    ``same_folder`` puts both in ONE directory: two live agents, one cwd."""
+    cloud_dir = tmp_path / "api"
+    cloud_dir.mkdir(exist_ok=True)
+    other = tmp_path / "other"
+    other.mkdir(exist_ok=True)
+    local: dict[str, object] = {
+        "path": str(cloud_dir if same_folder else other),
+        "title": "api-local",
+    }
+    cloud: dict[str, object] = {
+        "path": str(cloud_dir),
+        "node": "cloud",
+        "cloudTask": "Fix the login bug",
+    }
+    return tmp_config({"version": SCHEMA_VERSION, "projects": [cloud, local]})
+
+
 class TestTheIdleReaperNeverParksACloudPane:
     @pytest.fixture(autouse=True)
     def _every_session_is_live(self, monkeypatch):
@@ -2929,7 +2948,10 @@ class TestTheIdleReaperNeverParksACloudPane:
         from magent.sessions import AGENT_TOOLS
 
         cloud = load_config(_cloud_cfg(tmp_config, tmp_path))
-        assert reap._scope(cloud, tools=AGENT_TOOLS, psmux_bin="psmux") == ([], {})
+        scoped, counts = reap._scope(cloud, tools=AGENT_TOOLS, psmux_bin="psmux")
+        # Never a candidate, but a live agent in its folder all the same: R3
+        # counts it (see the shared-folder tests below).
+        assert scoped == [] and list(counts.values()) == [1]
         # The control: the same project as a local one IS in scope (claude has
         # an idle probe).
         local = load_config(_cloud_cfg(tmp_config, tmp_path, node=None, cloudTask=None))
@@ -2953,6 +2975,89 @@ class TestTheIdleReaperNeverParksACloudPane:
         }
         assert reap.gather(cfg, **kw).rows == {}
         assert reap._read_one(cfg, "api", **kw) is None
+
+
+class TestACloudPaneStillCountsTowardsASharedFolder:
+    """R3 spares a session that does not own its directory. A cloud pane is
+    never a CANDIDATE, but its local `claude --cloud` is a live agent in that
+    folder: a local session sharing it could be handed the cloud pane's process
+    or session file and parked on the wrong idle signal. So the cloud pane is
+    out of the candidates and IN the count."""
+
+    @pytest.fixture(autouse=True)
+    def _live(self, monkeypatch):
+        self.live = None  # None = every session answers
+        monkeypatch.setattr(
+            psmux,
+            "live_sessions",
+            lambda names, psmux=None, **kw: [
+                n for n in names if self.live is None or n in self.live
+            ],
+        )
+        monkeypatch.setattr(psmux, "pane_trees", lambda names, **kw: {})
+
+    @pytest.fixture
+    def kw(self):
+        from magent.sessions import AGENT_TOOLS
+
+        return {
+            "tools": AGENT_TOOLS,
+            "config_dir": None,
+            "now": 1.0,
+            "psmux_bin": "psmux",
+        }
+
+    def test_the_cloud_pane_is_counted_but_never_a_candidate(
+        self, tmp_config, tmp_path, kw
+    ):
+        from magent import reap
+
+        cfg = load_config(_shared_cwd_cfg(tmp_config, tmp_path))
+        scoped, counts = reap._scope(cfg, tools=kw["tools"], psmux_bin="psmux")
+        assert [r["session"] for r in scoped] == ["api-local"]
+        assert list(counts.values()) == [2]
+
+    def test_the_sweep_vetoes_the_local_session_and_never_lists_the_cloud_one(
+        self, tmp_config, tmp_path, kw
+    ):
+        from magent import reap
+
+        cfg = load_config(_shared_cwd_cfg(tmp_config, tmp_path))
+        sweep = reap.gather(cfg, **kw)
+        assert list(sweep.rows) == ["api-local"]
+        assert sweep.rows["api-local"].reason == "shared-cwd"
+
+    def test_the_just_before_the_stop_recheck_vetoes_it_too(
+        self, tmp_config, tmp_path, kw
+    ):
+        from magent import reap
+
+        cfg = load_config(_shared_cwd_cfg(tmp_config, tmp_path))
+        row = reap._read_one(cfg, "api-local", **kw)
+        assert row is not None and row.reason == "shared-cwd"
+        assert reap._read_one(cfg, "api", **kw) is None
+
+    def test_a_cloud_pane_in_another_folder_vetoes_nothing(
+        self, tmp_config, tmp_path, kw
+    ):
+        # The control: the veto is about the DIRECTORY, not about a cloud pane
+        # existing somewhere.
+        from magent import reap
+
+        cfg = load_config(_shared_cwd_cfg(tmp_config, tmp_path, same_folder=False))
+        sweep = reap.gather(cfg, **kw)
+        assert sweep.rows["api-local"].reason != "shared-cwd"
+
+    def test_a_cloud_pane_that_is_not_live_is_not_counted(
+        self, tmp_config, tmp_path, kw
+    ):
+        # No live pane, no local `claude` to confuse with the local session's.
+        from magent import reap
+
+        self.live = {"api-local"}
+        cfg = load_config(_shared_cwd_cfg(tmp_config, tmp_path))
+        sweep = reap.gather(cfg, **kw)
+        assert sweep.rows["api-local"].reason != "shared-cwd"
 
 
 class TestBringUpGatesTheCloudCreate:
@@ -3298,6 +3403,10 @@ class TestAnOnceOnlyPaneTheVerifyFoundLateIsNotToldToBeRevived:
         text = failed["api"]
         assert text.startswith(why)
         assert "revive" not in text
+        # A refused window never reached send-keys, so this bring-up typed
+        # nothing: say that, not "cannot tell" (that is the missing-pane case).
+        assert "typed no agent command into it" in text
+        assert "cannot tell" not in text
         assert "`magent down api`" in text and "`magent up`" in text
         assert "claude.ai/code" in text
         assert text.isascii()
