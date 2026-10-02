@@ -783,6 +783,7 @@ class FakePlatform(Platform):
         supports_attention: bool = False,
         supports_hotkey: bool = False,
         supports_wt_keybindings: bool = False,
+        supports_wt_profiles: bool = False,
         supports_attach_windows: bool = False,
         supports_nudge: bool = False,
         nudge_error: Exception | None = None,
@@ -809,6 +810,7 @@ class FakePlatform(Platform):
         self._supports_attention = supports_attention
         self._supports_hotkey = supports_hotkey
         self._supports_wt_keybindings = supports_wt_keybindings
+        self._supports_wt_profiles = supports_wt_profiles
         self._supports_attach_windows = supports_attach_windows
         self._supports_nudge = supports_nudge
         self._nudge_error = nudge_error
@@ -844,6 +846,7 @@ class FakePlatform(Platform):
         self.psmux_sessions: set[str] = set()
         self.psmux_launches: list[list[str]] = []
         self.attached_psmux: list[tuple] = []
+        self.attached_profiles: list[str | None] = []
         self.moved: list[tuple] = []
         self.nudged: list[list] = []
         self.titles_set: list[tuple] = []
@@ -889,8 +892,11 @@ class FakePlatform(Platform):
             self.psmux_sessions.add(w.window_name)
         return {}
 
-    def attach_psmux(self, session_name, title, color=None, config_path=None) -> None:
+    def attach_psmux(
+        self, session_name, title, color=None, config_path=None, profile=None
+    ) -> None:
         self.attached_psmux.append((session_name, title, color, config_path))
+        self.attached_profiles.append(profile)
 
     def supports_psmux(self) -> bool:
         return self._supports_psmux
@@ -900,6 +906,9 @@ class FakePlatform(Platform):
 
     def supports_wt_keybindings(self) -> bool:
         return self._supports_wt_keybindings
+
+    def supports_wt_profiles(self) -> bool:
+        return self._supports_wt_profiles
 
     def supports_attach_windows(self) -> bool:
         return self._supports_attach_windows

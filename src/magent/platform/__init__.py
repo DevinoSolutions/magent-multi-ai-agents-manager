@@ -22,6 +22,10 @@ class TerminalLaunchOpts:
     ssh_host: str | None = None
     ssh_remote_dir: str | None = None
     ssh_shell: str = "bash -lc"
+    # The Windows Terminal profile to open the tab with (``wt -p``): the one
+    # carrying this window's image icon. None = no ``-p``, i.e. the default
+    # profile's icon, exactly as before ``wt_profiles`` existed.
+    profile: str | None = None
 
 
 @dataclass
@@ -118,6 +122,7 @@ class Platform(ABC):
         title: str,
         color: str | None = None,
         config_path: str | None = None,
+        profile: str | None = None,
     ) -> None:
         raise NotImplementedError("psmux is only supported on Windows")
 
@@ -174,6 +179,12 @@ class Platform(ABC):
     def supports_wt_keybindings(self) -> bool:
         """True if this platform has a Windows Terminal settings.json whose
         ``sendInput`` keybindings magent can install (see ``magent.wt_keys``)."""
+        return False
+
+    def supports_wt_profiles(self) -> bool:
+        """True if this platform has a Windows Terminal whose profile fragments
+        magent can write, so a tab can wear a real image icon (see
+        ``magent.wt_profiles``)."""
         return False
 
     def supports_attach_windows(self) -> bool:
