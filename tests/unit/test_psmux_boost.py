@@ -344,6 +344,9 @@ class TestTheThreeOwnersAllCallTheOneSeam:
             def supports_hotkey(self) -> bool:
                 return False
 
+            def supports_wt_profiles(self) -> bool:
+                return False
+
         cfg = config.MagentConfig(
             projects=[config.ProjectConfig(path="api")],
             settings=config.Settings(upload_server=False),
@@ -377,6 +380,9 @@ class TestTheThreeOwnersAllCallTheOneSeam:
                 return None
 
             def supports_hotkey(self) -> bool:
+                return False
+
+            def supports_wt_profiles(self) -> bool:
                 return False
 
         cfg = config.MagentConfig(
