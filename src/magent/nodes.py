@@ -36,6 +36,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
+from magent import node_auth
 from magent.config import (
     _NODE_NICK_RE,
     NODE_AUTO,
@@ -4251,21 +4252,35 @@ def masked_lines(ps: CloudPushSet) -> list[str]:
     return shown + unreadable
 
 
+# A file only this user can open is node_auth's to make (a protected DACL at
+# CreateFile on Windows, which ``os.chmod`` cannot be; a verified 0600 on POSIX),
+# and its refusal is a hand-off's here: ``reason`` is an error CLASS name or
+# "not-private", never a path.
+HandoffNotPrivate = node_auth.PrivateFileRefused
+
+
+def _open_private(prefix: str, suffix: str) -> tuple[int, Path]:
+    """A new EMPTY file only this user can open, and a write descriptor on it.
+    HandoffNotPrivate when that cannot be had; nothing is left behind then. The
+    one seam a test replaces to make "cannot be had" happen."""
+    return node_auth.create_private_temp(prefix, suffix)
+
+
 def write_private_temp(text: str, *, prefix: str, suffix: str = ".txt") -> Path:
     """``text`` in a fresh temp file only this user can read, as UTF-8 with LF
-    endings. ``mkstemp`` makes it 0600 on POSIX and it is chmod'd to 0600 again
-    before any byte is written (an ACL-bearing temp dir can widen a creation
-    mode); on Windows it inherits the per-user %TEMP% ACL [A].
+    endings. The file is made private BEFORE any byte is written
+    (``_open_private``), and when it cannot be, HandoffNotPrivate: the secret
+    is never put in a file that is not.
 
     A failure part-way deletes the file before it is re-raised: a half-written
     secret must not outlive the error that interrupted it."""
-    fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix)
-    path = Path(name)
+    # Encoded first: text that cannot be encoded (a lone surrogate) raises with
+    # no file made.
+    data = text.encode("utf-8")
+    fd, path = _open_private(prefix, suffix)
     try:
-        with contextlib.suppress(OSError):
-            os.chmod(path, 0o600)
         try:
-            fh = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+            fh = os.fdopen(fd, "wb")
         except BaseException:
             # fdopen never took the descriptor: close it, or the file stays
             # open (and, on Windows, undeletable) behind the error.
@@ -4273,12 +4288,58 @@ def write_private_temp(text: str, *, prefix: str, suffix: str = ".txt") -> Path:
                 os.close(fd)
             raise
         with fh:
-            fh.write(text)
+            fh.write(data)
     except BaseException:
         with contextlib.suppress(OSError):
             path.unlink()
         raise
     return path
+
+
+# What a hand-off file is called, and how long one may sit before the next
+# ``node push`` clears it: a terminal closed at the prompt skips the ``finally``
+# that deletes it, and ``--yes`` keeps it on purpose. An hour is long enough
+# that a file being pasted from, or a prompt another terminal is waiting at, is
+# not pulled out from under the user.
+HANDOFF_PREFIX = "magent-cloud-env-"
+HANDOFF_SUFFIX = ".env"
+HANDOFF_STALE_S = 3600.0
+
+
+def sweep_handoff_leftovers(
+    *, older_than_s: float = HANDOFF_STALE_S, now: float | None = None
+) -> tuple[int, int]:
+    """Delete the hand-off files an earlier push left in the temp dir:
+    ``(removed, could_not_delete)``. Only OUR files -- the prefix and suffix
+    ``write_manual_handoff`` uses, a plain file (never a link), this user's
+    (POSIX: a shared /tmp can hold another account's), and older than
+    ``older_than_s``. Reads no file's content and names none."""
+    cutoff = (time.time() if now is None else now) - older_than_s
+    try:
+        found = list(
+            Path(tempfile.gettempdir()).glob(f"{HANDOFF_PREFIX}*{HANDOFF_SUFFIX}")
+        )
+    except OSError:
+        return 0, 0
+    removed = stuck = 0
+    for path in found:
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_mtime > cutoff:
+            continue
+        if not node_auth.owned_by_current_user(st):
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            stuck += 1
+        else:
+            removed += 1
+    return removed, stuck
 
 
 def write_manual_handoff(ps: CloudPushSet) -> Path:
@@ -4303,4 +4364,6 @@ def write_manual_handoff(ps: CloudPushSet) -> Path:
             raise PushSetUnreadable(label, type(exc).__name__) from None
         parts.append(f"# from {label}\n")
         parts.append(text.replace("\r\n", "\n").rstrip("\n") + "\n")
-    return write_private_temp("".join(parts), prefix="magent-cloud-env-", suffix=".env")
+    return write_private_temp(
+        "".join(parts), prefix=HANDOFF_PREFIX, suffix=HANDOFF_SUFFIX
+    )
