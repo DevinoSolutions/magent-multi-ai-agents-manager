@@ -3497,3 +3497,208 @@ class TestUpBrandsAFreshCloudPaneAtCloud:
         )
         runner.invoke(cli.main, ["--config", path, "up"])
         assert seen == [["api"]]
+
+
+# ---------------------------------------------------------------------------
+# J8 (follow-up): a LOCAL project that shares a cloud project's session name.
+# Its window would be created, verified and re-sent into the live cloud pane
+# (`claude --continue` typed into a `claude --cloud` session), and a later
+# revive could do the same.
+# ---------------------------------------------------------------------------
+
+
+def _grouped_twin_cfg(tmp_config, tmp_path: Path, *, cloud_first=True) -> str:
+    """A cloud project (group a) and a local one (group b) for the SAME folder:
+    one session name, two groups, so a group filter drops one of them before
+    the first-wins dedupe could."""
+    folder = tmp_path / "api"
+    folder.mkdir(exist_ok=True)
+    local: dict[str, object] = {"path": str(folder), "group": "b"}
+    cloud: dict[str, object] = {
+        "path": str(folder),
+        "group": "a",
+        "node": "cloud",
+        "cloudTask": "Fix the login bug",
+    }
+    return tmp_config(
+        {
+            "version": SCHEMA_VERSION,
+            "settings": {"psmux": True},
+            "projects": [cloud, local] if cloud_first else [local, cloud],
+        }
+    )
+
+
+class TestTheLaunchPathNeverQueuesALocalWindowOnACloudPanesName:
+    @pytest.mark.parametrize(
+        ("running", "live"), [(False, False), (False, True), (True, False)]
+    )
+    def test_the_local_twin_of_an_earlier_cloud_project_is_skipped_by_name(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys, running, live
+    ):
+        # Cloud first: the cloud entry is `project_for_session`'s first enabled
+        # match, so it passes its own twin check. The local entry must not then
+        # queue a `resend=True` window under the same name: that is the window
+        # whose verify re-sends `claude --continue` into the cloud pane.
+        path = _twin_cfg(tmp_config, tmp_path, cloud_first=True)
+        n, windows, asked, targets, _ = _dispatch(
+            monkeypatch, fake_platform, path, which=1, running=running, live=live
+        )
+        out = capsys.readouterr().out
+        assert (n, windows, asked, targets) == (0, [], [], [])
+        assert out.count("SKIP:") == 1
+        assert launch.twin_session_refusal("api") in out
+
+    def test_the_loop_creates_the_one_cloud_window_and_skips_the_local_one(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys
+    ):
+        monkeypatch.setattr("magent.launch.cloud_refusal", lambda config, sid: None)
+        monkeypatch.setattr("magent.psmux.live_sessions", lambda names, *a, **kw: [])
+        fake_platform._supports_psmux = True
+        cfg = load_config(_twin_cfg(tmp_config, tmp_path, cloud_first=True))
+        result = launch._launch_projects(
+            fake_platform, cfg, RunOpts(), cfg.projects, None
+        )
+        out = capsys.readouterr().out
+        [w] = result.psmux_windows
+        assert (w.command, w.resend, w.nick) == (
+            'claude --cloud "Fix the login bug"',
+            False,
+            "cloud",
+        )
+        assert out.count("SKIP:") == 1 and launch.twin_session_refusal("api") in out
+        assert [t.key for t in result.targets] == ["api"]
+
+    def test_a_disabled_cloud_project_owns_nothing(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys
+    ):
+        # `project_for_session` reads ENABLED projects only: a disabled cloud
+        # entry creates no pane, so it must not take the local project's name.
+        folder = tmp_path / "api"
+        folder.mkdir()
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"psmux": True},
+                "projects": [
+                    {
+                        "path": str(folder),
+                        "node": "cloud",
+                        "cloudTask": "t",
+                        "enabled": False,
+                    },
+                    {"path": str(folder)},
+                ],
+            }
+        )
+        n, [w], _, _, _ = _dispatch(monkeypatch, fake_platform, path, which=1)
+        assert (n, w.resend, w.nick) == (1, True, None)
+        assert "SKIP" not in capsys.readouterr().out
+
+    def test_the_other_order_is_still_the_cloud_twins_skip(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys
+    ):
+        # [local, cloud]: the J7 behaviour, unchanged -- the local project
+        # keeps its window, the cloud entry is the one skipped.
+        path = _twin_cfg(tmp_config, tmp_path, cloud_first=False)
+        n, [w], _, _, _ = _dispatch(monkeypatch, fake_platform, path, which=0)
+        assert (n, w.resend, w.nick) == (1, True, None)
+        n, windows, asked, _, _ = _dispatch(monkeypatch, fake_platform, path, which=1)
+        assert (n, windows, asked) == (0, [], [])
+        assert launch.twin_session_refusal("api") in capsys.readouterr().out
+
+
+class TestACloudFirstTwinNeverReachesTheSessionLists:
+    """``up``, revive, status and the reaper read ``eligible_projects``. Without
+    a group filter its first-wins dedupe already keeps the local twin out; with
+    one, the cloud project can be filtered away FIRST, and the local twin would
+    become the row that owns the cloud pane's name."""
+
+    @pytest.fixture
+    def sent(self, monkeypatch):
+        out: list[str] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "has_session", lambda *a, **k: True)
+        monkeypatch.setattr(psmux, "idle_sessions", lambda names, **k: set(names))
+        monkeypatch.setattr(
+            psmux, "send_keys", lambda sid, *a, **k: out.append(sid) or True
+        )
+        return out
+
+    def test_without_a_group_the_cloud_project_owns_the_name(
+        self, tmp_config, tmp_path
+    ):
+        cfg = load_config(_twin_cfg(tmp_config, tmp_path, cloud_first=True))
+        [entry] = psmux.eligible_projects(cfg)
+        assert entry["node"] == "cloud" and "--cloud" in str(entry["cmd"])
+
+    def test_a_group_filter_leaves_the_local_twin_no_command_and_a_reason(
+        self, tmp_config, tmp_path
+    ):
+        cfg = load_config(_grouped_twin_cfg(tmp_config, tmp_path))
+        [entry] = psmux.eligible_projects(cfg, "b")
+        assert entry["node"] is None and entry["cmd"] == ""
+        assert entry["cmd_why"] == launch.twin_session_refusal("api")
+
+    def test_the_other_order_leaves_the_local_project_alone(self, tmp_config, tmp_path):
+        # [local, cloud]: the local project owns the name, so its row is the
+        # ordinary one in either group view.
+        cfg = load_config(_grouped_twin_cfg(tmp_config, tmp_path, cloud_first=False))
+        [entry] = psmux.eligible_projects(cfg, "b")
+        assert entry["cmd"] and "cmd_why" not in entry
+
+    def test_a_project_with_no_cloud_twin_is_untouched(self, tmp_config, tmp_path):
+        cfg = load_config(
+            _cloud_cfg(tmp_config, tmp_path, node=None, cloudTask=None, group="b")
+        )
+        [entry] = psmux.eligible_projects(cfg, "b")
+        assert entry["cmd"] and "cmd_why" not in entry
+
+    def test_status_says_why_the_local_twin_is_down(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "live_sessions", lambda names, psmux=None, **kw: [])
+        cfg = load_config(_grouped_twin_cfg(tmp_config, tmp_path))
+        _up, down, _all = psmux.psmux_status(cfg, "b")
+        assert [d["reason"] for d in down] == [launch.twin_session_refusal("api")]
+
+    def test_bring_up_refuses_the_local_twin_by_name_and_creates_nothing(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        windows: list[psmux.PsmuxWindowOpts] = []
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fake_platform)
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux, "launch_verified", lambda plat, wins: (windows.extend(wins), {})[1]
+        )
+        cfg = load_config(_grouped_twin_cfg(tmp_config, tmp_path))
+        up, failed = psmux.bring_up(cfg, group="b")
+        assert (up, windows) == ([], [])
+        assert failed == {"api": launch.twin_session_refusal("api")}
+
+    def test_bring_up_without_a_group_makes_one_window_and_it_is_the_cloud_one(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        windows: list[psmux.PsmuxWindowOpts] = []
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fake_platform)
+        monkeypatch.setattr("magent.launch.cloud_refusal", lambda config, sid: None)
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "live_sessions", lambda names, psmux=None, **kw: [])
+        monkeypatch.setattr(
+            psmux, "launch_verified", lambda plat, wins: (windows.extend(wins), {})[1]
+        )
+        cfg = load_config(_twin_cfg(tmp_config, tmp_path, cloud_first=True))
+        up, failed = psmux.bring_up(cfg)
+        [w] = windows
+        assert (up, failed) == (["api"], {})
+        assert (w.resend, w.nick) == (False, "cloud")
+
+    def test_revive_never_types_into_the_cloud_panes_name_for_the_local_twin(
+        self, sent, tmp_config, tmp_path
+    ):
+        why: dict[str, str] = {}
+        cfg = load_config(_grouped_twin_cfg(tmp_config, tmp_path))
+        revived = psmux.revive_sessions(cfg, only=["api"], group="b", vetoed=why)
+        assert revived == [] and sent == []
+        assert why["api"] == launch.twin_session_refusal("api")

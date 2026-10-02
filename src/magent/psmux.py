@@ -1804,9 +1804,21 @@ def eligible_projects(
     ``cmd_why``, so every consumer that already reads an empty command as
     "nothing to run" stays correct and the surfaces that can name the reason do.
     Each entry carries ``node`` (``"cloud"`` or None).
+
+    A LOCAL project whose session name a cloud project owns (the first ENABLED
+    project with that name, as the create gate reads it) gets ``cmd == ""`` and
+    that reason too: its command would be typed, verified, re-sent or revived
+    into the cloud pane. Without a group filter the first-wins dedupe below
+    already keeps it out; a group filter can drop the cloud project before the
+    dedupe sees it, and this is what closes that gap.
     """
     from magent.config import is_cloud, runs_on_node
-    from magent.launch import _expand_base_dir, _resolve_path
+    from magent.launch import (
+        _expand_base_dir,
+        _resolve_path,
+        project_for_session,
+        twin_session_refusal,
+    )
     from magent.sessions import is_ide_tool, pane_command
     from magent.titles import get_leaf_name
 
@@ -1814,6 +1826,7 @@ def eligible_projects(
     if base_dir:
         base_dir = _expand_base_dir(base_dir)
 
+    has_cloud = any(is_cloud(p) for p in config.projects)
     out: list[dict[str, object]] = []
     seen: set[str] = set()
     for proj in config.projects:
@@ -1851,6 +1864,13 @@ def eligible_projects(
             cmd, cmd_why = _cloud_command(
                 tool, config.settings.tools.get(tool, ""), proj.cloud_task
             )
+        elif (
+            has_cloud
+            and (owner := project_for_session(config, sid)) is not None
+            and is_cloud(owner)
+        ):
+            pane_tool = tool
+            cmd, cmd_why = "", twin_session_refusal(sid)
         else:
             pane = pane_command(
                 tool,
@@ -2045,6 +2065,12 @@ def bring_up(
                 refused[sid] = reason
                 continue
         if not p["cmd"]:
+            # A local project on a cloud pane's name has no command and must
+            # say so: silence would read as "brought up".
+            twin = p.get("cmd_why")
+            if not cloud and isinstance(twin, str) and twin:
+                get_logger("launch").warning("%s not created: %s", sid, twin)
+                refused[sid] = twin
             continue
         windows.append(
             PsmuxWindowOpts(
@@ -2357,7 +2383,9 @@ def revive_sessions(
             )
             continue
         if not p["cmd"]:
-            why[_field_str(p, "session")] = "its tool has no command configured"
+            why[_field_str(p, "session")] = (
+                _field_str(p, "cmd_why") or "its tool has no command configured"
+            )
             continue
         candidates.append(p)
     known = {_field_str(p, "session") for p in eligible}
