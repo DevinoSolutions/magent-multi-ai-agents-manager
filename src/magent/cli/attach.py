@@ -761,24 +761,31 @@ def _ensure_attach_profiles(sids: Sequence[str], config_path: str | None) -> Non
 
     A remote session has no local project directory to find a logo in and the
     host's colours are not in its status reply, so each gets the generated
-    badge in its derived colour. Reads THIS machine's ``settings.terminalIcons``
-    tolerantly (no config means "on", like every other default) and never
-    removes anything -- turning the setting off is `run_magent`'s and
-    ``magent terminal icons --remove``'s job. Never raises.
+    badge in its derived colour -- but only where nothing else has described
+    that window yet (``only_if_missing``): a host session that shares its name
+    with one of THIS machine's projects must not take that tab's icon away from
+    the launch's. Reads THIS machine's ``settings.terminalIcons`` tolerantly (no
+    config means "on", like every other default) and, with it off, does what
+    `run_magent` does: removes the fragment, so no `wt -p` is passed from a
+    stale one. One sync for the whole batch. Never raises.
     """
     from magent import wt_profiles  # heavy subsystem: in-body per policy
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
     if not sids or not get_platform().supports_wt_profiles():
         return
+    wt_profiles.begin_launch()
     config_file = find_config(config_path)
     if config_file.exists():
         try:
             if not load_config(str(config_file)).settings.terminal_icons:
+                wt_profiles.sync([], setting=False)
                 return
         except (ValueError, OSError):
             pass  # an unreadable config is "no opinion", not a reason to skip
-    wt_profiles.sync([wt_profiles.IconSpec(key=sid, label=sid) for sid in sids])
+    wt_profiles.sync(
+        [wt_profiles.IconSpec(key=sid, label=sid, only_if_missing=True) for sid in sids]
+    )
 
 
 def _spawn_windows(

@@ -298,4 +298,14 @@ def terminal_icons_cmd(ctx: click.Context, remove: bool) -> None:
             f"  {style('Restart Windows Terminal to drop the profiles.', dim=True)}"
         )
     else:
-        click.echo(f"  {style('Nothing to remove.', dim=True)}")
+        directory = wt_profiles.fragment_dir()
+        if directory is not None and directory.is_dir():
+            # What magent wrote is gone (or could not be touched while another
+            # magent held the lock); the folder stays because it still holds
+            # something else.
+            click.echo(
+                f"  {style('Kept', bold=True)} {directory}"
+                f" {style('-- it holds files magent did not write, or another magent is using it.', dim=True)}"
+            )
+        else:
+            click.echo(f"  {style('Nothing to remove.', dim=True)}")

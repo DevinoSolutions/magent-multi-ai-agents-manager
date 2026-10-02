@@ -93,6 +93,19 @@ class TestIconsCommand:
         assert not wt_profiles.fragment_dir().exists()
         assert (sibling / "theirs.json").is_file()
 
+    def test_remove_leaves_a_folder_that_holds_someone_elses_file(
+        self, runner, on_wt, icons_on
+    ):
+        _seed("api")
+        directory = wt_profiles.fragment_dir()
+        (directory / "notes.txt").write_text("mine", encoding="utf-8")
+        result = runner.invoke(cli.main, ["terminal", "icons", "--remove"])
+        assert result.exit_code == 0
+        assert "Removed" not in result.stdout
+        assert "Kept" in result.stdout
+        assert (directory / "notes.txt").is_file()
+        assert not (directory / wt_profiles.FRAGMENT_FILE).exists()
+
     def test_remove_with_nothing_there(self, runner, on_wt, icons_on):
         result = runner.invoke(cli.main, ["terminal", "icons", "--remove"])
         assert result.exit_code == 0
