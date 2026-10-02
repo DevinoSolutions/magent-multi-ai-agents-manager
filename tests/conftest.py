@@ -5,6 +5,7 @@ import subprocess
 import sys
 import types
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from click.testing import CliRunner
@@ -326,7 +327,11 @@ def _no_real_wt_fragment(tmp_path_factory, monkeypatch):
     in tmp. Same device as ``_no_real_ssh``: patched on the MODULE attribute,
     so ``test_home_isolation`` can still import the real resolver by value.
     """
-    root = tmp_path_factory.mktemp("wt-fragments")
+    # A unique PATH, not a directory: `mktemp` numbers its dirs by scanning every
+    # sibling, so one per test (all ~8000 of them, autouse) made the suite
+    # quadratic and pushed the CI quality job past its 10-minute timeout. The
+    # folder comes into being only for the few tests that write a fragment.
+    root = tmp_path_factory.getbasetemp() / "wt-fragments" / uuid4().hex
     monkeypatch.setattr("magent.wt_profiles.fragments_root", lambda: root)
 
 
