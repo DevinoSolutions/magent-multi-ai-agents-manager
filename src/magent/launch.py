@@ -1455,6 +1455,29 @@ def twin_session_refusal(sid: str) -> str:
     )
 
 
+def shadowed_cloud_projects(config: MagentConfig) -> list[tuple[ProjectConfig, str]]:
+    """Every enabled cloud project whose session name ANOTHER enabled project
+    owns, each with that session id: ``(project, sid)``, in config order.
+
+    ``psmux.eligible_projects`` keeps the first of a duplicate id and the create
+    gate reads the first enabled project by name, so a ``[local, cloud]`` pair
+    for one folder silently never starts the cloud entry -- ``up`` says nothing.
+    This is the one place that names it, for ``status`` (and anything else that
+    can say so out loud) to word with ``twin_session_refusal``'s fix."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    out: list[tuple[ProjectConfig, str]] = []
+    for proj in config.projects:
+        if not proj.enabled or not is_cloud(proj):
+            continue
+        sid = nodes.node_sid(proj)
+        owner = project_for_session(config, sid)
+        if owner is not None and owner is not proj:
+            out.append((proj, sid))
+    return out
+
+
 def cloud_refusal(config: MagentConfig, sid: str) -> str | None:
     """Why the cloud session for ``sid`` must NOT be created now, or None.
 

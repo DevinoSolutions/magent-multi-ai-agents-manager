@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from magent.config import MagentConfig
     from magent.platform import Platform
@@ -1729,6 +1729,28 @@ def socket_id(session_dict: dict[str, object]) -> str:
     return str(session_dict.get("session") or session_dict.get("name") or "")
 
 
+def cloud_pane_ids(rows: Iterable[Mapping[str, object]]) -> set[str]:
+    """Session ids of the CLOUD panes among ``rows`` (session-dict rows, as
+    ``config_sessions``/``eligible_projects`` return them).
+
+    The FIRST row for a session id decides, the way ``eligible_projects`` keeps
+    one entry per id and the create gate reads the first enabled project by
+    name: in a ``[local, cloud]`` pair for one folder the pane is a LOCAL
+    agent's, so it is not a cloud id -- a bare "any row says cloud" would call
+    that local pane a cloud one and refuse ``send`` into a perfectly drivable
+    agent. A row with no name is ignored."""
+    seen: set[str] = set()
+    cloud: set[str] = set()
+    for row in rows:
+        sid = socket_id(dict(row))
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        if row.get("node") == "cloud":
+            cloud.add(sid)
+    return cloud
+
+
 def _field_str(d: dict[str, object], key: str) -> str:
     """A descriptor dict's string field (narrows dict[str, object] to str)."""
     value = d.get(key, "")
@@ -1913,13 +1935,24 @@ def psmux_status(
     differently. It used to run its own single-shot fan-out with no retry while
     the picker retried its misses, which is how ``status``/``down`` came to
     report sessions stopped that the picker was still attaching to.
+
+    A CLOUD pane carries ``node: "cloud"`` (on cloud rows only). One whose
+    command cannot be built (no task, a tool that is not claude) and a local
+    project on a cloud pane's session name have no command but are still
+    PROBED: the pane they name may well be live, and a reason says why nothing
+    would be started, not that the session is not there. A live twin lands in
+    ``up`` as the cloud pane it is, with a ``note`` naming the cloud project
+    that owns the name; one that is not live keeps its refusal as the reason.
     """
+    from magent.launch import project_for_session
+
     binary = find_psmux()
     projects = eligible_projects(config, group)
     up: list[dict[str, object]] = []
     down: list[dict[str, object]] = []
 
     probeable: list[dict[str, object]] = []
+    why_by_sid: dict[str, str] = {}
     for p in projects:
         info: dict[str, object] = {
             "name": p["name"],
@@ -1928,7 +1961,13 @@ def psmux_status(
             "tool": p["tool"],
             "group": p.get("group"),
         }
-        if binary and p["resolved"] and p["cmd"]:
+        cloud = p.get("node") == "cloud"
+        if cloud:
+            info["node"] = "cloud"
+        cmd_why = p.get("cmd_why")
+        if binary and p["resolved"] and (p["cmd"] or cmd_why):
+            if isinstance(cmd_why, str) and cmd_why:
+                why_by_sid[_field_str(info, "session")] = cmd_why
             probeable.append(info)
         else:
             info["reason"] = _down_reason(binary, p)
@@ -1938,7 +1977,25 @@ def psmux_status(
         live_sessions([_field_str(i, "session") for i in probeable], psmux=binary)
     )
     for info in probeable:
-        (up if _field_str(info, "session") in live else down).append(info)
+        sid = _field_str(info, "session")
+        why = why_by_sid.get(sid)
+        if sid in live:
+            if why and info.get("node") != "cloud":
+                # A local project on a cloud pane's name: the live pane IS the
+                # cloud pane, so it is up -- and never a down project, an idle
+                # agent, or a casualty.
+                owner = project_for_session(config, sid)
+                info["node"] = "cloud"
+                info["note"] = (
+                    "the live cloud pane of the cloud project at "
+                    f"{owner.path if owner else sid}; this project shares its "
+                    "session name, so nothing is started for it"
+                )
+            up.append(info)
+        else:
+            if why:
+                info["reason"] = why
+            down.append(info)
 
     return up, down, projects
 
@@ -1995,7 +2052,10 @@ def bring_up(
     owns -- is not attempted: it lands in the second item with its reason, the
     same place a creation casualty does, and so reaches every printer of it. A
     cloud session that is already live is never gated (nothing is created for
-    it) and is left to ``launch_verified``, whose launch dedupes it.
+    it) and is left to ``launch_verified``, whose launch dedupes it. A local
+    project on a cloud pane's session name is refused the same way -- unless
+    that name answers ``has-session``: then it is the live cloud pane, which is
+    up, so it is neither created nor reported as a casualty.
     """
     from magent.platform import get_platform
 
@@ -2008,13 +2068,20 @@ def bring_up(
         if (only is None or _field_str(p, "session") in only) and p["resolved"]
     ]
     # THE liveness answer, once for every cloud project (a dropped probe reads
-    # "not live", which only asks the gate: the safe direction).
+    # "not live", which only asks the gate: the safe direction) and for every
+    # local twin of one, whose session name may be the live cloud pane itself.
     cloud_sids = [_field_str(p, "session") for p in rows if p.get("node") == "cloud"]
-    live_cloud = set(live_sessions(cloud_sids)) if cloud_sids else set()
+    twin_sids = [
+        _field_str(p, "session")
+        for p in rows
+        if p.get("node") != "cloud" and not p["cmd"] and p.get("cmd_why")
+    ]
+    pane_sids = [*cloud_sids, *twin_sids]
+    live_panes = set(live_sessions(pane_sids)) if pane_sids else set()
     for p in rows:
         sid = _field_str(p, "session")
         cloud = p.get("node") == "cloud"
-        if cloud and sid not in live_cloud:
+        if cloud and sid not in live_panes:
             reason = _cloud_create_refusal(config, p, sid)
             if reason:
                 get_logger("launch").warning(
@@ -2024,9 +2091,10 @@ def bring_up(
                 continue
         if not p["cmd"]:
             # A local project on a cloud pane's name has no command and must
-            # say so: silence would read as "brought up".
+            # say so: silence would read as "brought up" -- unless the name is
+            # the LIVE cloud pane, which is up and nobody's casualty.
             twin = p.get("cmd_why")
-            if not cloud and isinstance(twin, str) and twin:
+            if not cloud and isinstance(twin, str) and twin and sid not in live_panes:
                 get_logger("launch").warning("%s not created: %s", sid, twin)
                 refused[sid] = twin
             continue

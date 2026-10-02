@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from magent import agent_state, cli, psmux
+from magent import agent_state, cli, launch, psmux
 from magent.cli import status as status_mod
 from magent.config import SCHEMA_VERSION
 from magent.lockfile import LockHeld, exclusive_lock, lock_path
@@ -1162,6 +1162,284 @@ class TestIdleColumnNeedsPositiveProof:
         assert result.exit_code == 0
         assert json.loads(result.stdout)["psmux_sessions"][0]["idle"] is True
         assert fan_outs == [["api"]]
+
+    def test_a_cloud_pane_at_a_bare_shell_is_never_idle_and_says_cloud(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # idle is the verdict revive acts on; a cloud pane back at pwsh after
+        # provisioning is NOT a dead agent, and a revive would start a second
+        # cloud session (spec §18.5).
+        _both_off(monkeypatch)
+        (tmp_path / "api").mkdir()
+        up = [{"name": "api", "session": "api", "group": None}]
+        projects = [
+            {
+                "name": "api",
+                "session": "api",
+                "resolved": str(tmp_path / "api"),
+                "node": "cloud",
+            }
+        ]
+        _fake_psmux(monkeypatch, up, projects, {"api": "pwsh"})
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+
+        assert result.exit_code == 0
+        [row] = json.loads(result.stdout)["psmux_sessions"]
+        assert row["node"] == "cloud"
+        assert row["idle"] is False
+
+    def test_a_cloud_row_is_tagged_in_the_human_list(self, capsys):
+        status_mod._print_session_row(
+            1,
+            {"name": "api", "app": "pwsh", "idle": False, "state": "", "node": "cloud"},
+        )
+        assert "cloud" in capsys.readouterr().out
+
+
+class TestACloudPaneIsWordedTruthfully:
+    """A cloud pane's local session is only the viewer: its state is worded
+    from what is KNOWN -- why nothing would be started, and that a shell
+    foreground cannot tell "the cloud session started and `claude --cloud`
+    returned" from "the command never landed" -- never as a healthy agent and
+    never as a bare "down"."""
+
+    def _cloud_row(self, tmp_path):
+        (tmp_path / "api").mkdir(exist_ok=True)
+        return {
+            "name": "api",
+            "session": "api",
+            "resolved": str(tmp_path / "api"),
+            "node": "cloud",
+        }
+
+    def test_a_live_cloud_pane_at_a_shell_is_not_a_healthy_idle_one(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        row = self._cloud_row(tmp_path)
+        _fake_psmux(
+            monkeypatch,
+            [{"name": "api", "session": "api", "group": None, "node": "cloud"}],
+            [row],
+            {"api": "pwsh"},
+        )
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"projects": []}), "status"]
+        )
+        assert result.exit_code == 0
+        assert "cloud" in result.stdout
+        assert "start unconfirmed" in result.stdout
+        assert "idle" not in result.stdout
+
+    def test_a_cloud_pane_still_running_its_command_is_not_called_unconfirmed(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        _fake_psmux(
+            monkeypatch,
+            [{"name": "api", "session": "api", "group": None, "node": "cloud"}],
+            [self._cloud_row(tmp_path)],
+            {"api": "claude"},
+        )
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"projects": []}), "status"]
+        )
+        assert "cloud" in result.stdout and "unconfirmed" not in result.stdout
+
+    def test_a_live_twin_of_a_cloud_pane_is_never_idle(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # `psmux_status` marks the up entry of a live cloud pane that a local
+        # twin's row stands for; the `projects` row says node None.
+        _both_off(monkeypatch)
+        (tmp_path / "api").mkdir()
+        twin = {"name": "api", "session": "api", "resolved": str(tmp_path / "api")}
+        _fake_psmux(
+            monkeypatch,
+            [{"name": "api", "session": "api", "group": None, "node": "cloud"}],
+            [twin],
+            {"api": "pwsh"},
+        )
+        result = runner.invoke(
+            cli.main,
+            ["--config", tmp_config({"projects": []}), "status", "--json"],
+        )
+        [row] = json.loads(result.stdout)["psmux_sessions"]
+        assert row["node"] == "cloud" and row["idle"] is False
+
+    def test_a_down_cloud_pane_says_why_nothing_would_start(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        _fake_psmux(
+            monkeypatch,
+            [],
+            [self._cloud_row(tmp_path)],
+            down=[
+                {
+                    "name": "api",
+                    "session": "api",
+                    "group": None,
+                    "node": "cloud",
+                    "reason": launch.NO_CLOUD_TASK,
+                }
+            ],
+        )
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"projects": []}), "status"]
+        )
+        assert result.exit_code == 0
+        assert "api" in result.stdout and "cloud" in result.stdout
+        assert launch.NO_CLOUD_TASK in result.stdout
+
+    def test_a_down_cloud_pane_with_no_reason_says_its_cloud_session_may_run(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        _fake_psmux(
+            monkeypatch,
+            [],
+            [self._cloud_row(tmp_path)],
+            down=[{"name": "api", "session": "api", "group": None, "node": "cloud"}],
+        )
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"projects": []}), "status"]
+        )
+        assert "cloud session" in result.stdout
+        assert "claude.ai/code" in result.stdout
+
+    def test_a_down_local_project_gets_no_cloud_line(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        (tmp_path / "web").mkdir()
+        _fake_psmux(
+            monkeypatch,
+            [],
+            [{"name": "web", "session": "web", "resolved": str(tmp_path / "web")}],
+            down=[{"name": "web", "session": "web", "group": None}],
+        )
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"projects": []}), "status"]
+        )
+        assert "cloud" not in result.stdout
+
+
+class TestAShadowedCloudProjectIsNamedWithItsFix:
+    """``[local, cloud]`` for one session name: the first-wins dedupe keeps the
+    local project and silently drops the cloud one, so `up` never starts it and
+    nothing says why."""
+
+    def _cfg(self, tmp_config, tmp_path, *, cloud_first=False):
+        folder = tmp_path / "api"
+        folder.mkdir(exist_ok=True)
+        local = {"path": str(folder)}
+        cloud = {"path": str(folder), "node": "cloud", "cloudTask": "Fix the bug"}
+        return tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "projects": [cloud, local] if cloud_first else [local, cloud],
+            }
+        )
+
+    def test_the_human_status_names_the_project_and_the_fix(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        _fake_psmux(monkeypatch, [], [])
+        result = runner.invoke(
+            cli.main, ["--config", self._cfg(tmp_config, tmp_path), "status"]
+        )
+        assert result.exit_code == 0
+        out = result.stdout
+        assert "cloud project" in out and str(tmp_path / "api") in out
+        assert "is never started" in out
+        assert "set a title" in out
+
+    def test_the_json_carries_it_only_when_there_is_one(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        _fake_psmux(monkeypatch, [], [])
+        shadowed = runner.invoke(
+            cli.main, ["--config", self._cfg(tmp_config, tmp_path), "status", "--json"]
+        )
+        [entry] = json.loads(shadowed.stdout)["shadowed_cloud"]
+        assert entry["session"] == "api"
+        assert entry["path"] == str(tmp_path / "api")
+        assert "set a title" in entry["why"]
+
+        clean = runner.invoke(
+            cli.main,
+            [
+                "--config",
+                self._cfg(tmp_config, tmp_path, cloud_first=True),
+                "status",
+                "--json",
+            ],
+        )
+        assert "shadowed_cloud" not in json.loads(clean.stdout)
+
+    def test_a_config_with_no_cloud_project_says_nothing(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        _fake_psmux(monkeypatch, [], [])
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"projects": []}), "status"]
+        )
+        assert "cloud" not in result.stdout
+
+
+class TestTheStatusMenuNeverRevivesACloudPane:
+    """`r<n>` in the status menu is a human asking for a pane's agent back; for
+    a cloud pane that is a second billed `claude --cloud`. J8's veto answers,
+    and the menu shows its reason."""
+
+    def test_r_on_a_cloud_row_prints_the_veto_and_types_nothing(
+        self, monkeypatch, capsys, tmp_config, tmp_path
+    ):
+        (tmp_path / "api").mkdir()
+        cfgpath = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "projects": [
+                    {
+                        "path": str(tmp_path / "api"),
+                        "node": "cloud",
+                        "cloudTask": "Fix the bug",
+                    }
+                ],
+            }
+        )
+        sent: list[object] = []
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: "psmux")
+        monkeypatch.setattr("magent.psmux.has_session", lambda *a, **k: True)
+        monkeypatch.setattr("magent.psmux.idle_sessions", lambda names, **k: set(names))
+        monkeypatch.setattr(
+            "magent.psmux.send_keys", lambda *a, **k: sent.append(a) or True
+        )
+        monkeypatch.setattr(status_mod.click, "prompt", lambda *a, **k: "r1")
+        monkeypatch.setattr(status_mod.click, "pause", lambda *a, **k: None)
+
+        status_mod._session_actions(
+            Path(cfgpath),
+            [
+                {
+                    "name": "api",
+                    "app": "pwsh",
+                    "idle": False,
+                    "state": "",
+                    "node": "cloud",
+                }
+            ],
+        )
+
+        out = capsys.readouterr().out
+        assert "Did not revive api: a cloud pane is never re-typed" in out
+        assert sent == []
 
 
 class TestPsmuxSessionsJson:

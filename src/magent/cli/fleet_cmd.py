@@ -35,14 +35,28 @@ _EXIT_NOT_CONFIRMED = 4
 _EFFORT_CHOICES = ["low", "medium", "high", "xhigh", "max"]
 
 
-def _live_names(config_path: str | None, psmux_bin: str) -> list[str]:
-    """Live psmux session names for this config, in config order."""
+def _cloud_ids(config_path: str | None) -> set[str]:
+    """Session ids of this config's cloud panes (first row per id decides --
+    see ``psmux.cloud_pane_ids``)."""
     from magent import psmux  # heavy subsystem: in-body per policy
 
+    return psmux.cloud_pane_ids(psmux.config_sessions(config_path))
+
+
+def _live_names(
+    config_path: str | None, psmux_bin: str, *, drivable: bool = True
+) -> list[str]:
+    """Live psmux session names for this config, in config order.
+
+    ``drivable`` (the default) leaves a cloud pane out: it is a viewer onto a
+    cloud session, not an agent that reads typed input, so a command that
+    drives panes must never reach it. A read-only one passes False."""
+    from magent import psmux  # heavy subsystem: in-body per policy
+
+    rows = psmux.config_sessions(config_path)
+    cloud = psmux.cloud_pane_ids(rows) if drivable else set()
     candidates = [
-        sid
-        for sid in (psmux.socket_id(d) for d in psmux.config_sessions(config_path))
-        if sid
+        sid for sid in (psmux.socket_id(d) for d in rows) if sid and sid not in cloud
     ]
     if not candidates:
         return []
@@ -64,13 +78,8 @@ def _require_psmux() -> str:
     sys.exit(_EXIT_PSMUX_ERROR)
 
 
-def _resolve_or_exit(session: str, live: list[str]) -> str:
-    """Resolve ``session`` among live names, or print the live set and exit 2."""
-    from magent import fleet  # heavy subsystem: in-body per policy
-
-    name = fleet.resolve_session(session, live)
-    if name:
-        return name
+def _no_match_exit(session: str, live: list[str]) -> NoReturn:
+    """``session`` named nothing: print the live set and exit 2."""
     click.echo(
         f"  {style('x', fg='red')} no live session matches '{session}'.", err=True
     )
@@ -96,24 +105,70 @@ def _node_sessions(config_path: str | None) -> dict[str, Node]:
     }
 
 
-def _resolve_target(config_path: str | None, session: str) -> tuple[str, Node | None]:
+def _resolve_target(
+    config_path: str | None, session: str, *, drives: str | None = None
+) -> tuple[str, Node | None]:
     """Resolve ``session`` among this PC's live psmux sessions AND the node
     sessions: ``(name, node)``, ``node`` set when the match runs on a node.
     A name both carry is the local one. A missing psmux is fatal (exit 3)
     only when no node session matches; no match at all exits 2, listing
-    both kinds."""
+    both kinds.
+
+    ``drives`` names the command about to TYPE into the pane (``send``,
+    ``model``); a cloud pane is then refused by name (exit 2). A read-only
+    command (``peek``) leaves it None. The name is judged among EVERYTHING the
+    user could mean -- the cloud panes too, live or not -- and only a cloud
+    WINNER is refused: resolving among cloud panes alone would refuse the
+    local pane ``api`` because ``api-cloud`` contains it, and filtering the
+    cloud panes out first would quietly pick a local pane for a prefix the
+    cloud one shares."""
     from magent import fleet, psmux  # heavy subsystem: in-body per policy
 
     remote = _node_sessions(config_path)
     psmux_bin = psmux.find_psmux() if remote else _require_psmux()
-    local = _live_names(config_path, psmux_bin) if psmux_bin else []
+    local = _live_names(config_path, psmux_bin, drivable=False) if psmux_bin else []
     names = [*local, *(n for n in remote if n not in local)]
-    name = fleet.resolve_session(session, names)
-    if name is not None and name in remote and name not in local:
+    cloud = _cloud_ids(config_path) if drives else set()
+    name = fleet.resolve_session(
+        session, [*names, *(c for c in sorted(cloud) if c not in names)]
+    )
+    if name is None:
+        if psmux_bin is None:
+            _require_psmux()
+        _no_match_exit(session, names)
+    if name in remote and name not in local:
         return name, remote[name]
-    if psmux_bin is None:
-        _require_psmux()
-    return _resolve_or_exit(session, names), None
+    if drives and name in cloud:
+        _refuse_cloud(name, drives)
+    return name, None
+
+
+# What a cloud pane does with typed input, and the one thing the CLI offers
+# instead. `claude -p ... --cloud <session-id>` is valid ONLY as a follow-up to
+# an existing session id (spec V5), never a way to start one.
+_CLOUD_FOLLOW_UP = 'claude -p "<msg>" --cloud <session-id>'
+
+
+def _refuse_cloud(name: str, command: str = "send") -> NoReturn:
+    """``send``/``model`` against a cloud pane: said plainly, exit 2.
+
+    A cloud pane is only a viewer onto a cloud session, so what is typed into
+    it goes to a shell -- and the one command that does work there, `claude
+    --cloud`, starts a NEW billed cloud session each time (spec 18.5)."""
+    follow_up = (
+        f" To follow up on an existing session, run `{_CLOUD_FOLLOW_UP}`"
+        " (it needs that session's id, which claude.ai/code lists)."
+        if command == "send"
+        else ""
+    )
+    click.echo(
+        f"  {style('x', fg='red')} {name} is a cloud session: `magent {command}` "
+        "types nothing into a cloud pane, which only views the session -- a "
+        f"`claude --cloud` typed there would start (and bill) another one.{follow_up}"
+        f" `magent peek {name}` reads the pane.",
+        err=True,
+    )
+    sys.exit(_EXIT_NOT_FOUND)
 
 
 def _refuse_node(name: str, node: Node, command: str) -> NoReturn:
@@ -213,14 +268,15 @@ def send_cmd(
     then confirms the prompt left the input line.
 
     Exit codes: 0 sent, 2 session not found (or a node session: not
-    supported yet), 3 psmux error, 4 send not confirmed (the pane could not
-    be read back, or the session never went idle).
+    supported yet; or a cloud session: it takes no typed input), 3 psmux
+    error, 4 send not confirmed (the pane could not be read back, or the
+    session never went idle).
     """
     from pathlib import Path
 
     from magent import fleet, psmux  # heavy subsystem: in-body per policy
 
-    name, node = _resolve_target(ctx.obj.get("config_path"), session)
+    name, node = _resolve_target(ctx.obj.get("config_path"), session, drives="send")
     if node is not None:
         _refuse_node(name, node, "send")
     psmux_bin = _require_psmux()
@@ -329,7 +385,8 @@ def model_cmd(
     ``magent model --all <model> [--effort E]``. Busy sessions are retried
     until --max-minutes runs out; the footer is re-read to confirm each switch.
     A per-session table is printed at the end. A node session is refused
-    (exit 2): not supported yet; ``--all`` covers this PC's sessions.
+    (exit 2): not supported yet; so is a cloud session (it takes no typed
+    input). ``--all`` covers this PC's sessions, cloud panes left out.
     """
     from magent import fleet, psmux  # heavy subsystem: in-body per policy
 
@@ -347,7 +404,9 @@ def model_cmd(
         psmux_bin = _require_psmux()
         targets = _live_names(ctx.obj.get("config_path"), psmux_bin)
     else:
-        name, node = _resolve_target(ctx.obj.get("config_path"), session or "")
+        name, node = _resolve_target(
+            ctx.obj.get("config_path"), session or "", drives="model"
+        )
         if node is not None:
             _refuse_node(name, node, "model")
         psmux_bin = _require_psmux()
