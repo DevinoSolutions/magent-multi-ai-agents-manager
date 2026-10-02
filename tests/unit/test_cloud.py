@@ -1965,6 +1965,48 @@ class TestACloudProjectOnTheWrongToolIsSkippedOnce:
         assert (n, windows) == (0, [])
         assert out.count("SKIP:") == 1 and "cannot type" in out
 
+    @pytest.mark.parametrize("dry_run", [False, True])
+    @pytest.mark.parametrize(
+        ("proj", "settings"),
+        [({"tool": "code"}, None), ({}, {"defaultTool": "cursor"})],
+        ids=["own-tool", "inherited-default-tool"],
+    )
+    def test_an_ide_tool_is_one_skip_line_and_opens_nothing(
+        self, fake_platform, tmp_config, tmp_path, capsys, proj, settings, dry_run
+    ):
+        # The user asked for a cloud session and an IDE hosts none: the loop
+        # must refuse it, not open a local IDE window.
+        fake_platform._supports_psmux = True
+        merged = {"psmux": True, **(settings or {})}
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path, settings=merged, **proj))
+        result = launch._launch_projects(
+            fake_platform, cfg, RunOpts(dry_run=dry_run), cfg.projects, None
+        )
+        out = capsys.readouterr().out
+        assert out.count("SKIP:") == 1
+        assert "SKIP: api — " in out and "claude --cloud" in out
+        assert fake_platform.launched_vscode == []
+        assert fake_platform.launched_terminals == []
+        assert fake_platform.psmux_launches == []
+        assert (result.psmux_windows, result.targets) == ([], [])
+
+    def test_an_ide_project_that_is_not_cloud_still_opens_its_ide(
+        self, fake_platform, tmp_config, tmp_path
+    ):
+        # The refusal is the cloud project's alone.
+        folder = tmp_path / "api"
+        folder.mkdir()
+        cfg = load_config(
+            tmp_config(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [{"path": str(folder), "tool": "code"}],
+                }
+            )
+        )
+        launch._launch_projects(fake_platform, cfg, RunOpts(), cfg.projects, None)
+        assert len(fake_platform.launched_vscode) == 1
+
     def test_claude_at_a_path_is_accepted(
         self, monkeypatch, fake_platform, tmp_config, tmp_path
     ):

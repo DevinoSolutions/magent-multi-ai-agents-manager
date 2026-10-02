@@ -1644,6 +1644,13 @@ def _launch_projects(
             )
             continue
 
+        if is_cloud(proj) and is_ide_tool(tool):
+            # The user asked for a cloud session, and an IDE hosts none: say so
+            # rather than open a local window that is not what they configured.
+            title = proj.title or get_leaf_name(proj.path)
+            click.echo(f"SKIP: {title} — {cloud_tool_refusal(tool, tools.get(tool))}")
+            continue
+
         if is_ide_tool(tool):
             new_count += _dispatch_ide_project(
                 plat,
