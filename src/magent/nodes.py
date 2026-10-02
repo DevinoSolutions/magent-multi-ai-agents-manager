@@ -3981,10 +3981,12 @@ def _framed(*fields: bytes) -> bytes:
 
 
 class PushSetUnreadable(OSError):
-    """A file the push set names could not be read, so no digest of the set
-    can be taken. ``label`` is its project-relative path and ``reason`` the OS
-    error's CLASS name: no value, and not the OS's own words (they carry the
-    absolute path)."""
+    """A file the push set names could not be read, so neither a digest of the
+    set nor the by-hand hand-off can be made. ``label`` is its project-relative
+    path and ``reason`` the OS error's CLASS name: no value, and not the OS's
+    own words (they carry the absolute path). Both raise sites suppress the OS
+    error (``from None``): chained, its text would put that path back into any
+    traceback or error report of this refusal."""
 
     def __init__(self, label: str, reason: str) -> None:
         super().__init__(f"{label}: cannot be read ({reason})")
@@ -4011,7 +4013,7 @@ def _digest_input(ps: CloudPushSet, mode: str) -> bytes:
         try:
             body = hashlib.sha256(path.read_bytes()).digest()
         except OSError as exc:
-            raise PushSetUnreadable(label, type(exc).__name__) from exc
+            raise PushSetUnreadable(label, type(exc).__name__) from None
         parts.append(_framed(b"file", _text_bytes(label), body))
     parts.extend(
         _framed(b"outside", _text_bytes(path.as_posix()))
@@ -4237,9 +4239,9 @@ def masked_lines(ps: CloudPushSet) -> list[str]:
 
 def write_private_temp(text: str, *, prefix: str, suffix: str = ".txt") -> Path:
     """``text`` in a fresh temp file only this user can read, as UTF-8 with LF
-    endings. ``mkstemp`` makes it 0600 on POSIX (chmod'd again before the text
-    goes in, as ``_digest_key`` does, because an ACL-bearing temp dir can widen
-    a creation mode); on Windows it inherits the per-user %TEMP% ACL [A].
+    endings. ``mkstemp`` makes it 0600 on POSIX and it is chmod'd to 0600 again
+    before any byte is written (an ACL-bearing temp dir can widen a creation
+    mode); on Windows it inherits the per-user %TEMP% ACL [A].
 
     A failure part-way deletes the file before it is re-raised: a half-written
     secret must not outlive the error that interrupted it."""
@@ -4266,9 +4268,10 @@ def write_private_temp(text: str, *, prefix: str, suffix: str = ".txt") -> Path:
 
 
 def write_manual_handoff(ps: CloudPushSet) -> Path:
-    """Every ``.env*`` file's text, decoded and verbatim, in ONE private temp
-    file for pasting into the environment dialog. The caller deletes it on
-    confirm.
+    """Every ``.env*`` file's text, decoded, in ONE private temp file for
+    pasting into the environment dialog. Only the line endings change: CRLF
+    becomes LF, so a file that mixes the two cannot paste as a mix. The caller
+    deletes the file on confirm.
 
     PushSetUnreadable (an OSError: the file's project-relative label and the
     error's class, as ``push_set_digest`` raises it) when an env file cannot be
@@ -4283,7 +4286,7 @@ def write_manual_handoff(ps: CloudPushSet) -> Path:
         try:
             text = _dotenv_text(path)
         except OSError as exc:
-            raise PushSetUnreadable(label, type(exc).__name__) from exc
+            raise PushSetUnreadable(label, type(exc).__name__) from None
         parts.append(f"# from {label}\n")
-        parts.append(text.rstrip("\n") + "\n")
+        parts.append(text.replace("\r\n", "\n").rstrip("\n") + "\n")
     return write_private_temp("".join(parts), prefix="magent-cloud-env-", suffix=".env")
