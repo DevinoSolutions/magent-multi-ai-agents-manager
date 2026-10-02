@@ -3694,3 +3694,152 @@ class TestACloudPaneTakesNoUpload:
         assert status == 409 and body["cloud"] is True
         assert self._nothing_written()
         assert 'data-name="api"' not in self._page()
+
+
+class TestAPressReadsServesCloudPaneRoute:
+    """The Alt+V listener's two non-uploading presses (native Ctrl+V, local
+    files) ask serve which panes are cloud ones, and the question is a CONFIG
+    one: ``/api/cloud-panes`` must answer from the config alone -- no psmux
+    probe, no ``_sessions_lock`` -- and in the shape ``altv.pane_is_cloud``
+    reads. ``pane_is_cloud`` fails OPEN, so a drift in that shape would not
+    fail a press, it would silently turn the guard off; these tests therefore
+    join the REAL handler to the REAL reader instead of a hand-copied reply."""
+
+    @pytest.fixture(autouse=True)
+    def _serve(self, tmp_path, monkeypatch):
+        import magent.upload_server as mod
+
+        self.mod = mod
+        self.tmp_path = tmp_path
+        self.config = tmp_path / "magent.config.json"
+        monkeypatch.setattr(UploadHandler, "config_path", str(self.config))
+        # Sentinels: a handler that touched the live-session cache would move
+        # them.
+        monkeypatch.setattr(UploadHandler, "cached_sessions", [])
+        monkeypatch.setattr(UploadHandler, "sessions_ts", 123.0)
+
+        from http.server import HTTPServer
+
+        self.server = HTTPServer(("127.0.0.1", 0), UploadHandler)
+        self.port = self.server.server_address[1]
+        self.url = f"http://127.0.0.1:{self.port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        yield
+        self.server.shutdown()
+        self.server.server_close()
+
+    def _configure(self, *projects: tuple[str, str | None]) -> None:
+        """Write a config of ``(title, node)`` projects, in that order."""
+        self.config.write_text(
+            json.dumps(
+                {
+                    "projects": [
+                        {
+                            "path": str(self.tmp_path / f"{title}-{i}"),
+                            "title": title,
+                            **({"node": node} if node else {}),
+                        }
+                        for i, (title, node) in enumerate(projects)
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _get(self, path: str = "/api/cloud-panes") -> tuple[int, dict]:
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        return resp.status, json.loads(resp.read())
+
+    def test_the_reply_is_the_cloud_ids_in_the_ok_envelope(self):
+        self._configure(("web", None), ("api", "cloud"), ("docs", "cloud"))
+        status, body = self._get()
+        assert status == 200
+        assert body == {"ok": True, "cloud_panes": ["api", "docs"]}
+
+    def test_the_real_reply_is_what_pane_is_cloud_reads(self):
+        from magent import altv
+
+        self._configure(("web", None), ("api", "cloud"))
+        assert altv.pane_is_cloud(self.url, "api") is True
+        assert altv.pane_is_cloud(self.url, "web") is False
+        assert altv.pane_is_cloud(self.url, "nope") is False
+
+    def test_a_local_first_pair_is_a_local_pane_and_a_cloud_first_pair_is_not(self):
+        # First row wins, the rule the create gate uses (psmux.cloud_pane_ids).
+        from magent import altv
+
+        self._configure(("api", None), ("api", "cloud"))
+        assert altv.pane_is_cloud(self.url, "api") is False
+
+        self._configure(("api", "cloud"), ("api", None))
+        assert altv.pane_is_cloud(self.url, "api") is True
+
+    def test_a_cloud_pane_is_found_with_no_psmux_and_no_live_sweep(self, monkeypatch):
+        # /api/sessions is live-filtered: with the multiplexer absent (or a
+        # probe that flapped) the cloud row is simply not in it. The cloud
+        # route reads the config, so the answer survives.
+        import magent.psmux as psmux_mod
+        from magent import altv
+
+        monkeypatch.setattr(psmux_mod, "find_psmux", lambda: None)
+        self._configure(("api", "cloud"))
+        assert self._get("/api/sessions") == (200, {"ok": True, "sessions": []})
+        assert altv.pane_is_cloud(self.url, "api") is True
+
+    def test_the_route_makes_no_psmux_call_and_takes_no_session_lock(self, monkeypatch):
+        import subprocess
+
+        import magent.psmux as psmux_mod
+
+        def _boom(*_a, **_k):
+            raise AssertionError("the cloud-pane route asked psmux something")
+
+        for name in ("find_psmux", "live_sessions", "discover_sessions"):
+            monkeypatch.setattr(psmux_mod, name, _boom)
+        monkeypatch.setattr(self.mod, "_discover_sessions", _boom)
+        monkeypatch.setattr(subprocess, "Popen", _boom)
+        self._configure(("api", "cloud"))
+
+        # The lock is HELD for the whole request: a handler that waited on it
+        # (as /api/sessions does for a stale snapshot) would stall past the
+        # client's timeout instead of answering.
+        with self.mod._sessions_lock:
+            status, body = self._get()
+
+        assert (status, body) == (200, {"ok": True, "cloud_panes": ["api"]})
+        assert UploadHandler.sessions_ts == 123.0
+        assert UploadHandler.cached_sessions == []
+
+    def test_an_unconfigured_serve_answers_an_empty_list(self):
+        # No config file at all: nothing is a cloud pane (config_sessions -> []).
+        assert self._get() == (200, {"ok": True, "cloud_panes": []})
+
+    def test_a_press_through_the_real_route_refuses_only_the_cloud_pane(
+        self, monkeypatch
+    ):
+        from magent import altv, psmux
+
+        sends: list[str] = []
+        monkeypatch.setattr(
+            psmux,
+            "send_keys",
+            lambda name, *keys, target=None, literal=False, **kw: (
+                sends.append(name) or True
+            ),
+        )
+        monkeypatch.setattr(altv, "flash_async", lambda *a, **k: None)
+        self._configure(("web", None), ("api", "cloud"))
+
+        def _no_capture() -> bytes | None:
+            raise AssertionError("the native path must never capture")
+
+        assert altv.handle_press(self.url, "api", _no_capture, native=True) == (
+            "cloud-pane"
+        )
+        assert sends == []
+        assert altv.handle_press(self.url, "web", _no_capture, native=True) == (
+            "ok-native"
+        )
+        assert sends == ["web"]
