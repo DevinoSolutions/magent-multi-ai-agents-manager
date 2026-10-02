@@ -3666,9 +3666,13 @@ def read_repo_record(
 # A GitHub remote, by HOST: https/ssh/git URLs (with an optional user and port)
 # and scp-style `git@github.com:owner/repo`. The host must END at `/` (or a
 # port), so `github.com.evil.example` and `gitlab.com/github.com-x` fail.
+# `ssh.github.com` (GitHub's ssh-over-443 host, which a firewalled network
+# needs) is GitHub too, but it only serves ssh, so only the two ssh forms
+# accept it.
 _GITHUB_REMOTE = re.compile(
-    r"^(?:(?:https?|ssh|git)://(?:[^@/\s]+@)?github\.com(?::\d+)?/"
-    r"|(?:[^@/\s]+@)?github\.com:)",
+    r"^(?:(?:https?|git)://(?:[^@/\s]+@)?github\.com(?::\d+)?/"
+    r"|ssh://(?:[^@/\s]+@)?(?:ssh\.)?github\.com(?::\d+)?/"
+    r"|(?:[^@/\s]+@)?(?:ssh\.)?github\.com:)",
     re.IGNORECASE,
 )
 
@@ -3686,21 +3690,25 @@ def cloud_git_refusal(state: LocalGitState) -> str | None:
     structural = refusal_for(state, allow_dirty=True)
     if structural is not None:
         return structural
+    # The same `{path}: ` lead as the structural refusals above: a create over
+    # several projects prints one refusal each, and each must say whose.
+    where = state.path
     if _GITHUB_REMOTE.match(state.url.strip()) is None:
         return (
-            "its remote is not on GitHub: a cloud session clones from and "
-            "pushes back to GitHub only"
+            f"{where}: its remote is not on GitHub: a cloud session clones from "
+            "and pushes back to GitHub only"
         )
     branch = state.branch
     if state.dirty:
         return (
-            f"{branch} has uncommitted or untracked changes: the cloud clones "
-            f"{branch} from GitHub and never receives them, so commit and push first"
+            f"{where}: {branch} has uncommitted or untracked changes: the cloud "
+            f"clones {branch} from GitHub and never receives them, so commit and "
+            "push first"
         )
     if state.unpushed:
         return (
-            f"{branch} has unpushed commits: the cloud clones {branch} from "
-            "GitHub, so push first"
+            f"{where}: {branch} has unpushed commits: the cloud clones {branch} "
+            "from GitHub, so push first"
         )
     return None
 
@@ -3718,11 +3726,16 @@ def dotenv_names(path: Path) -> tuple[str, ...]:
 
     Over-listing is the safe direction (a line inside a multi-line quoted value
     that looks like ``K=v`` adds a name the user can ignore); an unreadable
-    file names nothing."""
+    file names nothing. A UTF-8 BOM would hide the first name from the
+    line-start match, and Windows PowerShell 5.1's ``>`` writes UTF-16 (a NUL
+    between every character), so both byte-order marks are honoured. The
+    DIGEST hashes bytes and never decodes, so it needs neither."""
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        raw = path.read_bytes()
     except OSError:
         return ()
+    codec = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+    text = raw.decode(codec, errors="replace")
     return tuple(sorted(set(_DOTENV_NAME.findall(text))))
 
 
@@ -3751,6 +3764,20 @@ class CloudPushSet:
         return path.relative_to(self.project_dir).as_posix()
 
 
+def _spelled_inside(path: Path, project_dir: Path, root: Path) -> Path | None:
+    """``path`` spelled under ``project_dir`` when the file is inside the
+    project, else None. ``_push`` judges "inside" against the RESOLVED root, so
+    a hit git lists under the real path of a project configured as a link (or
+    a relative one) is inside, though not lexically; it is re-spelled under
+    ``project_dir`` the way ``_under_root`` re-spells one under the root."""
+    if path.is_relative_to(project_dir):
+        return path
+    parent = _try_resolve(path.parent)
+    if parent is not None and parent.is_relative_to(root):
+        return project_dir / parent.relative_to(root) / path.name
+    return None
+
+
 def cloud_push_set(
     project_dir: Path,
     states: Sequence[LocalGitState],
@@ -3759,10 +3786,15 @@ def cloud_push_set(
     extras: Sequence[str] = (),
 ) -> CloudPushSet:
     """Split the push set into what travels and what cannot (spec §18.11)."""
+    root = _try_resolve(project_dir) or project_dir
     inside: list[Path] = []
     outside: list[Path] = []
     for path in push_set(project_dir, states, home=home, extras=extras):
-        (inside if path.is_relative_to(project_dir) else outside).append(path)
+        spelled = _spelled_inside(path, project_dir, root)
+        if spelled is None:
+            outside.append(path)
+        else:
+            inside.append(spelled)
     inside.sort(key=lambda p: p.relative_to(project_dir).as_posix())
     names: set[str] = set()
     for path in inside:
@@ -3786,59 +3818,151 @@ def _cloud_dir() -> Path:
     return node_dir(NODE_CLOUD)
 
 
+def _read_key(path: Path) -> bytes | None:
+    """The key at ``path``, or None when it is missing, is not exactly 32
+    bytes, or cannot be opened. Opened with ``READ_FLAGS`` (no final-component
+    link followed where the OS has O_NOFOLLOW, no blocking on a FIFO)."""
+    try:
+        fd = os.open(path, READ_FLAGS)
+    except OSError:
+        return None
+    try:
+        data = os.read(fd, 33)
+    except OSError:
+        data = b""
+    finally:
+        os.close(fd)
+    return data if len(data) == 32 else None
+
+
 def _digest_key() -> bytes:
     """A random per-machine key, so a recorded digest is never a plain --
     and for a short secret, guessable -- hash of the file. Made once, 0600
-    (a POSIX mode; on Windows the profile's own ACL is what protects it)."""
+    (a POSIX mode; on Windows the profile's own ACL is what protects it).
+
+    An intact key is never rewritten: a rewrite would change every recorded
+    digest at once. A missing one is made COMPLETE in a ``mkstemp`` sibling and
+    hard-linked into place, so a reader never sees a half-written key and two
+    first creators cannot both win (the loser's ``link`` fails and it returns
+    the winner's key). A short or garbled key is replaced, by a rename, which
+    swaps the directory entry and never writes through a link planted at the
+    name."""
     path = _cloud_dir() / "cloud-digest.key"
-    try:
-        key = path.read_bytes()
-    except OSError:
-        key = b""
-    if len(key) == 32:
+    key = _read_key(path)
+    if key is not None:
         return key
     path.parent.mkdir(parents=True, exist_ok=True)
-    key = os.urandom(32)
-    # O_BINARY (absent off Windows, hence getattr -- READ_FLAGS' device): a key
-    # byte of 0x0a must not become CRLF on the way to disk.
-    fd = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0),
-        0o600,
+    fresh = os.urandom(32)
+    # mkstemp opens O_BINARY (a key byte of 0x0a must not become CRLF) and 0600.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
     )
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(key)
-    # An ACL-bearing home (a hosted CI runner's) can widen the creation mode:
-    # chmod explicitly, as the other 0600 writers in this repo do.
-    with contextlib.suppress(OSError):
-        os.chmod(path, 0o600)
-    return key
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(fresh)
+        # An ACL-bearing home (a hosted CI runner's) can widen the creation
+        # mode: chmod explicitly, as the other 0600 writers in this repo do.
+        with contextlib.suppress(OSError):
+            os.chmod(tmp, 0o600)
+        try:
+            os.link(tmp, path)
+        except OSError:
+            # Lost the race (FileExistsError), the name holds a broken key, or
+            # this filesystem has no hard links: take the winner's key if
+            # there is one, else put ours in place.
+            winner = _read_key(path)
+            if winner is not None:
+                return winner
+            _replace_retrying(tmp, path)
+        return fresh
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def _framed(*fields: bytes) -> bytes:
+    """``fields`` each behind its 8-byte length, so where one ends and the next
+    begins is never ambiguous: no field's bytes (a path may hold a newline) can
+    pose as a boundary."""
+    return b"".join(len(f).to_bytes(8, "big") + f for f in fields)
+
+
+class PushSetUnreadable(OSError):
+    """A file the push set names could not be read, so no digest of the set
+    can be taken. ``label`` is its project-relative path and ``reason`` the OS
+    error's CLASS name: no value, and not the OS's own words (they carry the
+    absolute path)."""
+
+    def __init__(self, label: str, reason: str) -> None:
+        super().__init__(f"{label}: cannot be read ({reason})")
+        self.label = label
+        self.reason = reason
+
+
+def _text_bytes(text: str) -> bytes:
+    # surrogatepass: a path from the OS can hold a lone surrogate (an
+    # undecodable POSIX byte, an unpaired Windows UTF-16 unit); every one maps
+    # to its own bytes, so the digest is total and still injective.
+    return text.encode("utf-8", "surrogatepass")
+
+
+def _digest_input(ps: CloudPushSet, mode: str) -> bytes:
+    """What ``push_set_digest`` authenticates: the ``mode``, then each
+    travelling file (sorted by its project-relative path) as its path and the
+    SHA-256 of its bytes, then each outside path (sorted); every field framed.
+    The sort is HERE, so a hand-built set cannot change the digest by order.
+    PushSetUnreadable when a file cannot be read."""
+    parts = [_framed(b"mode", _text_bytes(mode))]
+    for path in sorted(ps.files, key=ps.rel):
+        label = ps.rel(path)
+        try:
+            body = hashlib.sha256(path.read_bytes()).digest()
+        except OSError as exc:
+            raise PushSetUnreadable(label, type(exc).__name__) from exc
+        parts.append(_framed(b"file", _text_bytes(label), body))
+    parts.extend(
+        _framed(b"outside", _text_bytes(path.as_posix()))
+        for path in sorted(ps.outside, key=Path.as_posix)
+    )
+    return b"".join(parts)
 
 
 def push_set_digest(ps: CloudPushSet, mode: str) -> str:
-    """HMAC-SHA256 over every travelling file's path AND bytes, every outside
-    path, and the hand-off ``mode`` (an age recipient, or ``"manual"``).
+    """HMAC-SHA256, under the machine's key, over every travelling file's path
+    AND bytes, every outside path, and the hand-off ``mode`` (an age
+    recipient, or ``"manual"``).
 
     A changed value, a new file and a rotated key all change it; the record
-    stores this and nothing else about the files."""
-    mac = hmac.new(_digest_key(), digestmod=hashlib.sha256)
-    mac.update(b"mode:" + mode.encode() + b"\n")
-    for path in ps.files:
-        mac.update(b"f:" + ps.rel(path).encode() + b"\n")
-        try:
-            mac.update(hashlib.sha256(path.read_bytes()).digest())
-        except OSError:
-            mac.update(b"unreadable")
-    for path in ps.outside:
-        mac.update(b"o:" + path.as_posix().encode() + b"\n")
-    return mac.hexdigest()
+    stores this and nothing else about the files. PushSetUnreadable (an
+    OSError) when a file of the set cannot be read: a digest of a set with a
+    hole in it would match every other such set."""
+    message = _digest_input(ps, mode)
+    return hmac.new(_digest_key(), message, hashlib.sha256).hexdigest()
 
 
 def _records_path() -> Path:
     return _cloud_dir() / "cloud-records.json"
 
 
+def _plain(value: object) -> str | None:
+    """``value`` when it is a str that encodes to UTF-8, else None. JSON text
+    can carry a lone surrogate (``"\\ud800"``), which parses to a str that
+    raises on ``.encode()`` -- and the digest compare encodes."""
+    if not isinstance(value, str):
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return value
+
+
 def _read_records() -> dict[str, dict[str, str]]:
+    """Every well-formed record, keyed by sid. A record is exactly ``{digest,
+    mode, commit}``, all plain strings (``commit`` may be absent: ``""``);
+    anything else is dropped whole, never kept as a partial dict that a caller
+    would index into."""
     try:
         text = _records_path().read_text(encoding="utf-8")
         # Nested past the bound is no record file, refused before json parses
@@ -3850,12 +3974,13 @@ def _read_records() -> dict[str, dict[str, str]]:
         return {}
     records: dict[str, dict[str, str]] = {}
     for sid, rec in data.items():
-        if isinstance(sid, str) and isinstance(rec, dict):
-            records[sid] = {
-                k: v
-                for k, v in rec.items()
-                if isinstance(k, str) and isinstance(v, str)
-            }
+        if _plain(sid) is None or not isinstance(rec, dict):
+            continue
+        digest, mode = _plain(rec.get("digest")), _plain(rec.get("mode"))
+        commit = _plain(rec.get("commit", ""))
+        if digest is None or mode is None or commit is None:
+            continue
+        records[sid] = {"digest": digest, "mode": mode, "commit": commit}
     return records
 
 
@@ -3864,30 +3989,101 @@ def read_cloud_record(sid: str) -> dict[str, str] | None:
     return _read_records().get(sid)
 
 
-def write_cloud_record(sid: str, *, digest: str, mode: str, commit: str = "") -> None:
-    """Record a hand-off, through the module's one atomic JSON writer."""
-    records = _read_records()
-    records[sid] = {"digest": digest, "mode": mode, "commit": commit}
-    write_json_atomic(_records_path(), records)
+# The record file is one read-modify-write shared by every project, so two
+# writers (a fan-out's threads; `magent node push` beside a create) would each
+# read the old file and the second to land would drop the first's record. The
+# same shape as the node map, so the same seam: `map_lock`'s -- a thread lock,
+# then `persistent_lock` (a waiting, never-deleted sidecar). NOT
+# `exclusive_lock`: it never waits, so contention would be an error, and it
+# deletes its file. A lost record would only have failed safe (the next create
+# asks for the hand-off again), but a wait is cheaper than a repeat hand-off.
+CLOUD_RECORDS_LOCK_NAME = "cloud-records"
+CLOUD_RECORDS_LOCK_WAIT_S = 10.0
+_CLOUD_RECORDS_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _records_lock(wait_s: float) -> Iterator[None]:
+    deadline = time.monotonic() + wait_s
+    if not _CLOUD_RECORDS_LOCK.acquire(timeout=max(wait_s, 0.0)):
+        raise LockHeld("the cloud records are held by another writer in this process")
+    try:
+        remaining = max(deadline - time.monotonic(), 0.0)
+        with persistent_lock(CLOUD_RECORDS_LOCK_NAME, wait_s=remaining):
+            yield
+    finally:
+        _CLOUD_RECORDS_LOCK.release()
+
+
+def write_cloud_record(
+    sid: str,
+    *,
+    digest: str,
+    mode: str,
+    commit: str = "",
+    wait_s: float = CLOUD_RECORDS_LOCK_WAIT_S,
+) -> None:
+    """Record a hand-off, through the module's one atomic JSON writer, under
+    the records lock (LockHeld, an OSError, after ``wait_s``). ``mode`` is
+    ``"manual"`` or the age recipient the set was sealed to: this file is
+    plain text, so nothing else may ever be written into it."""
+    if mode != "manual" and not _is_recipient(mode):
+        raise ValueError("a cloud record's mode is 'manual' or an age recipient")
+    with _records_lock(wait_s):
+        records = _read_records()
+        records[sid] = {"digest": digest, "mode": mode, "commit": commit}
+        write_json_atomic(_records_path(), records)
+
+
+_AGE_RECIPIENT = re.compile(r"age1[0-9a-z]+")
+
+
+def _is_recipient(text: str) -> bool:
+    """One age PUBLIC key: ``age1`` then lowercase letters and digits, and
+    nothing else. No whitespace is allowed, so no second line can ride along
+    behind it -- an ``AGE-SECRET-KEY-1...`` identity pasted under the right
+    line must never come back as the recipient. The one predicate both
+    ``read_recipient`` and ``write_recipient`` use."""
+    return _AGE_RECIPIENT.fullmatch(text) is not None
 
 
 def read_recipient() -> str | None:
     """The age recipient ``magent node cloud-setup`` recorded, or None.
 
-    Anything that is not an ``age1…`` public key -- above all an identity
-    pasted into the wrong file -- reads as no recipient. Phase 1 never writes
-    one, so it always answers None there."""
+    Anything that is not one ``age1…`` public key -- above all an identity
+    pasted into the wrong file, or a file that is not text -- reads as no
+    recipient. Phase 1 never writes one, so it always answers None there."""
     try:
         text = (
             (_cloud_dir() / "cloud-recipient.txt").read_text(encoding="utf-8").strip()
         )
-    except OSError:
+    except (OSError, ValueError):
         return None
-    return text if text.startswith("age1") else None
+    return text if _is_recipient(text) else None
 
 
 def write_recipient(recipient: str) -> None:
+    """Record the recipient. ValueError (never quoting what it refused) unless
+    it is one public key: the value is stored in plain text and copied into
+    records."""
+    if not _is_recipient(recipient):
+        raise ValueError("the recipient must be one age public key (age1...)")
     write_text_atomic(_cloud_dir() / "cloud-recipient.txt", recipient + "\n")
+
+
+def _record_current(
+    rec: dict[str, str], ps: CloudPushSet, recipient: str | None
+) -> bool:
+    """Does ``rec`` describe the CURRENT push set: sealed to the current
+    recipient, or handed off by hand, and unchanged since? PushSetUnreadable
+    when the set cannot be read."""
+    mode = rec["mode"]
+    if mode != "manual" and (recipient is None or mode != recipient):
+        return False
+    # Bytes both sides: compare_digest refuses a non-ASCII str.
+    return hmac.compare_digest(
+        rec["digest"].encode("utf-8"), push_set_digest(ps, mode).encode("utf-8")
+    )
 
 
 def cloud_env_refusal(
@@ -3896,15 +4092,20 @@ def cloud_env_refusal(
     """Why the create must wait for ``magent node push``, or None (spec §18.11).
 
     Passes when nothing needs handing off, or when the record matches the
-    CURRENT push set: sealed to the current recipient, or handed off by hand."""
+    CURRENT push set: sealed to the current recipient, or handed off by hand.
+    A push-set file that cannot be read is a refusal that names it (its
+    project-relative path, never a value)."""
     if ps.empty:
         return None
     rec = read_cloud_record(sid)
-    if rec is not None:
-        mode = rec.get("mode", "")
-        current = mode == "manual" or (recipient is not None and mode == recipient)
-        if current and rec.get("digest") == push_set_digest(ps, mode):
+    try:
+        if rec is not None and _record_current(rec, ps, recipient):
             return None
+    except PushSetUnreadable as exc:
+        return (
+            f"the push set cannot be checked: {exc.label} cannot be read "
+            f"({exc.reason}); fix or remove it, then run: magent node push {name}"
+        )
     shown = [*ps.names, *(ps.rel(p) for p in ps.files if not _is_env_file(p.name))]
     what = ", ".join(shown) or f"{len(ps.outside)} file(s) outside the project"
     return (

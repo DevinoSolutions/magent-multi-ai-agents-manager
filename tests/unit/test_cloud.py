@@ -5,13 +5,19 @@ only after the push set was sealed or handed off."""
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import hmac
+import os
 import sys
+import threading
+import time
 from typing import TYPE_CHECKING
 
 import pytest
 
 from magent import nodes
 from magent.config import SCHEMA_VERSION, ConfigError, load_config
+from magent.lockfile import LockHeld, persistent_lock
 from magent.nodes import LocalGitState
 
 if TYPE_CHECKING:
@@ -354,6 +360,10 @@ class TestTheCloudRefusesACheckoutItCouldNotCloneOrPushBack:
             "git@github.com:me/api.git",
             "ssh://git@github.com/me/api.git",
             "ssh://git@github.com:22/me/api.git",
+            # GitHub's ssh-over-443 host, the one a firewalled network needs.
+            "ssh://git@ssh.github.com:443/me/api.git",
+            "ssh://ssh.github.com/me/api.git",
+            "git@ssh.github.com:me/api.git",
         ],
     )
     def test_a_clean_pushed_github_branch_is_accepted(self, tmp_path, url):
@@ -367,6 +377,12 @@ class TestTheCloudRefusesACheckoutItCouldNotCloneOrPushBack:
             "https://gitlab.com/github.com-x/api.git",
             "git@github.com.evil.example:me/api.git",
             "https://evil.example/github.com/me/api.git",
+            # ssh.github.com serves ssh only, and only that exact host.
+            "https://ssh.github.com/me/api.git",
+            "https://ssh.github.com.evil.example/me/api.git",
+            "ssh://git@evilssh.github.com/me/api.git",
+            "git@evilssh.github.com:me/api.git",
+            "git@xssh.github.com.evil.example:me/api.git",
         ],
     )
     def test_the_host_is_parsed_not_substring_matched(self, tmp_path, url):
@@ -402,6 +418,22 @@ class TestTheCloudRefusesACheckoutItCouldNotCloneOrPushBack:
     ):
         refusal = nodes.cloud_git_refusal(_state(tmp_path, dirty=True))
         assert refusal is not None and "untracked" in refusal
+
+    @pytest.mark.parametrize(
+        "kw",
+        [
+            {"url": ""},
+            {"detached": True},
+            {"no_commits": True},
+            {"url": "https://gitlab.com/me/api.git"},
+            {"dirty": True},
+            {"unpushed": True},
+        ],
+    )
+    def test_every_refusal_names_the_checkout_first(self, tmp_path, kw):
+        # A multi-project create prints several refusals; each must say whose.
+        refusal = nodes.cloud_git_refusal(_state(tmp_path, **kw))
+        assert refusal is not None and refusal.startswith(f"{tmp_path}: ")
 
     def test_the_structural_refusals_are_the_node_checks_not_a_copy(self, tmp_path):
         # Composed over `refusal_for`, so the wording cannot drift from the
@@ -441,6 +473,21 @@ class TestThePushSetForTheCloud:
         path.write_bytes(b"  export  FOO = 1\r\nBAR=2\r\n\r\n\r\n  \r\n#BAZ=3\r\n")
         assert nodes.dotenv_names(path) == ("BAR", "FOO")
 
+    def test_a_utf8_bom_does_not_hide_the_first_name(self, tmp_path):
+        # Notepad and PowerShell 5 write one; `^[ \t]*NAME` would skip line 1.
+        path = tmp_path / ".env"
+        path.write_bytes(b"\xef\xbb\xbfFIRST=1\r\nSECOND=2\r\n")
+        assert nodes.dotenv_names(path) == ("FIRST", "SECOND")
+
+    @pytest.mark.parametrize(
+        ("bom", "codec"), [(b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")]
+    )
+    def test_a_utf16_env_file_still_names_its_variables(self, tmp_path, bom, codec):
+        # `echo X=1 > .env` in Windows PowerShell 5.1 writes UTF-16 LE + BOM.
+        path = tmp_path / ".env"
+        path.write_bytes(bom + "FIRST=1\r\nSECOND=2\r\n".encode(codec))
+        assert nodes.dotenv_names(path) == ("FIRST", "SECOND")
+
     def test_an_unreadable_env_file_names_nothing(self, tmp_path):
         assert nodes.dotenv_names(tmp_path / "missing.env") == ()
 
@@ -469,6 +516,34 @@ class TestThePushSetForTheCloud:
         ps = nodes.cloud_push_set(repo, [_state(repo)], home=tmp_path / "home")
         assert ps.files == (repo / ".env",)
         assert ps.outside == (outside,)
+
+    def test_a_project_reached_through_a_link_still_owns_its_files(self, tmp_path):
+        # `_push` judges "inside" against the RESOLVED root, so a hit git lists
+        # under the real path is inside a project configured as the link.
+        real = _project(tmp_path)
+        link = tmp_path / "link"
+        try:
+            link.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("cannot create symlinks here")
+        ps = nodes.cloud_push_set(
+            link, [_state(real, ignored=(".env",))], home=tmp_path / "h"
+        )
+        assert ps.outside == ()
+        assert [ps.rel(p) for p in ps.files] == [".env"]
+        assert ps.names == ("API_TOKEN", "DB_URL")
+
+    def test_a_relative_project_dir_still_owns_its_files(self, tmp_path, monkeypatch):
+        repo = _project(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        ps = nodes.cloud_push_set(
+            repo.relative_to(tmp_path),
+            [_state(repo, ignored=(".env",))],
+            home=tmp_path / "h",
+        )
+        assert ps.outside == ()
+        assert [ps.rel(p) for p in ps.files] == [".env"]
+        assert ps.names == ("API_TOKEN", "DB_URL")
 
     def test_the_existing_env_file_predicate_is_untouched(self):
         # J3 must not redefine nodes._is_env_file (it takes a NAME and
@@ -510,6 +585,162 @@ class TestTheDigestIsKeyedAndCoversValues:
     def test_the_key_is_private_to_the_user(self, tmp_path, cloud_home):
         nodes.push_set_digest(self._ps(tmp_path), "manual")
         assert (cloud_home / "cloud-digest.key").stat().st_mode & 0o077 == 0
+
+    def test_a_different_key_gives_a_different_digest(self, tmp_path, cloud_home):
+        ps = self._ps(tmp_path)
+        first = nodes.push_set_digest(ps, "manual")
+        (cloud_home / "cloud-digest.key").write_bytes(b"\x01" * 32)
+        assert nodes.push_set_digest(ps, "manual") != first
+
+    def test_the_digest_is_the_hmac_and_not_a_bare_hash(self, tmp_path, cloud_home):
+        # A bare sha256 of a short secret is guessable offline; the key is what
+        # stops a leaked record file from being a guessing oracle.
+        ps = self._ps(tmp_path)
+        digest = nodes.push_set_digest(ps, "manual")
+        key = (cloud_home / "cloud-digest.key").read_bytes()
+        message = nodes._digest_input(ps, "manual")
+        assert digest == hmac.new(key, message, hashlib.sha256).hexdigest()
+        assert digest != hashlib.sha256(message).hexdigest()
+
+    def test_a_new_file_in_the_set_changes_the_digest(self, tmp_path, cloud_home):
+        ps = self._ps(tmp_path)
+        before = nodes.push_set_digest(ps, "manual")
+        extra = ps.project_dir / ".env.local"
+        extra.write_text("EXTRA=1\n", encoding="utf-8")
+        bigger = dataclasses.replace(ps, files=(*ps.files, extra))
+        assert nodes.push_set_digest(bigger, "manual") != before
+
+    def test_a_changed_outside_path_changes_the_digest(self, tmp_path, cloud_home):
+        ps = self._ps(tmp_path)
+        npmrc = dataclasses.replace(ps, outside=(tmp_path / "h" / ".npmrc",))
+        netrc = dataclasses.replace(ps, outside=(tmp_path / "h" / ".netrc",))
+        digests = {nodes.push_set_digest(x, "manual") for x in (ps, npmrc, netrc)}
+        assert len(digests) == 3
+
+    def test_a_crafted_path_cannot_forge_a_field_boundary(self, tmp_path, cloud_home):
+        # Unframed, outside=("a", "c") and outside=("a\no:c",) fed the same bytes.
+        ps = self._ps(tmp_path)
+        first, second = tmp_path / "a", tmp_path / "c"
+        forged = type(tmp_path)(f"{first.as_posix()}\no:{second.as_posix()}")
+        two = dataclasses.replace(ps, outside=(first, second))
+        one = dataclasses.replace(ps, outside=(forged,))
+        assert nodes.push_set_digest(one, "manual") != nodes.push_set_digest(
+            two, "manual"
+        )
+
+    def test_the_fields_are_length_prefixed(self):
+        assert nodes._framed(b"a", b"bc") != nodes._framed(b"ab", b"c")
+        assert nodes._framed(b"", b"x") != nodes._framed(b"x", b"")
+
+    def test_the_digest_does_not_depend_on_the_order_the_set_was_built_in(
+        self, tmp_path, cloud_home
+    ):
+        # The function sorts, so a hand-built set cannot change what it says.
+        repo = _project(tmp_path)
+        built = nodes.cloud_push_set(
+            repo, [_state(repo, ignored=_ALL)], home=tmp_path / "h"
+        )
+        ps = dataclasses.replace(
+            built, outside=(tmp_path / "h" / ".netrc", tmp_path / "h" / ".npmrc")
+        )
+        assert len(ps.files) == 3
+        flipped = dataclasses.replace(
+            ps, files=ps.files[::-1], outside=ps.outside[::-1]
+        )
+        assert nodes.push_set_digest(flipped, "manual") == nodes.push_set_digest(
+            ps, "manual"
+        )
+
+    def test_an_unreadable_file_is_signalled_not_hashed_as_a_token(
+        self, tmp_path, cloud_home
+    ):
+        # `b"unreadable"` made a vanished file hash the same every time, so a
+        # record taken while it was missing matched the next time it was.
+        ps = self._ps(tmp_path)
+        (ps.project_dir / ".env").unlink()
+        with pytest.raises(nodes.PushSetUnreadable) as err:
+            nodes.push_set_digest(ps, "manual")
+        assert err.value.label == ".env"
+        assert isinstance(err.value, OSError)
+        assert ".env" in str(err.value)
+        assert str(tmp_path) not in str(err.value)
+
+
+class TestTheDigestKeyIsMadeOnceAndNeverRewritten:
+    def _names(self, cloud_home: Path) -> list[str]:
+        return sorted(p.name for p in cloud_home.iterdir())
+
+    def test_an_intact_key_is_never_rewritten(self, cloud_home):
+        cloud_home.mkdir(parents=True)
+        path = cloud_home / "cloud-digest.key"
+        path.write_bytes(b"K" * 32)
+        before = path.stat()
+        assert nodes._digest_key() == b"K" * 32
+        after = path.stat()
+        assert path.read_bytes() == b"K" * 32
+        assert (after.st_mtime_ns, after.st_ino) == (before.st_mtime_ns, before.st_ino)
+        assert self._names(cloud_home) == ["cloud-digest.key"]
+
+    @pytest.mark.parametrize("junk", [b"", b"short", b"X" * 31, b"X" * 33, b"X" * 4096])
+    def test_a_short_or_garbage_key_is_replaced_and_then_stable(self, cloud_home, junk):
+        cloud_home.mkdir(parents=True)
+        path = cloud_home / "cloud-digest.key"
+        path.write_bytes(junk)
+        key = nodes._digest_key()
+        assert len(key) == 32
+        assert path.read_bytes() == key
+        assert nodes._digest_key() == key
+        assert self._names(cloud_home) == ["cloud-digest.key"]
+
+    def test_first_creation_leaves_no_temp_file_behind(self, cloud_home):
+        key = nodes._digest_key()
+        assert (cloud_home / "cloud-digest.key").read_bytes() == key
+        assert self._names(cloud_home) == ["cloud-digest.key"]
+
+    def test_a_lost_creation_race_returns_the_winners_key(
+        self, cloud_home, monkeypatch
+    ):
+        # Another process links its key into place between our look and our
+        # link: ours must not overwrite it, and we must hand back the winner's.
+        winner = b"W" * 32
+
+        def lose(src, dst):
+            with open(dst, "wb") as fh:
+                fh.write(winner)
+            raise FileExistsError(dst)
+
+        monkeypatch.setattr(os, "link", lose)
+        assert nodes._digest_key() == winner
+        assert (cloud_home / "cloud-digest.key").read_bytes() == winner
+        assert self._names(cloud_home) == ["cloud-digest.key"]
+
+    def test_a_filesystem_without_hard_links_still_gets_a_key(
+        self, cloud_home, monkeypatch
+    ):
+        def no_links(src, dst):
+            raise PermissionError("hard links are not supported here")
+
+        monkeypatch.setattr(os, "link", no_links)
+        key = nodes._digest_key()
+        assert len(key) == 32
+        assert (cloud_home / "cloud-digest.key").read_bytes() == key
+        assert self._names(cloud_home) == ["cloud-digest.key"]
+
+    def test_a_planted_symlink_is_replaced_never_written_through(
+        self, tmp_path, cloud_home
+    ):
+        cloud_home.mkdir(parents=True)
+        victim = tmp_path / "victim.txt"
+        victim.write_bytes(b"precious")
+        path = cloud_home / "cloud-digest.key"
+        try:
+            path.symlink_to(victim)
+        except (OSError, NotImplementedError):
+            pytest.skip("cannot create symlinks here")
+        key = nodes._digest_key()
+        assert victim.read_bytes() == b"precious"
+        assert not path.is_symlink()
+        assert path.read_bytes() == key
 
 
 class TestTheCreateWaitsForThePushSet:
@@ -628,3 +859,208 @@ class TestTheCreateWaitsForThePushSet:
             "AGE-SECRET-KEY-1X", encoding="utf-8"
         )
         assert nodes.read_recipient() is None
+
+    def test_the_digest_is_compared_in_constant_time_on_bytes(
+        self, tmp_path, cloud_home, monkeypatch
+    ):
+        ps = self._ps(tmp_path)
+        nodes.write_cloud_record(
+            "api", digest=nodes.push_set_digest(ps, "manual"), mode="manual"
+        )
+        seen: list[tuple[object, object]] = []
+        real = hmac.compare_digest
+
+        def spy(a, b):
+            seen.append((a, b))
+            return real(a, b)
+
+        monkeypatch.setattr(nodes.hmac, "compare_digest", spy)
+        assert nodes.cloud_env_refusal("api", "api", ps, recipient=None) is None
+        assert seen
+        assert all(isinstance(a, bytes) and isinstance(b, bytes) for a, b in seen)
+
+    def test_a_non_ascii_digest_in_a_record_is_a_mismatch_not_a_crash(
+        self, tmp_path, cloud_home
+    ):
+        # hmac.compare_digest raises TypeError on a non-ASCII str.
+        ps = self._ps(tmp_path)
+        nodes.write_cloud_record("api", digest="dé", mode="manual")
+        assert nodes.cloud_env_refusal("api", "api", ps, recipient=None) is not None
+
+    def test_an_unreadable_push_file_is_a_refusal_that_names_it(
+        self, tmp_path, cloud_home
+    ):
+        ps = self._ps(tmp_path)
+        nodes.write_cloud_record("api", digest="whatever", mode="manual")
+        (ps.project_dir / ".env").unlink()
+        refusal = nodes.cloud_env_refusal("api", "api", ps, recipient=None)
+        assert refusal is not None
+        assert ".env" in refusal
+        assert "magent node push api" in refusal
+        assert "hunter2" not in refusal
+        assert str(tmp_path) not in refusal
+
+
+class TestTheRecordsAreWhatTheyClaimToBe:
+    def _put(self, cloud_home: Path, raw: str) -> None:
+        cloud_home.mkdir(parents=True, exist_ok=True)
+        (cloud_home / "cloud-records.json").write_text(raw, encoding="utf-8")
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            '{"api": {}}',
+            '{"api": {"mode": "manual"}}',
+            '{"api": {"digest": "d"}}',
+            '{"api": {"digest": null, "mode": "manual"}}',
+            '{"api": {"digest": 7, "mode": "manual"}}',
+            '{"api": {"digest": ["d"], "mode": "manual"}}',
+            '{"api": {"digest": true, "mode": "manual"}}',
+            '{"api": {"digest": "d", "mode": null}}',
+            '{"api": {"digest": "d", "mode": "manual", "commit": 3}}',
+            # A lone surrogate is valid JSON text but cannot be encoded: it
+            # would crash the constant-time compare.
+            '{"api": {"digest": "\\ud800", "mode": "manual"}}',
+            '{"api": {"digest": "d", "mode": "\\udc00"}}',
+            '{"api": {"digest": "d", "mode": "manual", "commit": "\\ud800"}}',
+            '{"api": "not a record"}',
+            '{"api": ["digest", "mode"]}',
+        ],
+    )
+    def test_a_malformed_record_reads_as_no_record(self, cloud_home, raw):
+        # Never a partial dict, and never `{}`: the docstring promises None.
+        self._put(cloud_home, raw)
+        assert nodes.read_cloud_record("api") is None
+
+    def test_a_record_without_a_commit_reads_with_an_empty_one(self, cloud_home):
+        self._put(cloud_home, '{"api": {"digest": "d", "mode": "manual"}}')
+        assert nodes.read_cloud_record("api") == {
+            "digest": "d",
+            "mode": "manual",
+            "commit": "",
+        }
+
+    def test_one_bad_record_does_not_take_the_good_ones_with_it(self, cloud_home):
+        self._put(
+            cloud_home,
+            '{"bad": {"digest": 1}, "good": {"digest": "d", "mode": "manual"}}',
+        )
+        assert nodes.read_cloud_record("bad") is None
+        assert nodes.read_cloud_record("good") is not None
+
+    @pytest.mark.parametrize(
+        "mode",
+        ["", "other", "AGE-SECRET-KEY-1XYZ", "age1abc\nAGE-SECRET-KEY-1XYZ", "age1"],
+    )
+    def test_a_record_mode_is_manual_or_a_public_recipient(self, cloud_home, mode):
+        # The recipient is stored in this plain-text file as the `mode`.
+        with pytest.raises(ValueError, match="mode") as err:
+            nodes.write_cloud_record("api", digest="d", mode=mode)
+        assert "AGE-SECRET" not in str(err.value)
+        assert nodes.read_cloud_record("api") is None
+
+    def test_concurrent_writers_do_not_lose_each_others_records(
+        self, cloud_home, monkeypatch
+    ):
+        real = nodes.write_json_atomic
+
+        def slow(path, data):
+            # Widen the read-modify-write window so a lost update is certain.
+            time.sleep(0.02)
+            real(path, data)
+
+        monkeypatch.setattr(nodes, "write_json_atomic", slow)
+        sids = [f"p{i}" for i in range(8)]
+        errors: list[BaseException] = []
+
+        def write(sid: str) -> None:
+            try:
+                nodes.write_cloud_record(sid, digest=f"d-{sid}", mode="manual")
+            except BaseException as exc:  # noqa: BLE001  # reason: collected and asserted empty below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write, args=(s,)) for s in sids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+        digests = {s: (nodes.read_cloud_record(s) or {}).get("digest") for s in sids}
+        assert digests == {s: f"d-{s}" for s in sids}
+
+    def test_a_write_that_cannot_get_the_lock_says_so(self, cloud_home):
+        with (
+            persistent_lock(nodes.CLOUD_RECORDS_LOCK_NAME, wait_s=1.0),
+            pytest.raises(LockHeld),
+        ):
+            nodes.write_cloud_record("api", digest="d", mode="manual", wait_s=0.05)
+        assert nodes.read_cloud_record("api") is None
+        nodes.write_cloud_record("api", digest="d", mode="manual", wait_s=0.5)
+        assert nodes.read_cloud_record("api") is not None
+
+
+class TestTheRecipientIsOnePublicKey:
+    def _put(self, cloud_home: Path, raw: str | bytes) -> None:
+        cloud_home.mkdir(parents=True, exist_ok=True)
+        data = raw if isinstance(raw, bytes) else raw.encode("utf-8")
+        (cloud_home / "cloud-recipient.txt").write_bytes(data)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # The leak: it starts with age1, and a bare startswith returned
+            # the identity verbatim into every record that stores the recipient.
+            "age1abc\nAGE-SECRET-KEY-1XYZ",
+            "age1abc\r\nAGE-SECRET-KEY-1XYZ\r\n",
+            "age1abc AGE-SECRET-KEY-1XYZ",
+            "age1abc\tAGE-SECRET-KEY-1XYZ",
+            "AGE-SECRET-KEY-1XYZ",
+            "age1",
+            "age1ABC",
+            "age1abc/def",
+            "",
+            "   \n",
+        ],
+    )
+    def test_anything_but_one_public_key_reads_as_none(self, cloud_home, text):
+        self._put(cloud_home, text)
+        assert nodes.read_recipient() is None
+
+    @pytest.mark.parametrize("raw", [b"\xff\xfe", b"age1abc\xff", b"\xff\xfeage1abc"])
+    def test_a_file_that_is_not_utf8_reads_as_none(self, cloud_home, raw):
+        self._put(cloud_home, raw)
+        assert nodes.read_recipient() is None
+
+    @pytest.mark.parametrize("text", ["age1abc", "age1abc\n", "  age1abc \r\n"])
+    def test_one_public_key_reads_back_stripped(self, cloud_home, text):
+        self._put(cloud_home, text)
+        assert nodes.read_recipient() == "age1abc"
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "age1abc\nAGE-SECRET-KEY-1XYZ",
+            "age1abc AGE-SECRET-KEY-1XYZ",
+            "age1abc\n",
+            "AGE-SECRET-KEY-1XYZ",
+            "age1",
+            "",
+        ],
+    )
+    def test_writing_anything_but_one_public_key_is_refused(self, cloud_home, bad):
+        with pytest.raises(ValueError, match="recipient") as err:
+            nodes.write_recipient(bad)
+        # The refusal never echoes what it refused.
+        assert "AGE-SECRET" not in str(err.value)
+        assert not (cloud_home / "cloud-recipient.txt").exists()
+
+    def test_a_refused_write_leaves_the_old_recipient_alone(self, cloud_home):
+        nodes.write_recipient("age1good")
+        with pytest.raises(ValueError, match="recipient"):
+            nodes.write_recipient("age1good\nAGE-SECRET-KEY-1XYZ")
+        assert nodes.read_recipient() == "age1good"
+
+    def test_one_predicate_judges_both_sides(self):
+        assert nodes._is_recipient("age1qqqq")
+        assert not nodes._is_recipient("age1qqqq\nAGE-SECRET-KEY-1X")
+        assert not nodes._is_recipient("manual")
