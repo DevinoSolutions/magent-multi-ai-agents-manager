@@ -424,6 +424,10 @@ class TestAttachFlowCharacterization:
             def supports_window_close(self) -> bool:
                 return False
 
+            def supports_wt_profiles(self) -> bool:
+                # Tab icons have their own pins (test_attach_tab_icons.py).
+                return False
+
             def snapshot_windows(self) -> dict[str, int]:
                 # Nothing open locally: every up-session gets a fresh window.
                 return {}
