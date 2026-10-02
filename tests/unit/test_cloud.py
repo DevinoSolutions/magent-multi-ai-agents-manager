@@ -1891,7 +1891,8 @@ class TestTheEnvParserIsQuoteAware:
         raw = f"LOG={quote}C:\\logs\\{quote}\nNEXT=1\nMORE=2\n".encode()
         names, lines = self._read(tmp_path, raw)
         assert names == ("LOG",)
-        assert len(lines) == 1 and lines[0].startswith("LOG  ")
+        assert len(lines) == 2 and lines[0].startswith("LOG  ")
+        assert lines[1] == "(2 line(s) not shown)"
 
     def test_a_backtick_value_may_span_lines_too(self, tmp_path):
         # Node dotenv's multi-line form: `...`, with the same continuation.
@@ -1922,7 +1923,9 @@ class TestTheEnvParserIsQuoteAware:
         # re-parsed as names.
         names, lines = self._read(tmp_path, b'A="never closed\nX=1\nY=2\n')
         assert names == ("A",)
-        assert len(lines) == 1 and lines[0].startswith("A  ")
+        assert len(lines) == 2 and lines[0].startswith("A  ")
+        # What it swallowed is counted, never listed.
+        assert lines[1] == "(2 line(s) not shown)"
 
     def test_an_inline_comment_is_not_part_of_an_unquoted_value(self, tmp_path):
         raw = b"A=x # note\nB=y\t# tab\nC=#nospace\nD= # all comment\n"
@@ -2083,6 +2086,7 @@ class TestAMultiLineSecretNeverPrintsAName:
         raw = f"KEY=-----BEGIN PRIVATE KEY-----\n{FRAG}=\nNEXT=1\n".encode()
         names, lines = _read_env(tmp_path, raw)
         assert names == ("KEY",)
+        assert lines[1:] == ["(2 line(s) not shown)"]
         _no_fragment(names, lines)
 
     def test_a_block_that_opens_and_closes_on_one_line_ends_there(self, tmp_path):
@@ -2266,6 +2270,253 @@ class TestAMultiLineSecretNeverPrintsAName:
         assert names == ("OK",)
         _no_fragment(names, lines)
         assert lines[-1] == "(1 line(s) not shown)"
+
+
+class TestWhatFollowsAnUnaccountedLine:
+    """A line the parser cannot account for (not blank, not a comment, not an
+    assignment) may be a slice of a secret, and the lines after it may be the
+    rest of the slice. ``TestAMultiLineSecretNeverPrintsAName`` pins the shapes
+    that carry a marker (a quote, armor); these carry none: raw base64 whose
+    last line ends in ``=`` reads as ``NAME=`` with an empty value. So an
+    unquoted EMPTY value straight after a withheld line is withheld too --
+    counted, never shown -- and a blank or comment line ends the doubt. The
+    hand-off FILE and the seal never go through any of this."""
+
+    # Two lines of raw base64, as the body of an unquoted key prints itself.
+    B64 = ("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "BKcwggSjAgEAAoIBAQC7/VJTUt9Us8cKj")
+
+    # ---- the context rule ----------------------------------------------------
+
+    @pytest.mark.parametrize("last", [f"{FRAG}=", "AAA="], ids=["fragment", "padding"])
+    def test_raw_base64_over_three_lines_prints_no_name(self, tmp_path, last):
+        raw = f"{self.B64[0]}\n{self.B64[1]}\n{last}\nNEXT=1\n".encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("NEXT",)
+        assert lines == ["NEXT  ******** (1 chars)", "(3 line(s) not shown)"]
+        _no_fragment(names, lines)
+
+    def test_a_body_on_its_own_lines_after_an_empty_key_prints_no_name(self, tmp_path):
+        raw = f"KEY=\n{self.B64[0]}\n{FRAG}=\nNEXT=1\n".encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("KEY", "NEXT")
+        assert lines == [
+            "KEY  ******** (0 chars)",
+            "NEXT  ******** (1 chars)",
+            "(2 line(s) not shown)",
+        ]
+        _no_fragment(names, lines)
+
+    def test_a_body_that_starts_on_the_key_line_prints_no_name(self, tmp_path):
+        raw = f"KEY={self.B64[0]}\n{self.B64[1]}\n{FRAG}=\nNEXT=1\n".encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("KEY", "NEXT")
+        assert lines == [
+            f"KEY  ******** ({len(self.B64[0])} chars)",
+            "NEXT  ******** (1 chars)",
+            "(2 line(s) not shown)",
+        ]
+        _no_fragment(names, lines)
+
+    def test_a_bare_word_then_an_empty_assignment_prints_no_name(self, tmp_path):
+        names, lines = _read_env(tmp_path, b"export FOO\nBAR=\nNEXT=1\n")
+        assert names == ("NEXT",)
+        assert lines == ["NEXT  ******** (1 chars)", "(2 line(s) not shown)"]
+        assert "BAR" not in "\n".join(lines)
+
+    def test_the_chain_runs_through_every_withheld_entry(self, tmp_path):
+        raw = b"export FOO\nBAR=\nBAZ=\nQUX = # c\nNEXT=1\n"
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("NEXT",)
+        assert lines == ["NEXT  ******** (1 chars)", "(4 line(s) not shown)"]
+
+    @pytest.mark.parametrize(
+        "empty",
+        ["BAR=", "BAR =", "BAR=   ", "BAR= # note", "export BAR=", "\tBAR=\t"],
+    )
+    def test_every_spelling_of_an_empty_value_is_withheld(self, tmp_path, empty):
+        names, lines = _read_env(tmp_path, f"export FOO\n{empty}\nNEXT=1\n".encode())
+        assert names == ("NEXT",)
+        assert lines == ["NEXT  ******** (1 chars)", "(2 line(s) not shown)"]
+
+    @pytest.mark.parametrize(
+        "sep",
+        ["", "   ", "\t", "# a note", "  # indented"],
+        ids=["blank", "spaces", "tab", "comment", "indented-comment"],
+    )
+    def test_a_blank_or_comment_line_ends_the_doubt(self, tmp_path, sep):
+        # `DEBUG=` and friends are real settings, and they stay listed.
+        raw = f"export FOO\n{sep}\nDEBUG=\nverbose=\nhttp_proxy=\n".encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("DEBUG", "http_proxy", "verbose")
+        assert lines == [
+            "DEBUG  ******** (0 chars)",
+            "http_proxy  ******** (0 chars)",
+            "verbose  ******** (0 chars)",
+            "(1 line(s) not shown)",
+        ]
+
+    def test_a_value_that_says_something_is_shown_after_junk(self, tmp_path):
+        names, lines = _read_env(tmp_path, b"export FOO\nBAR=1\nBAZ=x y\n")
+        assert names == ("BAR", "BAZ")
+        assert lines == [
+            "BAR  ******** (1 chars)",
+            "BAZ  ******** (3 chars)",
+            "(1 line(s) not shown)",
+        ]
+
+    @pytest.mark.parametrize("empty", ['""', "''", "``"])
+    def test_an_empty_quoted_value_is_a_statement_not_an_artifact(
+        self, tmp_path, empty
+    ):
+        names, lines = _read_env(tmp_path, f"export FOO\nBAR={empty}\n".encode())
+        assert names == ("BAR",)
+        assert lines == ["BAR  ******** (0 chars)", "(1 line(s) not shown)"]
+
+    def test_a_shown_entry_ends_the_doubt(self, tmp_path):
+        names, lines = _read_env(tmp_path, b"export FOO\nX=1\nY=\nZ=\n")
+        assert names == ("X", "Y", "Z")
+        assert lines[-1] == "(1 line(s) not shown)"
+
+    @pytest.mark.parametrize(
+        ("withheld", "counted"),
+        [
+            ("-----BEGIN X-----\nabc\n-----END X-----", 3),
+            ("B" * (nodes._DOTENV_NAME_MAX + 1) + "=1", 1),
+            ("abc123==", 1),
+        ],
+        ids=["armor-block", "over-long-name", "padding"],
+    )
+    def test_every_kind_of_withheld_line_hands_the_doubt_on(
+        self, tmp_path, withheld, counted
+    ):
+        raw = f"{withheld}\nBAR=\nNEXT=1\n".encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("NEXT",)
+        assert lines == [
+            "NEXT  ******** (1 chars)",
+            f"({counted + 1} line(s) not shown)",
+        ]
+
+    # ---- armor anywhere in a line that is not an assignment -----------------
+
+    @pytest.mark.parametrize(
+        "opener",
+        [
+            '"k": "-----BEGIN X-----',
+            "cert: -----BEGIN X-----",
+            '  ["-----BEGIN X-----',
+            "}-----BEGIN X-----",
+        ],
+        ids=["json-key", "colon", "bracket", "brace"],
+    )
+    def test_a_begin_marker_anywhere_in_a_line_opens_a_block(self, tmp_path, opener):
+        # `FRAG=1` is not empty, so the context rule would not hide it: only the
+        # block does.
+        raw = f'{opener}\n{FRAG}=1\n-----END X-----",\nNEXT=1\n'.encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("NEXT",)
+        assert lines == ["NEXT  ******** (1 chars)", "(3 line(s) not shown)"]
+        _no_fragment(names, lines)
+
+    def test_a_json_string_with_real_newlines_prints_no_name(self, tmp_path):
+        raw = (
+            f'{{\n  "k": "-----BEGIN X-----\n{FRAG}=1\n{FRAG}2=\n'
+            '-----END X-----"\n}\nNEXT=1\n'
+        ).encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("NEXT",)
+        # `{`, the opening line, two body lines, the closing line and `}`.
+        assert lines == ["NEXT  ******** (1 chars)", "(6 line(s) not shown)"]
+        _no_fragment(names, lines)
+
+    def test_a_block_opened_mid_line_is_closed_by_its_own_label(self, tmp_path):
+        raw = (
+            f'x "-----BEGIN A-----\n-----END B-----\n{FRAG}=1\n-----END A-----\nNEXT=1\n'
+        ).encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("NEXT",)
+        assert lines == ["NEXT  ******** (1 chars)", "(4 line(s) not shown)"]
+        _no_fragment(names, lines)
+
+    def test_a_comment_that_mentions_a_marker_opens_nothing(self, tmp_path):
+        raw = b"# paste the -----BEGIN X----- block below\nA=1\nB=2\n"
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("A", "B")
+        assert lines == ["A  ******** (1 chars)", "B  ******** (1 chars)"]
+
+    # ---- lines an open quote or block swallows are counted -------------------
+
+    def test_the_lines_an_adjacent_quote_swallows_are_counted(self, tmp_path):
+        # `"v"` closes, `#it` is plain text, and the `'` of `it's` opens a run
+        # that never closes: it eats the rest of the file.
+        raw = b'A="v"#it\'s\nSECRET_TAIL=zzz\nB=2\n'
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("A",)
+        assert lines[0].startswith("A  ")
+        assert lines[1:] == ["(2 line(s) not shown)"]
+        assert "SECRET_TAIL" not in "\n".join(lines)
+
+    @pytest.mark.parametrize(
+        ("raw", "swallowed"),
+        [
+            (b'A="open\nX=1\nY=2\n', 2),
+            (b"A='open\nX=1\n", 1),
+            (b"A=`open\nX=1\n\nY=2", 2),
+            (b"A=-----BEGIN P-----\nX=1\nY=2\n", 2),
+            (b'A="open\n\n  \nX=1\n', 1),
+            (b'A="open', 0),
+        ],
+        ids=["double", "single", "backtick", "armor", "blanks-not-counted", "nothing"],
+    )
+    def test_what_a_value_that_never_closes_swallows_is_counted(
+        self, tmp_path, raw, swallowed
+    ):
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("A",)
+        assert lines[1:] == ([f"({swallowed} line(s) not shown)"] if swallowed else [])
+
+    def test_a_value_that_closes_swallows_nothing(self, tmp_path):
+        armor = "-----BEGIN P-----\nc\n-----END P-----"
+        raw = f'K="a\nb"\nL={armor}\n'.encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("K", "L")
+        assert lines == [
+            "K  ******** (3 chars)",
+            f"L  ******** ({len(armor)} chars)",
+        ]
+
+    def test_blanks_after_a_closing_quote_on_a_later_line_swallow_nothing(
+        self, tmp_path
+    ):
+        # The value ends at the blank that follows its close, which is on the
+        # LAST line of a multi-line value: nothing was swallowed.
+        raw = b'K="a\nb" # a note\nL=1\n'
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("K", "L")
+        assert lines == ["K  ******** (3 chars)", "L  ******** (1 chars)"]
+
+    # ---- only the screen is guarded ------------------------------------------
+
+    def test_the_hand_off_and_the_seal_never_consult_the_display_scan(
+        self, tmp_path, private_tmp, cloud_home, monkeypatch
+    ):
+        raw = b'A="v"#it\'s\nSECRET_TAIL=zzz\nB=2\n'
+        # Built first: a push set's `names` are read through the scan.
+        ps = _env_set(tmp_path, {".env": raw})
+        sealed = nodes.push_set_digest(ps, "manual")
+        changed = _env_set(tmp_path, {".env": raw.replace(b"zzz", b"zzy")})
+
+        def refuse(text):
+            raise AssertionError("the display scan decides what is SHOWN only")
+
+        monkeypatch.setattr(nodes, "_dotenv_scan", refuse)
+        handoff = nodes.write_manual_handoff(changed)
+        # Every swallowed line travels, byte for byte.
+        assert handoff.read_text(encoding="utf-8").endswith(
+            raw.replace(b"zzz", b"zzy").decode()
+        )
+        # And the seal reads those lines too: change one and it no longer matches.
+        assert nodes.push_set_digest(changed, "manual") != sealed
 
 
 class TestTheEnvParserCostIsLinear:

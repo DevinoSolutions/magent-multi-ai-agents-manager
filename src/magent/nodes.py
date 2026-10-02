@@ -3757,11 +3757,12 @@ def _dotenv_text(path: Path) -> str:
     return raw.decode(codec, errors="replace")
 
 
-def _value_extent(first: str, lines: list[str], at: int) -> tuple[int, int]:
+def _value_extent(first: str, lines: list[str], at: int) -> tuple[int, int, bool]:
     """The length of the raw text between the quotes of a value that opens with
-    one, and the index of the last line the value occupies. ``first`` is the
-    rest of the line ``lines[at]`` from the opening quote; when the value runs
-    on, its further lines are TAKEN, so the caller never parses them.
+    one, the index of the last line the value occupies, and whether its quote
+    closed. ``first`` is the rest of the line ``lines[at]`` from the opening
+    quote; when the value runs on, its further lines are TAKEN, so the caller
+    never parses them.
 
     The value is one SHELL WORD, so ``'a''b'`` and ``"a"'b'`` are one value: a
     quote that follows a closing one (directly, or after unquoted text with no
@@ -3799,25 +3800,25 @@ def _value_extent(first: str, lines: list[str], at: int) -> tuple[int, int]:
                 quote = char
                 i += 1
             elif char in " \t":
-                return length, at
+                return length, at, True
             else:
                 i += 1
         if not quote or at + 1 >= len(lines):
-            return length, at
+            return length, at, not quote
         at += 1
         length += 1
         chunk = lines[at]
         i = 0
 
 
-def _armored_extent(first: str, lines: list[str], at: int) -> tuple[int, int]:
-    """The length of an armored block (a PEM key or certificate) and the index
-    of the line it ends on. ``first`` is the text of ``lines[at]`` from its
-    ``-----BEGIN``; the block runs to the first line holding the MATCHING
-    ``-----END <label>-----`` (any ``-----END`` when the opening names no
-    label), the matching one because a body that quotes another block's marker
-    is still one value. An unterminated block swallows every remaining line,
-    like an unterminated quote."""
+def _armored_extent(first: str, lines: list[str], at: int) -> tuple[int, int, bool]:
+    """The length of an armored block (a PEM key or certificate), the index of
+    the line it ends on, and whether it closed. ``first`` is the text of
+    ``lines[at]`` from its ``-----BEGIN``; the block runs to the first line
+    holding the MATCHING ``-----END <label>-----`` (any ``-----END`` when the
+    opening names no label), the matching one because a body that quotes
+    another block's marker is still one value. An unterminated block swallows
+    every remaining line, like an unterminated quote."""
     label = _ARMOR_LABEL.match(first)
     close = f"-----END {label[1]}-----" if label else _ARMOR_CLOSE
     chunk = first
@@ -3826,7 +3827,14 @@ def _armored_extent(first: str, lines: list[str], at: int) -> tuple[int, int]:
         at += 1
         chunk = lines[at]
         length += 1 + len(chunk)
-    return length - (len(chunk) - len(chunk.rstrip(" \t"))), at
+    return length - (len(chunk) - len(chunk.rstrip(" \t"))), at, close in chunk
+
+
+def _unshown(lines: list[str], first: int, last: int) -> int:
+    """How many of ``lines[first..last]`` hold anything: the count behind
+    ``(N line(s) not shown)``. A blank line has nothing to hide (and a file's
+    final newline leaves an empty last element)."""
+    return sum(1 for line in lines[first : last + 1] if line.strip())
 
 
 def _dotenv_scan(text: str) -> tuple[list[tuple[str, int]], int]:
@@ -3847,6 +3855,21 @@ def _dotenv_scan(text: str) -> tuple[list[tuple[str, int]], int]:
     reader does, and would turn the rest of ``SECRET=abc<U+2028>FOO=bar`` into a
     second variable), minus one trailing ``\\r``.
 
+    Doubt spreads forward. A line that is not blank, not a comment and not an
+    assignment (raw base64 is one: a body line has no ``=`` before its end) is
+    withheld, and so is an unquoted EMPTY value straight after a withheld line:
+    the last line of a base64 body (``AAA=``) reads as a variable with no
+    value, and is not one. Every withheld line hands the doubt on; a blank
+    line, a comment line or a shown entry ends it, so ``DEBUG=`` after a
+    comment is still listed. A ``-----BEGIN`` ANYWHERE in a line that is not an
+    assignment (a JSON string with real newlines carries one mid-line) opens an
+    armored block too. The lines a value that never closes swallows (an unmatched
+    quote or ``-----BEGIN``) are counted as well, so the count line says the
+    rest of the file went unread. KNOWN RESIDUAL, deliberately not guarded: a
+    two-line unquoted value (``KEY=AAAA`` then ``bbbb=``) shows ``bbbb``, with
+    no marker and no doubt before it; a length or case heuristic would hide
+    real names.
+
     A value that opens with ``"``, ``'`` or a backtick (after blanks) runs to
     its close (see ``_value_extent``); one that opens with ``-----BEGIN`` runs
     to its matching end (see ``_armored_extent``); any other value ends at an
@@ -3856,30 +3879,46 @@ def _dotenv_scan(text: str) -> tuple[list[tuple[str, int]], int]:
     lines = [line.removesuffix("\r") for line in text.split("\n")]
     entries: list[tuple[str, int]] = []
     withheld = 0
+    doubt = False
     at = 0
     while at < len(lines):
         line = lines[at]
         match = _DOTENV_LINE.match(line)
         if match is None:
             stripped = line.lstrip(" \t")
-            if stripped.startswith(_ARMOR_OPEN):
-                end = _armored_extent(stripped, lines, at)[1]
-                withheld += end - at + 1
+            if not stripped or stripped.startswith("#"):
+                doubt = False
+            elif _ARMOR_OPEN in stripped:
+                opening = stripped[stripped.index(_ARMOR_OPEN) :]
+                end = _armored_extent(opening, lines, at)[1]
+                withheld += _unshown(lines, at, end)
                 at = end
-            elif stripped and not stripped.startswith("#"):
+                doubt = True
+            else:
                 withheld += 1
+                doubt = True
             at += 1
             continue
         name, rest = match.groups()
         value = rest.lstrip(" \t")
-        if value[:1] in _DOTENV_QUOTES:
-            length, at = _value_extent(value, lines, at)
+        first = at
+        quoted = value[:1] in _DOTENV_QUOTES
+        closed = True
+        if quoted:
+            length, at, closed = _value_extent(value, lines, at)
         elif value.startswith(_ARMOR_OPEN):
-            length, at = _armored_extent(value, lines, at)
+            length, at, closed = _armored_extent(value, lines, at)
         else:
             length = len(_DOTENV_COMMENT.sub("", rest).strip(" \t"))
+        if not closed:
+            withheld += _unshown(lines, first + 1, at)
         at += 1
-        if len(name) > _DOTENV_NAME_MAX or value.startswith("="):
+        doubt = (
+            len(name) > _DOTENV_NAME_MAX
+            or value.startswith("=")
+            or (doubt and not quoted and length == 0)
+        )
+        if doubt:
             withheld += 1
         else:
             entries.append((name, length))
