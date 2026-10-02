@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`magent watch` no longer crashes on a digit press when macOS cannot list
+  windows.** The System Events window probes (`find_window`, `snapshot_windows`)
+  let an `osascript` timeout, which an Automation (TCC) prompt nobody can answer
+  produces, or a missing `osascript`, raise out of the watch loop. They now log a
+  warning and answer "no windows", so the press reports `no window found` as it
+  does elsewhere.
 - **`magent node doctor` no longer calls an idle node sync stale.** With nothing
   placed on a node, the sync daemon idle-exits by design, and `magent status`
   already says `node_sync: off`; the doctor still warned `sync-daemon its

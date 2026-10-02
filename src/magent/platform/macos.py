@@ -31,6 +31,27 @@ print(String(data: data, encoding: .utf8)!)
 """
 
 
+def _window_probe(script: str) -> str | None:
+    """Run a System Events probe; None when osascript cannot answer.
+
+    System Events needs Automation (TCC) consent, so on a box with no consenting
+    user the call blocks until its timeout, and a machine without osascript
+    raises. Either way the probe's answer is "no windows", never an exception
+    out of the caller (`magent watch`'s digit press, the tiling pass)."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        _log.warning("window probe: osascript gave no answer (%s)", exc)
+        return None
+    return result.stdout
+
+
 class MacOSPlatform(Platform):
     def set_dpi_aware(self) -> None:
         pass
@@ -88,14 +109,10 @@ class MacOSPlatform(Platform):
         end tell
         return windowList
         """
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        for line in result.stdout.strip().split(", "):
+        stdout = _window_probe(script)
+        if stdout is None:
+            return None
+        for line in stdout.strip().split(", "):
             parts = line.split(":")
             if len(parts) < 2:
                 continue
@@ -116,7 +133,8 @@ class MacOSPlatform(Platform):
         # containing ':' or ', ' (every 'magent:' window) parses intact -- unlike
         # find_window's comma/colon split. Requires Automation permission for
         # the invoking process; when TCC blocks it osascript fails and this
-        # returns {} (tiling then no-ops, matching the pre-override default).
+        # returns {} (an osascript timeout or absence too; tiling then no-ops,
+        # matching the pre-override default).
         script = """
         set out to {}
         tell application "System Events"
@@ -134,15 +152,9 @@ class MacOSPlatform(Platform):
         set AppleScript's text item delimiters to linefeed
         return out as text
         """
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
+        stdout = _window_probe(script)
         titles: dict[str, object] = {}
-        for line in result.stdout.splitlines():
+        for line in (stdout or "").splitlines():
             if "\t" not in line:
                 continue
             proc_name, win_name = line.split("\t", 1)
