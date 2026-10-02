@@ -3006,6 +3006,140 @@ class TestAFailureIsAWordNeverATraceback:
         assert SENTINEL not in result.stdout + result.stderr
 
 
+def _leftover(scratch: Path, name: str, *, age_s: float = 7200.0) -> Path:
+    """A hand-off file an earlier push left, ``age_s`` old, holding the sentinel."""
+    path = scratch / name
+    path.write_text(f"PLAIN_SETTING={SENTINEL}\n", encoding="utf-8")
+    then = time.time() - age_s
+    os.utime(path, (then, then))
+    return path
+
+
+class TestAPushClearsWhatAnEarlierPushLeft:
+    """A terminal closed at the prompt skips the ``finally`` that deletes the
+    hand-off file, and ``--yes`` keeps it by design. Each ``node push`` starts
+    by sweeping our own old ones and saying how many, never which or what."""
+
+    def test_old_files_are_cleared_and_counted_in_one_line(
+        self, runner, cloud_project, cloud_env
+    ):
+        _leftover(cloud_env, "magent-cloud-env-aaaa.env")
+        _leftover(cloud_env, "magent-cloud-env-bbbb.env")
+        result = _cloud_push(runner, cloud_project, stdin="y\n")
+        assert result.exit_code == 0
+        assert "cleared 2 hand-off file(s) an earlier push left behind" in result.stdout
+        assert "aaaa" not in result.stdout + result.stderr
+        assert SENTINEL not in result.stdout + result.stderr
+        assert _handoffs(cloud_env) == []
+
+    def test_a_push_with_nothing_left_over_says_nothing_about_it(
+        self, runner, cloud_project
+    ):
+        result = _cloud_push(runner, cloud_project, stdin="y\n")
+        assert result.exit_code == 0
+        assert "earlier push" not in result.stdout
+
+    def test_a_recent_file_is_kept_and_not_mentioned(
+        self, runner, cloud_project, cloud_env
+    ):
+        # Another terminal's push may be waiting at its prompt.
+        fresh = _leftover(cloud_env, "magent-cloud-env-aaaa.env", age_s=60.0)
+        result = _cloud_push(runner, cloud_project, stdin="y\n")
+        assert result.exit_code == 0
+        assert fresh.exists()
+        assert "earlier push" not in result.stdout
+
+    def test_the_sweep_comes_first_so_a_refused_push_still_clears(
+        self, runner, cloud_project, cloud_env, monkeypatch
+    ):
+        monkeypatch.setattr("magent.launch.node_git_states", lambda config, proj: [])
+        _leftover(cloud_env, "magent-cloud-env-aaaa.env")
+        result = _cloud_push(runner, cloud_project, "--yes")
+        assert result.exit_code == 2
+        assert "not a git repository" in result.stderr
+        assert "cleared 1 hand-off file(s)" in result.stdout
+        assert _handoffs(cloud_env) == []
+
+    def test_a_file_that_would_not_go_is_counted_and_the_push_goes_on(
+        self, runner, cloud_project, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "sweep_handoff_leftovers", lambda: (1, 2))
+        result = _cloud_push(runner, cloud_project, stdin="y\n")
+        assert result.exit_code == 0
+        assert "cleared 1 hand-off file(s) an earlier push left behind" in result.stdout
+        assert "2 more could not be deleted: delete them yourself" in result.stdout
+        assert nodes.read_cloud_record("api") is not None
+
+    def test_only_a_stuck_file_is_still_one_line(
+        self, runner, cloud_project, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "sweep_handoff_leftovers", lambda: (0, 1))
+        result = _cloud_push(runner, cloud_project, stdin="y\n")
+        assert "cleared" not in result.stdout
+        assert "1 more could not be deleted" in result.stdout
+
+    @pytest.mark.usefixtures("_node_user")
+    def test_a_node_project_push_does_not_sweep(
+        self, runner, tmp_config, api_dir, one_repo, monkeypatch
+    ):
+        # The hand-off belongs to the cloud flow: a node push has none.
+        monkeypatch.setattr(remote_mux, "push_files", lambda node, recipe: [".env"])
+        monkeypatch.setattr(
+            nodes,
+            "sweep_handoff_leftovers",
+            lambda: pytest.fail("a node push swept the temp dir"),
+        )
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "second")]))
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
+        assert result.exit_code == 0
+
+
+class TestAHandOffFileThatCannotBePrivateIsNeverWritten:
+    """The refusal comes BEFORE the values are written and before any record:
+    the gate stays shut, and nothing holding a value exists."""
+
+    @pytest.fixture
+    def not_private(self, monkeypatch):
+        def refuse(prefix, suffix):
+            raise nodes.HandoffNotPrivate("not-private")
+
+        monkeypatch.setattr(nodes, "_open_private", refuse)
+
+    @pytest.mark.parametrize(("extra", "text"), [(("--yes",), None), ((), "y\n")])
+    def test_it_is_a_named_refusal_with_nothing_written_or_recorded(
+        self, runner, cloud_project, cloud_env, not_private, extra, text
+    ):
+        result = _cloud_push(runner, cloud_project, *extra, stdin=text)
+        assert result.exit_code == 1
+        assert (
+            "could not make a private file for api's values (not-private)"
+            in result.stderr
+        )
+        assert "nothing was written and nothing was recorded" in result.stderr
+        assert "magent node push api" in result.stderr
+        assert "Traceback" not in result.output
+        assert isinstance(result.exception, SystemExit)
+        assert _handoffs(cloud_env) == []
+        assert nodes.read_cloud_record("api") is None
+        assert _cloud_gate(cloud_project) is not None
+
+    def test_the_prompt_is_never_reached(
+        self, runner, cloud_project, not_private, monkeypatch
+    ):
+        monkeypatch.setattr(
+            click, "confirm", lambda *a, **k: pytest.fail("asked to confirm a paste")
+        )
+        assert _cloud_push(runner, cloud_project).exit_code == 1
+
+    def test_the_log_names_the_reason_and_no_value(
+        self, runner, cloud_project, not_private, caplog
+    ):
+        caplog.set_level(logging.DEBUG)
+        _cloud_push(runner, cloud_project, "--yes")
+        assert "not-private" in caplog.text + _logged_text()
+        assert SENTINEL not in caplog.text + _logged_text()
+
+
 class TestNoValueEverReachesAScreenOrALog:
     """Every way the command can end, with the sentinel in the .env: it is in
     the hand-off file the user asked for and nowhere else."""
@@ -3021,6 +3155,7 @@ class TestNoValueEverReachesAScreenOrALog:
             ((), "y\n", "records-lock"),
             (("--yes",), None, "unreadable"),
             ((), "y\n", "os-error"),
+            ((), "y\n", "not-private"),
         ],
         ids=[
             "confirmed",
@@ -3031,6 +3166,7 @@ class TestNoValueEverReachesAScreenOrALog:
             "confirmed-lock-held",
             "unreadable",
             "os-error",
+            "not-private",
         ],
     )
     def test_the_sentinel_is_in_no_stdout_no_stderr_and_no_log(
@@ -3048,6 +3184,10 @@ class TestNoValueEverReachesAScreenOrALog:
         elif fault == "os-error":
             monkeypatch.setattr(
                 nodes, "write_manual_handoff", _raises(OSError(5, "disk on fire"))
+            )
+        elif fault == "not-private":
+            monkeypatch.setattr(
+                nodes, "_open_private", _raises(nodes.HandoffNotPrivate("not-private"))
             )
         result = _cloud_push(runner, cloud_project, *extra, stdin=text)
         everything = (

@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -19,7 +20,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from magent import cli, launch, nodes, psmux
+from magent import cli, launch, node_auth, nodes, psmux
 from magent.config import SCHEMA_VERSION, ConfigError, load_config
 from magent.launch import RunOpts
 from magent.lockfile import LockHeld, persistent_lock
@@ -1213,17 +1214,18 @@ def _env_set(tmp_path: Path, files: dict[str, bytes]) -> nodes.CloudPushSet:
     )
 
 
-class TestTheManualHandOff:
-    @pytest.fixture
-    def private_tmp(self, tmp_path, monkeypatch) -> Path:
-        """An empty directory standing in for the temp dir (``mkstemp`` reads
-        ``tempfile.tempdir`` at call time): no test writes to the real one, and
-        "no file left behind" is one ``iterdir`` away."""
-        tmp = tmp_path / "tmp"
-        tmp.mkdir()
-        monkeypatch.setattr(tempfile, "tempdir", str(tmp))
-        return tmp
+@pytest.fixture
+def private_tmp(tmp_path, monkeypatch) -> Path:
+    """An empty directory standing in for the temp dir (``mkstemp`` and
+    ``gettempdir`` read ``tempfile.tempdir`` at call time): no test writes to
+    the real one, and "no file left behind" is one ``iterdir`` away."""
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp))
+    return tmp
 
+
+class TestTheManualHandOff:
     def _ps(self, tmp_path: Path) -> nodes.CloudPushSet:
         repo = tmp_path / "api"
         repo.mkdir()
@@ -1424,6 +1426,365 @@ class TestTheManualHandOff:
         assert len(offered) == 1
         with pytest.raises(OSError):
             os.fstat(offered[0])
+
+
+@pytest.fixture
+def win_seam(monkeypatch) -> SimpleNamespace:
+    """The ONE seam under the Windows branch: node_auth's create-with-a-private-
+    DACL and its read-the-DACL-back, replaced with fakes that run on any OS. No
+    test runs a real ACL call here (``test_the_real_file_...`` below is the one
+    win32-only read-back, on a tmp file)."""
+    seam = SimpleNamespace(
+        events=[],
+        attempts=[],
+        sizes_at_check=[],
+        private=True,
+        create_error=None,
+        collide=0,
+    )
+
+    def create(path) -> int:
+        seam.events.append("create")
+        seam.attempts.append(path)
+        if seam.collide:
+            seam.collide -= 1
+            raise FileExistsError(17, "exists", str(path))
+        if seam.create_error is not None:
+            raise seam.create_error
+        return os.open(
+            path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        )
+
+    def verify(path) -> bool:
+        seam.events.append("verify")
+        seam.sizes_at_check.append(os.path.getsize(path))
+        return seam.private
+
+    monkeypatch.setattr(node_auth, "_win_create_private", create)
+    monkeypatch.setattr(node_auth, "_win_dacl_is_private", verify)
+    return seam
+
+
+@pytest.fixture
+def posix_seam(monkeypatch) -> SimpleNamespace:
+    """``fchmod`` and the mode read-back, replaced so the POSIX branch's
+    refusals can be driven on any OS: ``mode`` is what the file reads back as,
+    ``chmod_error`` what the chmod raises."""
+    seam = SimpleNamespace(calls=[], mode=0o600, chmod_error=None)
+    real_fstat = os.fstat
+    touched: set[int] = set()
+
+    def fchmod(fd: int, mode: int) -> None:
+        touched.add(fd)
+        seam.calls.append(mode)
+        if seam.chmod_error is not None:
+            raise seam.chmod_error
+
+    def fstat(fd: int):
+        if fd in touched:
+            return SimpleNamespace(st_mode=stat.S_IFREG | seam.mode)
+        return real_fstat(fd)
+
+    monkeypatch.setattr(os, "fchmod", fchmod, raising=False)
+    monkeypatch.setattr(os, "fstat", fstat)
+    return seam
+
+
+class TestTheHandOffFileIsPrivateBeforeAByteIsWritten:
+    """``os.chmod(0o600)`` does nothing to a Windows ACL, and a temp file
+    inherits %TEMP%'s, which on a real box grants other accounts Modify. So the
+    secret is only ever written into a file that was proven private first, and
+    when that cannot be had nothing is written at all."""
+
+    def test_the_windows_file_is_made_private_at_creation_and_checked_empty(
+        self, private_tmp, win_seam
+    ):
+        fd, path = node_auth._create_private_temp_win("t-", ".env")
+        os.close(fd)
+        assert path.parent == private_tmp
+        assert path.name.startswith("t-") and path.suffix == ".env"
+        assert win_seam.events == ["create", "verify"]
+        assert win_seam.sizes_at_check == [0]
+
+    def test_an_acl_that_reads_back_as_not_ours_is_a_refusal_and_the_file_goes(
+        self, private_tmp, win_seam
+    ):
+        win_seam.private = False
+        with pytest.raises(nodes.HandoffNotPrivate) as err:
+            node_auth._create_private_temp_win("t-", ".env")
+        assert err.value.reason == "not-private"
+        assert isinstance(err.value, OSError)
+        assert list(private_tmp.iterdir()) == []
+
+    def test_a_create_that_fails_is_a_refusal_naming_the_class_and_no_path(
+        self, private_tmp, win_seam
+    ):
+        win_seam.create_error = PermissionError(
+            13, "Access is denied", str(private_tmp / "secret-place")
+        )
+        with pytest.raises(nodes.HandoffNotPrivate) as err:
+            node_auth._create_private_temp_win("t-", ".env")
+        assert err.value.reason == "PermissionError"
+        assert "denied" not in str(err.value)
+        assert "secret-place" not in str(err.value)
+        assert err.value.__cause__ is None and err.value.__suppress_context__
+        assert win_seam.events == ["create"]
+        assert list(private_tmp.iterdir()) == []
+
+    def test_a_taken_name_is_retried_under_a_new_one(self, private_tmp, win_seam):
+        win_seam.collide = 2
+        fd, _ = node_auth._create_private_temp_win("t-", ".env")
+        os.close(fd)
+        assert win_seam.events == ["create", "create", "create", "verify"]
+        assert len({p.name for p in win_seam.attempts}) == 3
+
+    def test_eight_taken_names_in_a_row_are_a_refusal(self, private_tmp, win_seam):
+        win_seam.collide = 99
+        with pytest.raises(nodes.HandoffNotPrivate) as err:
+            node_auth._create_private_temp_win("t-", ".env")
+        assert err.value.reason == "FileExistsError"
+        assert win_seam.events == ["create"] * 8
+
+    def test_nothing_is_written_when_no_private_file_can_be_had(
+        self, private_tmp, win_seam, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "_open_private", node_auth._create_private_temp_win)
+        win_seam.private = False
+        monkeypatch.setattr(
+            os,
+            "fdopen",
+            lambda *a, **k: pytest.fail("a secret was about to be written"),
+        )
+        with pytest.raises(nodes.HandoffNotPrivate):
+            nodes.write_private_temp("API_TOKEN=hunter2-secret\n", prefix="t-")
+        assert list(private_tmp.iterdir()) == []
+
+    def test_the_secret_goes_in_only_after_the_check(
+        self, private_tmp, win_seam, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "_open_private", node_auth._create_private_temp_win)
+        path = nodes.write_private_temp("API_TOKEN=hunter2-secret\n", prefix="t-")
+        assert path.read_bytes() == b"API_TOKEN=hunter2-secret\n"
+        assert win_seam.events == ["create", "verify"]
+        assert win_seam.sizes_at_check == [0]
+
+    def test_this_platform_takes_its_own_branch(self, monkeypatch):
+        taken: list[str] = []
+
+        def fake(name: str):
+            def _make(prefix, suffix):
+                taken.append(name)
+                return -1, prefix
+
+            return _make
+
+        monkeypatch.setattr(node_auth, "_create_private_temp_win", fake("win"))
+        monkeypatch.setattr(node_auth, "_create_private_temp_posix", fake("posix"))
+        node_auth.create_private_temp("t-", ".env")
+        assert taken == ["win" if sys.platform == "win32" else "posix"]
+
+    def test_the_hand_off_asks_node_auth_for_its_file(self, monkeypatch):
+        asked: list[tuple[str, str]] = []
+
+        def fake(prefix, suffix):
+            asked.append((prefix, suffix))
+            raise node_auth.PrivateFileRefused("not-private")
+
+        monkeypatch.setattr(node_auth, "create_private_temp", fake)
+        with pytest.raises(nodes.HandoffNotPrivate):
+            nodes.write_private_temp("x", prefix="t-", suffix=".env")
+        assert asked == [("t-", ".env")]
+
+    def test_posix_chmods_to_0600_and_reads_the_mode_back_before_any_write(
+        self, private_tmp, posix_seam
+    ):
+        fd, path = node_auth._create_private_temp_posix("t-", ".env")
+        os.close(fd)
+        assert posix_seam.calls == [0o600]
+        assert path.parent == private_tmp and os.path.getsize(path) == 0
+
+    @pytest.mark.parametrize("mode", [0o640, 0o604, 0o044, 0o666])
+    def test_a_mode_that_does_not_stick_is_a_refusal_and_the_file_goes(
+        self, private_tmp, posix_seam, mode
+    ):
+        posix_seam.mode = mode
+        with pytest.raises(nodes.HandoffNotPrivate) as err:
+            node_auth._create_private_temp_posix("t-", ".env")
+        assert err.value.reason == "not-private"
+        assert list(private_tmp.iterdir()) == []
+
+    def test_a_chmod_that_fails_is_a_refusal_naming_the_class_and_no_path(
+        self, private_tmp, posix_seam
+    ):
+        posix_seam.chmod_error = PermissionError(1, "denied", "/secret-place/x")
+        with pytest.raises(nodes.HandoffNotPrivate) as err:
+            node_auth._create_private_temp_posix("t-", ".env")
+        assert err.value.reason == "PermissionError"
+        assert "denied" not in str(err.value)
+        assert "secret-place" not in str(err.value)
+        assert err.value.__cause__ is None and err.value.__suppress_context__
+        assert list(private_tmp.iterdir()) == []
+
+    def test_an_interrupt_during_the_chmod_still_deletes_the_file(
+        self, private_tmp, posix_seam
+    ):
+        posix_seam.chmod_error = KeyboardInterrupt()
+        with pytest.raises(KeyboardInterrupt):
+            node_auth._create_private_temp_posix("t-", ".env")
+        assert list(private_tmp.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="DACLs are a Windows thing")
+    def test_the_real_file_carries_this_users_dacl_alone(self, private_tmp):
+        path = nodes.write_private_temp("API_TOKEN=hunter2-secret\n", prefix="t-")
+        assert path.read_bytes() == b"API_TOKEN=hunter2-secret\n"
+        assert node_auth._win_dacl_is_private(path)
+        # The directory kept its own (inheriting) ACL: the file's is its own doing.
+        assert node_auth._win_dacl(path) != node_auth._win_dacl(private_tmp)
+
+
+def _age(path, seconds: float) -> None:
+    then = time.time() - seconds
+    os.utime(path, (then, then))
+
+
+class TestTheSweepClearsOnlyOurOwnLeftovers:
+    HOUR = 3600
+
+    def _leftover(self, tmp, name="magent-cloud-env-aaaa.env", age=2 * HOUR):
+        path = tmp / name
+        path.write_text("API_TOKEN=hunter2-secret\n", encoding="utf-8")
+        _age(path, age)
+        return path
+
+    def test_it_removes_old_hand_off_files_and_counts_them(self, private_tmp):
+        self._leftover(private_tmp, "magent-cloud-env-aaaa.env")
+        self._leftover(private_tmp, "magent-cloud-env-bbbb.env")
+        assert nodes.sweep_handoff_leftovers() == (2, 0)
+        assert list(private_tmp.iterdir()) == []
+
+    def test_a_recent_file_is_left_alone(self, private_tmp):
+        # A push in another terminal may be waiting at its prompt, or the user
+        # may be pasting from a --yes file right now.
+        kept = self._leftover(private_tmp, age=60)
+        assert nodes.sweep_handoff_leftovers() == (0, 0)
+        assert kept.exists()
+
+    def test_the_default_age_is_an_hour(self, private_tmp):
+        young = self._leftover(private_tmp, "magent-cloud-env-young.env", age=59 * 60)
+        old = self._leftover(private_tmp, "magent-cloud-env-old.env", age=61 * 60)
+        assert nodes.sweep_handoff_leftovers() == (1, 0)
+        assert young.exists() and not old.exists()
+
+    def test_only_our_prefix_and_suffix_are_touched(self, private_tmp):
+        others = [
+            self._leftover(private_tmp, name)
+            for name in (
+                "notes.env",
+                "magent-cloud-env-aaaa.txt",
+                "other-magent-cloud-env-aaaa.env",
+                "magent-cloud-env.env.bak",
+            )
+        ]
+        assert nodes.sweep_handoff_leftovers() == (0, 0)
+        assert all(p.exists() for p in others)
+
+    def test_a_directory_with_our_name_is_not_touched(self, private_tmp):
+        folder = private_tmp / "magent-cloud-env-dir.env"
+        folder.mkdir()
+        (folder / "inside.txt").write_text("keep", encoding="utf-8")
+        _age(folder, 2 * self.HOUR)
+        assert nodes.sweep_handoff_leftovers() == (0, 0)
+        assert (folder / "inside.txt").exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need a privilege")
+    def test_a_link_is_neither_followed_nor_removed(self, private_tmp, tmp_path):
+        target = tmp_path / "precious.env"
+        target.write_text("keep", encoding="utf-8")
+        _age(target, 2 * self.HOUR)
+        link = private_tmp / "magent-cloud-env-link.env"
+        link.symlink_to(target)
+        then = time.time() - 2 * self.HOUR
+        os.utime(link, (then, then), follow_symlinks=False)
+        assert nodes.sweep_handoff_leftovers() == (0, 0)
+        assert link.is_symlink() and target.exists()
+
+    def test_a_path_that_lstat_calls_a_link_is_left_alone_though_its_target_is_old(
+        self, private_tmp, monkeypatch
+    ):
+        # Platform-neutral: a Windows box without the symlink privilege runs it
+        # too. The path is a plain old file when FOLLOWED, a link when asked
+        # about itself -- and only the second is what the sweep may go by.
+        linked = self._leftover(private_tmp)
+        real_lstat = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            if os.fspath(path) == os.fspath(linked):
+                return SimpleNamespace(
+                    st_mode=stat.S_IFLNK | 0o777,
+                    st_mtime=real_lstat(path).st_mtime,
+                    st_uid=0,
+                )
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", lstat)
+        assert nodes.sweep_handoff_leftovers() == (0, 0)
+        assert linked.exists()
+
+    def test_another_users_file_is_left_alone(self, private_tmp, monkeypatch):
+        # Platform-neutral too: on a shared /tmp a file of ours-by-name can
+        # belong to another account.
+        theirs = self._leftover(private_tmp)
+        other = os.stat(theirs).st_uid + 1
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(os, "getuid", lambda: other, raising=False)
+        assert nodes.sweep_handoff_leftovers() == (0, 0)
+        assert theirs.exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX ownership")
+    def test_a_file_of_the_current_user_is_cleared_with_the_real_uid(self, private_tmp):
+        self._leftover(private_tmp)
+        assert nodes.sweep_handoff_leftovers() == (1, 0)
+
+    def test_no_file_is_ever_read(self, private_tmp, monkeypatch):
+        import builtins
+
+        self._leftover(private_tmp)
+
+        def no_open(*args, **kwargs):
+            pytest.fail("the sweep opened a file")
+
+        monkeypatch.setattr(builtins, "open", no_open)
+        monkeypatch.setattr(type(private_tmp), "open", no_open)
+        assert nodes.sweep_handoff_leftovers() == (1, 0)
+
+    def test_a_file_that_will_not_go_is_counted_not_hidden(
+        self, private_tmp, monkeypatch
+    ):
+        stuck = self._leftover(private_tmp)
+
+        def refuse(self, missing_ok=False):
+            raise PermissionError(13, "in use", str(self))
+
+        monkeypatch.setattr(type(private_tmp), "unlink", refuse)
+        assert nodes.sweep_handoff_leftovers() == (0, 1)
+        assert stuck.exists()
+
+    def test_a_file_that_vanished_first_is_not_counted(self, private_tmp, monkeypatch):
+        self._leftover(private_tmp)
+
+        def gone(self, missing_ok=False):
+            raise FileNotFoundError(2, "gone", str(self))
+
+        monkeypatch.setattr(type(private_tmp), "unlink", gone)
+        assert nodes.sweep_handoff_leftovers() == (0, 0)
+
+    def test_what_the_hand_off_writes_is_what_the_sweep_clears(
+        self, tmp_path, private_tmp
+    ):
+        path = nodes.write_manual_handoff(_env_set(tmp_path, {".env": b"A=1\n"}))
+        _age(path, 2 * self.HOUR)
+        assert nodes.sweep_handoff_leftovers() == (1, 0)
+        assert not path.exists()
 
 
 class TestTheEnvParserIsQuoteAware:

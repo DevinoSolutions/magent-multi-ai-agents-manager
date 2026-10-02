@@ -1735,9 +1735,14 @@ def _push_cloud(
     holds is a retry (exit 1), a file that cannot be read is a refusal that
     names it by its project-relative path and the error CLASS (exit 1), and
     any other OS error is its class only, the whole error going to nodes.log.
-    Nothing here ever quotes a value."""
+    Nothing here ever quotes a value.
+
+    First, the hand-off files an earlier push left behind are swept: a terminal
+    closed at the prompt skips the ``finally`` that deletes one, and ``--yes``
+    keeps it for the user. They hold values, so they do not get to pile up."""
     from magent import node_sync, nodes  # heavy subsystem: in-body per policy
 
+    _sweep_handoffs()
     try:
         _hand_off_cloud(cfg, proj, name, yes=yes)
     except LockHeld as exc:
@@ -1750,9 +1755,39 @@ def _push_cloud(
             f" fix or remove it, then run: magent node push {name}",
             1,
         )
+    except nodes.HandoffNotPrivate as exc:
+        # reason: an error class or "not-private", never a path. Raised before
+        # a byte of the values was written, and before any record.
+        log.get_logger("nodes").warning(
+            "push could not make a private hand-off file for %s: %s", name, exc
+        )
+        _fail(
+            f"could not make a private file for {name}'s values ({exc.reason});"
+            " nothing was written and nothing was recorded."
+            f" Fix the temp dir's permissions, then run: magent node push {name}",
+            1,
+        )
     except OSError as exc:
         text = _local_failure(exc, f"push could not hand off {name}'s files")
         _fail(f"could not hand off {name}'s files ({text})", 1)
+
+
+def _sweep_handoffs() -> None:
+    """One line when an earlier push left hand-off files behind, none when it
+    did not. Counts only: a file's name and content stay out of the line."""
+    from magent import nodes  # heavy subsystem: in-body per policy
+
+    removed, stuck = nodes.sweep_handoff_leftovers()
+    if not removed and not stuck:
+        return
+    parts = []
+    if removed:
+        parts.append(f"cleared {removed} hand-off file(s) an earlier push left behind")
+    if stuck:
+        parts.append(
+            f"{stuck} more could not be deleted: delete them yourself, they hold values"
+        )
+    _note("; ".join(parts))
 
 
 def _hand_off_cloud(
