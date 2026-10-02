@@ -3713,15 +3713,16 @@ def cloud_git_refusal(state: LocalGitState) -> str | None:
     return None
 
 
-# Horizontal whitespace only (`[ \t]`, not `\s`): `^\s*` would swallow a whole
-# run of blank lines from every line start, quadratic on a file that is mostly
-# blank. The names found are the same, since a name sits on its own line.
-# ONE grammar for a ``NAME=`` line, in two shapes below: ``_DOTENV_NAME`` scans
-# a whole file for the names, ``_DOTENV_LINE`` parses one line for its value
-# too. Built from one fragment so the two cannot drift.
-_DOTENV_HEAD = r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*="
-_DOTENV_NAME = re.compile(_DOTENV_HEAD, re.MULTILINE)
-_DOTENV_LINE = re.compile(_DOTENV_HEAD + r"[ \t]*(.*)$")
+# The ONE grammar of a ``NAME=value`` line: optional blanks, an optional
+# ``export``, the name, ``=``; group 2 is everything after the ``=``, its
+# leading blanks included (an inline comment is blanks followed by ``#``).
+# Horizontal whitespace only (`[ \t]`, not `\s`): the only blanks a .env allows
+# around a name, and a line it is matched against never holds a newline.
+_DOTENV_LINE = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)$"
+)
+# An unquoted value ends where blanks followed by ``#`` begin.
+_DOTENV_COMMENT = re.compile(r"[ \t]+#.*$")
 
 
 def _dotenv_text(path: Path) -> str:
@@ -3738,17 +3739,78 @@ def _dotenv_text(path: Path) -> str:
     return raw.decode(codec, errors="replace")
 
 
-def dotenv_names(path: Path) -> tuple[str, ...]:
-    """The variable NAMES a ``.env`` file defines, sorted -- never a value.
+def _quoted_length(first: str, lines: Iterator[str]) -> int:
+    """The length of the raw text between the quotes of a value that opens with
+    one. ``first`` is the rest of its line from the opening quote; when the
+    value runs on, its further lines are TAKEN from ``lines``, so the caller
+    never parses them.
 
-    Over-listing is the safe direction (a line inside a multi-line quoted value
-    that looks like ``K=v`` adds a name the user can ignore); an unreadable
-    file names nothing."""
+    The closing quote is the first unescaped one of the SAME type; what
+    follows it on its line is ignored. Inside ``"`` a backslash escapes the
+    next character (both count towards the length); ``'`` has no escape. A
+    newline inside the value counts as one character. An unterminated quote
+    swallows every remaining line."""
+    quote = first[0]
+    length = 0
+    chunk = first[1:]
+    while True:
+        i = 0
+        while i < len(chunk):
+            char = chunk[i]
+            if char == quote:
+                return length
+            step = 2 if char == "\\" and quote == '"' else 1
+            length += min(step, len(chunk) - i)
+            i += step
+        following = next(lines, None)
+        if following is None:
+            return length
+        length += 1
+        chunk = following
+
+
+def _dotenv_entries(text: str) -> list[tuple[str, int]]:
+    """``(name, value length)`` per variable a ``.env`` text defines, in file
+    order: the ONE parser behind ``dotenv_names`` and ``masked_lines``.
+
+    The names are PRINTED, so this is quote-aware, and under-lists rather than
+    over-lists: a line inside a multi-line quoted value (a PEM key's body) is a
+    slice of a secret, and never comes back as a name or a length. One line
+    model: a line ends at ``\\n`` only (``str.splitlines`` also splits on form
+    feeds and U+2028, which no .env reader does, and would turn the rest of
+    ``SECRET=abc<U+2028>FOO=bar`` into a second variable), minus one trailing
+    ``\\r``.
+
+    A value that opens with ``"`` or ``'`` (after blanks) runs to the matching
+    close (see ``_quoted_length``); any other value ends at an inline comment
+    and trailing blanks. A name defined twice appears twice: a caller that
+    keeps one keeps the LAST, which is the value an env-file reader ends with."""
+    lines = iter([line.removesuffix("\r") for line in text.split("\n")])
+    entries: list[tuple[str, int]] = []
+    for line in lines:
+        match = _DOTENV_LINE.match(line)
+        if match is None:
+            continue
+        name, rest = match.groups()
+        value = rest.lstrip(" \t")
+        if value[:1] in ('"', "'"):
+            length = _quoted_length(value, lines)
+        else:
+            length = len(_DOTENV_COMMENT.sub("", rest).strip(" \t"))
+        entries.append((name, length))
+    return entries
+
+
+def dotenv_names(path: Path) -> tuple[str, ...]:
+    """The variable NAMES a ``.env`` file defines, sorted -- never a value, and
+    never a slice of one: the names are printed, so a continuation line of a
+    multi-line quoted value is not a name (``_dotenv_entries``). That means a
+    malformed file can under-list; an unreadable one names nothing."""
     try:
         text = _dotenv_text(path)
     except OSError:
         return ()
-    return tuple(sorted(set(_DOTENV_NAME.findall(text))))
+    return tuple(sorted({name for name, _ in _dotenv_entries(text)}))
 
 
 @dataclass(frozen=True)
@@ -4152,6 +4214,11 @@ def masked_lines(ps: CloudPushSet) -> list[str]:
     """``NAME  ******** (n chars)`` per variable, sorted by name, for the
     terminal (spec §18.11c): a length, never a value.
 
+    The names and lengths come from ``_dotenv_entries``, which never reads a
+    multi-line value's continuation lines as variables. A name defined twice
+    shows once, with the LAST definition's length (files in ``env_files``
+    order, then the order within a file).
+
     An env file that cannot be read is listed after them as ``<path>  (could
     not be read)`` -- by its project-relative path, never skipped: the user
     would paste an environment that silently lacks it."""
@@ -4163,10 +4230,7 @@ def masked_lines(ps: CloudPushSet) -> list[str]:
         except OSError:
             unreadable.append(f"{ps.rel(path)}  (could not be read)")
             continue
-        for line in text.splitlines():
-            match = _DOTENV_LINE.match(line)
-            if match:
-                lengths[match.group(1)] = len(match.group(2).strip().strip("\"'"))
+        lengths.update(_dotenv_entries(text))
     shown = [f"{name}  ******** ({lengths[name]} chars)" for name in sorted(lengths)]
     return shown + unreadable
 

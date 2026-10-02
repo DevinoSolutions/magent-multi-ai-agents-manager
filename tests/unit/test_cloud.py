@@ -1185,6 +1185,17 @@ class TestOneDotenvDecoder:
             nodes._dotenv_text(tmp_path / "missing.env")
 
 
+def _env_set(tmp_path: Path, files: dict[str, bytes]) -> nodes.CloudPushSet:
+    """A push set whose ignored files are exactly ``files`` (name -> raw bytes)."""
+    repo = tmp_path / "api"
+    repo.mkdir(exist_ok=True)
+    for name, raw in files.items():
+        (repo / name).write_bytes(raw)
+    return nodes.cloud_push_set(
+        repo, [_state(repo, ignored=tuple(files))], home=tmp_path / "h"
+    )
+
+
 class TestTheManualHandOff:
     @pytest.fixture
     def private_tmp(self, tmp_path, monkeypatch) -> Path:
@@ -1206,15 +1217,6 @@ class TestTheManualHandOff:
             repo, [_state(repo, ignored=(".env",))], home=tmp_path / "h"
         )
 
-    def _env_set(self, tmp_path: Path, files: dict[str, bytes]) -> nodes.CloudPushSet:
-        repo = tmp_path / "api"
-        repo.mkdir(exist_ok=True)
-        for name, raw in files.items():
-            (repo / name).write_bytes(raw)
-        return nodes.cloud_push_set(
-            repo, [_state(repo, ignored=tuple(files))], home=tmp_path / "h"
-        )
-
     def test_the_terminal_lines_show_a_length_never_a_value(self, tmp_path):
         assert nodes.masked_lines(self._ps(tmp_path)) == [
             "API_TOKEN  ******** (14 chars)",
@@ -1229,9 +1231,7 @@ class TestTheManualHandOff:
     def test_quotes_blanks_and_a_trailing_space_are_measured_as_the_value(
         self, tmp_path
     ):
-        ps = self._env_set(
-            tmp_path, {".env": b"A=\"xy\"\nB='z'\nC=\nexport  D = ddd  \n"}
-        )
+        ps = _env_set(tmp_path, {".env": b"A=\"xy\"\nB='z'\nC=\nexport  D = ddd  \n"})
         assert nodes.masked_lines(ps) == [
             "A  ******** (2 chars)",
             "B  ******** (1 chars)",
@@ -1254,7 +1254,7 @@ class TestTheManualHandOff:
     )
     def test_a_utf16_env_file_is_measured_as_text(self, tmp_path, bom, codec):
         # Windows PowerShell 5.1's `>` writes UTF-16: not a NUL-riddled blank.
-        ps = self._env_set(
+        ps = _env_set(
             tmp_path, {".env": bom + "FIRST=abc\r\nSECOND=1\r\n".encode(codec)}
         )
         assert nodes.masked_lines(ps) == [
@@ -1263,7 +1263,7 @@ class TestTheManualHandOff:
         ]
 
     def test_a_utf8_bom_does_not_hide_the_first_name(self, tmp_path):
-        ps = self._env_set(tmp_path, {".env": b"\xef\xbb\xbfFIRST=1\r\nSECOND=2\r\n"})
+        ps = _env_set(tmp_path, {".env": b"\xef\xbb\xbfFIRST=1\r\nSECOND=2\r\n"})
         assert [line.split("  ")[0] for line in nodes.masked_lines(ps)] == [
             "FIRST",
             "SECOND",
@@ -1271,33 +1271,11 @@ class TestTheManualHandOff:
 
     def test_an_unreadable_env_file_is_listed_not_skipped(self, tmp_path):
         # A hand-off that silently lacks a file would be pasted as if whole.
-        ps = self._env_set(tmp_path, {".env": b"DEBUG=1\n", ".env.local": b"X=1\n"})
+        ps = _env_set(tmp_path, {".env": b"DEBUG=1\n", ".env.local": b"X=1\n"})
         (tmp_path / "api" / ".env.local").unlink()
         lines = nodes.masked_lines(ps)
         assert lines == ["DEBUG  ******** (1 chars)", ".env.local  (could not be read)"]
         assert str(tmp_path) not in "\n".join(lines)
-
-    @pytest.mark.parametrize(
-        "line",
-        [
-            "FOO=1",
-            "export FOO=1",
-            "  export  FOO = 1",
-            "\tFOO=1",
-            "export\tFOO=1",
-            "#FOO=1",
-            "export=1",
-            "1FOO=1",
-            "FOO",
-            "export FOO",
-            "FOO =",
-            "=1",
-            " ",
-        ],
-    )
-    def test_the_name_scan_and_the_line_parse_are_one_grammar(self, line):
-        parsed = nodes._DOTENV_LINE.match(line)
-        assert ([parsed.group(1)] if parsed else []) == nodes._DOTENV_NAME.findall(line)
 
     def test_the_hand_off_file_is_the_env_text_in_a_private_temp_file(
         self, tmp_path, monkeypatch
@@ -1315,7 +1293,7 @@ class TestTheManualHandOff:
     def test_each_env_file_is_introduced_by_its_project_relative_path(
         self, tmp_path, private_tmp
     ):
-        ps = self._env_set(tmp_path, {".env": b"A=1\n", ".env.local": b"B=2\n"})
+        ps = _env_set(tmp_path, {".env": b"A=1\n", ".env.local": b"B=2\n"})
         text = nodes.write_manual_handoff(ps).read_text(encoding="utf-8")
         assert "# from .env\nA=1\n# from .env.local\nB=2\n" in text
         assert str(tmp_path) not in text
@@ -1326,9 +1304,7 @@ class TestTheManualHandOff:
     def test_a_utf16_env_file_is_written_decoded_never_as_nul_riddled_bytes(
         self, tmp_path, private_tmp, bom, codec
     ):
-        ps = self._env_set(
-            tmp_path, {".env": bom + "FIRST=1\r\nSECOND=é\r\n".encode(codec)}
-        )
+        ps = _env_set(tmp_path, {".env": bom + "FIRST=1\r\nSECOND=é\r\n".encode(codec)})
         raw = nodes.write_manual_handoff(ps).read_bytes()
         assert b"\x00" not in raw
         lines = raw.decode("utf-8").splitlines()
@@ -1336,7 +1312,7 @@ class TestTheManualHandOff:
 
     def test_a_utf8_bom_never_lands_in_the_hand_off(self, tmp_path, private_tmp):
         # One BOM per FILE; the second file's would land mid-hand-off.
-        ps = self._env_set(
+        ps = _env_set(
             tmp_path,
             {
                 ".env": b"\xef\xbb\xbfFIRST=1\r\n",
@@ -1351,7 +1327,7 @@ class TestTheManualHandOff:
     def test_an_unreadable_env_file_refuses_the_hand_off_and_leaves_no_file(
         self, tmp_path, private_tmp
     ):
-        ps = self._env_set(
+        ps = _env_set(
             tmp_path, {".env": b"TOKEN=hunter2-secret\n", ".env.local": b"X=1\n"}
         )
         (tmp_path / "api" / ".env.local").unlink()
@@ -1420,3 +1396,157 @@ class TestTheManualHandOff:
         # On Windows an unlink of a file with an open descriptor fails, so an
         # empty directory also proves the descriptor was closed.
         assert list(private_tmp.iterdir()) == []
+
+
+class TestTheEnvParserIsQuoteAware:
+    """The names are PRINTED (``masked_lines``, ``cloud_env_refusal``), so a
+    line inside a multi-line quoted value -- a PEM key's body -- must never come
+    back as a variable name: it is a slice of a secret. ONE parser serves
+    ``dotenv_names`` and ``masked_lines``, with one line model."""
+
+    def _read(self, tmp_path: Path, raw: bytes) -> tuple[tuple[str, ...], list[str]]:
+        ps = _env_set(tmp_path, {".env": raw})
+        return nodes.dotenv_names(tmp_path / "api" / ".env"), nodes.masked_lines(ps)
+
+    @pytest.mark.parametrize(
+        ("line", "names"),
+        [
+            ("FOO=1", ["FOO"]),
+            ("export FOO=1", ["FOO"]),
+            ("  export  FOO = 1", ["FOO"]),
+            ("\tFOO=1", ["FOO"]),
+            ("export\tFOO=1", ["FOO"]),
+            ("FOO =", ["FOO"]),
+            ("export=1", ["export"]),
+            ("#FOO=1", []),
+            ("1FOO=1", []),
+            ("FOO", []),
+            ("export FOO", []),
+            ("=1", []),
+            (" ", []),
+            # ONE variable: a second `NAME=` on the same line is part of its value.
+            ("SECRET=abc FOO=bar", ["SECRET"]),
+        ],
+    )
+    def test_a_variable_is_a_name_at_the_start_of_a_line_and_nothing_else(
+        self, line, names
+    ):
+        assert [name for name, _ in nodes._dotenv_entries(line)] == names
+
+    def test_a_pem_bodys_continuation_lines_are_never_names(self, tmp_path):
+        raw = b'KEY="-----BEGIN\nAbCdEf1234Xyz==\n-----END"\nNEXT=1\n'
+        names, lines = self._read(tmp_path, raw)
+        assert names == ("KEY", "NEXT")
+        # 10 + newline + 15 + newline + 8: the whole value, counted once.
+        assert lines == ["KEY  ******** (35 chars)", "NEXT  ******** (1 chars)"]
+        shown = "\n".join(lines)
+        assert not any(piece in shown for piece in ("AbCdEf", "Xyz", "BEGIN", "END"))
+
+    def test_the_refusal_message_never_carries_a_slice_of_the_value(
+        self, tmp_path, cloud_home
+    ):
+        ps = _env_set(
+            tmp_path, {".env": b'KEY="-----BEGIN\nAbCdEf1234Xyz==\n-----END"\n'}
+        )
+        assert ps.names == ("KEY",)
+        message = nodes.cloud_env_refusal("api", "api", ps, None)
+        assert message is not None and "KEY" in message
+        assert "AbCdEf" not in message and "Xyz" not in message
+
+    def test_a_single_quoted_value_may_span_lines_too(self, tmp_path):
+        raw = b"K='line one\nSecretTail=zzz\nend'\nA=1\n"
+        names, lines = self._read(tmp_path, raw)
+        assert names == ("A", "K")
+        assert lines == ["A  ******** (1 chars)", "K  ******** (27 chars)"]
+
+    def test_an_escaped_quote_does_not_close_a_double_quoted_value(self, tmp_path):
+        # The `\"` before the line end is escaped, so `B=2` is still value.
+        raw = b'A="say \\"hi\\"\nB=2\nend"\nC=1\n'
+        names, lines = self._read(tmp_path, raw)
+        assert names == ("A", "C")
+        assert lines == ["A  ******** (18 chars)", "C  ******** (1 chars)"]
+
+    def test_a_backslash_is_just_a_character_in_a_single_quoted_value(self, tmp_path):
+        # `A='x\'` closes at the second quote: no escapes in single quotes.
+        names, lines = self._read(tmp_path, b"A='x" + b"\\" + b"'\nB=2\n")
+        assert names == ("A", "B")
+        assert lines == ["A  ******** (2 chars)", "B  ******** (1 chars)"]
+
+    def test_an_unterminated_quote_swallows_the_rest_of_the_file(self, tmp_path):
+        # Under-listing is the safe direction: the tail of a secret is never
+        # re-parsed as names.
+        names, lines = self._read(tmp_path, b'A="never closed\nX=1\nY=2\n')
+        assert names == ("A",)
+        assert len(lines) == 1 and lines[0].startswith("A  ")
+
+    def test_an_inline_comment_is_not_part_of_an_unquoted_value(self, tmp_path):
+        raw = b"A=x # note\nB=y\t# tab\nC=#nospace\nD= # all comment\n"
+        _, lines = self._read(tmp_path, raw)
+        assert lines == [
+            "A  ******** (1 chars)",
+            "B  ******** (1 chars)",
+            "C  ******** (8 chars)",
+            "D  ******** (0 chars)",
+        ]
+
+    def test_a_hash_inside_quotes_is_part_of_the_value(self, tmp_path):
+        _, lines = self._read(tmp_path, b'A="a#b"\nB=\'a # b\'\nC="x" # note\n')
+        assert lines == [
+            "A  ******** (3 chars)",
+            "B  ******** (5 chars)",
+            "C  ******** (1 chars)",
+        ]
+
+    @pytest.mark.parametrize(
+        "sep", ["\u2028", "\u2029", "\x85", "\x0b", "\x0c", "\x1c", "\r"]
+    )
+    def test_only_a_newline_ends_a_line(self, tmp_path, sep):
+        # `str.splitlines()` also splits on these; a .env reader does not, so
+        # `FOO=bar` after one is part of SECRET's value, never a second name.
+        raw = f"SECRET=abc{sep}FOO=bar\n".encode()
+        names, lines = self._read(tmp_path, raw)
+        assert names == ("SECRET",)
+        assert lines == ["SECRET  ******** (11 chars)"]
+
+    def test_crlf_files_count_no_carriage_returns(self, tmp_path):
+        raw = b'A=1\r\nB="x\r\ny"\r\nC=3\r\n'
+        names, lines = self._read(tmp_path, raw)
+        assert names == ("A", "B", "C")
+        assert lines == [
+            "A  ******** (1 chars)",
+            "B  ******** (3 chars)",
+            "C  ******** (1 chars)",
+        ]
+
+    def test_export_lines_are_variables(self, tmp_path):
+        raw = b'export A=1\n  export  B = "q"\n\texport\tC=3\n'
+        names, lines = self._read(tmp_path, raw)
+        assert names == ("A", "B", "C")
+        assert lines == [
+            "A  ******** (1 chars)",
+            "B  ******** (1 chars)",
+            "C  ******** (1 chars)",
+        ]
+
+    def test_an_empty_value_is_zero_chars_quoted_or_not(self, tmp_path):
+        _, lines = self._read(tmp_path, b"A=\nB=\"\"\nC=''\nD=1\n")
+        assert lines == [
+            "A  ******** (0 chars)",
+            "B  ******** (0 chars)",
+            "C  ******** (0 chars)",
+            "D  ******** (1 chars)",
+        ]
+
+    def test_what_follows_a_closing_quote_is_ignored_and_the_next_line_parses(
+        self, tmp_path
+    ):
+        names, lines = self._read(tmp_path, b'A="x" junk\nB=1\n')
+        assert names == ("A", "B")
+        assert lines == ["A  ******** (1 chars)", "B  ******** (1 chars)"]
+
+    def test_the_last_definition_of_a_name_wins(self, tmp_path):
+        ps = _env_set(tmp_path, {".env": b"A=1\nA=22\n", ".env.local": b"A=333\nB=4\n"})
+        assert nodes.masked_lines(ps) == [
+            "A  ******** (3 chars)",
+            "B  ******** (1 chars)",
+        ]
