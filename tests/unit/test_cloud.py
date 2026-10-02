@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import os
 import sys
+import tempfile
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -1182,3 +1183,240 @@ class TestOneDotenvDecoder:
     ):
         with pytest.raises(OSError):
             nodes._dotenv_text(tmp_path / "missing.env")
+
+
+class TestTheManualHandOff:
+    @pytest.fixture
+    def private_tmp(self, tmp_path, monkeypatch) -> Path:
+        """An empty directory standing in for the temp dir (``mkstemp`` reads
+        ``tempfile.tempdir`` at call time): no test writes to the real one, and
+        "no file left behind" is one ``iterdir`` away."""
+        tmp = tmp_path / "tmp"
+        tmp.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp))
+        return tmp
+
+    def _ps(self, tmp_path: Path) -> nodes.CloudPushSet:
+        repo = tmp_path / "api"
+        repo.mkdir()
+        (repo / ".env").write_text(
+            'API_TOKEN="hunter2-secret"\nDEBUG=1\n', encoding="utf-8"
+        )
+        return nodes.cloud_push_set(
+            repo, [_state(repo, ignored=(".env",))], home=tmp_path / "h"
+        )
+
+    def _env_set(self, tmp_path: Path, files: dict[str, bytes]) -> nodes.CloudPushSet:
+        repo = tmp_path / "api"
+        repo.mkdir(exist_ok=True)
+        for name, raw in files.items():
+            (repo / name).write_bytes(raw)
+        return nodes.cloud_push_set(
+            repo, [_state(repo, ignored=tuple(files))], home=tmp_path / "h"
+        )
+
+    def test_the_terminal_lines_show_a_length_never_a_value(self, tmp_path):
+        assert nodes.masked_lines(self._ps(tmp_path)) == [
+            "API_TOKEN  ******** (14 chars)",
+            "DEBUG  ******** (1 chars)",
+        ]
+
+    def test_the_value_appears_nowhere_in_the_terminal_lines(self, tmp_path):
+        shown = "\n".join(nodes.masked_lines(self._ps(tmp_path)))
+        assert "hunter2-secret" not in shown
+        assert "hunter2" not in shown
+
+    def test_quotes_blanks_and_a_trailing_space_are_measured_as_the_value(
+        self, tmp_path
+    ):
+        ps = self._env_set(
+            tmp_path, {".env": b"A=\"xy\"\nB='z'\nC=\nexport  D = ddd  \n"}
+        )
+        assert nodes.masked_lines(ps) == [
+            "A  ******** (2 chars)",
+            "B  ******** (1 chars)",
+            "C  ******** (0 chars)",
+            "D  ******** (3 chars)",
+        ]
+
+    def test_the_lines_name_the_variables_the_push_set_found(self, tmp_path):
+        repo = _project(tmp_path)
+        ps = nodes.cloud_push_set(
+            repo, [_state(repo, ignored=_ALL)], home=tmp_path / "home"
+        )
+        # The same names `dotenv_names` found, spelled with the same grammar.
+        assert [line.split("  ")[0] for line in nodes.masked_lines(ps)] == list(
+            ps.names
+        )
+
+    @pytest.mark.parametrize(
+        ("bom", "codec"), [(b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")]
+    )
+    def test_a_utf16_env_file_is_measured_as_text(self, tmp_path, bom, codec):
+        # Windows PowerShell 5.1's `>` writes UTF-16: not a NUL-riddled blank.
+        ps = self._env_set(
+            tmp_path, {".env": bom + "FIRST=abc\r\nSECOND=1\r\n".encode(codec)}
+        )
+        assert nodes.masked_lines(ps) == [
+            "FIRST  ******** (3 chars)",
+            "SECOND  ******** (1 chars)",
+        ]
+
+    def test_a_utf8_bom_does_not_hide_the_first_name(self, tmp_path):
+        ps = self._env_set(tmp_path, {".env": b"\xef\xbb\xbfFIRST=1\r\nSECOND=2\r\n"})
+        assert [line.split("  ")[0] for line in nodes.masked_lines(ps)] == [
+            "FIRST",
+            "SECOND",
+        ]
+
+    def test_an_unreadable_env_file_is_listed_not_skipped(self, tmp_path):
+        # A hand-off that silently lacks a file would be pasted as if whole.
+        ps = self._env_set(tmp_path, {".env": b"DEBUG=1\n", ".env.local": b"X=1\n"})
+        (tmp_path / "api" / ".env.local").unlink()
+        lines = nodes.masked_lines(ps)
+        assert lines == ["DEBUG  ******** (1 chars)", ".env.local  (could not be read)"]
+        assert str(tmp_path) not in "\n".join(lines)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "FOO=1",
+            "export FOO=1",
+            "  export  FOO = 1",
+            "\tFOO=1",
+            "export\tFOO=1",
+            "#FOO=1",
+            "export=1",
+            "1FOO=1",
+            "FOO",
+            "export FOO",
+            "FOO =",
+            "=1",
+            " ",
+        ],
+    )
+    def test_the_name_scan_and_the_line_parse_are_one_grammar(self, line):
+        parsed = nodes._DOTENV_LINE.match(line)
+        assert ([parsed.group(1)] if parsed else []) == nodes._DOTENV_NAME.findall(line)
+
+    def test_the_hand_off_file_is_the_env_text_in_a_private_temp_file(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        path = nodes.write_manual_handoff(self._ps(tmp_path))
+        assert path.parent == tmp_path
+        text = path.read_text(encoding="utf-8")
+        assert 'API_TOKEN="hunter2-secret"' in text and "DEBUG=1" in text
+        # Only these variables travel, and the user is told what does NOT.
+        assert "untracked files never reach" in text
+        if sys.platform != "win32":
+            assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_each_env_file_is_introduced_by_its_project_relative_path(
+        self, tmp_path, private_tmp
+    ):
+        ps = self._env_set(tmp_path, {".env": b"A=1\n", ".env.local": b"B=2\n"})
+        text = nodes.write_manual_handoff(ps).read_text(encoding="utf-8")
+        assert "# from .env\nA=1\n# from .env.local\nB=2\n" in text
+        assert str(tmp_path) not in text
+
+    @pytest.mark.parametrize(
+        ("bom", "codec"), [(b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")]
+    )
+    def test_a_utf16_env_file_is_written_decoded_never_as_nul_riddled_bytes(
+        self, tmp_path, private_tmp, bom, codec
+    ):
+        ps = self._env_set(
+            tmp_path, {".env": bom + "FIRST=1\r\nSECOND=é\r\n".encode(codec)}
+        )
+        raw = nodes.write_manual_handoff(ps).read_bytes()
+        assert b"\x00" not in raw
+        lines = raw.decode("utf-8").splitlines()
+        assert "FIRST=1" in lines and "SECOND=é" in lines
+
+    def test_a_utf8_bom_never_lands_in_the_hand_off(self, tmp_path, private_tmp):
+        # One BOM per FILE; the second file's would land mid-hand-off.
+        ps = self._env_set(
+            tmp_path,
+            {
+                ".env": b"\xef\xbb\xbfFIRST=1\r\n",
+                ".env.local": b"\xef\xbb\xbfSECOND=2\r\n",
+            },
+        )
+        raw = nodes.write_manual_handoff(ps).read_bytes()
+        assert b"\xef\xbb\xbf" not in raw
+        lines = raw.decode("utf-8").splitlines()
+        assert "FIRST=1" in lines and "SECOND=2" in lines
+
+    def test_an_unreadable_env_file_refuses_the_hand_off_and_leaves_no_file(
+        self, tmp_path, private_tmp
+    ):
+        ps = self._env_set(
+            tmp_path, {".env": b"TOKEN=hunter2-secret\n", ".env.local": b"X=1\n"}
+        )
+        (tmp_path / "api" / ".env.local").unlink()
+        with pytest.raises(nodes.PushSetUnreadable) as err:
+            nodes.write_manual_handoff(ps)
+        # J3's conventions: the project-relative label, the error's CLASS.
+        assert (err.value.label, err.value.reason) == (
+            ".env.local",
+            "FileNotFoundError",
+        )
+        assert isinstance(err.value, OSError)
+        assert str(tmp_path) not in str(err.value)
+        assert "hunter2-secret" not in str(err.value)
+        assert list(private_tmp.iterdir()) == []
+
+    def test_the_private_temp_holds_the_text_as_utf8_with_lf_endings(self, private_tmp):
+        path = nodes.write_private_temp("a\nb é\n", prefix="t-", suffix=".txt")
+        assert path.parent == private_tmp
+        assert path.name.startswith("t-") and path.suffix == ".txt"
+        assert path.read_bytes() == "a\nb é\n".encode()
+        if sys.platform != "win32":
+            assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_a_write_that_dies_part_way_leaves_no_secret_behind(
+        self, private_tmp, monkeypatch
+    ):
+        real_fdopen = os.fdopen
+
+        class _Dies:
+            def __init__(self, fh) -> None:
+                self._fh = fh
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> None:
+                self._fh.close()
+
+            def write(self, text: str) -> None:
+                self._fh.write(text[:8])
+                self._fh.flush()
+                raise OSError("disk full")
+
+        monkeypatch.setattr(
+            os, "fdopen", lambda fd, *a, **k: _Dies(real_fdopen(fd, *a, **k))
+        )
+        with pytest.raises(OSError, match="disk full"):
+            nodes.write_private_temp("API_TOKEN=hunter2-secret\n", prefix="t-")
+        assert list(private_tmp.iterdir()) == []
+
+    def test_text_that_cannot_be_encoded_leaves_no_file_behind(self, private_tmp):
+        # Not an OSError: the cleanup covers any failure, not just a full disk.
+        with pytest.raises(UnicodeEncodeError):
+            nodes.write_private_temp("ok\ud800", prefix="t-")
+        assert list(private_tmp.iterdir()) == []
+
+    def test_a_file_object_that_cannot_be_made_leaves_no_file_and_no_open_handle(
+        self, private_tmp, monkeypatch
+    ):
+        def refuse(fd, *args, **kwargs):
+            raise OSError("no handles")
+
+        monkeypatch.setattr(os, "fdopen", refuse)
+        with pytest.raises(OSError, match="no handles"):
+            nodes.write_private_temp("x", prefix="t-")
+        # On Windows an unlink of a file with an open descriptor fails, so an
+        # empty directory also proves the descriptor was closed.
+        assert list(private_tmp.iterdir()) == []
