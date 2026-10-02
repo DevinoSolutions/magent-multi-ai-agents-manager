@@ -1381,6 +1381,22 @@ def _retile_targets(
 # nothing to start a session on. J12's doctor row and J8's bring-up read it too.
 NO_CLOUD_TASK = 'no "cloudTask" set: name the task the cloud session starts on'
 
+# Why ``--go`` and the menu launch skip every cloud project when they have no
+# psmux pane to put it in. `doctor` words the same condition with this constant;
+# ``up`` does not read ``settings.psmux`` and is not subject to it.
+CLOUD_NEEDS_PSMUX = (
+    "cloud projects run in a psmux pane (settings.psmux, Windows); a plain"
+    " terminal would create a new cloud session on every launch"
+)
+
+
+def launch_uses_psmux(config: MagentConfig, plat: Platform) -> bool:
+    """Whether ``--go`` and the menu launch put agents in psmux panes: the
+    setting is on AND this platform has psmux. The one spelling of the
+    condition ``CLOUD_NEEDS_PSMUX`` is about, for the launch loop and `doctor`."""
+    return config.settings.psmux and plat.supports_psmux()
+
+
 # The one tool a cloud session runs: ``claude --cloud``.
 CLOUD_TOOL = "claude"
 
@@ -1419,6 +1435,30 @@ def cloud_tool_refusal(tool: str, base_cmd: str | None) -> str | None:
             f" starts with {parts[0]!r}, which is not claude"
         )
     return None
+
+
+def cloud_command(tool: str, base_cmd: str | None, task: str | None) -> tuple[str, str]:
+    """``(command, "")`` for a cloud pane, or ``("", why)`` when it has none.
+
+    THE ladder every surface reads -- ``--go``, ``up``'s bring-up rows, the
+    create gate and `doctor` -- so none words a refusal or orders two of them
+    differently: the tool (``cloud_tool_refusal``), then the task
+    (``NO_CLOUD_TASK``), then the command a pane can safely be typed
+    (``cloud_pane_command``'s own ``ValueError`` text). An empty command is
+    therefore never a bare ``bash --cloud "t"``. From config alone: no git, no
+    ssh, no records."""
+    # heavy subsystem: in-body per policy
+    from magent.sessions.claude import cloud_pane_command
+
+    refusal = cloud_tool_refusal(tool, base_cmd)
+    if refusal:
+        return "", refusal
+    if not task:
+        return "", NO_CLOUD_TASK
+    try:
+        return cloud_pane_command(base_cmd or "", task), ""
+    except ValueError as exc:
+        return "", str(exc)
 
 
 def project_for_session(config: MagentConfig, sid: str) -> ProjectConfig | None:
@@ -1523,13 +1563,12 @@ def cloud_refusal(config: MagentConfig, sid: str) -> str | None:
     proj = project_for_session(config, sid)
     if proj is None or not is_cloud(proj):
         return None
-    # tool -> task -> git -> push set, the order every surface refuses in.
+    # tool -> task -> typing -> git -> push set, the order every surface
+    # refuses in; the first three are the one ``cloud_command`` ladder.
     tool = proj.tool or config.settings.default_tool
-    refusal = cloud_tool_refusal(tool, config.settings.tools.get(tool))
-    if refusal:
-        return refusal
-    if not proj.cloud_task:
-        return NO_CLOUD_TASK
+    _cmd, why = cloud_command(tool, config.settings.tools.get(tool), proj.cloud_task)
+    if why:
+        return why
     try:
         return _cloud_checkout_refusal(config, proj, sid)
     except remote_mux.RemoteError as exc:
@@ -1612,7 +1651,7 @@ def _launch_projects(
     targets: list[_Target] = []
     new_count = 0
     tools = config.settings.tools
-    use_psmux = config.settings.psmux and plat.supports_psmux()
+    use_psmux = launch_uses_psmux(config, plat)
     psmux_windows: list[PsmuxWindowOpts] = []
     node_projects: list[ProjectConfig] = []
     _psmux_colors: dict[str, str | None] = {}
@@ -1949,29 +1988,16 @@ def _dispatch_cloud_project(
     a live session is never gated, only re-tiled or re-attached."""
     # heavy subsystem: in-body per policy
     from magent import psmux as psmux_mod
-    from magent.sessions.claude import cloud_pane_command
 
     if not use_psmux:
-        click.echo(
-            f"SKIP: {title} — cloud projects run in a psmux pane (settings.psmux,"
-            " Windows); a plain terminal would create a new cloud session on every"
-            " launch"
-        )
+        click.echo(f"SKIP: {title} — {CLOUD_NEEDS_PSMUX}")
         return 0
-    # tool -> task -> git -> push set, the order every surface refuses in. The
-    # tool is first, before the command is built or any git is read: it decides
-    # what the project is.
-    refusal = cloud_tool_refusal(tool, base_cmd)
-    if refusal:
-        click.echo(f"SKIP: {title} — {refusal}")
-        return 0
-    if not proj.cloud_task:
-        click.echo(f"SKIP: {title} — {NO_CLOUD_TASK}")
-        return 0
-    try:
-        cmd = cloud_pane_command(base_cmd, proj.cloud_task)
-    except ValueError as exc:
-        click.echo(f"SKIP: {title} — {exc}")
+    # tool -> task -> typing -> git -> push set, the order every surface refuses
+    # in. The first three are the one ``cloud_command`` ladder, asked before any
+    # git is read: the tool decides what the project is.
+    cmd, why = cloud_command(tool, base_cmd, proj.cloud_task)
+    if why:
+        click.echo(f"SKIP: {title} — {why}")
         return 0
     tile_key = _psmux_session_name(title)
     # The gate answers by session name, for the FIRST enabled project that owns
