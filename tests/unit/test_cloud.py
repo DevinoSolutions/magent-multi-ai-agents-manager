@@ -1477,11 +1477,41 @@ class TestTheEnvParserIsQuoteAware:
         assert names == ("A", "C")
         assert lines == ["A  ******** (18 chars)", "C  ******** (1 chars)"]
 
-    def test_a_backslash_is_just_a_character_in_a_single_quoted_value(self, tmp_path):
-        # `A='x\'` closes at the second quote: no escapes in single quotes.
-        names, lines = self._read(tmp_path, b"A='x" + b"\\" + b"'\nB=2\n")
-        assert names == ("A", "B")
-        assert lines == ["A  ******** (2 chars)", "B  ******** (1 chars)"]
+    def test_a_backslash_escapes_in_a_single_quoted_value_too(self, tmp_path):
+        # python-dotenv and Node dotenv let a backslash escape the next
+        # character inside '...'; bash does not. Where readers disagree the
+        # parser takes the rule that LISTS FEWER names: under bash's rule
+        # `A='first \'` closes at once and SLICE=zzz would print as a name.
+        raw = b"A='first " + b"\\" + b"'\nSLICE=zzz\nend'\nNEXT=1\n"
+        names, lines = self._read(tmp_path, raw)
+        assert names == ("A", "NEXT")
+        # first + backslash + quote (8) + newline + SLICE=zzz (9) + newline + end
+        assert lines == ["A  ******** (22 chars)", "NEXT  ******** (1 chars)"]
+        assert "SLICE" not in "\n".join(lines)
+
+    def test_a_backtick_value_may_span_lines_too(self, tmp_path):
+        # Node dotenv's multi-line form: `...`, with the same continuation.
+        raw = b"K=`line one\nSecretTail=zzz\nend`\nA=1\n"
+        names, lines = self._read(tmp_path, raw)
+        assert names == ("A", "K")
+        assert lines == ["A  ******** (1 chars)", "K  ******** (27 chars)"]
+
+    def test_an_escaped_backtick_does_not_close_a_backtick_value(self, tmp_path):
+        raw = b"K=`one " + b"\\" + b"`\nSLICE=zzz\nend`\nNEXT=1\n"
+        names, _ = self._read(tmp_path, raw)
+        assert names == ("K", "NEXT")
+
+    def test_other_quote_characters_are_plain_text_inside_a_backtick_value(
+        self, tmp_path
+    ):
+        # Only a backtick closes it: the `"` and `'` on the first line do not.
+        raw = b'K=`say "hi" it\'s\nSLICE=zzz\nend`\nNEXT=1\n'
+        names, _ = self._read(tmp_path, raw)
+        assert names == ("K", "NEXT")
+
+    def test_an_unterminated_backtick_swallows_the_rest_of_the_file(self, tmp_path):
+        names, _ = self._read(tmp_path, b"A=`never closed\nX=1\nY=2\n")
+        assert names == ("A",)
 
     def test_an_unterminated_quote_swallows_the_rest_of_the_file(self, tmp_path):
         # Under-listing is the safe direction: the tail of a secret is never
@@ -1561,6 +1591,64 @@ class TestTheEnvParserIsQuoteAware:
             "A  ******** (3 chars)",
             "B  ******** (1 chars)",
         ]
+
+
+class TestTheEnvParserCostIsLinear:
+    """The parser reads user files, and ``masked_lines`` runs before anything
+    is confirmed: one hostile or merely odd file must not stall it. Each shape
+    is one an unanchored or backtracking pattern turns quadratic; the bound is
+    generous (the linear parse takes milliseconds), so only a real blow-up
+    trips it."""
+
+    BOUND_S = 2.0
+
+    def _timed(self, text: str) -> tuple[list[tuple[str, int]], float]:
+        started = time.perf_counter()
+        entries = nodes._dotenv_entries(text)
+        return entries, time.perf_counter() - started
+
+    def test_a_long_run_of_blanks_after_an_unquoted_value(self):
+        # `[ \t]+#` retried from every blank of the run: quadratic without the
+        # lookbehind that pins it to the start of the run.
+        entries, took = self._timed("A=x" + " " * 400_000)
+        assert entries == [("A", 1)]
+        assert took < self.BOUND_S
+
+    def test_a_long_run_of_blanks_that_ends_in_a_comment_still_cuts_it(self):
+        entries, took = self._timed("A=x" + " " * 400_000 + "# note")
+        assert entries == [("A", 1)]
+        assert took < self.BOUND_S
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            " " * 400_000 + "!",
+            "A" + " " * 400_000,
+            "export" + " " * 400_000,
+        ],
+        ids=["blanks-then-junk", "name-then-blanks", "export-then-blanks"],
+    )
+    def test_a_long_run_of_blanks_in_a_line_that_is_not_a_variable(self, line):
+        entries, took = self._timed(line)
+        assert entries == []
+        assert took < self.BOUND_S
+
+    def test_a_million_character_quoted_value(self):
+        entries, took = self._timed('K="' + "x" * 1_000_000 + '"\nNEXT=1\n')
+        assert entries == [("K", 1_000_000), ("NEXT", 1)]
+        assert took < self.BOUND_S
+
+    def test_a_quoted_value_spanning_two_hundred_thousand_lines(self):
+        body = "\n".join("line" for _ in range(200_000))
+        entries, took = self._timed('K="' + body + '"\nNEXT=1\n')
+        assert [name for name, _ in entries] == ["K", "NEXT"]
+        assert took < self.BOUND_S
+
+    def test_a_two_hundred_thousand_line_file(self):
+        text = "".join(f"K{i}=v{i}\n" for i in range(200_000))
+        entries, took = self._timed(text)
+        assert len(entries) == 200_000
+        assert took < self.BOUND_S
 
 
 class TestAnUnreadableFileRefusalCarriesNoOsError:

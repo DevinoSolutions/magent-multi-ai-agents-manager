@@ -3721,8 +3721,14 @@ def cloud_git_refusal(state: LocalGitState) -> str | None:
 _DOTENV_LINE = re.compile(
     r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)$"
 )
-# An unquoted value ends where blanks followed by ``#`` begin.
-_DOTENV_COMMENT = re.compile(r"[ \t]+#.*$")
+# An unquoted value ends where blanks followed by ``#`` begin. The lookbehind
+# pins a match to the START of a run of blanks: without it ``.sub`` retries from
+# every blank of a long run that no ``#`` follows, which is quadratic (60k
+# blanks took seconds). The match is otherwise identical.
+_DOTENV_COMMENT = re.compile(r"(?<![ \t])[ \t]+#.*$")
+# The characters that open a quoted value. Backtick is Node dotenv's multi-line
+# form.
+_DOTENV_QUOTES = ('"', "'", "`")
 
 
 def _dotenv_text(path: Path) -> str:
@@ -3745,11 +3751,14 @@ def _quoted_length(first: str, lines: Iterator[str]) -> int:
     value runs on, its further lines are TAKEN from ``lines``, so the caller
     never parses them.
 
-    The closing quote is the first unescaped one of the SAME type; what
-    follows it on its line is ignored. Inside ``"`` a backslash escapes the
-    next character (both count towards the length); ``'`` has no escape. A
-    newline inside the value counts as one character. An unterminated quote
-    swallows every remaining line."""
+    The closing quote is the first unescaped one of the SAME type (``"``,
+    ``'`` or a backtick); what follows it on its line is ignored. In every
+    quote type a backslash escapes the next character (both count towards the
+    length). python-dotenv and Node dotenv do that inside ``'`` too, bash does
+    not; where readers disagree the parser takes the rule that closes LATER,
+    because the lines it swallows are never printed (under-listing is the safe
+    direction). A newline inside the value counts as one character. An
+    unterminated quote swallows every remaining line."""
     quote = first[0]
     length = 0
     chunk = first[1:]
@@ -3759,7 +3768,7 @@ def _quoted_length(first: str, lines: Iterator[str]) -> int:
             char = chunk[i]
             if char == quote:
                 return length
-            step = 2 if char == "\\" and quote == '"' else 1
+            step = 2 if char == "\\" else 1
             length += min(step, len(chunk) - i)
             i += step
         following = next(lines, None)
@@ -3781,10 +3790,11 @@ def _dotenv_entries(text: str) -> list[tuple[str, int]]:
     ``SECRET=abc<U+2028>FOO=bar`` into a second variable), minus one trailing
     ``\\r``.
 
-    A value that opens with ``"`` or ``'`` (after blanks) runs to the matching
-    close (see ``_quoted_length``); any other value ends at an inline comment
-    and trailing blanks. A name defined twice appears twice: a caller that
-    keeps one keeps the LAST, which is the value an env-file reader ends with."""
+    A value that opens with ``"``, ``'`` or a backtick (after blanks) runs to
+    the matching close (see ``_quoted_length``); any other value ends at an
+    inline comment and trailing blanks. A name defined twice appears twice: a
+    caller that keeps one keeps the LAST, which is the value an env-file reader
+    ends with. Cost is linear in the text."""
     lines = iter([line.removesuffix("\r") for line in text.split("\n")])
     entries: list[tuple[str, int]] = []
     for line in lines:
@@ -3793,7 +3803,7 @@ def _dotenv_entries(text: str) -> list[tuple[str, int]]:
             continue
         name, rest = match.groups()
         value = rest.lstrip(" \t")
-        if value[:1] in ('"', "'"):
+        if value[:1] in _DOTENV_QUOTES:
             length = _quoted_length(value, lines)
         else:
             length = len(_DOTENV_COMMENT.sub("", rest).strip(" \t"))
