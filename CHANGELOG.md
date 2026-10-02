@@ -22,7 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   additions are optional keys: `sessions --json` gains the value `"cloud"` for
   `node` and the state `"cloud"`, `status --json` gains `node` on
   `psmux_sessions` rows and top-level `shadowed_cloud` / `shadowed_local`, and
-  `up --json` gains `node`, `note` and `reason`. After a psmux crash, check claude.ai/code
+  `up --json` gains `node` (on its up and down entries and on `projects[]`)
+  and `note` (on an up entry). After a psmux crash, check claude.ai/code
   before `magent up`: magent cannot list cloud sessions, and the next create
   starts a new one.
 
