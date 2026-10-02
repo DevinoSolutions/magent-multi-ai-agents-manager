@@ -44,8 +44,9 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "the lowest load score over the sync daemon's last 30 minutes of "
             "samples (a node under 10% free memory is skipped while another is "
             "above it), and the project stays there until that node leaves "
-            '`settings.nodes`; `magent node plan` shows the choice. `"cloud"` is '
-            "reserved in this release and runs as an ordinary local session."
+            '`settings.nodes`; `magent node plan` shows the choice. `"cloud"` runs '
+            "the project as a Claude cloud session (`claude --cloud`) hosted in a "
+            "local pane; see `cloudTask`."
         ),
     ),
     (
@@ -57,6 +58,17 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "on top of the auto-detected gitignored `.env*`, "
             "`.claude/settings.local.json`, `CLAUDE.local.md` and `.mcp.json`. A "
             "missing file is a warning, not an error."
+        ),
+    ),
+    (
+        "cloudTask",
+        "string",
+        "none",
+        (
+            'The task a `"node": "cloud"` project\'s Claude cloud session starts '
+            "on (1-200 chars; letters, digits, spaces, `, . _ / : -`). A cloud "
+            "project runs the `claude` tool; with another tool, or without a "
+            "task, it loads but its cloud session is never created."
         ),
     ),
 ]
@@ -575,7 +587,7 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         "magent node push <project>",
         (
             "Re-ship a project's non-git files (`.env*` etc.) to its running node "
-            "session."
+            "session. A cloud project: hand the push set off by hand."
         ),
     ),
     (
@@ -584,7 +596,8 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "Bring a node session home (`--local` prints the `claude --resume` "
             "to run after a `git pull`) or move it to another node and resume it "
             "there. Pulls once more first; a node that does not answer is "
-            "reported, not fatal."
+            "reported, not fatal. A cloud session comes home by teleport "
+            "(`--local`)."
         ),
     ),
     ("magent config show", "Display current config."),

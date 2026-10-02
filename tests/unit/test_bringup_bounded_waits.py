@@ -902,7 +902,7 @@ def shrunk(monkeypatch):
     monkeypatch.setattr(
         windows,
         "decoration_argv",
-        lambda *a: [c for c in real_decorations(*a) if c[3] == "set"][:1],
+        lambda *a, **k: [c for c in real_decorations(*a, **k) if c[3] == "set"][:1],
     )
     # The one spawn that inherits the caller's console (new-session) would
     # open a real terminal window per fake client on a console-less test

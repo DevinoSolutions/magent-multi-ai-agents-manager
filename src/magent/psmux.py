@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from magent.config import MagentConfig
     from magent.platform import Platform
@@ -218,6 +218,11 @@ class PsmuxWindowOpts:
     window_name: str
     cwd: str
     command: str
+    # False for a command that must run at most ONCE per session: a cloud pane's
+    # `claude --cloud` creates a new cloud session every time it is typed.
+    resend: bool = True
+    # The status-left brand nick (`status_left`); None = the plain brand.
+    nick: str | None = None
 
 
 def session_name(title: str) -> str:
@@ -1415,7 +1420,9 @@ def f2_binding_argv(prefix: list[str], code_hint: bool) -> list[str]:
     return [*prefix, "unbind-key", "-n", "F2"]
 
 
-def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
+def decoration_argv(
+    name: str, psmux: str, code_hint: bool, *, nick: str | None = None
+) -> list[list[str]]:
     """The psmux commands that brand ``name`` and advertise its window hotkeys.
 
     Ten of them. The first six: magent *owns* F1 -> detach-client per session
@@ -1457,9 +1464,12 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     sixth command is the matching ``unbind-key``, so a session that was
     decorated back when ``code`` resolved on this host doesn't keep answering a
     key nothing advertises any more.
+
+    ``nick`` brands the status-left ``magent @<nick>`` (``status_left``); ``None``
+    is the plain brand, byte for byte, so no caller that has no nick changes.
     """
     hints, hints_len = status_hints(code_hint)
-    brand, brand_len = status_left(None)
+    brand, brand_len = status_left(nick)
     f2 = f2_binding_argv([psmux, "-L", name], code_hint)
     return [
         [psmux, "-L", name, "bind", "-n", "F1", "detach-client"],
@@ -1497,13 +1507,17 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
 
 
 def decorate_session(
-    name: str, psmux: str | None = None, code_hint: bool | None = None
+    name: str,
+    psmux: str | None = None,
+    code_hint: bool | None = None,
+    nick: str | None = None,
 ) -> None:
     """Brand one session's status line and advertise its F1/F2 hints.
 
     ``code_hint=None`` means "probe here": this machine is decorating, so
     whether ``code`` resolves here is exactly the question. Callers that
     already probed (``decorate_sessions``) pass the answer down instead.
+    ``nick`` is the brand nick (see ``decoration_argv``).
 
     Best-effort and guarded exactly like ``flash_message``: a status bar is
     cosmetic, so a missing binary, a hung psmux, or a non-zero exit is logged
@@ -1514,7 +1528,7 @@ def decorate_session(
         return
     if code_hint is None:
         code_hint = code_on_path()
-    for cmd in decoration_argv(name, binary, code_hint):
+    for cmd in decoration_argv(name, binary, code_hint, nick=nick):
         try:
             subprocess.run(
                 cmd,
@@ -1529,7 +1543,12 @@ def decorate_session(
             )
 
 
-def decorate_sessions(names: list[str], code_hint: bool | None = None) -> list[str]:
+def decorate_sessions(
+    names: list[str],
+    code_hint: bool | None = None,
+    *,
+    nicks: Mapping[str, str] | None = None,
+) -> list[str]:
     """Decorate many sessions concurrently. Returns the names attempted.
 
     Each session is its own psmux server, so the round-trips per name
@@ -1540,6 +1559,9 @@ def decorate_sessions(names: list[str], code_hint: bool | None = None) -> list[s
     the answer is a property of this machine, not of a session, so a
     per-session ``shutil.which`` would be one filesystem sweep per name for
     one shared answer.
+
+    ``nicks`` maps a session name to its brand nick; a name it does not list
+    gets the plain brand.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1547,9 +1569,15 @@ def decorate_sessions(names: list[str], code_hint: bool | None = None) -> list[s
     if not binary or not names:
         return []
     hint = code_on_path() if code_hint is None else code_hint
+    brand = nicks or {}
     with ThreadPoolExecutor(max_workers=16) as pool:
         list(
-            pool.map(lambda n: decorate_session(n, psmux=binary, code_hint=hint), names)
+            pool.map(
+                lambda n: decorate_session(
+                    n, psmux=binary, code_hint=hint, nick=brand.get(n)
+                ),
+                names,
+            )
         )
     return list(names)
 
@@ -1612,7 +1640,10 @@ def _touch_decor_stamp() -> None:
 
 
 def decorate_sessions_async(
-    names: list[str], code_hint: bool | None = None
+    names: list[str],
+    code_hint: bool | None = None,
+    *,
+    nicks: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Fire the decoration commands and return WITHOUT waiting for any of them.
 
@@ -1637,6 +1668,8 @@ def decorate_sessions_async(
     pass ran less than ``DECOR_TTL_S`` ago, so attach's repeated status polls
     can't pile up hundreds of orphan processes against a wedged psmux server.
 
+    ``nicks`` maps a session name to its brand nick, as in ``decorate_sessions``.
+
     Returns the names it fired for (``[]`` when throttled or unable to run).
     """
     binary = find_psmux()
@@ -1645,11 +1678,12 @@ def decorate_sessions_async(
     if _decor_stamp_fresh():
         return []
     hint = code_on_path() if code_hint is None else code_hint
+    brand = nicks or {}
     log = get_logger("launch")
     fired: list[str] = []
     for name in names:
         try:
-            for cmd in decoration_argv(name, binary, hint):
+            for cmd in decoration_argv(name, binary, hint, nick=brand.get(name)):
                 subprocess.Popen(
                     cmd,
                     stdin=subprocess.DEVNULL,
@@ -1695,6 +1729,28 @@ def socket_id(session_dict: dict[str, object]) -> str:
     return str(session_dict.get("session") or session_dict.get("name") or "")
 
 
+def cloud_pane_ids(rows: Iterable[Mapping[str, object]]) -> set[str]:
+    """Session ids of the CLOUD panes among ``rows`` (session-dict rows, as
+    ``config_sessions``/``eligible_projects`` return them).
+
+    The FIRST row for a session id decides, the way ``eligible_projects`` keeps
+    one entry per id and the create gate reads the first enabled project by
+    name: in a ``[local, cloud]`` pair for one folder the pane is a LOCAL
+    agent's, so it is not a cloud id -- a bare "any row says cloud" would call
+    that local pane a cloud one and refuse ``send`` into a perfectly drivable
+    agent. A row with no name is ignored."""
+    seen: set[str] = set()
+    cloud: set[str] = set()
+    for row in rows:
+        sid = socket_id(dict(row))
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        if row.get("node") == "cloud":
+            cloud.add(sid)
+    return cloud
+
+
 def _field_str(d: dict[str, object], key: str) -> str:
     """A descriptor dict's string field (narrows dict[str, object] to str)."""
     value = d.get(key, "")
@@ -1729,9 +1785,30 @@ def eligible_projects(
     rest of the product already uses for a project. A session absent from the
     mapping, and the default None, both mean the tool's own default store,
     which is byte-for-byte today's probe for every project.
+
+    A cloud project's ``cmd`` is the one ``claude --cloud "<task>"`` it runs
+    (never a resume command, never ``build_start_command``'s). One that cannot
+    start a session -- no task, a tool or wrapper that is not claude, an
+    executable that cannot be typed -- carries ``cmd == ""`` and the reason in
+    ``cmd_why``, so every consumer that already reads an empty command as
+    "nothing to run" stays correct and the surfaces that can name the reason do.
+    Each entry carries ``node`` (``"cloud"`` or None).
+
+    A LOCAL project whose session name a cloud project owns (the first ENABLED
+    project with that name, as the create gate reads it) gets ``cmd == ""`` and
+    that reason too: its command would be typed, verified, re-sent or revived
+    into the cloud pane. Without a group filter the first-wins dedupe below
+    already keeps it out; a group filter can drop the cloud project before the
+    dedupe sees it, and this is what closes that gap.
     """
-    from magent.config import runs_on_node
-    from magent.launch import _expand_base_dir, _resolve_path
+    from magent.config import is_cloud, runs_on_node
+    from magent.launch import (
+        _expand_base_dir,
+        _resolve_path,
+        cloud_command,
+        project_for_session,
+        twin_session_refusal,
+    )
     from magent.sessions import build_start_command, is_ide_tool
     from magent.titles import get_leaf_name
 
@@ -1739,6 +1816,7 @@ def eligible_projects(
     if base_dir:
         base_dir = _expand_base_dir(base_dir)
 
+    has_cloud = any(is_cloud(p) for p in config.projects)
     out: list[dict[str, object]] = []
     seen: set[str] = set()
     for proj in config.projects:
@@ -1766,23 +1844,38 @@ def eligible_projects(
             continue
         seen.add(sid)
         resolved = _resolve_path(proj.path, base_dir)
-        out.append(
-            {
-                "name": leaf,
-                "session": sid,
-                "path": proj.path,
-                "tool": tool,
-                "group": proj.group,
-                "resolved": resolved,
-                "cmd": build_start_command(
-                    tool,
-                    config.settings.tools.get(tool, ""),
-                    resolved,
-                    config_dir=config_dirs.get(sid) if config_dirs else None,
-                ),
-                "color": proj.color,
-            }
-        )
+        cmd_why = ""
+        if is_cloud(proj):
+            cmd, cmd_why = cloud_command(
+                tool, config.settings.tools.get(tool, ""), proj.cloud_task
+            )
+        elif (
+            has_cloud
+            and (owner := project_for_session(config, sid)) is not None
+            and is_cloud(owner)
+        ):
+            cmd, cmd_why = "", twin_session_refusal(sid)
+        else:
+            cmd = build_start_command(
+                tool,
+                config.settings.tools.get(tool, ""),
+                resolved,
+                config_dir=config_dirs.get(sid) if config_dirs else None,
+            )
+        row: dict[str, object] = {
+            "name": leaf,
+            "session": sid,
+            "path": proj.path,
+            "tool": tool,
+            "group": proj.group,
+            "resolved": resolved,
+            "cmd": cmd,
+            "color": proj.color,
+            "node": proj.node,
+        }
+        if cmd_why:
+            row["cmd_why"] = cmd_why
+        out.append(row)
     return out
 
 
@@ -1792,6 +1885,11 @@ def _down_reason(binary: str | None, project: dict[str, object]) -> str:
         return "psmux not installed"
     if not project["resolved"]:
         return "folder not found"
+    # A cloud pane's command is withheld for a specific reason; "no agent
+    # command" would send the user after a setting that is not the problem.
+    cmd_why = project.get("cmd_why")
+    if isinstance(cmd_why, str) and cmd_why:
+        return cmd_why
     return "no agent command"
 
 
@@ -1817,13 +1915,24 @@ def psmux_status(
     differently. It used to run its own single-shot fan-out with no retry while
     the picker retried its misses, which is how ``status``/``down`` came to
     report sessions stopped that the picker was still attaching to.
+
+    A CLOUD pane carries ``node: "cloud"`` (on cloud rows only). One whose
+    command cannot be built (no task, a tool that is not claude) and a local
+    project on a cloud pane's session name have no command but are still
+    PROBED: the pane they name may well be live, and a reason says why nothing
+    would be started, not that the session is not there. A live twin lands in
+    ``up`` as the cloud pane it is, with a ``note`` naming the cloud project
+    that owns the name; one that is not live keeps its refusal as the reason.
     """
+    from magent.launch import project_for_session
+
     binary = find_psmux()
     projects = eligible_projects(config, group)
     up: list[dict[str, object]] = []
     down: list[dict[str, object]] = []
 
     probeable: list[dict[str, object]] = []
+    why_by_sid: dict[str, str] = {}
     for p in projects:
         info: dict[str, object] = {
             "name": p["name"],
@@ -1832,7 +1941,13 @@ def psmux_status(
             "tool": p["tool"],
             "group": p.get("group"),
         }
-        if binary and p["resolved"] and p["cmd"]:
+        cloud = p.get("node") == "cloud"
+        if cloud:
+            info["node"] = "cloud"
+        cmd_why = p.get("cmd_why")
+        if binary and p["resolved"] and (p["cmd"] or cmd_why):
+            if isinstance(cmd_why, str) and cmd_why:
+                why_by_sid[_field_str(info, "session")] = cmd_why
             probeable.append(info)
         else:
             info["reason"] = _down_reason(binary, p)
@@ -1842,9 +1957,53 @@ def psmux_status(
         live_sessions([_field_str(i, "session") for i in probeable], psmux=binary)
     )
     for info in probeable:
-        (up if _field_str(info, "session") in live else down).append(info)
+        sid = _field_str(info, "session")
+        why = why_by_sid.get(sid)
+        if sid in live:
+            if why and info.get("node") != "cloud":
+                # A local project on a cloud pane's name: the live pane IS the
+                # cloud pane, so it is up -- and never a down project, an idle
+                # agent, or a casualty.
+                owner = project_for_session(config, sid)
+                info["node"] = "cloud"
+                info["note"] = (
+                    "the live cloud pane of the cloud project at "
+                    f"{owner.path if owner else sid}; this project shares its "
+                    "session name, so nothing is started for it"
+                )
+            up.append(info)
+        else:
+            if why:
+                info["reason"] = why
+            down.append(info)
 
     return up, down, projects
+
+
+def _cloud_create_refusal(
+    config: MagentConfig, row: dict[str, object], sid: str
+) -> str | None:
+    """Why the cloud pane ``row`` (session ``sid``) must not be created now.
+
+    Three questions, cheapest first. (1) Does this session name belong to the
+    project the row was built from? The gate answers by NAME, for the first
+    ENABLED project that owns it, and ``eligible_projects`` skips an IDE
+    project: an IDE project listed ahead of a cloud one for the same folder
+    would make the gate read the IDE project (not cloud: waved through) while
+    the pane created is the cloud one, skipping the git and ``.env`` checks.
+    (2) Can its command be built at all? (3) The gate itself."""
+    # in-body: launch is a heavy subsystem that itself imports psmux in-body, so
+    # by call time both are loaded and this is not a cycle.
+    from magent import launch
+    from magent.config import is_cloud
+
+    owner = launch.project_for_session(config, sid)
+    if owner is None or not is_cloud(owner):
+        return launch.twin_session_refusal(sid)
+    cmd_why = row.get("cmd_why")
+    if isinstance(cmd_why, str) and cmd_why:
+        return cmd_why
+    return launch.cloud_refusal(config, sid)
 
 
 def bring_up(
@@ -1865,29 +2024,75 @@ def bring_up(
     every name it had attempted, so both callers printed "Brought up N
     session(s)" for sessions that were never created. A caller cannot report
     honestly on a list that never distinguished the two.
+
+    A cloud pane is typed ONCE (``resend=False``) and branded ``@cloud``: every
+    ``claude --cloud`` is a new billed cloud session the CLI can neither list
+    nor stop. So a cloud create the gate (``launch.cloud_refusal``) refuses --
+    or one whose command cannot be built, or whose session name another project
+    owns -- is not attempted: it lands in the second item with its reason, the
+    same place a creation casualty does, and so reaches every printer of it. A
+    cloud session that is already live is never gated (nothing is created for
+    it) and is left to ``launch_verified``, whose launch dedupes it. A local
+    project on a cloud pane's session name is refused the same way -- unless
+    that name answers ``has-session``: then it is the live cloud pane, which is
+    up, so it is neither created nor reported as a casualty.
     """
     from magent.platform import get_platform
 
     plat = get_platform()
     windows: list[PsmuxWindowOpts] = []
-    for p in eligible_projects(config, group):
-        if only is not None and _field_str(p, "session") not in only:
-            continue
-        if not p["resolved"] or not p["cmd"]:
+    refused: dict[str, str] = {}
+    rows = [
+        p
+        for p in eligible_projects(config, group)
+        if (only is None or _field_str(p, "session") in only) and p["resolved"]
+    ]
+    # THE liveness answer, once for every cloud project (a dropped probe reads
+    # "not live", which only asks the gate: the safe direction) and for every
+    # local twin of one, whose session name may be the live cloud pane itself.
+    cloud_sids = [_field_str(p, "session") for p in rows if p.get("node") == "cloud"]
+    twin_sids = [
+        _field_str(p, "session")
+        for p in rows
+        if p.get("node") != "cloud" and not p["cmd"] and p.get("cmd_why")
+    ]
+    pane_sids = [*cloud_sids, *twin_sids]
+    live_panes = set(live_sessions(pane_sids)) if pane_sids else set()
+    for p in rows:
+        sid = _field_str(p, "session")
+        cloud = p.get("node") == "cloud"
+        if cloud and sid not in live_panes:
+            reason = _cloud_create_refusal(config, p, sid)
+            if reason:
+                get_logger("launch").warning(
+                    "cloud session %s not created: %s", sid, reason
+                )
+                refused[sid] = reason
+                continue
+        if not p["cmd"]:
+            # A local project on a cloud pane's name has no command and must
+            # say so: silence would read as "brought up" -- unless the name is
+            # the LIVE cloud pane, which is up and nobody's casualty.
+            twin = p.get("cmd_why")
+            if not cloud and isinstance(twin, str) and twin and sid not in live_panes:
+                get_logger("launch").warning("%s not created: %s", sid, twin)
+                refused[sid] = twin
             continue
         windows.append(
             PsmuxWindowOpts(
-                window_name=_field_str(p, "session"),
+                window_name=sid,
                 cwd=_field_str(p, "resolved"),
                 command=_field_str(p, "cmd"),
+                resend=not cloud,
+                nick="cloud" if cloud else None,
             )
         )
     names = [w.window_name for w in windows]
     if not windows:
-        return [], {}
+        return [], refused
     failed = launch_verified(plat, windows)
     stuck = set(failed)
-    return [n for n in names if n not in stuck], failed
+    return [n for n in names if n not in stuck], {**failed, **refused}
 
 
 # Mirrors ``platform/windows.py::_SEND_VERIFY_SETTLE_S`` on purpose: a freshly
@@ -1931,6 +2136,36 @@ def _missing_sessions(names: list[str], binary: str) -> list[str]:
 _LATE_LIVE = (
     "; it answers now, but this bring-up typed no agent command into it"
     " -- run `magent up` to revive it"
+)
+
+
+def _late_live_once(sid: str) -> str:
+    """``_LATE_LIVE`` for a ``resend=False`` window (a cloud pane). "Revive it"
+    is wrong twice over there: revive never re-types a cloud pane (a second
+    ``claude --cloud`` is a new billed session), and an ``up`` that finds the
+    session live creates nothing. The advice that works is down, then up --
+    after the user has looked at what an earlier run did.
+
+    Only a REFUSED window reaches this, and every platform refusal fires before
+    the send-keys (the dedupe or the kill-server got no answer, or the
+    new-session outran its budget), so this bring-up typed nothing. What it
+    cannot know is whether an EARLIER run started a session in that pane; the
+    created-then-lost case is the missing pane's, worded by ``_NOT_RETYPED``."""
+    return (
+        "; it answers now, but this bring-up typed no agent command into it, and"
+        " a cloud pane is never re-typed -- check claude.ai/code for a session an"
+        f" earlier run may have started, then run `magent down {sid}` and"
+        " `magent up` to start it afresh"
+    )
+
+
+# The reason for a ``resend=False`` window the creation verify found missing and
+# deliberately did NOT respawn (see ``launch_verified``).
+_NOT_RETYPED = (
+    "its command runs at most once per session (a cloud pane's `claude --cloud`"
+    " starts a new cloud session each time it is typed), and the first attempt"
+    " may already have typed it, so it was not re-created; check claude.ai/code,"
+    " then run `magent up` to try again"
 )
 
 
@@ -1979,6 +2214,11 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str,
     below, which is the component that already knows how to respawn what is
     missing and report what stayed down.
 
+    A window marked ``resend=False`` (a command that may run only once) is the
+    one exception to the respawn: it is never re-created, because the respawn
+    types the command again. When it is missing it is reported with that
+    reason instead (``_NOT_RETYPED``), exactly like a refusal.
+
     Returns the sessions still missing after the one retry, plus every name
     the platform refused, in input order, each mapped to why: the platform's
     refusal reason, or ``""`` when the log is the only account (the Session-0
@@ -2023,6 +2263,10 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str,
         # no psmux binary the creation above cannot have succeeded either.
         return dict.fromkeys(names, "")
 
+    # Windows whose command may run only once (a cloud pane: each `claude
+    # --cloud` is a new, billed cloud session).
+    once = {w.window_name for w in windows if not w.resend}
+
     def _report(down: list[str]) -> dict[str, str]:
         gone = set(down)
         late = [n for n in names if n in refused and n not in gone]
@@ -2032,7 +2276,7 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str,
                 ", ".join(late),
             )
         return {
-            n: refused[n] + _LATE_LIVE
+            n: refused[n] + (_late_live_once(n) if n in once else _LATE_LIVE)
             if n in refused and n not in gone
             # ...and the missing ones, refused or not, as the platform left them.
             else refused.get(n, "")
@@ -2044,6 +2288,21 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str,
     # t=0 would misclassify slow-but-fine servers on a loaded host.
     time.sleep(_CREATE_VERIFY_SETTLE_S)
     missing = _missing_sessions(names, binary)
+    # The respawn re-runs the launch path, which TYPES the command again. A
+    # window whose command may run only once (a cloud pane: each `claude
+    # --cloud` is a new, billed cloud session) is therefore never respawned,
+    # and "missing" cannot tell a session that never started from one that
+    # started, typed, and then wedged or died -- the first attempt may already
+    # have typed it. It is refused instead, and the next `magent up` is the
+    # user's informed retry.
+    for n in missing:
+        if n in once and n not in refused:
+            refused[n] = _NOT_RETYPED
+            log.warning(
+                "%s is missing after bring-up and its command runs at most once;"
+                " not respawning it",
+                n,
+            )
     respawn = [n for n in missing if n not in refused]
     if not respawn:
         return _report(missing)
@@ -2129,8 +2388,19 @@ def revive_sessions(
     for p in eligible:
         if only is not None and _field_str(p, "session") not in only:
             continue
+        if p.get("node") == "cloud":
+            # Every re-type -- a resume command, a parked resume, a fresh start
+            # -- would be a NEW cloud session (spec §18.5), in every mode:
+            # vetoed before the pane is read or anything is sent.
+            why[_field_str(p, "session")] = (
+                "a cloud pane is never re-typed: that would start a second cloud"
+                " session"
+            )
+            continue
         if not p["cmd"]:
-            why[_field_str(p, "session")] = "its tool has no command configured"
+            why[_field_str(p, "session")] = (
+                _field_str(p, "cmd_why") or "its tool has no command configured"
+            )
             continue
         candidates.append(p)
     known = {_field_str(p, "session") for p in eligible}
@@ -2256,6 +2526,7 @@ def config_sessions(config_path: str | None) -> list[dict[str, object]]:
                 # "" (never None) when the folder can't be resolved, so a JSON
                 # consumer can treat it as a plain string field.
                 "resolved": _resolve_path(p["path"], base_dir) or "",
+                "node": p.get("node"),
             }
         )
     return out

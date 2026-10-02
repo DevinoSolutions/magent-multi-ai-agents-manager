@@ -2468,3 +2468,47 @@ class TestUploadServerSupervisor:
             sup.tick()
 
         assert "no pid file" in caplog.text
+
+
+class TestTheDecorationWrappersForwardNicks:
+    """The two thin wrappers carry a brand nick down as a KEYWORD only, and a
+    caller with no nick gets exactly today's behaviour."""
+
+    @pytest.mark.parametrize(
+        "name", ["decorate_psmux_sessions", "decorate_psmux_sessions_async"]
+    )
+    def test_a_nick_map_reaches_the_psmux_fan_out(self, monkeypatch, name):
+        seen: dict[str, object] = {}
+        target = name.replace("_psmux", "")
+        monkeypatch.setattr(
+            f"magent.psmux.{target}",
+            lambda names, code_hint=None, *, nicks=None: seen.update(
+                names=names, code_hint=code_hint, nicks=nicks
+            ),
+        )
+        getattr(launch, name)(["api", "web"], nicks={"api": "cloud"})
+        assert seen == {
+            "names": ["api", "web"],
+            "code_hint": None,
+            "nicks": {"api": "cloud"},
+        }
+
+    @pytest.mark.parametrize(
+        "name", ["decorate_psmux_sessions", "decorate_psmux_sessions_async"]
+    )
+    def test_no_nick_map_is_none_all_the_way_down(self, monkeypatch, name):
+        seen: dict[str, object] = {}
+        target = name.replace("_psmux", "")
+        monkeypatch.setattr(
+            f"magent.psmux.{target}",
+            lambda names, code_hint=None, *, nicks=None: seen.update(nicks=nicks),
+        )
+        getattr(launch, name)(["api"])
+        assert seen == {"nicks": None}
+
+    @pytest.mark.parametrize(
+        "name", ["decorate_psmux_sessions", "decorate_psmux_sessions_async"]
+    )
+    def test_the_nick_map_is_keyword_only(self, name):
+        with pytest.raises(TypeError):
+            getattr(launch, name)(["api"], None, {"api": "cloud"})

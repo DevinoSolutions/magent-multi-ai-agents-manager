@@ -1091,12 +1091,21 @@ class WindowsPlatform(Platform):
         console-helper spawn when a pane passed the tree stages), not a
         round-trip per session: a full batch would otherwise serialize five.
 
+        A window marked ``resend=False`` never enters the pending set: its
+        command may run only once (a cloud pane's ``claude --cloud`` starts a
+        new cloud session per typing), so it is not probed and never re-typed,
+        and it does not shield its neighbours from the verification.
+
         Never raises. A pane that stays bare through every attempt is logged
         and left as-is -- at worst exactly what it was before this pass -- so
         one stuck pane cannot cost the wave its remaining sessions.
         """
         log = get_logger("platform")
-        pending = {w.window_name: w for w in batch}
+        # A pane whose command may run only once (a cloud pane) is never
+        # re-typed, whatever its shell reading says -- spec §18.5.
+        pending = {w.window_name: w for w in batch if w.resend}
+        if not pending:
+            return
         sends = 1  # the caller already typed the command once
         while True:
             time.sleep(_SEND_VERIFY_SETTLE_S)
@@ -1179,7 +1188,7 @@ class WindowsPlatform(Platform):
                     cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
                 for w in batch
-                for cmd in decoration_argv(w.window_name, psmux, code_hint)
+                for cmd in decoration_argv(w.window_name, psmux, code_hint, nick=w.nick)
             ]
         except OSError as exc:
             get_logger("platform").warning("status-line decoration failed: %s", exc)

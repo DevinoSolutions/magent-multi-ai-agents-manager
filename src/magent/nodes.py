@@ -16,6 +16,7 @@ import copy
 import dataclasses
 import errno
 import hashlib
+import hmac
 import ipaddress
 import json
 import math
@@ -35,6 +36,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
+from magent import node_auth
 from magent.config import (
     _NODE_NICK_RE,
     NODE_AUTO,
@@ -3658,3 +3660,840 @@ def read_repo_record(
         raise ValueError(f"{path}: not a repo record")
     repos = tuple(s for s in (_repo_status(r) for r in rows) if s is not None)
     return RepoRecord(ts=ts, source=source, repos=repos)
+
+
+# --- the cloud backend (spec §18) ------------------------------------------
+
+# A GitHub remote, by HOST: https/ssh/git URLs (with an optional user and port)
+# and scp-style `git@github.com:owner/repo`. The host must END at `/` (or a
+# port), so `github.com.evil.example` and `gitlab.com/github.com-x` fail.
+# `ssh.github.com` (GitHub's ssh-over-443 host, which a firewalled network
+# needs) is GitHub too, but it only serves ssh, so only the two ssh forms
+# accept it.
+_GITHUB_REMOTE = re.compile(
+    r"^(?:(?:https?|git)://(?:[^@/\s]+@)?github\.com(?::\d+)?/"
+    r"|ssh://(?:[^@/\s]+@)?(?:ssh\.)?github\.com(?::\d+)?/"
+    r"|(?:[^@/\s]+@)?(?:ssh\.)?github\.com:)",
+    re.IGNORECASE,
+)
+
+
+def cloud_git_refusal(state: LocalGitState) -> str | None:
+    """Why ``claude --cloud`` must not start from this checkout, or None.
+
+    The VM clones the GitHub remote at the checkout's branch and the work
+    comes home by push + teleport (spec §18.3), so anything the clone would
+    not contain, or could not push back to, is refused here. The structural
+    checks (no origin, a detached HEAD, no commits) are ``refusal_for``'s,
+    wording included; the dirty and unpushed checks are re-worded for the
+    cloud, because ``refusal_for`` would offer ``--allow-dirty``, which a
+    cloud create never accepts."""
+    structural = refusal_for(state, allow_dirty=True)
+    if structural is not None:
+        return structural
+    # The same `{path}: ` lead as the structural refusals above: a create over
+    # several projects prints one refusal each, and each must say whose.
+    where = state.path
+    if _GITHUB_REMOTE.match(state.url.strip()) is None:
+        return (
+            f"{where}: its remote is not on GitHub: a cloud session clones from "
+            "and pushes back to GitHub only"
+        )
+    branch = state.branch
+    if state.dirty:
+        return (
+            f"{where}: {branch} has uncommitted or untracked changes: the cloud "
+            f"clones {branch} from GitHub and never receives them, so commit and "
+            "push first"
+        )
+    if state.unpushed:
+        return (
+            f"{where}: {branch} has unpushed commits: the cloud clones {branch} "
+            "from GitHub, so push first"
+        )
+    return None
+
+
+# The ONE grammar of a ``NAME=value`` line: optional blanks, an optional
+# ``export``, the name, ``=``; group 2 is everything after the ``=``, its
+# leading blanks included (an inline comment is blanks followed by ``#``).
+# Horizontal whitespace only (`[ \t]`, not `\s`): the only blanks a .env allows
+# around a name, and a line it is matched against never holds a newline.
+_DOTENV_LINE = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)$"
+)
+# An unquoted value ends where blanks followed by ``#`` begin. The lookbehind
+# pins a match to the START of a run of blanks: without it ``.sub`` retries from
+# every blank of a long run that no ``#`` follows, which is quadratic (60k
+# blanks took seconds). The match is otherwise identical.
+_DOTENV_COMMENT = re.compile(r"(?<![ \t])[ \t]+#.*$")
+# The characters that open a quoted value. Backtick is Node dotenv's multi-line
+# form.
+_DOTENV_QUOTES = ('"', "'", "`")
+# The longest NAME that is printed. A variable name is a word; a run of
+# letters longer than this before an ``=`` is a slice of a secret (a base64
+# body line that ends in ``=``), and is never shown.
+_DOTENV_NAME_MAX = 128
+# PEM-style armor. No .env reader joins an unquoted value across lines, but a
+# pasted key or certificate is exactly that, and its body lines end in ``=``
+# often enough to read as variables: so the lines from an opening to its
+# matching close are ONE value, wherever the opening sits.
+_ARMOR_OPEN = "-----BEGIN"
+_ARMOR_CLOSE = "-----END"
+_ARMOR_LABEL = re.compile(r"-----BEGIN ([^-\n]+)-----")
+
+
+def _dotenv_text(path: Path) -> str:
+    """The text of a ``.env`` file, decoded the one way everything that shows
+    or hands off its contents reads it. OSError when it cannot be read.
+
+    A UTF-8 BOM would hide the first name from the line-start match (and land
+    mid-file in a hand-off), and Windows PowerShell 5.1's ``>`` writes UTF-16
+    (a NUL between every character), so both byte-order marks are honoured and
+    neither reaches the text. Undecodable bytes become U+FFFD, never an error.
+    The DIGEST hashes bytes and never decodes, so it needs none of this."""
+    raw = path.read_bytes()
+    codec = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+    return raw.decode(codec, errors="replace")
+
+
+def _value_extent(first: str, lines: list[str], at: int) -> tuple[int, int, bool]:
+    """The length of the raw text between the quotes of a value that opens with
+    one, the index of the last line the value occupies, and whether its quote
+    closed. ``first`` is the rest of the line ``lines[at]`` from the opening
+    quote; when the value runs on, its further lines are TAKEN, so the caller
+    never parses them.
+
+    The value is one SHELL WORD, so ``'a''b'`` and ``"a"'b'`` are one value: a
+    quote that follows a closing one (directly, or after unquoted text with no
+    blank between) opens the next run, and that run may itself run over lines.
+    A blank outside the quotes ends the word and what follows it is ignored, so
+    the ``# it's`` of a trailing comment opens nothing.
+
+    A run's closing quote is the first one of the SAME type (``"``, ``'`` or a
+    backtick) that does not directly follow a backslash. That holds in every
+    quote type, and whether or not the backslash is itself escaped (``"x\\\\"``
+    does not close): python-dotenv and Node dotenv read ``\\"`` as an escaped
+    quote however many backslashes precede it, and do it inside ``'`` too, while
+    bash does neither. Where readers disagree the parser takes the rule that
+    closes LATER, because the lines it swallows are never printed (under-listing
+    is the safe direction; the cost is that ``LOG='C:\\logs\\'`` swallows the
+    rest of the file). A newline inside a run counts as one character. An
+    unterminated quote swallows every remaining line."""
+    length = 0
+    chunk = first
+    quote = ""
+    i = 0
+    while True:
+        while i < len(chunk):
+            char = chunk[i]
+            if quote:
+                if char == quote:
+                    quote = ""
+                    i += 1
+                    continue
+                # A backslash and the quote it escapes are one step (two characters).
+                step = 2 if char == "\\" and chunk[i + 1 : i + 2] == quote else 1
+                length += step
+                i += step
+            elif char in _DOTENV_QUOTES:
+                quote = char
+                i += 1
+            elif char in " \t":
+                return length, at, True
+            else:
+                i += 1
+        if not quote or at + 1 >= len(lines):
+            return length, at, not quote
+        at += 1
+        length += 1
+        chunk = lines[at]
+        i = 0
+
+
+def _armored_extent(first: str, lines: list[str], at: int) -> tuple[int, int, bool]:
+    """The length of an armored block (a PEM key or certificate), the index of
+    the line it ends on, and whether it closed. ``first`` is the text of
+    ``lines[at]`` from its ``-----BEGIN``; the block runs to the first line
+    holding the MATCHING ``-----END <label>-----`` (any ``-----END`` when the
+    opening names no label), the matching one because a body that quotes
+    another block's marker is still one value. An unterminated block swallows
+    every remaining line, like an unterminated quote."""
+    label = _ARMOR_LABEL.match(first)
+    close = f"-----END {label[1]}-----" if label else _ARMOR_CLOSE
+    chunk = first
+    length = len(first)
+    while close not in chunk and at + 1 < len(lines):
+        at += 1
+        chunk = lines[at]
+        length += 1 + len(chunk)
+    return length - (len(chunk) - len(chunk.rstrip(" \t"))), at, close in chunk
+
+
+def _unshown(lines: list[str], first: int, last: int) -> int:
+    """How many of ``lines[first..last]`` hold anything: the count behind
+    ``(N line(s) not shown)``. A blank line has nothing to hide (and a file's
+    final newline leaves an empty last element)."""
+    return sum(1 for line in lines[first : last + 1] if line.strip())
+
+
+def _dotenv_scan(text: str) -> tuple[list[tuple[str, int]], int]:
+    """``(entries, withheld)`` for a ``.env`` text: ``(name, value length)`` per
+    variable it defines, in file order, and how many lines were NOT accounted
+    for -- the ONE parser behind ``dotenv_names`` and ``masked_lines``.
+
+    The names are PRINTED, so this is quote-aware, and under-lists rather than
+    over-lists: a line inside a multi-line value (a PEM key's body, in quotes or
+    in ``-----BEGIN``/``-----END`` armor, which may also stand on its own lines)
+    is a slice of a secret, and never comes back as a name or a length. A name
+    is printed only when it is an identifier (``_DOTENV_LINE``), no longer than
+    ``_DOTENV_NAME_MAX``, and not followed by a value that starts with ``=``
+    (``abc123==`` is a base64 body's last line, not a variable). When in doubt
+    the line is WITHHELD: counted here, never shown. Blank lines and comment
+    lines are neither. One line model: a line ends at ``\\n`` only
+    (``str.splitlines`` also splits on form feeds and U+2028, which no .env
+    reader does, and would turn the rest of ``SECRET=abc<U+2028>FOO=bar`` into a
+    second variable), minus one trailing ``\\r``.
+
+    Doubt spreads forward. A line that is not blank, not a comment and not an
+    assignment (raw base64 is one: a body line has no ``=`` before its end) is
+    withheld, and so is an unquoted EMPTY value straight after a withheld line:
+    the last line of a base64 body (``AAA=``) reads as a variable with no
+    value, and is not one. Every withheld line hands the doubt on; a blank
+    line, a comment line or a shown entry ends it, so ``DEBUG=`` after a
+    comment is still listed. (An entry whose unquoted value carries a
+    ``-----BEGIN`` glued after text, ``A=x-----BEGIN X-----``, is shown but
+    does not end it: its body may follow.) A ``-----BEGIN`` ANYWHERE in a line
+    that is not an
+    assignment (a JSON string with real newlines carries one mid-line) opens an
+    armored block too. The lines a value that never closes swallows (an unmatched
+    quote or ``-----BEGIN``) are counted as well, so the count line says the
+    rest of the file went unread. KNOWN RESIDUAL, deliberately not guarded: a
+    two-line unquoted value (``KEY=AAAA`` then ``bbbb=``) shows ``bbbb``, with
+    no marker and no doubt before it; a length or case heuristic would hide
+    real names.
+
+    A value that opens with ``"``, ``'`` or a backtick (after blanks) runs to
+    its close (see ``_value_extent``); one that opens with ``-----BEGIN`` runs
+    to its matching end (see ``_armored_extent``); any other value ends at an
+    inline comment and trailing blanks. A name defined twice appears twice: a
+    caller that keeps one keeps the LAST, which is the value an env-file reader
+    ends with. Cost is linear in the text."""
+    lines = [line.removesuffix("\r") for line in text.split("\n")]
+    entries: list[tuple[str, int]] = []
+    withheld = 0
+    doubt = False
+    at = 0
+    while at < len(lines):
+        line = lines[at]
+        match = _DOTENV_LINE.match(line)
+        if match is None:
+            stripped = line.lstrip(" \t")
+            if not stripped or stripped.startswith("#"):
+                doubt = False
+            elif _ARMOR_OPEN in stripped:
+                opening = stripped[stripped.index(_ARMOR_OPEN) :]
+                end = _armored_extent(opening, lines, at)[1]
+                withheld += _unshown(lines, at, end)
+                at = end
+                doubt = True
+            else:
+                withheld += 1
+                doubt = True
+            at += 1
+            continue
+        name, rest = match.groups()
+        value = rest.lstrip(" \t")
+        first = at
+        quoted = value[:1] in _DOTENV_QUOTES
+        closed = True
+        if quoted:
+            length, at, closed = _value_extent(value, lines, at)
+        elif value.startswith(_ARMOR_OPEN):
+            length, at, closed = _armored_extent(value, lines, at)
+        else:
+            length = len(_DOTENV_COMMENT.sub("", rest).strip(" \t"))
+        if not closed:
+            withheld += _unshown(lines, first + 1, at)
+        at += 1
+        hold = (
+            len(name) > _DOTENV_NAME_MAX
+            or value.startswith("=")
+            or (doubt and not quoted and length == 0)
+        )
+        if hold:
+            withheld += 1
+        else:
+            entries.append((name, length))
+        # An opener glued after unquoted text (`A=x-----BEGIN X-----`) is shown
+        # like any value, but no reader joins what follows it and its body may
+        # be the very next line.
+        doubt = hold or (not quoted and _ARMOR_OPEN in value)
+    return entries, withheld
+
+
+def _dotenv_entries(text: str) -> list[tuple[str, int]]:
+    """``(name, value length)`` per variable a ``.env`` text defines, in file
+    order (``_dotenv_scan`` without its count of withheld lines)."""
+    return _dotenv_scan(text)[0]
+
+
+def dotenv_names(path: Path) -> tuple[str, ...]:
+    """The variable NAMES a ``.env`` file defines, sorted -- never a value, and
+    never a slice of one: the names are printed, so a continuation line of a
+    multi-line value, an over-long name or a body line's padding is not a name
+    (``_dotenv_scan``). That means a malformed file can under-list; an
+    unreadable one names nothing."""
+    try:
+        text = _dotenv_text(path)
+    except OSError:
+        return ()
+    return tuple(sorted({name for name, _ in _dotenv_entries(text)}))
+
+
+@dataclass(frozen=True)
+class CloudPushSet:
+    """B's push set, read for a cloud project (spec §18.10-11).
+
+    ``files`` sit inside the project and travel (sealed, or by hand for the
+    ``.env*`` ones); ``outside`` files never reach a cloud session. Paths and
+    names only: no field ever holds a value."""
+
+    project_dir: Path
+    files: tuple[Path, ...]
+    outside: tuple[Path, ...]
+    names: tuple[str, ...]
+
+    @property
+    def env_files(self) -> tuple[Path, ...]:
+        return tuple(p for p in self.files if _is_env_file(p.name))
+
+    @property
+    def empty(self) -> bool:
+        return not self.files and not self.outside
+
+    def rel(self, path: Path) -> str:
+        return path.relative_to(self.project_dir).as_posix()
+
+
+def _spelled_inside(path: Path, project_dir: Path, root: Path) -> Path | None:
+    """``path`` spelled under ``project_dir`` when the file is inside the
+    project, else None. ``_push`` judges "inside" against the RESOLVED root, so
+    a hit git lists under the real path of a project configured as a link (or
+    a relative one) is inside, though not lexically; it is re-spelled under
+    ``project_dir`` the way ``_under_root`` re-spells one under the root."""
+    if path.is_relative_to(project_dir):
+        return path
+    parent = _try_resolve(path.parent)
+    if parent is not None and parent.is_relative_to(root):
+        return project_dir / parent.relative_to(root) / path.name
+    return None
+
+
+def cloud_push_set(
+    project_dir: Path,
+    states: Sequence[LocalGitState],
+    *,
+    home: Path,
+    extras: Sequence[str] = (),
+) -> CloudPushSet:
+    """Split the push set into what travels and what cannot (spec §18.11)."""
+    root = _try_resolve(project_dir) or project_dir
+    inside: list[Path] = []
+    outside: list[Path] = []
+    for path in push_set(project_dir, states, home=home, extras=extras):
+        spelled = _spelled_inside(path, project_dir, root)
+        if spelled is None:
+            outside.append(path)
+        else:
+            inside.append(spelled)
+    inside.sort(key=lambda p: p.relative_to(project_dir).as_posix())
+    names: set[str] = set()
+    for path in inside:
+        if _is_env_file(path.name):
+            names.update(dotenv_names(path))
+    return CloudPushSet(
+        project_dir=project_dir,
+        files=tuple(inside),
+        outside=tuple(sorted(outside)),
+        names=tuple(sorted(names)),
+    )
+
+
+def _cloud_dir() -> Path:
+    # ``node_dir`` reads NODES_DIR at CALL time, so a test's monkeypatched
+    # NODES_DIR is honoured. "cloud" is a reserved nick, so no pool node can
+    # own this directory. Every file kept here is named `cloud-<x>.<ext>`: the
+    # dot means it can never be a `<sid>/` dir (psmux.session_name turns "."
+    # into "-"), and none of the names is in _RESERVED_NAMES (sessions.json,
+    # load.jsonl, pull.json, node-map.json).
+    return node_dir(NODE_CLOUD)
+
+
+def _read_key(path: Path) -> bytes | None:
+    """The key at ``path``, or None when it is missing, is not exactly 32
+    bytes, or cannot be opened. Opened with ``READ_FLAGS`` (no final-component
+    link followed where the OS has O_NOFOLLOW, no blocking on a FIFO)."""
+    try:
+        fd = os.open(path, READ_FLAGS)
+    except OSError:
+        return None
+    try:
+        data = os.read(fd, 33)
+    except OSError:
+        data = b""
+    finally:
+        os.close(fd)
+    return data if len(data) == 32 else None
+
+
+def _digest_key() -> bytes:
+    """A random per-machine key, so a recorded digest is never a plain --
+    and for a short secret, guessable -- hash of the file. Made once, 0600
+    (a POSIX mode; on Windows the profile's own ACL is what protects it).
+
+    An intact key is never rewritten: a rewrite would change every recorded
+    digest at once. A missing one is made COMPLETE in a ``mkstemp`` sibling and
+    hard-linked into place, so a reader never sees a half-written key and two
+    first creators cannot both win (the loser's ``link`` fails and it returns
+    the winner's key). A short or garbled key is replaced, by a rename, which
+    swaps the directory entry and never writes through a link planted at the
+    name."""
+    path = _cloud_dir() / "cloud-digest.key"
+    key = _read_key(path)
+    if key is not None:
+        return key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fresh = os.urandom(32)
+    # mkstemp opens O_BINARY (a key byte of 0x0a must not become CRLF) and 0600.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(fresh)
+        # An ACL-bearing home (a hosted CI runner's) can widen the creation
+        # mode: chmod explicitly, as the other 0600 writers in this repo do.
+        with contextlib.suppress(OSError):
+            os.chmod(tmp, 0o600)
+        try:
+            os.link(tmp, path)
+        except OSError:
+            # Lost the race (FileExistsError), the name holds a broken key, or
+            # this filesystem has no hard links.
+            return _place_key(tmp, path, fresh)
+        return fresh
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+# Serializes the one place a key is put in place by a rename (which clobbers):
+# `_place_key`. `persistent_lock`, the waiting never-deleted sidecar, as
+# `map_lock` uses it.
+CLOUD_KEY_LOCK_NAME = "cloud-digest-key"
+CLOUD_KEY_LOCK_WAIT_S = 10.0
+
+
+def _place_key(tmp: Path, path: Path, fresh: bytes) -> bytes:
+    """The key ``path`` ends up holding, when ``os.link`` could not place
+    ``tmp`` there. A rename is the only other atomic way to publish a complete
+    key (a reader never sees a partial one), but it overwrites, and nothing
+    portable renames without clobbering. So the look and the rename happen
+    under one lock: the first complete key wins, and a creator that waited
+    finds it and returns it instead of replacing it."""
+    with persistent_lock(CLOUD_KEY_LOCK_NAME, wait_s=CLOUD_KEY_LOCK_WAIT_S):
+        winner = _read_key(path)
+        if winner is not None:
+            return winner
+        _replace_retrying(tmp, path)
+    return fresh
+
+
+def _framed(*fields: bytes) -> bytes:
+    """``fields`` each behind its 8-byte length, so where one ends and the next
+    begins is never ambiguous: no field's bytes (a path may hold a newline) can
+    pose as a boundary."""
+    return b"".join(len(f).to_bytes(8, "big") + f for f in fields)
+
+
+class PushSetUnreadable(OSError):
+    """A file the push set names could not be read, so neither a digest of the
+    set nor the by-hand hand-off can be made. ``label`` is its project-relative
+    path and ``reason`` the OS error's CLASS name: no value, and not the OS's
+    own words (they carry the absolute path). Both raise sites suppress the OS
+    error (``from None``): chained, its text would put that path back into any
+    traceback or error report of this refusal."""
+
+    def __init__(self, label: str, reason: str) -> None:
+        super().__init__(f"{label}: cannot be read ({reason})")
+        self.label = label
+        self.reason = reason
+
+
+def _text_bytes(text: str) -> bytes:
+    # surrogatepass: a path from the OS can hold a lone surrogate (an
+    # undecodable POSIX byte, an unpaired Windows UTF-16 unit); every one maps
+    # to its own bytes, so the digest is total and still injective.
+    return text.encode("utf-8", "surrogatepass")
+
+
+def _digest_input(ps: CloudPushSet, mode: str) -> bytes:
+    """What ``push_set_digest`` authenticates: the ``mode``, then each
+    travelling file (sorted by its project-relative path) as its path and the
+    SHA-256 of its bytes, then each outside path (sorted); every field framed.
+    The sort is HERE, so a hand-built set cannot change the digest by order.
+    PushSetUnreadable when a file cannot be read."""
+    parts = [_framed(b"mode", _text_bytes(mode))]
+    for path in sorted(ps.files, key=ps.rel):
+        label = ps.rel(path)
+        try:
+            body = hashlib.sha256(path.read_bytes()).digest()
+        except OSError as exc:
+            raise PushSetUnreadable(label, type(exc).__name__) from None
+        parts.append(_framed(b"file", _text_bytes(label), body))
+    parts.extend(
+        _framed(b"outside", _text_bytes(path.as_posix()))
+        for path in sorted(ps.outside, key=Path.as_posix)
+    )
+    return b"".join(parts)
+
+
+def push_set_digest(ps: CloudPushSet, mode: str) -> str:
+    """HMAC-SHA256, under the machine's key, over every travelling file's path
+    AND bytes, every outside path, and the hand-off ``mode`` (an age
+    recipient, or ``"manual"``).
+
+    A changed value, a new file and a rotated key all change it; the record
+    stores this and nothing else about the files. PushSetUnreadable (an
+    OSError) when a file of the set cannot be read: a digest of a set with a
+    hole in it would match every other such set."""
+    message = _digest_input(ps, mode)
+    return hmac.new(_digest_key(), message, hashlib.sha256).hexdigest()
+
+
+def _records_path() -> Path:
+    return _cloud_dir() / "cloud-records.json"
+
+
+def _plain(value: object) -> str | None:
+    """``value`` when it is a str that encodes to UTF-8, else None. JSON text
+    can carry a lone surrogate (``"\\ud800"``), which parses to a str that
+    raises on ``.encode()`` -- and the digest compare encodes."""
+    if not isinstance(value, str):
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return value
+
+
+def _read_records() -> dict[str, dict[str, str]]:
+    """Every well-formed record, keyed by sid. A record is exactly ``{digest,
+    mode, commit}``, all plain strings (``commit`` may be absent: ``""``);
+    anything else is dropped whole, never kept as a partial dict that a caller
+    would index into."""
+    try:
+        text = _records_path().read_text(encoding="utf-8")
+        # Nested past the bound is no record file, refused before json parses
+        # it (read_sessions' rule); RecursionError is the backstop.
+        data = None if nests_too_deep(text) else json.loads(text)
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    records: dict[str, dict[str, str]] = {}
+    for sid, rec in data.items():
+        if _plain(sid) is None or not isinstance(rec, dict):
+            continue
+        digest, mode = _plain(rec.get("digest")), _plain(rec.get("mode"))
+        commit = _plain(rec.get("commit", ""))
+        if digest is None or mode is None or commit is None:
+            continue
+        records[sid] = {"digest": digest, "mode": mode, "commit": commit}
+    return records
+
+
+def read_cloud_record(sid: str) -> dict[str, str] | None:
+    """``{digest, mode, commit}`` of the last hand-off for ``sid``, or None."""
+    return _read_records().get(sid)
+
+
+# The record file is one read-modify-write shared by every project, so two
+# writers (a fan-out's threads; `magent node push` beside a create) would each
+# read the old file and the second to land would drop the first's record. The
+# same shape as the node map, so the same seam: `map_lock`'s -- a thread lock,
+# then `persistent_lock` (a waiting, never-deleted sidecar). NOT
+# `exclusive_lock`: it never waits, so contention would be an error, and it
+# deletes its file. A lost record would only have failed safe (the next create
+# asks for the hand-off again), but a wait is cheaper than a repeat hand-off.
+CLOUD_RECORDS_LOCK_NAME = "cloud-records"
+CLOUD_RECORDS_LOCK_WAIT_S = 10.0
+_CLOUD_RECORDS_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _records_lock(wait_s: float) -> Iterator[None]:
+    deadline = time.monotonic() + wait_s
+    if not _CLOUD_RECORDS_LOCK.acquire(timeout=max(wait_s, 0.0)):
+        raise LockHeld("the cloud records are held by another writer in this process")
+    try:
+        remaining = max(deadline - time.monotonic(), 0.0)
+        with persistent_lock(CLOUD_RECORDS_LOCK_NAME, wait_s=remaining):
+            yield
+    finally:
+        _CLOUD_RECORDS_LOCK.release()
+
+
+def write_cloud_record(
+    sid: str,
+    *,
+    digest: str,
+    mode: str,
+    commit: str = "",
+    wait_s: float = CLOUD_RECORDS_LOCK_WAIT_S,
+) -> None:
+    """Record a hand-off, through the module's one atomic JSON writer, under
+    the records lock (LockHeld, an OSError, after ``wait_s``). ``mode`` is
+    ``"manual"`` or the age recipient the set was sealed to: this file is
+    plain text, so nothing else may ever be written into it."""
+    if mode != "manual" and not _is_recipient(mode):
+        raise ValueError("a cloud record's mode is 'manual' or an age recipient")
+    with _records_lock(wait_s):
+        records = _read_records()
+        records[sid] = {"digest": digest, "mode": mode, "commit": commit}
+        write_json_atomic(_records_path(), records)
+
+
+_AGE_RECIPIENT = re.compile(r"age1[0-9a-z]+")
+
+
+def _is_recipient(text: str) -> bool:
+    """One age PUBLIC key: ``age1`` then lowercase letters and digits, and
+    nothing else. No whitespace is allowed, so no second line can ride along
+    behind it -- an ``AGE-SECRET-KEY-1...`` identity pasted under the right
+    line must never come back as the recipient. The one predicate both
+    ``read_recipient`` and ``write_recipient`` use."""
+    return _AGE_RECIPIENT.fullmatch(text) is not None
+
+
+def read_recipient() -> str | None:
+    """The age recipient ``magent node cloud-setup`` recorded, or None.
+
+    Anything that is not one ``age1…`` public key -- above all an identity
+    pasted into the wrong file, or a file that is not text -- reads as no
+    recipient. Phase 1 never writes one, so it always answers None there."""
+    try:
+        text = (
+            (_cloud_dir() / "cloud-recipient.txt").read_text(encoding="utf-8").strip()
+        )
+    except (OSError, ValueError):
+        return None
+    return text if _is_recipient(text) else None
+
+
+def write_recipient(recipient: str) -> None:
+    """Record the recipient. ValueError (never quoting what it refused) unless
+    it is one public key: the value is stored in plain text and copied into
+    records."""
+    if not _is_recipient(recipient):
+        raise ValueError("the recipient must be one age public key (age1...)")
+    write_text_atomic(_cloud_dir() / "cloud-recipient.txt", recipient + "\n")
+
+
+def _record_current(
+    rec: dict[str, str], ps: CloudPushSet, recipient: str | None
+) -> bool:
+    """Does ``rec`` describe the CURRENT push set: sealed to the current
+    recipient, or handed off by hand, and unchanged since? PushSetUnreadable
+    when the set cannot be read."""
+    mode = rec["mode"]
+    if mode != "manual" and (recipient is None or mode != recipient):
+        return False
+    # Bytes both sides: compare_digest refuses a non-ASCII str.
+    return hmac.compare_digest(
+        rec["digest"].encode("utf-8"), push_set_digest(ps, mode).encode("utf-8")
+    )
+
+
+def cloud_env_refusal(
+    sid: str, name: str, ps: CloudPushSet, recipient: str | None
+) -> str | None:
+    """Why the create must wait for ``magent node push``, or None (spec §18.11).
+
+    Passes when nothing needs handing off, or when the record matches the
+    CURRENT push set: sealed to the current recipient, or handed off by hand.
+    A push-set file that cannot be read is a refusal that names it (its
+    project-relative path, never a value)."""
+    if ps.empty:
+        return None
+    rec = read_cloud_record(sid)
+    try:
+        if rec is not None and _record_current(rec, ps, recipient):
+            return None
+    except PushSetUnreadable as exc:
+        return (
+            f"the push set cannot be checked: {exc.label} cannot be read "
+            f"({exc.reason}); fix or remove it, then run: magent node push {name}"
+        )
+    shown = [*ps.names, *(ps.rel(p) for p in ps.files if not _is_env_file(p.name))]
+    if not ps.names:
+        # Env files that define no name (an empty one) are still files the
+        # user must hand off: name them by path, never "0 file(s) outside".
+        shown = [ps.rel(p) for p in ps.env_files] + shown
+    what = ", ".join(shown) or f"{len(ps.outside)} file(s) outside the project"
+    return (
+        f"the push set ({what}) has not reached the cloud since it last "
+        f"changed; run: magent node push {name}"
+    )
+
+
+def masked_lines(ps: CloudPushSet) -> list[str]:
+    """``NAME  ******** (n chars)`` per variable, sorted by name, for the
+    terminal (spec §18.11c): a length, never a value.
+
+    The names and lengths come from ``_dotenv_scan``, which never reads a
+    multi-line value's continuation lines as variables. A name defined twice
+    shows once, with the LAST definition's length (files in ``env_files``
+    order, then the order within a file).
+
+    Lines the scan would not vouch for are not listed, only counted: ONE
+    ``(N line(s) not shown)`` line follows the names, with no fragment of any of
+    them. An env file that cannot be read is listed after that as ``<path>
+    (could not be read)`` -- by its project-relative path, never skipped: the
+    user would paste an environment that silently lacks it."""
+    lengths: dict[str, int] = {}
+    unreadable: list[str] = []
+    withheld = 0
+    for path in ps.env_files:
+        try:
+            text = _dotenv_text(path)
+        except OSError:
+            unreadable.append(f"{ps.rel(path)}  (could not be read)")
+            continue
+        entries, held_back = _dotenv_scan(text)
+        lengths.update(entries)
+        withheld += held_back
+    shown = [f"{name}  ******** ({lengths[name]} chars)" for name in sorted(lengths)]
+    if withheld:
+        shown.append(f"({withheld} line(s) not shown)")
+    return shown + unreadable
+
+
+# A file only this user can open is node_auth's to make (a protected DACL at
+# CreateFile on Windows, which ``os.chmod`` cannot be; a verified 0600 on POSIX),
+# and its refusal is a hand-off's here: ``reason`` is an error CLASS name or
+# "not-private", never a path.
+HandoffNotPrivate = node_auth.PrivateFileRefused
+
+
+def _open_private(prefix: str, suffix: str) -> tuple[int, Path]:
+    """A new EMPTY file only this user can open, and a write descriptor on it.
+    HandoffNotPrivate when that cannot be had; nothing is left behind then. The
+    one seam a test replaces to make "cannot be had" happen."""
+    return node_auth.create_private_temp(prefix, suffix)
+
+
+def write_private_temp(text: str, *, prefix: str, suffix: str = ".txt") -> Path:
+    """``text`` in a fresh temp file only this user can read, as UTF-8 with LF
+    endings. The file is made private BEFORE any byte is written
+    (``_open_private``), and when it cannot be, HandoffNotPrivate: the secret
+    is never put in a file that is not.
+
+    A failure part-way deletes the file before it is re-raised: a half-written
+    secret must not outlive the error that interrupted it."""
+    # Encoded first: text that cannot be encoded (a lone surrogate) raises with
+    # no file made.
+    data = text.encode("utf-8")
+    fd, path = _open_private(prefix, suffix)
+    try:
+        try:
+            fh = os.fdopen(fd, "wb")
+        except BaseException:
+            # fdopen never took the descriptor: close it, or the file stays
+            # open (and, on Windows, undeletable) behind the error.
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+        with fh:
+            fh.write(data)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise
+    return path
+
+
+# What a hand-off file is called, and how long one may sit before the next
+# ``node push`` clears it: a terminal closed at the prompt skips the ``finally``
+# that deletes it, and ``--yes`` keeps it on purpose. An hour is long enough
+# that a file being pasted from, or a prompt another terminal is waiting at, is
+# not pulled out from under the user.
+HANDOFF_PREFIX = "magent-cloud-env-"
+HANDOFF_SUFFIX = ".env"
+HANDOFF_STALE_S = 3600.0
+
+
+def sweep_handoff_leftovers(
+    *, older_than_s: float = HANDOFF_STALE_S, now: float | None = None
+) -> tuple[int, int]:
+    """Delete the hand-off files an earlier push left in the temp dir:
+    ``(removed, could_not_delete)``. Only OUR files -- the prefix and suffix
+    ``write_manual_handoff`` uses, a plain file (never a link), this user's
+    (POSIX: a shared /tmp can hold another account's), and older than
+    ``older_than_s``. Reads no file's content and names none."""
+    cutoff = (time.time() if now is None else now) - older_than_s
+    try:
+        found = list(
+            Path(tempfile.gettempdir()).glob(f"{HANDOFF_PREFIX}*{HANDOFF_SUFFIX}")
+        )
+    except OSError:
+        return 0, 0
+    removed = stuck = 0
+    for path in found:
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_mtime > cutoff:
+            continue
+        if not node_auth.owned_by_current_user(st):
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            stuck += 1
+        else:
+            removed += 1
+    return removed, stuck
+
+
+def write_manual_handoff(ps: CloudPushSet) -> Path:
+    """Every ``.env*`` file's text, decoded, in ONE private temp file for
+    pasting into the environment dialog. Only the line endings change: CRLF
+    becomes LF, so a file that mixes the two cannot paste as a mix. The caller
+    deletes the file on confirm.
+
+    PushSetUnreadable (an OSError: the file's project-relative label and the
+    error's class, as ``push_set_digest`` raises it) when an env file cannot be
+    read -- before any temp file exists, so a refused hand-off leaves nothing
+    behind and is never pasted as if whole."""
+    parts = [
+        "# magent: paste into claude.ai/code > environment settings > Environment variables\n",
+        "# Only these variables travel: untracked files never reach a cloud session.\n",
+    ]
+    for path in ps.env_files:
+        label = ps.rel(path)
+        try:
+            text = _dotenv_text(path)
+        except OSError as exc:
+            raise PushSetUnreadable(label, type(exc).__name__) from None
+        parts.append(f"# from {label}\n")
+        parts.append(text.replace("\r\n", "\n").rstrip("\n") + "\n")
+    return write_private_temp(
+        "".join(parts), prefix=HANDOFF_PREFIX, suffix=HANDOFF_SUFFIX
+    )

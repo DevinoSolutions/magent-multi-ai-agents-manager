@@ -202,6 +202,32 @@ def claude_fresh_command(
     return fresh
 
 
+# The executable token of a configured claude command. psmux types it into
+# pwsh as `cmd /c <command>`, so cmd.exe reads it too: no quotes, no spaces, no
+# metacharacter of either, and no leading '-' (it would read as a flag). A path
+# is fine.
+_EXE_RE = re.compile(r"[A-Za-z0-9_.:\\/][A-Za-z0-9_.:\\/-]*")
+
+
+def cloud_pane_command(base_cmd: str, task: str) -> str:
+    """The one command a cloud pane runs: ``<exe> --cloud "<task>"`` (spec §18.5).
+
+    Only the executable survives from ``base_cmd``: every flag there
+    (``--continue``, ``--resume``, a model) belongs to a LOCAL conversation, and
+    ``--cloud`` always starts a new one. Re-validates ``task`` against config's
+    rule so no caller can type an unchecked string. Raises ValueError."""
+    # In-body: config pulls in click, and this module is otherwise import-light.
+    from magent.config import CLOUD_ID_LIKE, CLOUD_TASK_RE
+
+    parts = base_cmd.split()
+    exe = parts[0] if parts else ""
+    if not _EXE_RE.fullmatch(exe):
+        raise ValueError(f"cannot type claude executable {exe!r} into a pane safely")
+    if not CLOUD_TASK_RE.fullmatch(task) or CLOUD_ID_LIKE.search(task):
+        raise ValueError(f"unsafe cloud task {task!r}")
+    return f'{exe} --cloud "{task}"'
+
+
 def get_claude_session_ids(
     project_dir: str,
     count: int,

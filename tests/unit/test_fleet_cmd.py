@@ -500,7 +500,9 @@ class TestSessionsJson:
         result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
 
         assert result.exit_code == 0
-        assert all(r["node"] is None for r in json.loads(result.stdout))
+        # A cloud row names itself (J9); a pool-node row would have forced the
+        # typed load above, and this config names none.
+        assert [r["node"] for r in json.loads(result.stdout)] == [None, "cloud"]
 
     def _node_config(self, tmp_config, tmp_path, *extra):
         return tmp_config(

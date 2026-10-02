@@ -47,7 +47,7 @@ from magent.psmux import session0_message, session0_server_pids
 from magent.style import style
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
 
     from magent.config import MagentConfig
     from magent.node_auth import TokenHealth
@@ -444,6 +444,13 @@ def _psmux_sessions(
     argument and not a default: the same config windows the `agents` array ages
     with (``_agents_snapshot`` -> ``engine_from_config``) must age this column,
     or the two halves of one report contradict each other about one record.
+    A CLOUD pane (a ``node: "cloud"`` up entry, or a project row that says so)
+    is only a viewer onto a cloud session: its foreground is a bare shell once
+    ``claude --cloud`` has handed the work off, so it is NEVER ``idle`` -- that
+    verdict is what a revive acts on, and a revive would type a second, billed
+    ``claude --cloud``. It is left out of the idle probe altogether and its row
+    carries ``node: "cloud"`` (the key exists on cloud rows only, so every
+    other row's shape is untouched).
     Pure data: the shell decides how to print it and what to exit with.
     """
     from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
@@ -452,27 +459,53 @@ def _psmux_sessions(
     sids = [psmux_mod.socket_id(u) for u in up]
     if not sids:
         return []
+    cloud = psmux_mod.cloud_pane_ids(projects) | {
+        psmux_mod.socket_id(u) for u in up if u.get("node") == "cloud"
+    }
+    drivable = [s for s in sids if s not in cloud]
     binary = psmux_mod.find_psmux() or ""
     apps = psmux_mod.pane_current_commands(sids, psmux=binary or None)
-    idle = psmux_mod.idle_sessions(sids, psmux=binary or None, foreground=apps)
+    idle = (
+        psmux_mod.idle_sessions(drivable, psmux=binary or None, foreground=apps)
+        if drivable
+        else set()
+    )
     resolved = {psmux_mod.socket_id(p): _as_str(p.get("resolved")) for p in projects}
     states = _session_states(_session_cwds(binary, sids, resolved), staleness)
     rows: list[dict[str, object]] = []
     for sid in sids:
         app = apps.get(sid, "")
         state, _age = states.get(sid, (None, None))
-        rows.append(
-            {
-                "name": sid,
-                "app": app,
-                "idle": sid in idle,
-                # "" (never None) when the store has no record, so a JSON
-                # consumer treats it as a plain string field -- the same
-                # convention psmux.config_sessions uses for "resolved".
-                "state": state or "",
-            }
-        )
+        row: dict[str, object] = {
+            "name": sid,
+            "app": app,
+            "idle": sid in idle,
+            # "" (never None) when the store has no record, so a JSON
+            # consumer treats it as a plain string field -- the same
+            # convention psmux.config_sessions uses for "resolved".
+            "state": state or "",
+        }
+        if sid in cloud:
+            row["node"] = "cloud"
+        rows.append(row)
     return rows
+
+
+def _cloud_app_label(app: str) -> str:
+    """How a live cloud pane's foreground reads in the session list.
+
+    ``claude --cloud`` hands the work to the cloud and RETURNS, so a healthy
+    pane sits at a bare shell -- and so does one the command never reached
+    (``new-session`` made the pane, the first type failed). The two look
+    identical from here: no record says what was typed (the hand-off records
+    hold a digest, not a send), and a pane read is no proof either way. So a
+    shell reads "start unconfirmed" -- neither "idle" (nothing is idle about
+    it) nor healthy; the cloud session itself is only on claude.ai/code."""
+    from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
+
+    if psmux_mod.is_idle_command(app):
+        return "cloud, start unconfirmed"
+    return f"cloud ({app})" if app else "cloud"
 
 
 def _print_session_row(idx: int, row: dict[str, object]) -> None:
@@ -483,15 +516,93 @@ def _print_session_row(idx: int, row: dict[str, object]) -> None:
 
     sid = _as_str(row.get("name"))
     idle = bool(row.get("idle"))
-    app = "idle" if idle else (_as_str(row.get("app")) or "?")
-    app_txt = (
-        style(app, fg="yellow", bold=True) if idle else style(app, fg="cyan", dim=True)
-    )
+    if row.get("node") == "cloud":
+        # A cloud pane is a viewer, never an idle agent: name it for what it is
+        # and, at a bare shell, say what that reading cannot (see
+        # `_cloud_app_label`).
+        app = _cloud_app_label(_as_str(row.get("app")))
+        app_txt = style(app, fg="magenta", dim=True)
+    else:
+        app = "idle" if idle else (_as_str(row.get("app")) or "?")
+        app_txt = (
+            style(app, fg="yellow", bold=True)
+            if idle
+            else style(app, fg="cyan", dim=True)
+        )
     extra = f"{' ' * max(2, 26 - len(sid))}{app_txt}"
     label = _status_label(_as_str(row.get("state")) or None)
     if label:
         extra += f"{' ' * max(2, 14 - len(app))}{label}"
     _menu_item(str(idx), sid, extra=extra)
+
+
+def _cloud_down_line(entry: dict[str, object]) -> str:
+    """The one line for a cloud pane `psmux_status` reports down: its reason
+    when nothing would start it, else the fact that matters -- the pane being
+    gone says nothing about the cloud session behind it."""
+    sid = _as_str(entry.get("session")) or _as_str(entry.get("name"))
+    reason = _as_str(entry.get("reason"))
+    if reason:
+        return f"{sid} (cloud pane) not running: {reason}"
+    return (
+        f"{sid} (cloud pane) not running here; its cloud session may still be "
+        "running -- see claude.ai/code"
+    )
+
+
+def _shadowed_cloud(cfg: MagentConfig) -> list[dict[str, str]]:
+    """The enabled cloud projects `up` will never start because another enabled
+    project owns their session name -- ``[{session, path, why}]``, empty when
+    none (the common case). `eligible_projects` keeps the first of a duplicate
+    id and the create gate reads the first enabled project by name, so a
+    ``[local, cloud]`` pair for one folder silently drops the cloud entry;
+    this is where it is said out loud, with the fix."""
+    from magent.launch import (  # heavy subsystem: in-body per policy
+        shadowed_cloud_projects,
+        twin_session_refusal,
+    )
+
+    return [
+        {"session": sid, "path": proj.path, "why": twin_session_refusal(sid)}
+        for proj, sid in shadowed_cloud_projects(cfg)
+    ]
+
+
+def _shadowed_local(cfg: MagentConfig) -> list[dict[str, str]]:
+    """The mirror of ``_shadowed_cloud``: the enabled LOCAL projects `up` will
+    never start because a cloud project owns their session name -- ``[{session,
+    path, why}]``. In ``[cloud, local]`` the first-wins dedupe keeps the cloud
+    row and drops the local one in silence; same fix text as the cloud half."""
+    from magent.launch import (  # heavy subsystem: in-body per policy
+        shadowed_local_projects,
+        twin_session_refusal,
+    )
+
+    return [
+        {"session": sid, "path": proj.path, "why": twin_session_refusal(sid)}
+        for proj, sid in shadowed_local_projects(cfg)
+    ]
+
+
+def _echo_cloud_notes(cfg: MagentConfig, down: list[dict[str, object]]) -> None:
+    """What `status` says about cloud panes beyond the session list. A cloud
+    pane that is not there is not simply "down": its cloud session lives on
+    (billed, listed only on claude.ai/code), and when nothing will start the
+    pane the reason is the news -- one line per such entry. Then one line per
+    project `up` will never start because the other half of a cloud/local pair
+    for one folder won the name (``_shadowed_cloud``, ``_shadowed_local``)."""
+    for entry in down:
+        if entry.get("node") == "cloud":
+            click.echo(f"  {style(_cloud_down_line(entry), dim=True)}")
+    for kind, shadows in (
+        ("cloud", _shadowed_cloud(cfg)),
+        ("local", _shadowed_local(cfg)),
+    ):
+        for shadow in shadows:
+            click.echo(
+                f"  {style('!', fg='yellow')} {kind} project {shadow['path']} is "
+                f"never started: {shadow['why']}"
+            )
 
 
 def _gather_status(cfg: MagentConfig) -> dict[str, str]:
@@ -608,6 +719,7 @@ def _render_status(config_file: Path) -> StatusReport:
         click.echo(
             f"\n  {style(str(len(stopped)), fg='yellow', bold=True)} not running  {style('(' + preview + ')', dim=True)}"
         )
+    _echo_cloud_notes(cfg, down)
     status = _gather_status(cfg)
     # The daemon behind those rows: stale freezes every one of them, which is
     # why it degrades, as a paused sync does (_node_sync_state). Named
@@ -815,6 +927,15 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         payload["psmux_sessions"] = _psmux_sessions(
             up, projects, staleness_from_config(cfg)
         )
+        # Additive too, and present only when there is one: a cloud project
+        # `up` will never start because another project owns its session name.
+        shadowed = _shadowed_cloud(cfg)
+        if shadowed:
+            payload["shadowed_cloud"] = shadowed
+        # ...and its mirror: a local project a cloud one's name shadows.
+        shadowed_here = _shadowed_local(cfg)
+        if shadowed_here:
+            payload["shadowed_local"] = shadowed_here
         # Additive too, and for the same reason the human line is on stderr and
         # not in the verdict: a count of psmux servers stranded in logon
         # Session 0 is a fact about the machine, not about magent's daemons, so
@@ -874,11 +995,25 @@ def _down_host(explicit: str | None, local_targets: list[str]) -> str | None:
     return _read_last_host()
 
 
+def _cloud_panes(config_file: Path, up: list[dict[str, object]]) -> set[str]:
+    """The session ids a shutdown may be stopping cloud panes under: the config's
+    cloud ids (first project per name decides, as everywhere -- a ``[local,
+    cloud]`` pair's pane is a local agent's) plus every live entry
+    `psmux_status` marked ``node: "cloud"`` (a local twin that a group filter
+    left standing on a live cloud pane's name)."""
+    from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
+
+    return psmux_mod.cloud_pane_ids(psmux_mod.config_sessions(str(config_file))) | {
+        psmux_mod.socket_id(u) for u in up if u.get("node") == "cloud"
+    }
+
+
 def _report_shutdown(
     stopped: Sequence[str],
     still: Sequence[str],
     node_stopped: Sequence[str] = (),
     node_still: Sequence[str] = (),
+    cloud: Collection[str] = (),
 ) -> None:
     """Say what was PROVED stopped, and say the survivors loudly.
 
@@ -892,6 +1027,11 @@ def _report_shutdown(
     here (D9, in ``stopped``/``still``). Two sessions, one name, one report:
     a name is claimed stopped only when neither half kept it running, and
     "nothing to stop" is said only when neither half found anything.
+
+    ``cloud`` is the session ids that are cloud panes. Stopping one closes the
+    local VIEW only: the cloud session it started keeps running (and billing)
+    and the CLI can neither list nor stop it, so each one stopped here says so
+    and where to look. A cloud pane that survived claims nothing.
     """
     survivors = {*still, *node_still}
     claimed = [
@@ -902,6 +1042,12 @@ def _report_shutdown(
             f"  {style('+', fg='green')} Stopped {style(str(len(claimed)), fg='green', bold=True)}"
             f" session(s): {style(', '.join(claimed), dim=True)}"
         )
+        for sid in (s for s in claimed if s in cloud):
+            click.echo(
+                f"  {style('!', fg='yellow')} {sid} was a cloud pane: only its "
+                "local view stopped -- the cloud session keeps running; manage it "
+                "at claude.ai/code"
+            )
     elif not survivors:
         click.echo(f"  {style('-', dim=True)} No running sessions to stop.")
     if still:
@@ -1138,7 +1284,13 @@ def down_cmd(
                     # daemon to the nodes it still serves.
                     sync.before_pulls()
                 node_stopped, node_still = stop_node_sessions(cfg, node_targets)
-            _report_shutdown(stopped, still, node_stopped, node_still)
+            _report_shutdown(
+                stopped,
+                still,
+                node_stopped,
+                node_still,
+                cloud=_cloud_panes(config_file, up),
+            )
             if held_back is not None:
                 _echo_map_unread_hint(*held_back)
             else:
@@ -1360,11 +1512,17 @@ def _menu_down(config_file: Path) -> None:
         click.echo(f"  {style('-', dim=True)} Nothing is running.")
     else:
         order, buckets = _grouped(up)
+        # Said BEFORE the confirm, not only after it: stopping a cloud pane
+        # closes the local view and nothing else (see `_report_shutdown`).
+        cloud = _cloud_panes(config_file, up)
+        cloud_notes = dict.fromkeys(
+            cloud, "cloud pane: its cloud session keeps running"
+        )
         for g in order:
             click.echo(
                 f"  {style(g, fg='green', bold=True)}  {style(f'({len(buckets[g])})', dim=True)}"
             )
-            _print_names(buckets[g])
+            _print_names(buckets[g], reasons=cloud_notes)
         pickable = [g for g in order if g != "(no group)"]
         srv_on = _probe_port(cfg.settings.upload_port)
         click.echo()
@@ -1406,7 +1564,7 @@ def _menu_down(config_file: Path) -> None:
         # Same verified report the `down` command gives: the menu used to
         # print the length of the list it had tried, which is the half of
         # NF-S3-001 that survived pass-2 (the server line was fixed then).
-        _report_shutdown(*stop_psmux(targets))
+        _report_shutdown(*stop_psmux(targets), cloud=cloud)
         if also_server:
             from magent.upload_server import (
                 stop_server,  # heavy subsystem: in-body per policy

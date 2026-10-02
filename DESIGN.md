@@ -3109,6 +3109,48 @@ member), `tests/unit/test_node_onboard.py`, `tests/unit/test_node_ready_gate.py`
 `tests/unit/test_node_sync_lifetime.py`, and `tests/e2e/test_nodes_real.py`
 D7 (the session starts on the node, the folder trusted).
 
+### The cloud pane is typed once (2026-09-24)
+
+A `"node": "cloud"` project is a LOCAL psmux pane running `claude --cloud
+"<cloudTask>"`. Every `--cloud` with a task creates a new cloud session, so a
+re-typed command is a second session, not a retry. The pane is therefore typed
+exactly once: `PsmuxWindowOpts.resend=False`, `revive` skips it, `attach
+--no-mux` refuses it, and the idle reaper never parks it (`reap._scope` never
+selects a cloud pane as a candidate, but it still counts one for the
+shared-folder veto, so a local agent in the same folder is not parked from
+under it). `launch.cloud_refusal` is the only create gate. It refuses, in this
+order, a project the one ladder `launch.cloud_command(tool, base_cmd, task)`
+has no pane command for (a tool that is not `claude`, no `cloudTask`, a
+command a pane cannot safely be typed; `--go`, `up`'s
+`psmux.eligible_projects`, the gate and `doctor` all read that ladder, so no
+surface words a refusal differently), a checkout the cloud could not clone or
+push back (no GitHub remote, a detached HEAD, uncommitted or unpushed work),
+and a push set that has not been handed off yet (spec §18.11).
+`psmux.bring_up` runs it only for a cloud session that is not live, so a live
+pane is never second-guessed; liveness is asked through `psmux.live_sessions`
+(one call for the cloud and twin session ids together), never a per-project
+probe. A refusal is one more entry in `bring_up`'s `failed` dict, so it
+reaches the user on the line that already reports casualties.
+
+A session name has one owner, first-wins: `psmux.cloud_pane_ids(rows)` is the
+one answer to "which panes are cloud", `launch.project_for_session(cfg, sid)`
+is the first ENABLED project that owns a name, and `status` and `doctor` name
+the project the dedupe leaves out (`launch.shadowed_cloud_projects`,
+`launch.shadowed_local_projects`). Every surface that would type into a pane
+refuses a live cloud one: `serve` answers 409 (`cloud: true`) and Alt+V
+narrates `cloud-pane`, `send` and `model` exit 2, `attach --no-mux` refuses
+the row by name. `down` closes the pane and says the cloud session keeps
+running, because the CLI cannot stop it. An idle cloud VM pauses and is later
+reclaimed, so no surface calls a cloud row dead. magent keeps no record of
+what it typed, so a live cloud pane at a bare shell reads "cloud, start
+unconfirmed" in `status`, never idle.
+
+Proof: `tests/unit/test_cloud.py` (`TestBringUpGatesTheCloudCreate`,
+`TestTheCreateGate`, `TestTheCloudPaneIsAPsmuxSession`,
+`TestReviveNeverRetypesACloudPane`, `TestTheIdleReaperNeverParksACloudPane`,
+`TestACloudPaneStillCountsTowardsASharedFolder`,
+`TestAttachNoMuxNeverTypesACloudCommand`).
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
@@ -3321,6 +3363,95 @@ counted created", is closed: a refusal is now final, see §2.)
    outcome: return the unsure names beside the refusals, and have
    `report_bring_up_casualties` name them on their own line ("may not have its
    agent") without counting them as failed.
+
+**The CLI cannot list, stop, archive or delete a cloud session (2026-09-24):**
+Claude Code has no command for it, so `down` closes only the local pane and
+prints that the cloud session keeps running. The user archives or deletes it
+at claude.ai/code. magent never pretends otherwise (spec §18.14).
+
+**Each cloud create is a new cloud session (2026-09-24):** magent types
+`claude --cloud "<cloudTask>"`, which always creates; it never reattaches the
+pane by session id. A killed pane followed by `up` starts a second session,
+and the first keeps running until the user archives it. The create gate and
+`resend=False` make this rare; they cannot make it impossible. The sharpest
+case is a psmux server dying: its cloud pane goes with it, the next `up` sees
+the cloud session as not live, and the gate lets a NEW one through, because
+magent cannot list cloud sessions to see that the first still runs. Check
+claude.ai/code before `magent up` after a crash. Two `magent up` runs racing
+from separate processes can each find the session not live and both create,
+because no lock is held across a bring-up; the window is narrow (between the
+`live_sessions` probe and the create) and it is the same residual as magent
+being unable to list cloud sessions.
+
+**Alt+V and the phone page refuse a cloud pane (2026-09-24):** the image would
+land on this PC, not in the cloud VM. `serve` answers 409 and Alt+V narrates
+`cloud-pane`. Uploading into a cloud session needs a channel Claude Code does
+not offer.
+
+**`send` and `model` refuse a cloud pane (2026-09-24):** the pane is a local
+viewer, so typing into it does not reach the agent. Both exit 2; `send` names
+`claude -p "<msg>" --cloud <session-id>` as the channel, and magent does not
+drive it.
+
+**Cloud projects need psmux (2026-09-24):** without psmux a plain terminal
+would re-type `claude --cloud` on every launch and create a new session each
+time, so the plain-terminal path skips a cloud project with a reason. `up`
+always goes through psmux; `--go` and the menu launch use it only when
+`settings.psmux` is on and the platform supports psmux
+(`launch.launch_uses_psmux`, worded once as `launch.CLOUD_NEEDS_PSMUX`), and
+otherwise skip the project.
+
+**`--cloud` needs a claude.ai login (2026-10-02):** a `claude setup-token`
+token does not authorize it, and it is unavailable on Bedrock, Vertex and
+third-party providers or when `allow_remote_sessions` is off. magent cannot
+see which of these applies from the PC, so `doctor`'s `cloud` check states
+them and checks only what this PC can see: that `claude` is on PATH and lists
+`--cloud`, and the config problems the create would refuse (a tool that is not
+`claude`, no `cloudTask`, a command a pane cannot safely be typed, a project
+left out by a shared session name), with a warning for a project `--go` would
+skip for lack of `settings.psmux`.
+
+**Cloud projects are unrouted if per-project account routing merges (2026-09-24):**
+account routing is not on main yet. The cloud session runs under the claude.ai
+account the local `claude` is signed in to, and routing has no local
+`CLAUDE_CONFIG_DIR` to give a cloud pane, so when routing lands its planner
+must treat a cloud project as unrouted without a refusal.
+
+**cloud: J0 findings (2026-09-24):** the user-run J0 probe has not been run,
+so every item U1-U13 reads "not probed".
+
+**Sealed hand-off is not built yet (2026-10-02):** phase 2 waits on the
+user-run J0-B probe (whether a synced plugin's or a repo-committed
+SessionStart hook runs in a hosted cloud session, and whether a carrier ref
+can be pushed and fetched). Until it passes, `magent node push` hands every
+cloud push set off by hand.
+
+**A cloud pane at a bare shell is "start unconfirmed" (2026-10-02):** `claude
+--cloud` hands the work to the cloud and returns, so a healthy cloud pane sits
+at a bare shell, and so does one the command never reached (the pane was
+created and the first type failed; `up` will not revive a cloud pane). magent
+keeps no record of what it typed, so the two cannot be told apart. `magent
+status` therefore words a live cloud pane at a shell "cloud, start
+unconfirmed", never idle or healthy, and `sessions --json` gives it the state
+`"cloud"` without reading the pane. A record written after the send would
+settle it; none is kept today.
+
+**`node push` name display under-lists, with one residual shape (2026-10-02):**
+`node push` prints `.env` NAMES only, masked, and its parser would rather
+leave a line out than print a slice of a value: a line that could belong to a
+multi-line value is withheld and counted as `(N line(s) not shown)`. One shape
+can still show a value fragment as a name: a two-line UNQUOTED multi-line
+value (`KEY=AAAA`, then `bbbb=`), which is not valid dotenv anyway. The digest
+and the hand-off file are unaffected, so the create gate and what the user
+pastes are right; only the printed list can be wrong.
+
+**`attach --no-mux` against an older host cannot tell a cloud row (2026-10-02):**
+a host older than this branch reports no `node` field, so the refusal has
+nothing to read. That is safe: such a host never builds a `--cloud` command.
+
+**The cloud gate's `live_sessions` probe has no overall timeout bound (2026-10-02):**
+the same as the existing sweeps (`status`, `down`, the session picker), which
+call the same function.
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in

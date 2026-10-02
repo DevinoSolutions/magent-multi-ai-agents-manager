@@ -1092,6 +1092,7 @@ class TestDoctorCli:
             "nodes",
             "idle-reap",
             "claude-token",
+            "cloud",
         } == names
 
 
@@ -1345,3 +1346,535 @@ class TestTheClaudeTokenRow:
         monkeypatch.setattr(node_auth, "mint_token", boom)
         monkeypatch.setattr(node_auth, "ensure_token", boom)
         assert _check_claude_token(_nodes_cfg(tmp_config))[0] == "warn"
+
+
+_CLOUD_HELP = "  --cloud [description|session_id|url]  Create a cloud session\n"
+
+
+def _cloud_project(
+    tmp_path: Path,
+    name: str = "api",
+    *,
+    task: str | None = "Fix the login bug",
+    **entry,
+):
+    """One config entry pinned to the cloud, over a real folder."""
+    folder = tmp_path / name
+    folder.mkdir(exist_ok=True)
+    project = {"path": str(folder), "node": "cloud", **entry}
+    if task is not None:
+        project["cloudTask"] = task
+    return project
+
+
+def _cloud_doctor_cfg(tmp_config, *projects, settings=None):
+    # psmux ON unless a test says otherwise: `--go` needs it for a cloud pane,
+    # and the shipped default (off) is its own pinned case below.
+    payload = {
+        "version": SCHEMA_VERSION,
+        "projects": list(projects),
+        "settings": {"psmux": True, **(settings or {})},
+    }
+    return load_config(tmp_config(payload))
+
+
+class TestTheCloudCheck:
+    """`doctor`'s `cloud` row (spec section 18): asked only when an ENABLED cloud
+    project exists, WARN at worst. It runs `claude --help` once, so every test
+    stands two walls between it and a real `claude`: conftest's autouse
+    `_no_real_claude` makes `node_auth.find_claude` answer None, and the fixture
+    below refuses any spawn of a program named claude that is not under this
+    test's own tmp_path (the rest of a full `doctor` run spawns what it spawns)."""
+
+    @pytest.fixture(autouse=True)
+    def _only_the_fake_claude_can_run(self, tmp_path, monkeypatch):
+        real_run = subprocess.run
+
+        def guarded(argv, *args, **kwargs):
+            program = str(argv[0])
+            if Path(program).stem.lower() == "claude":
+                assert program.startswith(str(tmp_path)), f"doctor ran {program}"
+                # The probe's contract: bounded, never reading the terminal,
+                # decoding a foreign build's bytes without raising, and a
+                # non-zero exit is an answer rather than an exception.
+                assert 0 < kwargs.get("timeout", 0) <= 30
+                assert kwargs.get("stdin") is subprocess.DEVNULL
+                assert kwargs.get("encoding") == "utf-8"
+                assert kwargs.get("errors") == "replace"
+                assert kwargs.get("check") is False
+                assert kwargs.get("capture_output") is True
+            return real_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", guarded)
+
+    @pytest.fixture(autouse=True)
+    def _a_platform_with_psmux(self, monkeypatch):
+        """`--go` runs a cloud project in a psmux pane only where the platform
+        has one; a test that wants it absent patches this again."""
+        monkeypatch.setattr(
+            "magent.platform.get_platform", lambda: FakePlatform(supports_psmux=True)
+        )
+
+    @pytest.fixture
+    def ready(self, fake_claude):
+        """Everything in place: a claude whose help lists --cloud."""
+        fake_claude.set_reply("--help", stdout=_CLOUD_HELP)
+        return fake_claude
+
+    def test_no_enabled_cloud_project_probes_nothing(
+        self, tmp_config, tmp_path, monkeypatch
+    ):
+        def probed():
+            pytest.fail("doctor looked for claude")
+
+        monkeypatch.setattr("magent.node_auth.find_claude", probed)
+        local = _cloud_doctor_cfg(tmp_config, {"path": str(tmp_path)})
+        disabled = _cloud_doctor_cfg(
+            tmp_config, _cloud_project(tmp_path, enabled=False, task=None)
+        )
+        for cfg in (None, local, disabled):
+            assert doctor._check_cloud(cfg) == (OK, "no cloud projects")
+
+    def test_all_in_place_passes_and_states_the_account_facts(
+        self, ready, tmp_config, tmp_path
+    ):
+        cfg = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path))
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert status == OK
+        assert "/login" in detail and "/web-setup" in detail
+        assert "claude.ai login" in detail and "setup-token" in detail
+        assert "Bedrock" in detail and "allow_remote_sessions" in detail
+
+    def test_it_asks_claude_help_once_as_a_list_however_many_projects(
+        self, ready, tmp_config, tmp_path
+    ):
+        cfg = _cloud_doctor_cfg(
+            tmp_config,
+            _cloud_project(tmp_path, "api"),
+            _cloud_project(tmp_path, "web"),
+        )
+
+        assert doctor._check_cloud(cfg)[0] == OK
+
+        assert [call.argv for call in ready.calls()] == [["--help"]]
+
+    def test_a_claude_without_cloud_support_warns(
+        self, fake_claude, tmp_config, tmp_path
+    ):
+        fake_claude.set_reply("--help", stdout="Usage: claude [options]\n  --resume\n")
+        cfg = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path))
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert status == WARN
+        assert "--cloud" in detail and "claude update" in detail
+
+    def test_no_claude_on_path_warns(self, tmp_config, tmp_path):
+        # conftest's autouse _no_real_claude is what answers None here.
+        cfg = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path))
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert status == WARN
+        assert "claude CLI on PATH" in detail
+
+    def test_a_claude_that_cannot_be_started_warns_by_class_only(
+        self, tmp_config, tmp_path, monkeypatch
+    ):
+        missing = tmp_path / "nowhere" / "claude"
+        monkeypatch.setattr("magent.node_auth.find_claude", lambda: str(missing))
+        cfg = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path))
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert status == WARN
+        assert "could not run claude --help (FileNotFoundError)" in detail
+        assert str(tmp_path) not in detail
+
+    def test_a_claude_that_hangs_warns(self, tmp_config, tmp_path, monkeypatch):
+        def hang(argv, *_args, **_kwargs):
+            raise subprocess.TimeoutExpired(argv, 15)
+
+        monkeypatch.setattr("magent.node_auth.find_claude", lambda: str(tmp_path / "c"))
+        monkeypatch.setattr(subprocess, "run", hang)
+        cfg = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path))
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert status == WARN
+        assert "could not run claude --help (TimeoutExpired)" in detail
+
+    def test_a_cloud_project_without_a_task_warns_with_the_gates_own_words(
+        self, ready, tmp_config, tmp_path
+    ):
+        from magent import launch
+
+        cfg = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path, task=None))
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert (status, detail) == (WARN, f"api: {launch.NO_CLOUD_TASK}")
+
+    def test_a_non_claude_tool_warns_with_the_gates_own_words(
+        self, ready, tmp_config, tmp_path
+    ):
+        from magent import launch
+
+        cfg = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path, tool="codex"))
+        expected = launch.cloud_tool_refusal("codex", cfg.settings.tools.get("codex"))
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert expected is not None
+        assert (status, detail) == (WARN, f"api: {expected}")
+
+    def test_a_claude_tool_whose_command_is_not_claude_warns_the_same_way(
+        self, ready, tmp_config, tmp_path
+    ):
+        from magent import launch
+
+        cfg = _cloud_doctor_cfg(
+            tmp_config,
+            _cloud_project(tmp_path),
+            settings={"tools": {"claude": "bash -c claude"}},
+        )
+        expected = launch.cloud_tool_refusal("claude", "bash -c claude")
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert expected is not None
+        assert (status, detail) == (WARN, f"api: {expected}")
+
+    def test_a_project_with_two_static_problems_names_the_one_the_gate_names_first(
+        self, ready, tmp_config, tmp_path
+    ):
+        # tool -> task, the order every surface refuses in: a wrong tool makes
+        # the missing task moot, so doctor does not say it twice.
+        from magent import launch
+
+        cfg = _cloud_doctor_cfg(
+            tmp_config, _cloud_project(tmp_path, tool="codex", task=None)
+        )
+
+        _status, detail = doctor._check_cloud(cfg)
+
+        expected = launch.cloud_tool_refusal("codex", cfg.settings.tools.get("codex"))
+        assert detail == f"api: {expected}"
+        assert launch.NO_CLOUD_TASK not in detail
+
+    def test_an_executable_the_pane_cannot_type_warns_with_the_create_paths_words(
+        self, ready, tmp_config, tmp_path
+    ):
+        # `~/bin/claude` passes the tool check (its stem IS claude) and then
+        # cannot be typed into a pane safely: `--go` SKIPs with
+        # cloud_pane_command's own words, so doctor must not say OK.
+        from magent.sessions.claude import cloud_pane_command
+
+        base = "~/bin/claude --continue"
+        with pytest.raises(ValueError, match="cannot type claude executable") as why:
+            cloud_pane_command(base, "Fix the login bug")
+        cfg = _cloud_doctor_cfg(
+            tmp_config,
+            _cloud_project(tmp_path),
+            settings={"tools": {"claude": base}},
+        )
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert (status, detail) == (WARN, f"api: {why.value}")
+
+    def test_a_task_the_pane_cannot_type_warns_with_the_create_paths_words(
+        self, ready, tmp_config, tmp_path
+    ):
+        # Config load refuses such a task, so reach it the way a stale or
+        # hand-built config object would: the command is re-validated at build
+        # time, and `--go` SKIPs on it.
+        from magent.sessions.claude import cloud_pane_command
+
+        cfg = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path))
+        cfg.projects[0].cloud_task = "fix it; rm everything"
+        with pytest.raises(ValueError, match="unsafe cloud task") as why:
+            cloud_pane_command("claude --continue", cfg.projects[0].cloud_task)
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert (status, detail) == (WARN, f"api: {why.value}")
+
+    def test_a_claude_launcher_given_by_path_with_flags_stays_ok(
+        self, ready, tmp_config, tmp_path
+    ):
+        cfg = _cloud_doctor_cfg(
+            tmp_config,
+            _cloud_project(tmp_path),
+            settings={"tools": {"claude": "/usr/local/bin/claude --continue"}},
+        )
+
+        assert doctor._check_cloud(cfg)[0] == OK
+
+    def test_the_pane_command_is_checked_only_after_the_tool_and_the_task(
+        self, ready, tmp_config, tmp_path
+    ):
+        # First reason per project, in the create path's order: an untypeable
+        # executable behind a missing task is the task's problem first.
+        from magent import launch
+
+        cfg = _cloud_doctor_cfg(
+            tmp_config,
+            _cloud_project(tmp_path, task=None),
+            settings={"tools": {"claude": "~/bin/claude"}},
+        )
+
+        _status, detail = doctor._check_cloud(cfg)
+
+        assert launch.NO_CLOUD_TASK in detail
+        assert "cannot type" not in detail
+
+    def test_a_local_then_cloud_pair_names_the_cloud_project_never_started(
+        self, ready, tmp_config, tmp_path
+    ):
+        from magent import launch
+
+        cloud = _cloud_project(tmp_path)
+        cfg = _cloud_doctor_cfg(tmp_config, {"path": cloud["path"]}, cloud)
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert status == WARN
+        assert f"cloud project {cloud['path']} is never started" in detail
+        assert launch.twin_session_refusal("api") in detail
+        assert "local project" not in detail
+
+    def test_a_cloud_then_local_pair_names_the_local_project_never_started(
+        self, ready, tmp_config, tmp_path
+    ):
+        from magent import launch
+
+        cloud = _cloud_project(tmp_path)
+        cfg = _cloud_doctor_cfg(tmp_config, cloud, {"path": cloud["path"]})
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert status == WARN
+        assert f"local project {cloud['path']} is never started" in detail
+        assert launch.twin_session_refusal("api") in detail
+        assert "cloud project" not in detail
+
+    def test_a_disabled_cloud_project_is_ignored(self, ready, tmp_config, tmp_path):
+        # Its missing task and its shadowing a local twin are nobody's problem:
+        # `up` never reads a disabled entry.
+        cfg = _cloud_doctor_cfg(
+            tmp_config,
+            _cloud_project(tmp_path, "api"),
+            _cloud_project(tmp_path, "web", task=None, enabled=False),
+        )
+
+        assert doctor._check_cloud(cfg)[0] == OK
+
+    def test_it_never_calls_a_paused_cloud_vm_dead(self, ready, tmp_config, tmp_path):
+        healthy = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path))
+        troubled = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path, task=None))
+
+        for cfg in (healthy, troubled):
+            _status, detail = doctor._check_cloud(cfg)
+            assert "dead" not in detail.lower()
+        # ...and says why an idle session is not a failure.
+        assert "not a failure" in doctor._check_cloud(healthy)[1]
+
+    def test_a_project_with_no_tool_inherits_the_default_tool(
+        self, ready, tmp_config, tmp_path
+    ):
+        # The create path reads `proj.tool or settings.defaultTool`; a doctor
+        # that assumed claude would call this project fine and `up` refuses it.
+        from magent import launch
+
+        cfg = _cloud_doctor_cfg(
+            tmp_config, _cloud_project(tmp_path), settings={"defaultTool": "codex"}
+        )
+        expected = launch.cloud_tool_refusal("codex", cfg.settings.tools.get("codex"))
+
+        assert expected is not None
+        assert doctor._check_cloud(cfg) == (WARN, f"api: {expected}")
+
+    def test_a_projects_own_tool_beats_the_default_tool(
+        self, ready, tmp_config, tmp_path
+    ):
+        cfg = _cloud_doctor_cfg(
+            tmp_config,
+            _cloud_project(tmp_path, tool="claude"),
+            settings={"defaultTool": "codex"},
+        )
+
+        assert doctor._check_cloud(cfg)[0] == OK
+
+    def test_a_help_that_only_mentions_cloud_in_prose_warns(
+        self, fake_claude, tmp_config, tmp_path
+    ):
+        # The flag is what is asked for, not the word.
+        fake_claude.set_reply(
+            "--help",
+            stdout="Usage: claude [options]\n  --resume  Resume a cloud session\n",
+        )
+        cfg = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path))
+
+        assert doctor._check_cloud(cfg) == (
+            WARN,
+            "this claude has no --cloud: update Claude Code (claude update)",
+        )
+
+    def test_every_problem_project_is_named_not_just_the_first(
+        self, ready, tmp_config, tmp_path
+    ):
+        from magent import launch
+
+        cfg = _cloud_doctor_cfg(
+            tmp_config,
+            _cloud_project(tmp_path, "api", task=None),
+            _cloud_project(tmp_path, "web", tool="codex"),
+            _cloud_project(tmp_path, "ops"),
+        )
+        web = launch.cloud_tool_refusal("codex", cfg.settings.tools.get("codex"))
+
+        assert doctor._check_cloud(cfg) == (
+            WARN,
+            f"api: {launch.NO_CLOUD_TASK}; web: {web}",
+        )
+
+    def test_a_config_problem_does_not_skip_the_claude_probe(
+        self, fake_claude, tmp_config, tmp_path
+    ):
+        # The probe is the one thing the create gate cannot see from here, so it
+        # runs whatever else is wrong, and its words come after the config's.
+        from magent import launch
+
+        fake_claude.set_reply("--help", stdout="Usage: claude [options]\n")
+        cfg = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path, task=None))
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert status == WARN
+        assert detail == (
+            f"api: {launch.NO_CLOUD_TASK}; "
+            "this claude has no --cloud: update Claude Code (claude update)"
+        )
+        assert [call.argv for call in fake_claude.calls()] == [["--help"]]
+
+    def test_the_default_config_warns_that_go_skips_a_cloud_project(
+        self, ready, tmp_config, tmp_path
+    ):
+        # `settings.psmux` ships false, and `--go` then SKIPs every cloud project
+        # with launch.CLOUD_NEEDS_PSMUX: an OK row would promise a launch that
+        # never happens. The words are the SKIP line's, verbatim.
+        from magent import launch
+
+        cfg = load_config(
+            tmp_config(
+                {"version": SCHEMA_VERSION, "projects": [_cloud_project(tmp_path)]}
+            )
+        )
+
+        assert cfg.settings.psmux is False
+        assert doctor._check_cloud(cfg) == (
+            WARN,
+            f"api: --go skips it: {launch.CLOUD_NEEDS_PSMUX}",
+        )
+
+    def test_a_platform_without_psmux_warns_the_same_way(
+        self, ready, tmp_config, tmp_path, monkeypatch
+    ):
+        from magent import launch
+
+        monkeypatch.setattr(
+            "magent.platform.get_platform", lambda: FakePlatform(supports_psmux=False)
+        )
+        cfg = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path))
+
+        assert cfg.settings.psmux is True
+        assert doctor._check_cloud(cfg) == (
+            WARN,
+            f"api: --go skips it: {launch.CLOUD_NEEDS_PSMUX}",
+        )
+
+    def test_the_psmux_note_names_every_cloud_project_and_never_a_local_one(
+        self, ready, tmp_config, tmp_path
+    ):
+        from magent import launch
+
+        local = tmp_path / "docs"
+        local.mkdir()
+        cfg = _cloud_doctor_cfg(
+            tmp_config,
+            _cloud_project(tmp_path, "api"),
+            {"path": str(local)},
+            _cloud_project(tmp_path, "web"),
+            settings={"psmux": False},
+        )
+        why = launch.CLOUD_NEEDS_PSMUX
+
+        assert doctor._check_cloud(cfg) == (
+            WARN,
+            f"api: --go skips it: {why}; web: --go skips it: {why}",
+        )
+
+    def test_the_psmux_note_adds_to_a_config_problem_instead_of_hiding_it(
+        self, ready, tmp_config, tmp_path
+    ):
+        # `up` ignores settings.psmux, so the missing task is a problem on its
+        # own surface; the `--go` skip is the other surface's, said after it.
+        from magent import launch
+
+        cfg = _cloud_doctor_cfg(
+            tmp_config, _cloud_project(tmp_path, task=None), settings={"psmux": False}
+        )
+
+        assert doctor._check_cloud(cfg) == (
+            WARN,
+            (
+                f"api: {launch.NO_CLOUD_TASK}; "
+                f"api: --go skips it: {launch.CLOUD_NEEDS_PSMUX}"
+            ),
+        )
+
+    def _real_run(self, runner, monkeypatch, config_path):
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        result = runner.invoke(cli.main, ["--config", config_path, "doctor", "--json"])
+        return json.loads(result.stdout)["checks"]
+
+    def test_the_row_sits_between_agent_tools_and_terminal(
+        self, runner, monkeypatch, tmp_config
+    ):
+        # ORDER: never between "upload port" and "nodes", which another pin holds
+        # adjacent.
+        checks = self._real_run(
+            runner,
+            monkeypatch,
+            tmp_config({"version": SCHEMA_VERSION, "projects": []}),
+        )
+
+        names = [c["name"] for c in checks]
+        assert names.index("cloud") == names.index("agent tools") + 1, names
+        assert names.index("terminal") == names.index("cloud") + 1, names
+        assert checks[names.index("cloud")]["detail"] == "no cloud projects"
+
+    def test_a_cloud_project_makes_the_row_a_warning_through_the_real_path(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        # Nothing on PATH answers to claude (the autouse conftest seam), so the
+        # real _run_checks composition reports it instead of spawning anything.
+        checks = self._real_run(
+            runner,
+            monkeypatch,
+            tmp_config(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [_cloud_project(tmp_path)],
+                }
+            ),
+        )
+
+        row = next(c for c in checks if c["name"] == "cloud")
+        assert row["status"] == WARN
+        assert "claude CLI on PATH" in row["detail"]

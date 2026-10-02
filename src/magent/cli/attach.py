@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1278,12 +1279,32 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
     to, and dialing back in would silently start a SECOND agent on a
     conversation the user thinks is still running. Reconnect is a psmux
     feature because psmux is what makes the far side outlive the connection.
+
+    A CLOUD pane is refused by name, whatever its command says: its ``cmd`` is
+    ``claude --cloud "<task>"``, and running that straight over ssh would start
+    a NEW billed cloud session (one the CLI can neither list nor stop) on every
+    attach -- there is no pane here whose single typing could be remembered.
+    The row's ``node`` decides, never a parse of the command text; every other
+    project of the host still opens.
     """
 
     projects = _project_dicts(status)
     if not projects:
         click.echo(f"  {style('x', fg='red')} No eligible projects in the host config.")
         sys.exit(1)
+
+    cloud_rows = [p for p in projects if p.get("node") == "cloud"]
+    for p in cloud_rows:
+        click.echo(
+            f"  {style('x', fg='red')} {_as_str(p.get('name')) or _as_str(p.get('session'))}: "
+            "a cloud pane is not attachable with --no-mux: each run would start a "
+            "new cloud session; attach without --no-mux, or open claude.ai/code"
+        )
+    if cloud_rows:
+        projects = [p for p in projects if p.get("node") != "cloud"]
+        if not projects:
+            sys.exit(1)
+        click.echo()
 
     click.echo(
         f"  {style(str(len(projects)), fg='green', bold=True)} project(s) "
@@ -1455,6 +1476,28 @@ def up_cmd(
     # moments ago by bring_up_psmux may still be booting its agent, and typing
     # into that pane would double-launch.
     live_ids = [_as_str(d.get("session")) or _as_str(d.get("name")) for d in up]
+    # A cloud pane is branded `@cloud`, and every decoration here re-writes the
+    # status line: one without the nick would overwrite the brand. The nicks are
+    # passed ONLY when a cloud project exists, so every other call stays the
+    # positional one the existing tests fake (`lambda names: names`).
+    # A LIVE pane counts as cloud too: a local project sharing a cloud pane's
+    # session name (`up -g b` while the cloud project's group is not selected)
+    # has no cloud row in `projects`, yet the pane it names carries the brand.
+    nicks = {
+        _as_str(p.get("session")): "cloud"
+        for p in [*projects, *up]
+        if p.get("node") == "cloud"
+    }
+    decorate_async = (
+        partial(decorate_psmux_sessions_async, nicks=nicks)
+        if nicks
+        else decorate_psmux_sessions_async
+    )
+    decorate_sync = (
+        partial(decorate_psmux_sessions, nicks=nicks)
+        if nicks
+        else decorate_psmux_sessions
+    )
 
     if as_json:
         # `up --json` is a pure read by default (attach polls it repeatedly);
@@ -1482,7 +1525,7 @@ def up_cmd(
         # 120s one and re-ran the whole thing. A status query must never wait on
         # a cosmetic status bar; the async variant fires and returns, throttled
         # by a stamp so attach's repeated polls can't pile up processes.
-        decorate_psmux_sessions_async(live_ids)
+        decorate_async(live_ids)
         # deferred: resolving __version__ costs an importlib.metadata import,
         # and only the JSON envelope needs it (see cli/ui.py::_banner).
         from magent import __version__
@@ -1516,6 +1559,8 @@ def up_cmd(
                             "group": p["group"],
                             "resolved": p["resolved"],
                             "cmd": p["cmd"],
+                            # "cloud" for a cloud pane, else None (additive).
+                            "node": p.get("node"),
                         }
                         for p in projects
                     ],
@@ -1530,6 +1575,14 @@ def up_cmd(
     )
     _divider()
     click.echo()
+    # A live pane that owns a name this selection's project shares: say whose
+    # it is, so "All N session(s) already up" is not the whole story.
+    for entry in up:
+        if entry.get("note"):
+            click.echo(
+                f"  {style('+', fg='green')} {_as_str(entry.get('name'))}: "
+                f"{_as_str(entry.get('note'))}"
+            )
 
     targets = (
         None
@@ -1599,7 +1652,7 @@ def up_cmd(
     # branch above does the same for its live sessions. Same host-side `code`
     # probe as there: one for the batch, not one per session. Node sessions
     # are left out: they live on their node and were decorated there at birth.
-    decorate_psmux_sessions([*live_ids, *(s for s in created if s not in node_sids)])
+    decorate_sync([*live_ids, *(s for s in created if s not in node_sids)])
 
     if cfg.settings.upload_server:
         _maybe_start_upload_server(cfg.settings.upload_port, str(config_file))
