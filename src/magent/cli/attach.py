@@ -1296,6 +1296,7 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
 
     # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
     from magent.env import attach_client_env
+    from magent.wt_profiles import profile_for
 
     titles: list[str] = []
     for sid, p in zip(sids, projects, strict=True):
@@ -1311,22 +1312,20 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
         click.echo(f"  {style('o', fg='cyan')} {title}")
         # Same seam as the supervised panes above: strip only a harness-leaked
         # colour override, keep everything else, `None` for a human's shell.
-        subprocess.Popen(
+        wt_args = ["wt", "-w", "new", "--title", title, "--suppressApplicationTitle"]
+        profile = profile_for(sid)
+        if profile:
+            wt_args.extend(["-p", profile])
+        wt_args.extend(
             [
-                "wt",
-                "-w",
-                "new",
-                "--title",
-                title,
-                "--suppressApplicationTitle",
                 "--",
                 attach_client.ssh_program(),
                 "-t",
                 target,
                 f"cd {remote_dir} && {cmd}",
-            ],
-            env=attach_client_env(),
+            ]
         )
+        subprocess.Popen(wt_args, env=attach_client_env())
         titles.append(title)
         time.sleep(_SPAWN_STAGGER_S)
 
