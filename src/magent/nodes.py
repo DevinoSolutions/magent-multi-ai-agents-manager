@@ -3751,14 +3751,17 @@ def _quoted_length(first: str, lines: Iterator[str]) -> int:
     value runs on, its further lines are TAKEN from ``lines``, so the caller
     never parses them.
 
-    The closing quote is the first unescaped one of the SAME type (``"``,
-    ``'`` or a backtick); what follows it on its line is ignored. In every
-    quote type a backslash escapes the next character (both count towards the
-    length). python-dotenv and Node dotenv do that inside ``'`` too, bash does
-    not; where readers disagree the parser takes the rule that closes LATER,
-    because the lines it swallows are never printed (under-listing is the safe
-    direction). A newline inside the value counts as one character. An
-    unterminated quote swallows every remaining line."""
+    The closing quote is the first one of the SAME type (``"``, ``'`` or a
+    backtick) that does not directly follow a backslash; what follows it on
+    its line is ignored. That holds in every quote type, and whether or not the
+    backslash is itself escaped (``"x\\\\"`` does not close): python-dotenv and
+    Node dotenv read ``\\"`` as an escaped quote however many backslashes
+    precede it, and do it inside ``'`` too, while bash does neither. Where
+    readers disagree the parser takes the rule that closes LATER, because the
+    lines it swallows are never printed (under-listing is the safe direction;
+    the cost is that ``LOG='C:\\logs\\'`` swallows the rest of the file). A
+    newline inside the value counts as one character. An unterminated quote
+    swallows every remaining line."""
     quote = first[0]
     length = 0
     chunk = first[1:]
@@ -3768,8 +3771,9 @@ def _quoted_length(first: str, lines: Iterator[str]) -> int:
             char = chunk[i]
             if char == quote:
                 return length
-            step = 2 if char == "\\" else 1
-            length += min(step, len(chunk) - i)
+            # A backslash and the quote it escapes are one step (two characters).
+            step = 2 if char == "\\" and chunk[i + 1 : i + 2] == quote else 1
+            length += step
             i += step
         following = next(lines, None)
         if following is None:

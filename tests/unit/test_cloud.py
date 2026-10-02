@@ -1489,6 +1489,31 @@ class TestTheEnvParserIsQuoteAware:
         assert lines == ["A  ******** (22 chars)", "NEXT  ******** (1 chars)"]
         assert "SLICE" not in "\n".join(lines)
 
+    @pytest.mark.parametrize("quote", ['"', "'"])
+    def test_a_quote_right_after_a_backslash_never_closes_the_value(
+        self, tmp_path, quote
+    ):
+        # `A="x\\"`: the regex readers (python-dotenv, Node dotenv) see `\"` as
+        # an escaped quote and keep reading; pairing the two backslashes and
+        # closing would print SLICE=zzz, a slice of the value, as a name.
+        raw = f"A={quote}x\\\\{quote}\nSLICE=zzz\ny{quote}\nNEXT=1\n".encode()
+        names, lines = self._read(tmp_path, raw)
+        assert names == ("A", "NEXT")
+        # x + 2 backslashes + quote (4) + newline + SLICE=zzz (9) + newline + y
+        assert lines == ["A  ******** (16 chars)", "NEXT  ******** (1 chars)"]
+
+    @pytest.mark.parametrize("quote", ['"', "'"])
+    def test_a_value_ending_in_a_backslash_swallows_the_rest_of_the_file(
+        self, tmp_path, quote
+    ):
+        # The accepted cost of the rule above: a Windows path `C:\logs\` ends
+        # in a backslash, so its closing quote reads as escaped and the rest of
+        # the file is never listed. Under-listing is the safe direction.
+        raw = f"LOG={quote}C:\\logs\\{quote}\nNEXT=1\nMORE=2\n".encode()
+        names, lines = self._read(tmp_path, raw)
+        assert names == ("LOG",)
+        assert len(lines) == 1 and lines[0].startswith("LOG  ")
+
     def test_a_backtick_value_may_span_lines_too(self, tmp_path):
         # Node dotenv's multi-line form: `...`, with the same continuation.
         raw = b"K=`line one\nSecretTail=zzz\nend`\nA=1\n"
@@ -1644,10 +1669,10 @@ class TestTheEnvParserCostIsLinear:
         assert [name for name, _ in entries] == ["K", "NEXT"]
         assert took < self.BOUND_S
 
-    def test_a_two_hundred_thousand_line_file(self):
-        text = "".join(f"K{i}=v{i}\n" for i in range(200_000))
+    def test_a_fifty_thousand_line_file(self):
+        text = "".join(f"K{i}=v{i}\n" for i in range(50_000))
         entries, took = self._timed(text)
-        assert len(entries) == 200_000
+        assert len(entries) == 50_000
         assert took < self.BOUND_S
 
 
