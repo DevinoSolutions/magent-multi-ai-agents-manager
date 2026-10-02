@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    from magent.config import MagentConfig
+    from magent.config import MagentConfig, ProjectConfig
 
 OK = "ok"
 WARN = "warn"
@@ -91,6 +92,92 @@ def _check_agent_tools(cfg: MagentConfig | None) -> CheckResult:
     if missing:
         return (WARN, f"tool command(s) not on PATH: {', '.join(missing)}")
     return (OK, "every configured agent tool resolves on PATH")
+
+
+def _cloud_config_problems(cfg: MagentConfig, cloud: list[ProjectConfig]) -> list[str]:
+    """What the create gate would refuse for ``cloud`` from config alone, in the
+    gate's own words and order (tool, then task). No git, no push set, no
+    records, no live-session probe: those are the gate's to ask at create time.
+    Then the pairs for one folder where the first enabled project owns the
+    session name, so the other is never started -- the words `status` uses."""
+    from magent import launch, nodes  # heavy subsystem: in-body per policy
+
+    problems: list[str] = []
+    for proj in cloud:
+        tool = proj.tool or cfg.settings.default_tool
+        refusal = launch.cloud_tool_refusal(tool, cfg.settings.tools.get(tool))
+        if refusal is None and not proj.cloud_task:
+            refusal = launch.NO_CLOUD_TASK
+        if refusal:
+            problems.append(f"{nodes.project_name(proj)}: {refusal}")
+    for kind, shadows in (
+        ("cloud", launch.shadowed_cloud_projects(cfg)),
+        ("local", launch.shadowed_local_projects(cfg)),
+    ):
+        problems.extend(
+            f"{kind} project {proj.path} is never started: "
+            f"{launch.twin_session_refusal(sid)}"
+            for proj, sid in shadows
+        )
+    return problems
+
+
+def _claude_cloud_problem() -> str | None:
+    """Why this PC's ``claude`` cannot start a cloud session, or None: not on
+    PATH, would not run, or its help does not list ``--cloud``."""
+    from magent import node_auth  # heavy subsystem: in-body per policy
+
+    exe = node_auth.find_claude()
+    if exe is None:
+        return "cloud projects need the claude CLI on PATH"
+    try:
+        result = subprocess.run(
+            [exe, "--help"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # The class only: the OS's own words carry an absolute path.
+        return f"could not run claude --help ({type(exc).__name__})"
+    if "--cloud" not in (result.stdout or ""):
+        return "this claude has no --cloud: update Claude Code (claude update)"
+    return None
+
+
+def _check_cloud(cfg: MagentConfig | None) -> CheckResult:
+    """Spec section 18: asked only when an ENABLED cloud project exists, WARN at
+    worst. Reports what the create gate cannot see from here (does this claude
+    have ``--cloud``) and the static config problems it would refuse with, then
+    states the account facts a user must know before the first create. A paused
+    or reclaimed cloud VM is never a failure, and nothing here calls it dead."""
+    from magent.config import is_cloud  # heavy subsystem: in-body per policy
+
+    cloud = [p for p in (cfg.projects if cfg else ()) if p.enabled and is_cloud(p)]
+    if cfg is None or not cloud:
+        return (OK, "no cloud projects")
+    problems = _cloud_config_problems(cfg, cloud)
+    claude_problem = _claude_cloud_problem()
+    if claude_problem:
+        problems.append(claude_problem)
+    if problems:
+        return (WARN, "; ".join(problems))
+    return (
+        OK,
+        (
+            "claude has --cloud; node push hands the push set off by hand.\n"
+            "--cloud needs a claude.ai login (a setup-token does not authorize it) and is "
+            "unavailable on Bedrock, Vertex or third-party providers, or when the "
+            "allow_remote_sessions policy is off.\n"
+            "Run /login and /web-setup once from a desktop terminal: a Session-0 pane "
+            "cannot show the browser. An idle cloud session pauses and is reclaimed "
+            "later; that is not a failure."
+        ),
+    )
 
 
 def _check_terminal() -> CheckResult:
@@ -624,6 +711,7 @@ def _run_checks(config_file: Path) -> list[dict[str, str]]:
     rest: list[tuple[str, Callable[[], CheckResult]]] = [
         ("env", _check_env),
         ("agent tools", lambda: _check_agent_tools(cfg)),
+        ("cloud", lambda: _check_cloud(cfg)),
         ("terminal", _check_terminal),
         ("psmux wedge", _check_psmux_wedge),
         ("psmux-session0", _check_psmux_session0),
