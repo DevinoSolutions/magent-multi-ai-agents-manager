@@ -161,6 +161,7 @@ class ProjectConfig:
     windows: list[WindowConfig] | None = None
     node: str | None = None
     push: list[str] | None = None
+    cloud_task: str | None = None
 
 
 def is_cloud(proj: ProjectConfig) -> bool:
@@ -540,6 +541,7 @@ def _parse_project(raw: dict[str, object]) -> ProjectConfig:
         windows=_windows(raw),
         node=_str_or_none(raw, "node"),
         push=_str_list_or_none(raw, "push"),
+        cloud_task=_str_or_none(raw, "cloudTask"),
     )
 
 
@@ -656,6 +658,7 @@ _ALLOWED_PROJECT_KEYS = {
     "windows",
     "node",
     "push",
+    "cloudTask",
 }
 _ALLOWED_WINDOW_KEYS = {"name", "tool", "command"}
 # The two reserved nicks. `"node": "auto"` is the placement request, not a
@@ -860,6 +863,56 @@ def _check_node_projects(
             )
 
 
+# A cloud project's task text reaches `claude --cloud "<task>"` through TWO
+# parsers: psmux types `cmd /c <command>` into pwsh, then cmd.exe reads it. So
+# the charset admits no metacharacter of either ($ ` " ' % ^ & | < > ; ( ) ! #)
+# and no leading '-' (it would read as a flag). One rule, no quoting layer.
+CLOUD_TASK_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ,._/:-]{0,199}")
+# `claude --cloud <arg>` ATTACHES when <arg> is a session id (`session_...` or
+# `cse_...`) or a claude.ai/code URL -- such a task would never create
+# anything. Public: sessions/claude.py checks the same rule at command-build
+# time, so the two cannot drift.
+CLOUD_ID_LIKE = re.compile(r"^(?:session_|cse_)|://")
+
+
+def _check_cloud_projects(projects: list[ProjectConfig], default_tool: str) -> None:
+    """Spec §18.1: a cloud project runs claude, and a task it names is safe.
+
+    A cloud project with NO task still loads (the nodes release accepted that
+    config); ``launch.cloud_refusal`` refuses to create its session."""
+    for i, proj in enumerate(projects):
+        label = f"projects[{i}]"
+        if not is_cloud(proj):
+            if proj.cloud_task is not None:
+                click.echo(
+                    f'Warning: {label}.cloudTask is ignored: the project has no "node": "cloud"',
+                    err=True,
+                )
+            continue
+        tool = proj.tool or default_tool
+        if tool != "claude":
+            raise ConfigError(
+                f"{label}: a cloud project runs Claude Code; its tool is {tool!r}"
+            )
+        task = proj.cloud_task
+        if task is not None:
+            if CLOUD_ID_LIKE.search(task):
+                raise ConfigError(
+                    f"{label}.cloudTask must not be a session id or URL: "
+                    "claude would attach, not create"
+                )
+            if not CLOUD_TASK_RE.fullmatch(task):
+                raise ConfigError(
+                    f"{label}.cloudTask must be 1-200 characters of letters, digits, "
+                    "spaces and , . _ / : -, starting with a letter or digit"
+                )
+        for key, value in (("windows", proj.windows), ("happy", proj.happy)):
+            if value is not None:
+                click.echo(
+                    f"Warning: {label}.{key} is ignored on a cloud project", err=True
+                )
+
+
 def _check_session_names(projects: list[ProjectConfig], default_tool: str) -> None:
     """A node project's session id is its own (PR-D).
 
@@ -951,6 +1004,7 @@ def load_config(path: str) -> MagentConfig:
     _backfill_colors(projects)
     settings = _parse_settings(settings_raw)
     _check_node_projects(projects, settings.nodes)
+    _check_cloud_projects(projects, settings.default_tool)
     _check_session_names(projects, settings.default_tool)
 
     return MagentConfig(

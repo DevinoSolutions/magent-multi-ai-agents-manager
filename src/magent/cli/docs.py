@@ -44,8 +44,9 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "the lowest load score over the sync daemon's last 30 minutes of "
             "samples (a node under 10% free memory is skipped while another is "
             "above it), and the project stays there until that node leaves "
-            '`settings.nodes`; `magent node plan` shows the choice. `"cloud"` is '
-            "reserved in this release and runs as an ordinary local session."
+            '`settings.nodes`; `magent node plan` shows the choice. `"cloud"` runs '
+            "the project as a Claude cloud session (`claude --cloud`) hosted in a "
+            "local pane; see `cloudTask`."
         ),
     ),
     (
@@ -57,6 +58,16 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "on top of the auto-detected gitignored `.env*`, "
             "`.claude/settings.local.json`, `CLAUDE.local.md` and `.mcp.json`. A "
             "missing file is a warning, not an error."
+        ),
+    ),
+    (
+        "cloudTask",
+        "string",
+        "none",
+        (
+            'The task a `"node": "cloud"` project\'s Claude cloud session starts '
+            "on (1-200 chars; letters, digits, spaces, `, . _ / : -`). Without it "
+            "the project loads but its cloud session is never created."
         ),
     ),
 ]
