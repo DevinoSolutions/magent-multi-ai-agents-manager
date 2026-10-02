@@ -218,6 +218,11 @@ class PsmuxWindowOpts:
     window_name: str
     cwd: str
     command: str
+    # False for a command that must run at most ONCE per session: a cloud pane's
+    # `claude --cloud` creates a new cloud session every time it is typed.
+    resend: bool = True
+    # The status-left brand nick (`status_left`); None = the plain brand.
+    nick: str | None = None
 
 
 def session_name(title: str) -> str:
@@ -1415,7 +1420,9 @@ def f2_binding_argv(prefix: list[str], code_hint: bool) -> list[str]:
     return [*prefix, "unbind-key", "-n", "F2"]
 
 
-def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
+def decoration_argv(
+    name: str, psmux: str, code_hint: bool, *, nick: str | None = None
+) -> list[list[str]]:
     """The psmux commands that brand ``name`` and advertise its window hotkeys.
 
     Ten of them. The first six: magent *owns* F1 -> detach-client per session
@@ -1457,9 +1464,12 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     sixth command is the matching ``unbind-key``, so a session that was
     decorated back when ``code`` resolved on this host doesn't keep answering a
     key nothing advertises any more.
+
+    ``nick`` brands the status-left ``magent @<nick>`` (``status_left``); ``None``
+    is the plain brand, byte for byte, so no caller that has no nick changes.
     """
     hints, hints_len = status_hints(code_hint)
-    brand, brand_len = status_left(None)
+    brand, brand_len = status_left(nick)
     f2 = f2_binding_argv([psmux, "-L", name], code_hint)
     return [
         [psmux, "-L", name, "bind", "-n", "F1", "detach-client"],
@@ -1497,13 +1507,17 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
 
 
 def decorate_session(
-    name: str, psmux: str | None = None, code_hint: bool | None = None
+    name: str,
+    psmux: str | None = None,
+    code_hint: bool | None = None,
+    nick: str | None = None,
 ) -> None:
     """Brand one session's status line and advertise its F1/F2 hints.
 
     ``code_hint=None`` means "probe here": this machine is decorating, so
     whether ``code`` resolves here is exactly the question. Callers that
     already probed (``decorate_sessions``) pass the answer down instead.
+    ``nick`` is the brand nick (see ``decoration_argv``).
 
     Best-effort and guarded exactly like ``flash_message``: a status bar is
     cosmetic, so a missing binary, a hung psmux, or a non-zero exit is logged
@@ -1514,7 +1528,7 @@ def decorate_session(
         return
     if code_hint is None:
         code_hint = code_on_path()
-    for cmd in decoration_argv(name, binary, code_hint):
+    for cmd in decoration_argv(name, binary, code_hint, nick=nick):
         try:
             subprocess.run(
                 cmd,
@@ -1529,7 +1543,12 @@ def decorate_session(
             )
 
 
-def decorate_sessions(names: list[str], code_hint: bool | None = None) -> list[str]:
+def decorate_sessions(
+    names: list[str],
+    code_hint: bool | None = None,
+    *,
+    nicks: Mapping[str, str] | None = None,
+) -> list[str]:
     """Decorate many sessions concurrently. Returns the names attempted.
 
     Each session is its own psmux server, so the round-trips per name
@@ -1540,6 +1559,9 @@ def decorate_sessions(names: list[str], code_hint: bool | None = None) -> list[s
     the answer is a property of this machine, not of a session, so a
     per-session ``shutil.which`` would be one filesystem sweep per name for
     one shared answer.
+
+    ``nicks`` maps a session name to its brand nick; a name it does not list
+    gets the plain brand.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1547,9 +1569,15 @@ def decorate_sessions(names: list[str], code_hint: bool | None = None) -> list[s
     if not binary or not names:
         return []
     hint = code_on_path() if code_hint is None else code_hint
+    brand = nicks or {}
     with ThreadPoolExecutor(max_workers=16) as pool:
         list(
-            pool.map(lambda n: decorate_session(n, psmux=binary, code_hint=hint), names)
+            pool.map(
+                lambda n: decorate_session(
+                    n, psmux=binary, code_hint=hint, nick=brand.get(n)
+                ),
+                names,
+            )
         )
     return list(names)
 
@@ -1612,7 +1640,10 @@ def _touch_decor_stamp() -> None:
 
 
 def decorate_sessions_async(
-    names: list[str], code_hint: bool | None = None
+    names: list[str],
+    code_hint: bool | None = None,
+    *,
+    nicks: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Fire the decoration commands and return WITHOUT waiting for any of them.
 
@@ -1637,6 +1668,8 @@ def decorate_sessions_async(
     pass ran less than ``DECOR_TTL_S`` ago, so attach's repeated status polls
     can't pile up hundreds of orphan processes against a wedged psmux server.
 
+    ``nicks`` maps a session name to its brand nick, as in ``decorate_sessions``.
+
     Returns the names it fired for (``[]`` when throttled or unable to run).
     """
     binary = find_psmux()
@@ -1645,11 +1678,12 @@ def decorate_sessions_async(
     if _decor_stamp_fresh():
         return []
     hint = code_on_path() if code_hint is None else code_hint
+    brand = nicks or {}
     log = get_logger("launch")
     fired: list[str] = []
     for name in names:
         try:
-            for cmd in decoration_argv(name, binary, hint):
+            for cmd in decoration_argv(name, binary, hint, nick=brand.get(name)):
                 subprocess.Popen(
                     cmd,
                     stdin=subprocess.DEVNULL,
@@ -1934,6 +1968,16 @@ _LATE_LIVE = (
 )
 
 
+# The reason for a ``resend=False`` window the creation verify found missing and
+# deliberately did NOT respawn (see ``launch_verified``).
+_NOT_RETYPED = (
+    "its command runs at most once per session (a cloud pane's `claude --cloud`"
+    " starts a new cloud session each time it is typed), and the first attempt"
+    " may already have typed it, so it was not re-created; check claude.ai/code,"
+    " then run `magent up` to try again"
+)
+
+
 def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str, str]:
     """Create ``windows`` through the platform, then prove each session exists.
 
@@ -1978,6 +2022,11 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str,
     session in the wave. A raise is now logged and falls through to the probe
     below, which is the component that already knows how to respawn what is
     missing and report what stayed down.
+
+    A window marked ``resend=False`` (a command that may run only once) is the
+    one exception to the respawn: it is never re-created, because the respawn
+    types the command again. When it is missing it is reported with that
+    reason instead (``_NOT_RETYPED``), exactly like a refusal.
 
     Returns the sessions still missing after the one retry, plus every name
     the platform refused, in input order, each mapped to why: the platform's
@@ -2044,6 +2093,22 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> dict[str,
     # t=0 would misclassify slow-but-fine servers on a loaded host.
     time.sleep(_CREATE_VERIFY_SETTLE_S)
     missing = _missing_sessions(names, binary)
+    # The respawn re-runs the launch path, which TYPES the command again. A
+    # window whose command may run only once (a cloud pane: each `claude
+    # --cloud` is a new, billed cloud session) is therefore never respawned,
+    # and "missing" cannot tell a session that never started from one that
+    # started, typed, and then wedged or died -- the first attempt may already
+    # have typed it. It is refused instead, and the next `magent up` is the
+    # user's informed retry.
+    once = {w.window_name for w in windows if not w.resend}
+    for n in missing:
+        if n in once and n not in refused:
+            refused[n] = _NOT_RETYPED
+            log.warning(
+                "%s is missing after bring-up and its command runs at most once;"
+                " not respawning it",
+                n,
+            )
     respawn = [n for n in missing if n not in refused]
     if not respawn:
         return _report(missing)
