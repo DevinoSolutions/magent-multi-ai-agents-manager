@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import hashlib
 import hmac
+import json
 import os
 import sys
 import tempfile
@@ -43,6 +44,10 @@ def _cloud_cfg(
         "cloudTask": "Fix the login bug",
     }
     entry.update(proj)
+    if entry["node"] is None:
+        # `node=None` asks for the SAME project as an ordinary local one: the
+        # keys are absent from the file (a JSON null is not a valid node).
+        entry = {k: v for k, v in entry.items() if k not in ("node", "cloudTask")}
     config: dict[str, object] = {"version": SCHEMA_VERSION, "projects": [entry]}
     if settings is not None:
         config["settings"] = settings
@@ -2659,3 +2664,836 @@ class TestTheGateNeverRaises:
         refusal = launch.cloud_refusal(cfg, "api") or ""
         assert "PermissionError" in refusal
         assert "someone" not in refusal and "denied" not in refusal
+
+
+# ---------------------------------------------------------------------------
+# J8: `magent up`, revive, the reaper and the session lists. Every path that
+# could TYPE `claude --cloud` into a pane is a path that starts a new billed
+# cloud session the CLI can neither list nor stop.
+# ---------------------------------------------------------------------------
+
+
+def _ide_twin_cfg(tmp_config, tmp_path: Path, *, cloud_first=False) -> str:
+    """An IDE project and a cloud one for the SAME folder: config allows it (an
+    IDE session and a pane are not twins), ``eligible_projects`` skips the IDE
+    one, and ``project_for_session`` -- which the gate asks -- does not."""
+    folder = tmp_path / "api"
+    folder.mkdir(exist_ok=True)
+    ide: dict[str, object] = {"path": str(folder), "tool": "code"}
+    cloud: dict[str, object] = {
+        "path": str(folder),
+        "node": "cloud",
+        "cloudTask": "Fix the login bug",
+    }
+    return tmp_config(
+        {
+            "version": SCHEMA_VERSION,
+            "settings": {"psmux": True},
+            "projects": [cloud, ide] if cloud_first else [ide, cloud],
+        }
+    )
+
+
+class TestTheCloudPaneIsAPsmuxSession:
+    def test_a_cloud_project_is_eligible_and_carries_the_cloud_command(
+        self, tmp_config, tmp_path
+    ):
+        [entry] = psmux.eligible_projects(load_config(_cloud_cfg(tmp_config, tmp_path)))
+        assert entry["cmd"] == 'claude --cloud "Fix the login bug"'
+        assert entry["node"] == "cloud"
+        assert "cmd_why" not in entry
+
+    @pytest.mark.parametrize(
+        ("proj", "settings", "said"),
+        [
+            ({"cloudTask": None}, None, launch.NO_CLOUD_TASK),
+            ({"tool": "codex"}, None, "'codex'"),
+            ({}, {"tools": {"claude": 'bash -c "claude --continue"'}}, "'bash'"),
+            ({}, {"tools": {"claude": r"C:\a&b\claude.exe"}}, "cannot type"),
+        ],
+        ids=["no-task", "another-tool", "wrapper", "untypeable-executable"],
+    )
+    def test_a_cloud_project_that_cannot_start_a_session_has_no_command_and_says_why(
+        self, tmp_config, tmp_path, proj, settings, said
+    ):
+        # Never `bash --cloud "t"`: an empty command is what every consumer
+        # (bring_up, revive, the status table) already reads as "nothing to run".
+        [entry] = psmux.eligible_projects(
+            load_config(_cloud_cfg(tmp_config, tmp_path, settings=settings, **proj))
+        )
+        assert entry["cmd"] == ""
+        assert said in str(entry["cmd_why"])
+        assert entry["node"] == "cloud"
+
+    def test_a_local_project_carries_no_node_and_no_reason(self, tmp_config, tmp_path):
+        [entry] = psmux.eligible_projects(
+            load_config(_cloud_cfg(tmp_config, tmp_path, node=None, cloudTask=None))
+        )
+        assert entry["node"] is None
+        assert "cmd_why" not in entry
+
+    def test_a_pool_project_is_still_not_a_local_psmux_session(
+        self, tmp_config, tmp_path
+    ):
+        (tmp_path / "api").mkdir()
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"nodes": {"second": {"host": "box-second"}}},
+                "projects": [{"path": str(tmp_path / "api"), "node": "second"}],
+            }
+        )
+        assert psmux.eligible_projects(load_config(path)) == []
+
+    def test_config_sessions_marks_the_cloud_row_and_only_that_one(
+        self, tmp_config, tmp_path
+    ):
+        [row] = psmux.config_sessions(_cloud_cfg(tmp_config, tmp_path))
+        assert row["node"] == "cloud"
+        [local] = psmux.config_sessions(
+            _cloud_cfg(tmp_config, tmp_path, node=None, cloudTask=None)
+        )
+        assert local["node"] is None
+
+
+class TestADownCloudPaneSaysWhy:
+    """``status`` shows a project that is never probed with the one thing that
+    keeps it from being probed; for a cloud pane "no agent command" would send
+    the user after the wrong setting."""
+
+    def _down(self, monkeypatch, path):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "live_sessions", lambda names, psmux=None, **kw: [])
+        _up, down, _all = psmux.psmux_status(load_config(path))
+        return down
+
+    def test_a_cloud_project_with_no_task_names_the_task(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        [entry] = self._down(
+            monkeypatch, _cloud_cfg(tmp_config, tmp_path, cloudTask=None)
+        )
+        assert entry["reason"] == launch.NO_CLOUD_TASK
+
+    def test_a_cloud_project_on_another_tool_names_the_tool(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        [entry] = self._down(
+            monkeypatch, _cloud_cfg(tmp_config, tmp_path, tool="codex")
+        )
+        assert "'codex'" in str(entry["reason"])
+        assert "no agent command" not in str(entry["reason"])
+
+    def test_a_missing_folder_is_still_named_first(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        [entry] = self._down(
+            monkeypatch, _cloud_cfg(tmp_config, tmp_path, path=str(tmp_path / "gone"))
+        )
+        assert entry["reason"] == "folder not found"
+
+    def test_a_local_project_keeps_the_wording_it_had(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        [entry] = self._down(
+            monkeypatch,
+            _cloud_cfg(tmp_config, tmp_path, node=None, cloudTask=None, tool="nosuch"),
+        )
+        assert entry["reason"] == "no agent command"
+
+
+class TestReviveNeverRetypesACloudPane:
+    """Revive types the pane's command into a pane at a shell. For a cloud pane
+    that is a SECOND `claude --cloud` (a new billed session), so it is vetoed
+    in every mode, with a reason, before anything is read or sent."""
+
+    @pytest.fixture
+    def sent(self, monkeypatch):
+        out: list[str] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "has_session", lambda *a, **k: True)
+        monkeypatch.setattr(psmux, "idle_sessions", lambda names, **k: set(names))
+        monkeypatch.setattr(
+            psmux, "send_keys", lambda sid, *a, **k: out.append(sid) or True
+        )
+        return out
+
+    def test_a_pane_at_a_shell_is_not_re_typed_and_the_reason_says_why(
+        self, sent, tmp_config, tmp_path
+    ):
+        why: dict[str, str] = {}
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+        assert psmux.revive_sessions(cfg, only=["api"], vetoed=why) == []
+        assert sent == []
+        assert "cloud" in why["api"] and "second cloud session" in why["api"]
+
+    def test_a_bulk_revive_has_the_same_veto(self, sent, tmp_config, tmp_path):
+        why: dict[str, str] = {}
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+        assert psmux.revive_sessions(cfg, vetoed=why) == []
+        assert sent == [] and "cloud" in why["api"]
+
+    def test_a_human_asking_for_a_parked_pane_back_is_vetoed_too(
+        self, sent, tmp_config, tmp_path
+    ):
+        why: dict[str, str] = {}
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+        revived = psmux.revive_sessions(
+            cfg, only=["api"], resume_parked=True, vetoed=why
+        )
+        assert revived == [] and sent == []
+        assert "cloud" in why["api"]
+
+    def test_the_cloud_reason_beats_a_missing_command(self, sent, tmp_config, tmp_path):
+        why: dict[str, str] = {}
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path, cloudTask=None))
+        assert psmux.revive_sessions(cfg, only=["api"], vetoed=why) == []
+        assert "cloud" in why["api"] and "no command" not in why["api"]
+
+    def test_the_same_project_as_a_local_one_is_still_revived(
+        self, sent, tmp_config, tmp_path
+    ):
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path, node=None, cloudTask=None))
+        assert psmux.revive_sessions(cfg, only=["api"]) == ["api"]
+        assert sent == ["api"]
+
+    def test_status_prints_the_reason_for_r_n(
+        self, sent, monkeypatch, capsys, tmp_config, tmp_path
+    ):
+        from pathlib import Path
+
+        from magent.cli import status as status_mod
+
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+        monkeypatch.setattr(status_mod, "_load_config_or_exit", lambda path: cfg)
+        status_mod._revive_session(Path("unused.json"), "api")
+        out = capsys.readouterr().out
+        assert "Did not revive api: a cloud pane is never re-typed" in out
+        assert "Revived" not in out and sent == []
+
+    def _up_with_a_live_cloud_pane(self, runner, monkeypatch, cfg_path, *args):
+        from magent import cli
+
+        row = {
+            "name": "api",
+            "session": "api",
+            "path": "x",
+            "tool": "claude",
+            "group": None,
+            "resolved": "x",
+            "cmd": 'claude --cloud "t"',
+            "node": "cloud",
+        }
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: ([{"session": "api", "name": "api"}], [], [row]),
+        )
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions_async", lambda *a, **k: []
+        )
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
+        return runner.invoke(cli.main, ["--config", cfg_path, "up", *args])
+
+    def test_up_json_revive_types_nothing_into_a_live_cloud_pane(
+        self, sent, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        cfg = _cloud_cfg(tmp_config, tmp_path)
+        result = self._up_with_a_live_cloud_pane(
+            runner, monkeypatch, cfg, "--json", "--revive"
+        )
+        assert json.loads(result.stdout)["revived"] == []
+        assert sent == []
+
+    def test_interactive_up_types_nothing_into_a_live_cloud_pane(
+        self, sent, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        # The interactive path revives unconditionally (no flag to opt out of).
+        cfg = _cloud_cfg(tmp_config, tmp_path, settings={"uploadServer": False})
+        result = self._up_with_a_live_cloud_pane(runner, monkeypatch, cfg)
+        assert result.exit_code == 0
+        assert sent == [] and "Revived" not in result.output
+
+
+class TestTheIdleReaperNeverParksACloudPane:
+    @pytest.fixture(autouse=True)
+    def _every_session_is_live(self, monkeypatch):
+        monkeypatch.setattr(
+            psmux, "live_sessions", lambda names, psmux=None, **kw: list(names)
+        )
+        monkeypatch.setattr(psmux, "pane_trees", lambda names, **kw: {})
+
+    def test_a_live_cloud_pane_is_out_of_scope(self, tmp_config, tmp_path):
+        # Parking a pane is `--resume <id>` later; a cloud pane has no local
+        # conversation, and its VM is not what the reaper measures.
+        from magent import reap
+        from magent.sessions import AGENT_TOOLS
+
+        cloud = load_config(_cloud_cfg(tmp_config, tmp_path))
+        assert reap._scope(cloud, tools=AGENT_TOOLS, psmux_bin="psmux") == ([], {})
+        # The control: the same project as a local one IS in scope (claude has
+        # an idle probe).
+        local = load_config(_cloud_cfg(tmp_config, tmp_path, node=None, cloudTask=None))
+        scoped, _ = reap._scope(local, tools=AGENT_TOOLS, psmux_bin="psmux")
+        assert [r["session"] for r in scoped] == ["api"]
+
+    def test_the_sweep_and_the_just_before_the_stop_recheck_never_see_it(
+        self, tmp_config, tmp_path
+    ):
+        # `gather` picks who to park and `_read_one` re-reads ONE session right
+        # before the stop: both go through `_scope`.
+        from magent import reap
+        from magent.sessions import AGENT_TOOLS
+
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+        kw = {
+            "tools": AGENT_TOOLS,
+            "config_dir": None,
+            "now": 1.0,
+            "psmux_bin": "psmux",
+        }
+        assert reap.gather(cfg, **kw).rows == {}
+        assert reap._read_one(cfg, "api", **kw) is None
+
+
+class TestBringUpGatesTheCloudCreate:
+    def _run(
+        self,
+        monkeypatch,
+        fake_platform,
+        cfg_path,
+        *,
+        refusal=None,
+        live=False,
+        only=None,
+        failed=None,
+    ):
+        windows: list[psmux.PsmuxWindowOpts] = []
+        asked: list[str] = []
+        probed: list[list[str]] = []
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fake_platform)
+        monkeypatch.setattr(
+            "magent.launch.cloud_refusal",
+            lambda config, sid: (asked.append(sid), refusal)[1],
+        )
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        # THE liveness answer, asked once for every cloud project.
+        monkeypatch.setattr(
+            psmux,
+            "live_sessions",
+            lambda names, psmux=None, **kw: (
+                probed.append(list(names)),
+                list(names) if live else [],
+            )[1],
+        )
+        monkeypatch.setattr(
+            psmux,
+            "launch_verified",
+            lambda plat, wins: (windows.extend(wins), dict(failed or {}))[1],
+        )
+        result = psmux.bring_up(load_config(cfg_path), only=only)
+        return result, windows, asked, probed
+
+    def test_a_refused_cloud_create_is_a_failure_with_its_reason(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        result, windows, _, _ = self._run(
+            monkeypatch,
+            fake_platform,
+            _cloud_cfg(tmp_config, tmp_path),
+            refusal="main is dirty",
+        )
+        assert (result, windows) == (([], {"api": "main is dirty"}), [])
+
+    def test_an_accepted_cloud_create_is_typed_once_and_branded(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        (up, failed), [w], asked, _ = self._run(
+            monkeypatch, fake_platform, _cloud_cfg(tmp_config, tmp_path)
+        )
+        assert (up, failed, asked) == (["api"], {}, ["api"])
+        assert (w.command, w.resend, w.nick) == (
+            'claude --cloud "Fix the login bug"',
+            False,
+            "cloud",
+        )
+
+    def test_a_live_cloud_session_is_left_to_launch_verified_ungated(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        (_, failed), windows, asked, _ = self._run(
+            monkeypatch,
+            fake_platform,
+            _cloud_cfg(tmp_config, tmp_path),
+            refusal="dirty",
+            live=True,
+        )
+        assert (failed, len(windows), asked) == ({}, 1, [])
+
+    def test_a_local_project_never_asks_the_gate_or_the_liveness_seam(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        (up, failed), [w], asked, probed = self._run(
+            monkeypatch,
+            fake_platform,
+            _cloud_cfg(tmp_config, tmp_path, node=None, cloudTask=None),
+        )
+        assert (up, failed, asked, probed) == (["api"], {}, [], [])
+        assert (w.resend, w.nick) == (True, None)
+
+    def test_a_project_outside_only_is_not_gated_or_probed(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        result, windows, asked, probed = self._run(
+            monkeypatch,
+            fake_platform,
+            _cloud_cfg(tmp_config, tmp_path),
+            refusal="dirty",
+            only=["web"],
+        )
+        assert (result, windows, asked, probed) == (([], {}), [], [], [])
+
+    def test_a_refusal_rides_beside_launch_verifieds_own_casualties(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        (tmp_path / "api").mkdir()
+        (tmp_path / "web").mkdir()
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "projects": [
+                    {
+                        "path": str(tmp_path / "api"),
+                        "node": "cloud",
+                        "cloudTask": "Fix the login bug",
+                    },
+                    {"path": str(tmp_path / "web")},
+                ],
+            }
+        )
+        (up, failed), windows, _, _ = self._run(
+            monkeypatch,
+            fake_platform,
+            path,
+            refusal="main is dirty",
+            failed={"web": "psmux said no"},
+        )
+        assert up == []
+        assert failed == {"web": "psmux said no", "api": "main is dirty"}
+        assert [w.window_name for w in windows] == ["web"]
+
+    def test_a_cloud_project_with_no_task_is_refused_by_name(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fake_platform)
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "live_sessions", lambda names, psmux=None, **kw: [])
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path, cloudTask=None))
+        up, failed = psmux.bring_up(cfg)
+        assert up == [] and failed == {"api": launch.NO_CLOUD_TASK}
+        assert fake_platform.psmux_launches == []
+
+    @pytest.mark.parametrize(
+        ("proj", "settings", "said"),
+        [
+            ({"tool": "codex"}, None, "'codex'"),
+            ({}, {"tools": {"claude": 'bash -c "claude --continue"'}}, "'bash'"),
+        ],
+        ids=["another-tool", "wrapper"],
+    )
+    def test_a_cloud_project_on_the_wrong_tool_is_refused_not_typed_as_bash(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, proj, settings, said
+    ):
+        # The REAL gate answers: tool first, before any git is read.
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fake_platform)
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "live_sessions", lambda names, psmux=None, **kw: [])
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path, settings=settings, **proj))
+        up, failed = psmux.bring_up(cfg)
+        assert up == [] and said in failed["api"]
+        assert fake_platform.psmux_launches == []
+
+    def test_an_executable_it_cannot_type_is_refused_by_name_not_skipped(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        # Tool and task pass the gate; the command still cannot be built.
+        path = _cloud_cfg(
+            tmp_config,
+            tmp_path,
+            settings={"tools": {"claude": r"C:\a&b\claude.exe"}},
+        )
+        (up, failed), windows, _, _ = self._run(monkeypatch, fake_platform, path)
+        assert (up, windows) == ([], [])
+        assert "cannot type" in failed["api"]
+
+    def test_a_live_pane_with_no_command_is_not_called_a_failure(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        (up, failed), windows, _, _ = self._run(
+            monkeypatch,
+            fake_platform,
+            _cloud_cfg(tmp_config, tmp_path, cloudTask=None),
+            live=True,
+        )
+        assert (up, failed, windows) == ([], {}, [])
+
+    def test_a_refusal_reaches_the_printed_casualty_list(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys
+    ):
+        # launch.bring_up_psmux merges the dict and report_bring_up_casualties
+        # prints each reason: nothing else carries it.
+        (_, failed), _, _, _ = self._run(
+            monkeypatch,
+            fake_platform,
+            _cloud_cfg(tmp_config, tmp_path),
+            refusal="main is dirty",
+        )
+        launch.report_bring_up_casualties(failed)
+        out = capsys.readouterr().out
+        assert "failed to come up: api" in out and "main is dirty" in out
+
+
+class TestBringUpNeverCreatesACloudPaneOnAnotherProjectsGate:
+    """The gate is asked by session name and reads the FIRST enabled project
+    with it. ``eligible_projects`` skips an IDE project, so an IDE project
+    listed ahead of a cloud one for the same folder makes the gate read the
+    IDE project (not cloud: it waves it through) while the pane being created
+    is the cloud one: the git and .env checks would be skipped."""
+
+    def _run(self, monkeypatch, fake_platform, path, *, live=False):
+        windows: list[psmux.PsmuxWindowOpts] = []
+        asked: list[str] = []
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fake_platform)
+        monkeypatch.setattr(
+            "magent.launch.cloud_refusal",
+            lambda config, sid: (asked.append(sid), None)[1],
+        )
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux,
+            "live_sessions",
+            lambda names, psmux=None, **kw: list(names) if live else [],
+        )
+        monkeypatch.setattr(
+            psmux, "launch_verified", lambda plat, wins: (windows.extend(wins), {})[1]
+        )
+        return psmux.bring_up(load_config(path)), windows, asked
+
+    def test_the_cloud_twin_of_an_ide_project_is_refused_by_name(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        path = _ide_twin_cfg(tmp_config, tmp_path)
+        (up, failed), windows, asked = self._run(monkeypatch, fake_platform, path)
+        assert (up, windows, asked) == ([], [], [])
+        assert failed == {"api": launch.twin_session_refusal("api")}
+
+    def test_the_refusal_is_the_one_the_launch_path_prints(self):
+        assert launch.twin_session_refusal("api") == (
+            "another enabled project uses the session name api;"
+            " rename one (set a title)"
+        )
+
+    def test_the_first_project_with_the_name_is_gated_and_created(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        path = _ide_twin_cfg(tmp_config, tmp_path, cloud_first=True)
+        (up, failed), [w], asked = self._run(monkeypatch, fake_platform, path)
+        assert (up, failed, asked) == (["api"], {}, ["api"])
+        assert (w.resend, w.nick) == (False, "cloud")
+
+    def test_a_live_session_is_never_refused_for_its_name(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        # Nothing is created for a live session, so there is nothing to refuse.
+        path = _ide_twin_cfg(tmp_config, tmp_path)
+        (_, failed), _, asked = self._run(monkeypatch, fake_platform, path, live=True)
+        assert (failed, asked) == ({}, [])
+
+    def test_a_local_twin_listed_first_owns_the_pane_and_it_is_not_cloud(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        # `eligible_projects` keeps the first of two projects with one name:
+        # the local one, so no cloud command is typed and no gate is asked.
+        path = _twin_cfg(tmp_config, tmp_path)
+        (up, failed), [w], asked = self._run(monkeypatch, fake_platform, path)
+        assert (up, failed, asked) == (["api"], {}, [])
+        assert (w.resend, w.nick) == (True, None)
+        assert "--cloud" not in w.command
+
+
+class TestUpReportsACloudRefusal:
+    """Both bring-up surfaces print a refused create under the casualty line:
+    nothing about a refusal is silent."""
+
+    def _setup(self, monkeypatch, fake_platform, tmp_config, tmp_path):
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fake_platform)
+        monkeypatch.setattr(
+            "magent.launch.cloud_refusal", lambda config, sid: "main is dirty"
+        )
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "live_sessions", lambda names, psmux=None, **kw: [])
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
+        return _cloud_cfg(tmp_config, tmp_path, settings={"uploadServer": False})
+
+    def test_magent_up(self, runner, monkeypatch, fake_platform, tmp_config, tmp_path):
+        from magent import cli
+
+        cfg = self._setup(monkeypatch, fake_platform, tmp_config, tmp_path)
+        result = runner.invoke(cli.main, ["--config", cfg, "up"])
+        assert "failed to come up: api" in result.output
+        assert "main is dirty" in result.output
+        assert fake_platform.psmux_launches == []
+
+    def test_the_status_menus_bring_up(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys
+    ):
+        from pathlib import Path
+
+        import click
+
+        from magent.cli import status as status_mod
+
+        cfg = self._setup(monkeypatch, fake_platform, tmp_config, tmp_path)
+        monkeypatch.setattr(click, "prompt", lambda *a, **k: "a")
+        monkeypatch.setattr(click, "pause", lambda *a, **k: None)
+        status_mod._menu_up(Path(cfg))
+        out = capsys.readouterr().out
+        assert "failed to come up: api" in out and "main is dirty" in out
+        assert fake_platform.psmux_launches == []
+
+
+class TestAnOnceOnlyPaneTheVerifyFoundLateIsNotToldToBeRevived:
+    """A refused ``new-session`` the verify then finds live gets
+    ``_LATE_LIVE``: "run `magent up` to revive it". For a cloud pane that is
+    wrong twice: revive never re-types one (vetoed), and an `up` that finds the
+    session live creates nothing. The advice that works is down, then up."""
+
+    def _verify(self, monkeypatch, window):
+        from tests.conftest import FakePlatform
+
+        why = "psmux new-session for api gave no answer within 60s"
+        fp = FakePlatform(supports_psmux=True)
+
+        def _launch(windows):
+            fp.psmux_sessions.update(w.window_name for w in windows)
+            return {w.window_name: why for w in windows}
+
+        monkeypatch.setattr(fp, "launch_psmux_session", _launch)
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr("magent.psmux.time.sleep", lambda s: None)
+        monkeypatch.setattr(
+            psmux,
+            "has_session",
+            lambda name, psmux=None, timeout=None: name in fp.psmux_sessions,
+        )
+        return why, psmux.launch_verified(fp, [window])
+
+    @staticmethod
+    def _win(**kw):
+        return psmux.PsmuxWindowOpts(
+            window_name="api", cwd="/a/api", command="claude", **kw
+        )
+
+    def test_a_cloud_pane_is_told_to_take_it_down_first(self, monkeypatch):
+        why, failed = self._verify(monkeypatch, self._win(resend=False, nick="cloud"))
+        text = failed["api"]
+        assert text.startswith(why)
+        assert "revive" not in text
+        assert "`magent down api`" in text and "`magent up`" in text
+        assert "claude.ai/code" in text
+        assert text.isascii()
+
+    def test_an_ordinary_pane_keeps_the_advice_it_had(self, monkeypatch):
+        why, failed = self._verify(monkeypatch, self._win())
+        assert failed == {"api": why + psmux._LATE_LIVE}
+
+    def test_the_missing_pane_advice_still_reads_right(self):
+        # Missing is not live: `magent up` runs the gate and creates it, which
+        # is exactly what this text asks for, after the user checked the site.
+        assert "claude.ai/code" in psmux._NOT_RETYPED
+        assert "`magent up`" in psmux._NOT_RETYPED
+        assert "revive" not in psmux._NOT_RETYPED
+
+
+class TestUpJsonCarriesTheNode:
+    def test_the_projects_list_names_the_cloud_node(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        from magent import cli
+
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        result = runner.invoke(
+            cli.main, ["--config", _cloud_cfg(tmp_config, tmp_path), "up", "--json"]
+        )
+        [proj] = json.loads(result.stdout)["projects"]
+        assert proj["node"] == "cloud"
+
+    def test_a_local_project_says_none(self, runner, monkeypatch, tmp_config, tmp_path):
+        from magent import cli
+
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        path = _cloud_cfg(tmp_config, tmp_path, node=None, cloudTask=None)
+        result = runner.invoke(cli.main, ["--config", path, "up", "--json"])
+        [proj] = json.loads(result.stdout)["projects"]
+        assert proj["node"] is None
+
+
+_ROW = {
+    "name": "api",
+    "session": "api",
+    "path": "x",
+    "tool": "claude",
+    "group": None,
+    "resolved": "x",
+    "cmd": "c",
+}
+
+
+class TestUpBrandsAFreshCloudPaneAtCloud:
+    """The status line is re-decorated by `up` on every live session and on
+    every session just created. A decoration without the nick would overwrite
+    the `@cloud` brand with the plain one."""
+
+    def _json(self, runner, monkeypatch, cfg_path, rows):
+        from magent import cli
+
+        seen: list[tuple[list[str], dict[str, str]]] = []
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: (
+                [{"session": r["session"], "name": r["name"]} for r in rows],
+                [],
+                rows,
+            ),
+        )
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions_async",
+            lambda names, **kw: (
+                seen.append((list(names), kw.get("nicks", {}))) or list(names)
+            ),
+        )
+        runner.invoke(cli.main, ["--config", cfg_path, "up", "--json"])
+        return seen
+
+    def _interactive(self, runner, monkeypatch, cfg_path, rows, *, up, down, created):
+        from magent import cli
+
+        seen: list[tuple[list[str], dict[str, str]]] = []
+        monkeypatch.setattr(
+            "magent.launch.psmux_status", lambda cfg, group=None: (up, down, rows)
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "magent.launch.bring_up_psmux", lambda *a, **k: (list(created), {})
+        )
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions",
+            lambda names, **kw: (
+                seen.append((list(names), kw.get("nicks", {}))) or list(names)
+            ),
+        )
+        runner.invoke(cli.main, ["--config", cfg_path, "up"])
+        return seen
+
+    def test_a_live_cloud_session_is_redecorated_with_its_nick(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        row = {**_ROW, "node": "cloud"}
+        path = _cloud_cfg(tmp_config, tmp_path)
+        assert self._json(runner, monkeypatch, path, [row]) == [
+            (["api"], {"api": "cloud"})
+        ]
+
+    def test_only_the_cloud_session_of_a_mixed_fleet_is_nicked(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        rows = [
+            {**_ROW, "node": "cloud"},
+            {**_ROW, "name": "web", "session": "web", "node": None},
+        ]
+        path = _cloud_cfg(tmp_config, tmp_path)
+        assert self._json(runner, monkeypatch, path, rows) == [
+            (["api", "web"], {"api": "cloud"})
+        ]
+
+    def test_without_a_cloud_project_the_call_is_the_positional_one_it_was(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        # The existing tests fake these wrappers as `lambda names: names`, so
+        # a `nicks=` keyword must not be passed when there is nothing to brand.
+        from magent import cli
+
+        seen: list[list[str]] = []
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: (
+                [{"session": "api", "name": "api"}],
+                [],
+                [{**_ROW, "node": None}],
+            ),
+        )
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions_async",
+            lambda names: seen.append(list(names)) or list(names),
+        )
+        path = _cloud_cfg(tmp_config, tmp_path, node=None, cloudTask=None)
+        runner.invoke(cli.main, ["--config", path, "up", "--json"])
+        assert seen == [["api"]]
+
+    def test_the_interactive_decoration_of_a_live_cloud_session_is_nicked(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        path = _cloud_cfg(tmp_config, tmp_path, settings={"uploadServer": False})
+        seen = self._interactive(
+            runner,
+            monkeypatch,
+            path,
+            [{**_ROW, "node": "cloud"}],
+            up=[{"session": "api", "name": "api"}],
+            down=[],
+            created=[],
+        )
+        assert seen == [(["api"], {"api": "cloud"})]
+
+    def test_the_interactive_decoration_of_a_session_just_created_is_nicked(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        path = _cloud_cfg(tmp_config, tmp_path, settings={"uploadServer": False})
+        seen = self._interactive(
+            runner,
+            monkeypatch,
+            path,
+            [{**_ROW, "node": "cloud"}],
+            up=[],
+            down=[{"session": "api", "name": "api"}],
+            created=["api"],
+        )
+        assert seen == [(["api"], {"api": "cloud"})]
+
+    def test_the_interactive_call_without_a_cloud_project_is_positional(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        from magent import cli
+
+        seen: list[list[str]] = []
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: (
+                [{"session": "api", "name": "api"}],
+                [],
+                [{**_ROW, "node": None}],
+            ),
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions",
+            lambda names: seen.append(list(names)) or list(names),
+        )
+        path = _cloud_cfg(
+            tmp_config,
+            tmp_path,
+            node=None,
+            cloudTask=None,
+            settings={"uploadServer": False},
+        )
+        runner.invoke(cli.main, ["--config", path, "up"])
+        assert seen == [["api"]]

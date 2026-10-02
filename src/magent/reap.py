@@ -450,13 +450,16 @@ def _signals_for(
 def _scope(
     cfg: config.MagentConfig, *, tools: Mapping[str, AgentTool], psmux_bin: str | None
 ) -> tuple[list[dict[str, object]], dict[str, int]]:
-    """The in-scope eligible rows (local, live, non-IDE, tool has a probe) and
-    the per-directory live-session counts for R3, both from ONE eligible read."""
+    """The in-scope eligible rows (local, not cloud, live, non-IDE, tool has a
+    probe) and the per-directory live-session counts for R3, both from ONE
+    eligible read."""
     from magent import psmux
     from magent.sessions import is_ide_tool
 
     eligible = psmux.eligible_projects(cfg)
-    local = [r for r in eligible if r["resolved"]]
+    # A cloud pane has no local conversation to park (and `--resume` would be a
+    # second billed cloud session), so it is out of the live-session counts too.
+    local = [r for r in eligible if r["resolved"] and r.get("node") != "cloud"]
     live = psmux.live_sessions([str(r["session"]) for r in local], psmux=psmux_bin)
     live_rows = [r for r in local if r["session"] in live]
     counts: dict[str, int] = {}

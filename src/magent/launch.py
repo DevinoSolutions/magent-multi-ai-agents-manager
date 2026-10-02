@@ -1444,6 +1444,17 @@ def cloud_session_ids(config: MagentConfig) -> set[str]:
     return {nodes.node_sid(p) for p in config.projects if is_cloud(p)}
 
 
+def twin_session_refusal(sid: str) -> str:
+    """Why a cloud pane cannot be created under session name ``sid`` when the
+    gate would read ANOTHER project: the gate answers by name for the first
+    enabled project that owns it, and creating on that answer would skip the
+    cloud project's own git and ``.env`` checks. The one wording both create
+    paths (``--go`` and ``up``) refuse with."""
+    return (
+        f"another enabled project uses the session name {sid}; rename one (set a title)"
+    )
+
+
 def cloud_refusal(config: MagentConfig, sid: str) -> str | None:
     """Why the cloud session for ``sid`` must NOT be created now, or None.
 
@@ -1904,10 +1915,7 @@ def _dispatch_cloud_project(
     # rather than create ungated. The other project's own dispatch already
     # tiles and re-attaches that session.
     if project_for_session(config, tile_key) != proj:
-        click.echo(
-            f"SKIP: {title} — another enabled project uses the session name"
-            f" {tile_key}; rename one (set a title)"
-        )
+        click.echo(f"SKIP: {title} — {twin_session_refusal(tile_key)}")
         return 0
     # An entry identical to one already handled (the twin check compares by
     # value, so it passes both) must not queue a second `claude --cloud` under
