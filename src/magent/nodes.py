@@ -3716,9 +3716,12 @@ def cloud_git_refusal(state: LocalGitState) -> str | None:
 # Horizontal whitespace only (`[ \t]`, not `\s`): `^\s*` would swallow a whole
 # run of blank lines from every line start, quadratic on a file that is mostly
 # blank. The names found are the same, since a name sits on its own line.
-_DOTENV_NAME = re.compile(
-    r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=", re.MULTILINE
-)
+# ONE grammar for a ``NAME=`` line, in two shapes below: ``_DOTENV_NAME`` scans
+# a whole file for the names, ``_DOTENV_LINE`` parses one line for its value
+# too. Built from one fragment so the two cannot drift.
+_DOTENV_HEAD = r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*="
+_DOTENV_NAME = re.compile(_DOTENV_HEAD, re.MULTILINE)
+_DOTENV_LINE = re.compile(_DOTENV_HEAD + r"[ \t]*(.*)$")
 
 
 def _dotenv_text(path: Path) -> str:
@@ -4143,3 +4146,80 @@ def cloud_env_refusal(
         f"the push set ({what}) has not reached the cloud since it last "
         f"changed; run: magent node push {name}"
     )
+
+
+def masked_lines(ps: CloudPushSet) -> list[str]:
+    """``NAME  ******** (n chars)`` per variable, sorted by name, for the
+    terminal (spec §18.11c): a length, never a value.
+
+    An env file that cannot be read is listed after them as ``<path>  (could
+    not be read)`` -- by its project-relative path, never skipped: the user
+    would paste an environment that silently lacks it."""
+    lengths: dict[str, int] = {}
+    unreadable: list[str] = []
+    for path in ps.env_files:
+        try:
+            text = _dotenv_text(path)
+        except OSError:
+            unreadable.append(f"{ps.rel(path)}  (could not be read)")
+            continue
+        for line in text.splitlines():
+            match = _DOTENV_LINE.match(line)
+            if match:
+                lengths[match.group(1)] = len(match.group(2).strip().strip("\"'"))
+    shown = [f"{name}  ******** ({lengths[name]} chars)" for name in sorted(lengths)]
+    return shown + unreadable
+
+
+def write_private_temp(text: str, *, prefix: str, suffix: str = ".txt") -> Path:
+    """``text`` in a fresh temp file only this user can read, as UTF-8 with LF
+    endings. ``mkstemp`` makes it 0600 on POSIX (chmod'd again before the text
+    goes in, as ``_digest_key`` does, because an ACL-bearing temp dir can widen
+    a creation mode); on Windows it inherits the per-user %TEMP% ACL [A].
+
+    A failure part-way deletes the file before it is re-raised: a half-written
+    secret must not outlive the error that interrupted it."""
+    fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix)
+    path = Path(name)
+    try:
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+        try:
+            fh = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            # fdopen never took the descriptor: close it, or the file stays
+            # open (and, on Windows, undeletable) behind the error.
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+        with fh:
+            fh.write(text)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise
+    return path
+
+
+def write_manual_handoff(ps: CloudPushSet) -> Path:
+    """Every ``.env*`` file's text, decoded and verbatim, in ONE private temp
+    file for pasting into the environment dialog. The caller deletes it on
+    confirm.
+
+    PushSetUnreadable (an OSError: the file's project-relative label and the
+    error's class, as ``push_set_digest`` raises it) when an env file cannot be
+    read -- before any temp file exists, so a refused hand-off leaves nothing
+    behind and is never pasted as if whole."""
+    parts = [
+        "# magent: paste into claude.ai/code > environment settings > Environment variables\n",
+        "# Only these variables travel: untracked files never reach a cloud session.\n",
+    ]
+    for path in ps.env_files:
+        label = ps.rel(path)
+        try:
+            text = _dotenv_text(path)
+        except OSError as exc:
+            raise PushSetUnreadable(label, type(exc).__name__) from exc
+        parts.append(f"# from {label}\n")
+        parts.append(text.rstrip("\n") + "\n")
+    return write_private_temp("".join(parts), prefix="magent-cloud-env-", suffix=".env")
