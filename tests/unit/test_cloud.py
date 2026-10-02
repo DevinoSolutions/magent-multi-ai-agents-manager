@@ -75,6 +75,50 @@ class TestACloudProjectIsValidatedAtLoad:
             load_config(_cloud_cfg(tmp_config, tmp_path, cloudTask=task))
 
     @pytest.mark.parametrize(
+        "task",
+        [
+            "a\nb",  # a line break mid-text would end the typed command
+            "abc\n",  # ... and a trailing one must not slip past a `$` anchor
+            "a\r",
+            "a\tb",
+            "caf" + chr(0xE9),  # the charset is ASCII: a non-ASCII letter is refused
+            chr(0xFF41),  # full-width "a" looks like a letter and is not one
+        ],
+    )
+    def test_a_control_character_or_a_non_ascii_letter_is_refused(
+        self, tmp_config, tmp_path, task
+    ):
+        # Pins the match as a FULL match over an ASCII charset: a switch to
+        # `re.match(... $)` (which lets a trailing newline through) or to `\w`
+        # (which admits Unicode letters) fails here.
+        with pytest.raises(ConfigError, match=r"cloudTask must be"):
+            load_config(_cloud_cfg(tmp_config, tmp_path, cloudTask=task))
+
+    @pytest.mark.parametrize("task", ["-", " a", ".a", "_a", "/a", ":a", ",a"])
+    def test_a_task_must_start_with_a_letter_or_a_digit(
+        self, tmp_config, tmp_path, task
+    ):
+        # By design (a leading '-' reads as a flag); the others are refused
+        # with it rather than guessed at.
+        with pytest.raises(ConfigError, match=r"cloudTask must be"):
+            load_config(_cloud_cfg(tmp_config, tmp_path, cloudTask=task))
+
+    @pytest.mark.parametrize(
+        "task",
+        [
+            "Fix a/b: x, y.z_w-1",  # one of everything the charset admits
+            "a",  # the minimum length
+            "7",  # a digit may start a task
+            "a--b",  # '-' is only barred at the start
+            "a ",  # trailing space is plain charset
+            "Refactor the session_store module",  # mentions an id prefix mid-text
+        ],
+    )
+    def test_the_whole_allowed_charset_loads(self, tmp_config, tmp_path, task):
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path, cloudTask=task))
+        assert cfg.projects[0].cloud_task == task
+
+    @pytest.mark.parametrize(
         "task", ["session_01ABCdef", "cse_9zz", "https://claude.ai/code/session_1"]
     )
     def test_a_task_that_looks_like_a_session_id_or_url_is_refused(
@@ -91,9 +135,45 @@ class TestACloudProjectIsValidatedAtLoad:
         with pytest.raises(ConfigError, match=r"cloudTask must be"):
             load_config(_cloud_cfg(tmp_config, tmp_path, cloudTask="a" * 201))
 
-    def test_a_cloud_project_must_run_claude(self, tmp_config, tmp_path):
-        with pytest.raises(ConfigError, match="runs Claude Code"):
-            load_config(_cloud_cfg(tmp_config, tmp_path, tool="codex"))
+    def test_a_cloud_project_with_another_tool_still_loads_and_warns(
+        self, tmp_config, tmp_path, capsys
+    ):
+        # Never break a config that already loads: one such project would
+        # otherwise fail every command. J7's create gate refuses it instead.
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path, tool="codex"))
+        assert cfg.projects[0].tool == "codex"
+        err = capsys.readouterr().err
+        assert "projects[0] is a cloud project but its tool is 'codex'" in err
+        assert "until the tool is claude" in err
+
+    def test_a_cloud_project_inheriting_another_default_tool_warns(
+        self, tmp_config, tmp_path, capsys
+    ):
+        project_dir = tmp_path / "api"
+        project_dir.mkdir(exist_ok=True)
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"defaultTool": "codex"},
+                "projects": [{"path": str(project_dir), "node": "cloud"}],
+            }
+        )
+        cfg = load_config(path)
+        assert cfg.projects[0].tool is None
+        assert "projects[0] is a cloud project but its tool is 'codex'" in (
+            capsys.readouterr().err
+        )
+
+    def test_a_cloud_project_running_claude_does_not_warn_about_its_tool(
+        self, tmp_config, tmp_path, capsys
+    ):
+        load_config(_cloud_cfg(tmp_config, tmp_path, tool="claude"))
+        assert capsys.readouterr().err == ""
+
+    def test_a_bad_task_is_still_refused_on_another_tool(self, tmp_config, tmp_path):
+        # The tool is a warning; the shell-unsafe task stays a hard error.
+        with pytest.raises(ConfigError, match=r"cloudTask must be"):
+            load_config(_cloud_cfg(tmp_config, tmp_path, tool="codex", cloudTask="a;b"))
 
     def test_windows_and_happy_on_a_cloud_project_warn_and_are_ignored(
         self, tmp_config, tmp_path, capsys
@@ -102,6 +182,12 @@ class TestACloudProjectIsValidatedAtLoad:
         err = capsys.readouterr().err
         assert "projects[0].windows is ignored on a cloud project" in err
         assert "projects[0].happy is ignored on a cloud project" in err
+
+    def test_an_explicit_happy_false_on_a_cloud_project_is_a_no_op_and_silent(
+        self, tmp_config, tmp_path, capsys
+    ):
+        load_config(_cloud_cfg(tmp_config, tmp_path, happy=False))
+        assert capsys.readouterr().err == ""
 
     def test_a_cloud_task_on_a_project_that_is_not_cloud_warns(
         self, tmp_config, tmp_path, capsys
@@ -151,6 +237,13 @@ def test_the_config_reference_documents_cloud_task():
     from magent.cli.docs import _PROJECT_FIELD_DOCS
 
     assert "cloudTask" in {row[0] for row in _PROJECT_FIELD_DOCS}
+
+
+def test_the_cloud_task_row_says_a_cloud_project_runs_claude():
+    from magent.cli.docs import _PROJECT_FIELD_DOCS
+
+    row = next(row for row in _PROJECT_FIELD_DOCS if row[0] == "cloudTask")
+    assert "claude" in row[3]
 
 
 def test_the_node_row_no_longer_calls_cloud_reserved():

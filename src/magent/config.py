@@ -878,8 +878,10 @@ CLOUD_ID_LIKE = re.compile(r"^(?:session_|cse_)|://")
 def _check_cloud_projects(projects: list[ProjectConfig], default_tool: str) -> None:
     """Spec §18.1: a cloud project runs claude, and a task it names is safe.
 
-    A cloud project with NO task still loads (the nodes release accepted that
-    config); ``launch.cloud_refusal`` refuses to create its session."""
+    Only a task that is unsafe to type into a shell is a hard error. A cloud
+    project with NO task, or whose tool is not claude, still loads (configs the
+    nodes release accepted must keep loading) and ``launch.cloud_refusal``
+    refuses to create its session."""
     for i, proj in enumerate(projects):
         label = f"projects[{i}]"
         if not is_cloud(proj):
@@ -891,8 +893,11 @@ def _check_cloud_projects(projects: list[ProjectConfig], default_tool: str) -> N
             continue
         tool = proj.tool or default_tool
         if tool != "claude":
-            raise ConfigError(
-                f"{label}: a cloud project runs Claude Code; its tool is {tool!r}"
+            click.echo(
+                f"Warning: {label} is a cloud project but its tool is {tool!r}; "
+                "magent creates it with claude --cloud and will refuse to create "
+                "it until the tool is claude",
+                err=True,
             )
         task = proj.cloud_task
         if task is not None:
@@ -906,8 +911,13 @@ def _check_cloud_projects(projects: list[ProjectConfig], default_tool: str) -> N
                     f"{label}.cloudTask must be 1-200 characters of letters, digits, "
                     "spaces and , . _ / : -, starting with a letter or digit"
                 )
-        for key, value in (("windows", proj.windows), ("happy", proj.happy)):
-            if value is not None:
+        # An explicit `happy: false` is already what a cloud project does, so
+        # only a setting that asks for something is "ignored".
+        for key, ignored in (
+            ("windows", proj.windows is not None),
+            ("happy", bool(proj.happy)),
+        ):
+            if ignored:
                 click.echo(
                     f"Warning: {label}.{key} is ignored on a cloud project", err=True
                 )
