@@ -895,8 +895,8 @@ def _check_cloud_projects(projects: list[ProjectConfig], default_tool: str) -> N
         if tool != "claude":
             click.echo(
                 f"Warning: {label} is a cloud project but its tool is {tool!r}; "
-                "magent creates it with claude --cloud and will refuse to create "
-                "it until the tool is claude",
+                "a cloud project runs claude --cloud, and magent will refuse to "
+                "create it until its tool is claude",
                 err=True,
             )
         task = proj.cloud_task

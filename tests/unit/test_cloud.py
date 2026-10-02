@@ -144,7 +144,10 @@ class TestACloudProjectIsValidatedAtLoad:
         assert cfg.projects[0].tool == "codex"
         err = capsys.readouterr().err
         assert "projects[0] is a cloud project but its tool is 'codex'" in err
-        assert "until the tool is claude" in err
+        assert (
+            "a cloud project runs claude --cloud, and magent will refuse to "
+            "create it until its tool is claude"
+        ) in err
 
     def test_a_cloud_project_inheriting_another_default_tool_warns(
         self, tmp_config, tmp_path, capsys
