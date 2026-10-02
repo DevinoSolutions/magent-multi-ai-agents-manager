@@ -1149,3 +1149,36 @@ class TestTheRecipientIsOnePublicKey:
         assert nodes._is_recipient("age1qqqq")
         assert not nodes._is_recipient("age1qqqq\nAGE-SECRET-KEY-1X")
         assert not nodes._is_recipient("manual")
+
+
+class TestOneDotenvDecoder:
+    """``dotenv_names``, ``masked_lines`` and ``write_manual_handoff`` read a
+    ``.env`` through ONE decoder, so they can never disagree about its text."""
+
+    @pytest.mark.parametrize(
+        ("raw", "text"),
+        [
+            (b"A=1\r\nB=2\n", "A=1\r\nB=2\n"),
+            (b"\xef\xbb\xbfA=1\n", "A=1\n"),
+            (b"\xff\xfe" + "A=1\r\n".encode("utf-16-le"), "A=1\r\n"),
+            (b"\xfe\xff" + "A=1\r\n".encode("utf-16-be"), "A=1\r\n"),
+            (b"", ""),
+        ],
+    )
+    def test_a_byte_order_mark_picks_the_codec_and_never_reaches_the_text(
+        self, tmp_path, raw, text
+    ):
+        path = tmp_path / ".env"
+        path.write_bytes(raw)
+        assert nodes._dotenv_text(path) == text
+
+    def test_bytes_that_are_not_text_decode_lossily_instead_of_raising(self, tmp_path):
+        path = tmp_path / ".env"
+        path.write_bytes(b"A=\xff\xfe1\n")
+        assert nodes._dotenv_text(path).startswith("A=")
+
+    def test_an_unreadable_file_raises_the_os_error_for_the_caller_to_judge(
+        self, tmp_path
+    ):
+        with pytest.raises(OSError):
+            nodes._dotenv_text(tmp_path / "missing.env")
