@@ -14,8 +14,9 @@ from typing import TYPE_CHECKING, Literal
 import click
 
 from magent import attach_client, tailnet
-from magent.config import NODE_AUTO, runs_on_node
+from magent.config import NODE_AUTO, is_cloud, runs_on_node
 from magent.grid import TileSlot, compute_grid
+from magent.lockfile import LockHeld
 from magent.log import HEARTBEAT_MAX_AGE, get_logger, heartbeat_fresh, heartbeat_mtime
 from magent.platform import (
     Platform,
@@ -1376,6 +1377,154 @@ def _retile_targets(
     return [*base, *extras]
 
 
+# The one wording for a cloud project that loads (config accepts it) but has
+# nothing to start a session on. J12's doctor row and J8's bring-up read it too.
+NO_CLOUD_TASK = 'no "cloudTask" set: name the task the cloud session starts on'
+
+# The one tool a cloud session runs: ``claude --cloud``.
+CLOUD_TOOL = "claude"
+
+
+def _exe_stem(exe: str) -> str:
+    """``exe``'s file name without its directory, lower-cased, minus ONE
+    ``.exe``/``.cmd`` (the two ways Windows spells a claude launcher). Either
+    separator splits, whatever the OS: a configured path is typed into a pane,
+    not resolved here."""
+    name = exe.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for suffix in (".exe", ".cmd"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def cloud_tool_refusal(tool: str, base_cmd: str | None) -> str | None:
+    """Why this tool and command cannot start a cloud session, or None.
+
+    ``claude --cloud`` is the only cloud session there is, and
+    ``cloud_pane_command`` keeps just the first token of ``base_cmd``: a
+    wrapper such as ``bash -c "claude ..."`` would be typed as ``bash --cloud``.
+    So the tool must be ``claude`` and its command's executable must be a
+    claude launcher. Read from config alone -- no git, no ssh -- so it can run
+    first."""
+    if tool != CLOUD_TOOL:
+        return (
+            f"a cloud session runs claude --cloud, but this project's tool is {tool!r}"
+        )
+    parts = (base_cmd or "").split()
+    if not parts:
+        return f"unknown tool {tool!r} (add under settings.tools)"
+    if _exe_stem(parts[0]) != CLOUD_TOOL:
+        return (
+            f"a cloud session runs claude --cloud, but the {tool!r} command"
+            f" starts with {parts[0]!r}, which is not claude"
+        )
+    return None
+
+
+def project_for_session(config: MagentConfig, sid: str) -> ProjectConfig | None:
+    """The project the psmux session ``sid`` belongs to: the FIRST ENABLED one
+    in config order, which is the one ``psmux.eligible_projects`` names the
+    session after (it skips a disabled entry and keeps the first of a duplicate
+    id). The id is ``nodes.node_sid``'s, the one spelling of the title-or-leaf
+    rule."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    for proj in config.projects:
+        if proj.enabled and nodes.node_sid(proj) == sid:
+            return proj
+    return None
+
+
+def cloud_session_ids(config: MagentConfig) -> set[str]:
+    """Session ids of every cloud project (enabled or not)."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    return {nodes.node_sid(p) for p in config.projects if is_cloud(p)}
+
+
+def cloud_refusal(config: MagentConfig, sid: str) -> str | None:
+    """Why the cloud session for ``sid`` must NOT be created now, or None.
+
+    Asked only right before a create -- never for a live session: every
+    ``claude --cloud`` is a NEW cloud session (spec §18.5), so a refused create
+    costs nothing and a wrong one costs a duplicate the CLI cannot list or stop.
+    Gate, not advisory (plan J, "User decision"). Never raises for a reason it
+    can name: a lock that stays taken, an unreadable file or a git that fails
+    each come back as the refusal that says so."""
+    # heavy subsystem: in-body per policy (nodes + the ssh/git layer)
+    from magent import nodes, remote_mux
+    from magent.node_sync import printable
+
+    proj = project_for_session(config, sid)
+    if proj is None or not is_cloud(proj):
+        return None
+    if not proj.cloud_task:
+        return NO_CLOUD_TASK
+    tool = proj.tool or config.settings.default_tool
+    refusal = cloud_tool_refusal(tool, config.settings.tools.get(tool))
+    if refusal:
+        return refusal
+    try:
+        return _cloud_checkout_refusal(config, proj, sid)
+    except remote_mux.RemoteError as exc:
+        lines = exc.row_text.strip().splitlines()
+        if lines:
+            said = lines[-1]
+        elif exc.rc is None:
+            # git never answered: it timed out, or could not be started.
+            said = "no answer"
+        else:
+            said = f"exit {exc.rc}"
+        return f"git could not read {proj.path}: {printable(said)}"
+    # LockHeld and PushSetUnreadable are OSErrors: they come before it.
+    except LockHeld:
+        return "another magent is updating the cloud records; try again"
+    except nodes.PushSetUnreadable as exc:
+        return (
+            f"the push set cannot be checked: {printable(exc.label)} cannot be read"
+            f" ({exc.reason}); fix or remove it, then run: magent node push"
+            f" {nodes.project_name(proj)}"
+        )
+    except nodes.NodeConfigError as exc:
+        return printable(str(exc))
+    except OSError as exc:
+        # The class only: the OS's own words carry an absolute path.
+        get_logger("nodes").warning("cloud gate: %s: %s", sid, exc)
+        return f"{proj.path}: {_local_error_text(exc)}"
+
+
+def _cloud_checkout_refusal(
+    config: MagentConfig, proj: ProjectConfig, sid: str
+) -> str | None:
+    """The git and ``.env`` half of ``cloud_refusal``. It RAISES whatever
+    reading them raises; ``cloud_refusal`` is the one place that becomes words."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    project_dir = _node_project_dir(config, proj)
+    if project_dir is None:
+        return f"{proj.path} was not found on this PC"
+    states = node_git_states(config, proj)
+    if not states:
+        return (
+            f"{proj.path} is not a git repository: a cloud session clones one"
+            " from GitHub"
+        )
+    if len(states) > 1:
+        return f"a cloud session runs ONE repository; {proj.path} holds {len(states)}"
+    refusal = nodes.cloud_git_refusal(states[0])
+    if refusal:
+        return refusal
+    ps = nodes.cloud_push_set(
+        project_dir, states, home=Path.home(), extras=proj.push or ()
+    )
+    return nodes.cloud_env_refusal(
+        sid, nodes.project_name(proj), ps, nodes.read_recipient()
+    )
+
+
 def _launch_projects(
     plat: Platform,
     config: MagentConfig,
@@ -1538,7 +1687,7 @@ def _dispatch_cli_agent_project(
     match_mode = "magent-name" if prefix else "exact"
 
     windows_cfg = proj.windows
-    if is_remote or is_ide_tool(tool):
+    if is_remote or is_ide_tool(tool) or is_cloud(proj):
         windows_cfg = None
     titles = generate_titles(proj.title, proj.path, windows_cfg)
     window_count = len(titles)
@@ -1560,6 +1709,23 @@ def _dispatch_cli_agent_project(
             f"SKIP: {titles[0]} — unknown tool '{tool}' (add under settings.tools)"
         )
         return new_count
+
+    if is_cloud(proj):
+        return _dispatch_cloud_project(
+            config,
+            opts,
+            proj,
+            tool,
+            titles[0],
+            base_cmd,
+            base_dir,
+            use_psmux,
+            is_running,
+            match_mode,
+            targets,
+            psmux_windows,
+            psmux_colors,
+        )
 
     use_happy = proj.happy if proj.happy is not None else config.settings.happy
 
@@ -1676,6 +1842,86 @@ def _dispatch_cli_agent_project(
         )
 
     return new_count
+
+
+def _dispatch_cloud_project(
+    config: MagentConfig,
+    opts: RunOpts,
+    proj: ProjectConfig,
+    tool: str,
+    title: str,
+    base_cmd: str,
+    base_dir: str | None,
+    use_psmux: bool,
+    is_running: Callable[[str, str], bool],
+    match_mode: str,
+    targets: list[_Target],
+    psmux_windows: list[PsmuxWindowOpts],
+    psmux_colors: dict[str, str | None],
+) -> int:
+    """One LOCAL psmux pane running ``claude --cloud "<task>"`` (spec §18.5):
+    typed once, and created only past ``cloud_refusal``. A project that cannot
+    be created is skipped by name, one ``SKIP:`` line; an already-open window or
+    a live session is never gated, only re-tiled or re-attached."""
+    # heavy subsystem: in-body per policy
+    from magent import psmux as psmux_mod
+    from magent.sessions.claude import cloud_pane_command
+
+    if not use_psmux:
+        click.echo(
+            f"SKIP: {title} — cloud projects run in a psmux pane (settings.psmux,"
+            " Windows); a plain terminal would create a new cloud session on every"
+            " launch"
+        )
+        return 0
+    if not proj.cloud_task:
+        click.echo(f"SKIP: {title} — {NO_CLOUD_TASK}")
+        return 0
+    # Before any git read, and before the command is built: the tool decides
+    # what the project is.
+    refusal = cloud_tool_refusal(tool, base_cmd)
+    if refusal:
+        click.echo(f"SKIP: {title} — {refusal}")
+        return 0
+    try:
+        cmd = cloud_pane_command(base_cmd, proj.cloud_task)
+    except ValueError as exc:
+        click.echo(f"SKIP: {title} — {exc}")
+        return 0
+    tile_key = _psmux_session_name(title)
+    running = is_running(tile_key, match_mode)
+    if not running and not opts.dry_run and not opts.tile_only:
+        resolved_dir = _resolve_path(proj.path, base_dir)
+        if not resolved_dir:
+            click.echo(f"SKIP: {proj.path} not found")
+            return 0
+        # THE liveness answer: a live session is re-attached, never gated and
+        # never re-created. A probe that drops answers "not live", which asks
+        # the gate: the safe direction, because a refusal only skips the
+        # window and the bring-up's own has-session probe still dedupes.
+        if not psmux_mod.live_sessions([tile_key]):
+            refusal = cloud_refusal(config, tile_key)
+            if refusal:
+                click.echo(f"SKIP: {title} — {refusal}")
+                return 0
+        psmux_windows.append(
+            PsmuxWindowOpts(
+                window_name=tile_key,
+                cwd=resolved_dir,
+                command=cmd,
+                resend=False,
+                nick="cloud",
+            )
+        )
+        psmux_colors[tile_key] = proj.color
+    targets.append(
+        _Target(name=tile_key, key=tile_key, mode=match_mode, is_new=not running)
+    )
+    _log_project(title, tool, running, None, psmux=True, node="cloud")
+    # A dry run says what the real run would do: for an open window, nothing.
+    if opts.dry_run and not running:
+        click.echo(style(f"      would run: {cmd}", dim=True))
+    return 0 if running else 1
 
 
 def _node_map_snapshot(
