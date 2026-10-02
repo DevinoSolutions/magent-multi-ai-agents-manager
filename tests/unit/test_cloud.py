@@ -3311,16 +3311,20 @@ class TestOneSessionNamingRule:
     ):
         cfg = self._cfg(tmp_config, tmp_path)
         rows = psmux.eligible_projects(cfg)
-        assert launch.cloud_session_ids(cfg) == {r["session"] for r in rows}
-        assert launch.cloud_session_ids(cfg) == {"My-App-v1-2", "a-b-c", "dir2"}
+        assert {r["session"] for r in rows} == {"My-App-v1-2", "a-b-c", "dir2"}
+        # The gate and the shadow helpers name a project by `node_sid`; the
+        # bring-up names its row by the same rule.
+        for row, proj in zip(rows, cfg.projects, strict=True):
+            assert nodes.node_sid(proj) == row["session"]
 
     def test_a_disabled_or_ide_cloud_project_is_still_named_by_the_same_rule(
         self, tmp_config, tmp_path
     ):
-        # The bring-up lists only the enabled CLI-agent projects; the cloud
-        # helpers name every cloud project. The ones the bring-up skips must
-        # still carry exactly the name it WOULD have given them, or a refusal
-        # or a doctor row for them would point at a session that is not theirs.
+        # The bring-up lists only the enabled CLI-agent projects; `node_sid`
+        # names every project. The ones the bring-up skips must still carry
+        # exactly the name it WOULD have given them, or a refusal or a doctor
+        # row for an enabled IDE project would point at a session that is not
+        # theirs.
         specs: list[tuple[str, dict[str, object]]] = [
             ("Off Proj v1.0", {"enabled": False}),
             ("ide:proj", {"tool": "code"}),
@@ -3341,16 +3345,13 @@ class TestOneSessionNamingRule:
             )
         cfg = load_config(tmp_config({"version": SCHEMA_VERSION, "projects": projects}))
         assert {str(r["session"]) for r in psmux.eligible_projects(cfg)} == {"Live-One"}
-        assert launch.cloud_session_ids(cfg) == {
-            psmux.session_name(title) for title, _ in specs
-        }
-        assert launch.cloud_session_ids(cfg) == {
+        for (title, _), proj in zip(specs, cfg.projects, strict=True):
+            assert nodes.node_sid(proj) == psmux.session_name(title)
+        assert [nodes.node_sid(p) for p in cfg.projects] == [
             "Off-Proj-v1-0",
             "ide-proj",
             "Live-One",
-        }
-        for (title, _), proj in zip(specs, cfg.projects, strict=True):
-            assert nodes.node_sid(proj) == psmux.session_name(title)
+        ]
 
     def test_a_session_id_finds_its_project(self, tmp_config, tmp_path):
         cfg = self._cfg(tmp_config, tmp_path)
@@ -3372,16 +3373,6 @@ class TestOneSessionNamingRule:
         assert w.window_name == nodes.node_sid(proj)
         assert asked == [w.window_name]
         assert launch.project_for_session(load_config(path), w.window_name) is not None
-
-    def test_a_config_with_no_cloud_project_has_no_cloud_sessions(
-        self, tmp_config, tmp_path
-    ):
-        folder = tmp_path / "x"
-        folder.mkdir()
-        cfg = load_config(
-            tmp_config({"version": SCHEMA_VERSION, "projects": [{"path": str(folder)}]})
-        )
-        assert launch.cloud_session_ids(cfg) == set()
 
     def test_a_disabled_project_never_stands_for_the_session(
         self, tmp_config, tmp_path, monkeypatch
@@ -5046,7 +5037,7 @@ class TestTheSurfacesTellCloudApart:
             "magent.launch.stop_psmux", lambda targets: (list(targets), [])
         )
 
-    def test_down_passes_the_cloud_session_ids_to_the_report(
+    def test_down_passes_the_cloud_panes_to_the_report(
         self, runner, monkeypatch, tmp_config, tmp_path
     ):
         """`down` and the menu's shut-down both hand the report the cloud set;

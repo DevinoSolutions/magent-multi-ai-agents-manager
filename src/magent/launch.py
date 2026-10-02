@@ -1476,14 +1476,6 @@ def project_for_session(config: MagentConfig, sid: str) -> ProjectConfig | None:
     return None
 
 
-def cloud_session_ids(config: MagentConfig) -> set[str]:
-    """Session ids of every cloud project (enabled or not)."""
-    # heavy subsystem: in-body per policy
-    from magent import nodes
-
-    return {nodes.node_sid(p) for p in config.projects if is_cloud(p)}
-
-
 def twin_session_refusal(sid: str) -> str:
     """Why a cloud pane cannot be created under session name ``sid`` when the
     gate would read ANOTHER project: the gate answers by name for the first
