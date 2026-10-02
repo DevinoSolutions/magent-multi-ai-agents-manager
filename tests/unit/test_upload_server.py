@@ -3520,3 +3520,177 @@ class TestAClientThatGoesAwayIsNotACrash:
         from magent.upload_server import _client_went_away
 
         assert _client_went_away(exc) is gone
+
+
+class TestACloudPaneTakesNoUpload:
+    """A cloud pane is a LOCAL viewer of a session that runs in a VM, which
+    cannot read ``~/.magent/uploads`` on this PC (spec section 18.7): the upload
+    is refused before a byte is written, with a flag Alt+V narrates by name."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, tmp_path, monkeypatch):
+        import magent.psmux as psmux_mod
+        import magent.upload_server as mod
+
+        monkeypatch.setattr(mod, "_UPLOAD_DIR", tmp_path / "uploads")
+        monkeypatch.setattr(psmux_mod, "find_psmux", lambda: None)
+        self.upload_dir = tmp_path / "uploads"
+        self.flashes: list[tuple] = []
+        monkeypatch.setattr(mod, "_flash", lambda *a, **k: self.flashes.append(a))
+        monkeypatch.setattr(UploadHandler, "config_path", None)
+        self._sessions(
+            monkeypatch,
+            [
+                {"name": "api", "session": "api", "node": "cloud"},
+                {"name": "web", "session": "web", "node": None},
+            ],
+        )
+
+        from http.server import HTTPServer
+
+        self.server = HTTPServer(("127.0.0.1", 0), UploadHandler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        yield
+        self.server.shutdown()
+        self.server.server_close()
+
+    @staticmethod
+    def _sessions(monkeypatch, rows: list[dict[str, object]]) -> None:
+        monkeypatch.setattr(UploadHandler, "cached_sessions", rows)
+        monkeypatch.setattr(UploadHandler, "sessions_ts", time.time() + 9999)
+
+    def _post(self, project: str, *, flagged: bool = False) -> tuple[int, dict]:
+        fields = (
+            b""
+            if flagged
+            else (
+                b"------B\r\n"
+                b'Content-Disposition: form-data; name="project"\r\n\r\n'
+                + project.encode()
+                + b"\r\n"
+            )
+        )
+        body = (
+            fields + b"------B\r\n"
+            b'Content-Disposition: form-data; name="inject"\r\n\r\n0\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="shot.png"\r\n'
+            b"Content-Type: image/png\r\n\r\nFAKEPNG\r\n"
+            b"------B--\r\n"
+        )
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        path = f"/upload?project={project}" if flagged else "/upload"
+        conn.request(
+            "POST",
+            path,
+            body=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=----B",
+                "Content-Length": str(len(body)),
+            },
+        )
+        resp = conn.getresponse()
+        return resp.status, json.loads(resp.read())
+
+    def _nothing_written(self) -> bool:
+        return not (self.upload_dir.exists() and any(self.upload_dir.iterdir()))
+
+    def _page(self) -> str:
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/")
+        return conn.getresponse().read().decode()
+
+    def _settled(self) -> None:
+        """Wait until the POST handler has FINISHED, `finally` included.
+
+        The status-line flash is issued after the reply is written, so a test
+        that reads `self.flashes` straight after `_post` races it. This server
+        is single-threaded: a second request is only answered once the first
+        handler has returned."""
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/health")
+        conn.getresponse().read()
+
+    def test_an_upload_to_a_cloud_pane_is_409_and_writes_nothing(self):
+        status, body = self._post("api")
+        assert status == 409
+        assert body == {
+            "ok": False,
+            "cloud": True,
+            "error": "cloud session: attach images at claude.ai/code or in the Claude app",
+        }
+        assert self._nothing_written()
+
+    def test_the_alt_v_listeners_flagged_upload_is_refused_the_same_way(self):
+        status, body = self._post("api", flagged=True)
+        assert status == 409 and body["cloud"] is True
+        assert self._nothing_written()
+
+    def test_a_refused_cloud_upload_does_not_flash_the_panes_status_line(self):
+        # The mobile page already shows the error text; "upload failed" on the
+        # pane's own bar would call a deliberate refusal a fault.
+        self._post("api")
+        self._settled()
+        assert self.flashes == []
+
+    def test_an_ordinary_session_still_takes_the_upload(self):
+        status, body = self._post("web")
+        assert status == 200 and body["ok"] is True
+        assert "cloud" not in body
+        assert not self._nothing_written()
+        # The control for the no-flash pin above: this harness DOES see the
+        # confirmation an ordinary mobile upload gets.
+        self._settled()
+        assert len(self.flashes) == 1
+
+    def test_an_unknown_project_is_still_the_plain_400(self):
+        # The cloud 409 sits AFTER the Unknown-project check on purpose: only a
+        # name the server knows can be a cloud pane.
+        status, body = self._post("nope")
+        assert status == 400 and "cloud" not in body
+
+    def test_the_phone_page_does_not_offer_a_cloud_pane(self):
+        page = self._page()
+        assert 'data-name="web"' in page
+        assert 'data-name="api"' not in page
+
+    def test_the_page_shows_the_servers_own_error_text_whatever_the_status(self):
+        # The 409's `error` is the only explanation a stale page (pills
+        # rendered before the config changed) will ever show. Both send paths
+        # must read the JSON body of a non-2xx and surface it.
+        page = self._page()
+        assert "pickFail(d.error" in page
+        assert "pasteFail(d.error" in page
+
+    def test_a_local_agent_that_shares_the_session_name_still_takes_the_upload(
+        self, monkeypatch
+    ):
+        # `[local, cloud]` for one folder: the FIRST project owns the name
+        # (psmux.cloud_pane_ids), so the pane is a local agent's and refusing
+        # it would take a perfectly drivable pane away. One pill, not two.
+        self._sessions(
+            monkeypatch,
+            [
+                {"name": "api", "session": "api", "node": None},
+                {"name": "api", "session": "api", "node": "cloud"},
+            ],
+        )
+        status, body = self._post("api")
+        assert status == 200 and body["ok"] is True
+        assert self._page().count('data-name="api"') == 1
+
+    def test_a_cloud_pane_that_shadows_a_local_twin_refuses_the_name(self, monkeypatch):
+        # `[cloud, local]`: the cloud project owns the pane, so the shared name
+        # is a cloud pane whichever row the page or the POST looks at.
+        self._sessions(
+            monkeypatch,
+            [
+                {"name": "api", "session": "api", "node": "cloud"},
+                {"name": "api", "session": "api", "node": None},
+            ],
+        )
+        status, body = self._post("api")
+        assert status == 409 and body["cloud"] is True
+        assert self._nothing_written()
+        assert 'data-name="api"' not in self._page()
