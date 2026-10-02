@@ -68,16 +68,44 @@ class TestEnsureAttachProfiles:
         )
         assert _names() == []
 
-    def test_the_setting_off_does_not_remove_what_launch_wrote(
+    def test_the_setting_off_removes_a_stale_fragment_like_run_magent_does(
         self, monkeypatch, icons_on, tmp_path
     ):
-        # Removal is run_magent's and `terminal icons --remove`'s job.
         _platform(monkeypatch, wt=True)
         wt_profiles.sync([wt_profiles.IconSpec("old", "old", "#111111")])
         attach_mod._ensure_attach_profiles(
             ["api"], _config(tmp_path, terminalIcons=False)
         )
-        assert _names() == ["magent: old"]
+        assert _names() == []
+        assert wt_profiles.profile_for("old") is None
+
+    def test_a_host_session_named_like_a_local_project_does_not_take_its_icon(
+        self, monkeypatch, icons_on
+    ):
+        _platform(monkeypatch, wt=True)
+        wt_profiles.sync([wt_profiles.IconSpec("api", "Api", "#a855f7")])
+        directory = wt_profiles.fragment_dir()
+        before = (directory / wt_profiles.FRAGMENT_FILE).read_bytes()
+        icon = wt_profiles.read_fragment()[0].icon
+        for _ in range(3):
+            attach_mod._ensure_attach_profiles(["api"], None)
+            wt_profiles.sync([wt_profiles.IconSpec("api", "Api", "#a855f7")])
+        assert (directory / wt_profiles.FRAGMENT_FILE).read_bytes() == before
+        assert wt_profiles.read_fragment()[0].icon == icon
+        assert wt_profiles.read_fragment()[0].source == "generated"
+
+    def test_the_whole_batch_is_one_sync(self, monkeypatch, icons_on):
+        _platform(monkeypatch, wt=True)
+        calls: list[int] = []
+        real = wt_profiles.sync
+
+        def spy(specs, **kw):
+            calls.append(len(specs))
+            return real(specs, **kw)
+
+        monkeypatch.setattr(wt_profiles, "sync", spy)
+        attach_mod._ensure_attach_profiles(["a", "b", "c", "d"], None)
+        assert calls == [4]
 
     def test_an_unreadable_config_is_no_opinion(self, monkeypatch, icons_on, tmp_path):
         _platform(monkeypatch, wt=True)
@@ -98,7 +126,9 @@ class _Proc:
 
 
 class TestTheFlowOpensTabsWithTheirProfile:
-    def _run(self, monkeypatch, *, windows=None, no_mux=False, wt=True):
+    def _run(
+        self, monkeypatch, *, windows=None, no_mux=False, wt=True, config_path=None
+    ):
         status = {
             "up": [{"name": "api", "session": "api"}],
             "down": [],
@@ -121,7 +151,9 @@ class TestTheFlowOpensTabsWithTheirProfile:
         monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
         monkeypatch.setattr(attach_mod, "_remember_last_host", lambda target: None)
         _platform(monkeypatch, wt=wt, windows=windows)
-        attach_mod._attach_flow("user@host", no_mux=no_mux, group=None, yes=True)
+        attach_mod._attach_flow(
+            "user@host", no_mux=no_mux, group=None, yes=True, config_path=config_path
+        )
         return spawns
 
     def test_a_supervised_pane_gets_p(self, monkeypatch, icons_on):
@@ -136,6 +168,20 @@ class TestTheFlowOpensTabsWithTheirProfile:
     def test_without_wt_support_the_pane_is_unchanged(self, monkeypatch, icons_on):
         (argv,) = self._run(monkeypatch, wt=False)
         assert "-p" not in argv
+
+    @pytest.mark.parametrize("no_mux", [False, True])
+    def test_the_setting_off_passes_no_p_even_with_a_stale_fragment(
+        self, monkeypatch, icons_on, tmp_path, no_mux
+    ):
+        wt_profiles.sync([wt_profiles.IconSpec("api", "api", "#111111")])
+        assert wt_profiles.profile_for("api") == "magent: api"
+        (argv,) = self._run(
+            monkeypatch,
+            no_mux=no_mux,
+            config_path=_config(tmp_path, terminalIcons=False),
+        )
+        assert "-p" not in argv
+        assert _names() == []
 
     def test_an_already_open_window_writes_nothing(self, monkeypatch, icons_on):
         spawns = self._run(monkeypatch, windows={"magent:api": 1})

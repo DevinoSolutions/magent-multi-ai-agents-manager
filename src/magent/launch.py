@@ -48,7 +48,7 @@ from magent.wt_profiles import IconSpec
 
 if TYPE_CHECKING:
     import subprocess
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
     from magent.env import MagentEnv
@@ -1089,6 +1089,37 @@ def _psmux_session_name(title: str) -> str:
 
 
 
+def _tab_icons_on(plat: Platform, config: MagentConfig) -> bool:
+    """Whether this launch decorates tabs at all (the platform has Windows
+    Terminal AND ``settings.terminalIcons`` is on; ``MAGENT_WT_ICONS=0`` is
+    answered inside ``wt_profiles``)."""
+    return plat.supports_wt_profiles() and config.settings.terminal_icons
+
+
+def _tab_icon_spec(
+    key: str, label: str, proj: ProjectConfig, project_dir: str | None
+) -> IconSpec:
+    """``project_dir`` is where a repository logo is looked for -- None for a
+    remote project, which gets a generated badge (or an absolute ``icon``)."""
+    return IconSpec(
+        key=key,
+        label=label,
+        color=proj.color,
+        project_dir=Path(project_dir) if project_dir else None,
+        icon=proj.icon,
+    )
+
+
+def _sync_tab_profiles(
+    plat: Platform, config: MagentConfig, specs: Sequence[IconSpec]
+) -> None:
+    """Put every window of a launch phase into the fragment in ONE sync: one lock,
+    one manifest read, one prune, and a single bounded wait if another magent
+    holds the lock. Never raises (``wt_profiles.sync`` logs a failure)."""
+    if specs and _tab_icons_on(plat, config):
+        wt_profiles.sync(list(specs))
+
+
 def _ensure_tab_profile(
     plat: Platform,
     config: MagentConfig,
@@ -1101,31 +1132,24 @@ def _ensure_tab_profile(
     making sure the fragment carries it -- or None, which is "no ``-p``": the
     default profile's icon, exactly as before tab icons existed.
 
+    For a window whose ``wt`` is spawned right here (the non-psmux paths); the
+    batched phases collect their specs and call ``_sync_tab_profiles`` once.
     None for a platform with no Windows Terminal, with ``settings.terminalIcons``
     off, with the ``MAGENT_WT_ICONS=0`` kill switch, and for any failure to
-    write (``wt_profiles.sync`` logs it and never raises). ``project_dir`` is
-    where a repository logo is looked for -- None for a remote project, which
-    gets a generated badge (or an absolute ``icon``).
+    write (``wt_profiles.sync`` logs it and never raises).
     """
-    if not plat.supports_wt_profiles() or not config.settings.terminal_icons:
+    if not _tab_icons_on(plat, config):
         return None
-    wt_profiles.sync(
-        [
-            IconSpec(
-                key=key,
-                label=label,
-                color=proj.color,
-                project_dir=Path(project_dir) if project_dir else None,
-                icon=proj.icon,
-            )
-        ]
-    )
+    wt_profiles.sync([_tab_icon_spec(key, label, proj, project_dir)])
     return wt_profiles.profile_for(key)
 
 
 def run_magent(config: MagentConfig, opts: RunOpts) -> int:
     log = get_logger("launch")
     plat = get_platform()
+    # A fragment lock found held by an earlier launch in this process (the
+    # interactive menu runs several) must not mute this one's tab icons.
+    wt_profiles.begin_launch()
 
     slots = _prepare_grid(plat, config, opts)
     if slots is None:
@@ -1435,6 +1459,9 @@ class _LaunchResult:
     # Node projects this launch owes a bring-up (PR-D): collected by the loop,
     # brought up after the local phases, before tiling.
     node_projects: tuple[ProjectConfig, ...] = ()
+    # One IconSpec per collected psmux window: synced together, once, just
+    # before the attach windows open (`_start_psmux_and_upload`).
+    psmux_icons: tuple[IconSpec, ...] = ()
 
 
 def _discovered_targets(
@@ -1516,6 +1543,7 @@ def _launch_projects(
     psmux_windows: list[PsmuxWindowOpts] = []
     node_projects: list[ProjectConfig] = []
     _psmux_colors: dict[str, str | None] = {}
+    _psmux_icons: list[IconSpec] = []
 
     win_snapshot = plat.snapshot_windows()
 
@@ -1569,12 +1597,14 @@ def _launch_projects(
             targets,
             psmux_windows,
             _psmux_colors,
+            psmux_icons=_psmux_icons,
         )
 
     return _LaunchResult(
         targets=targets,
         psmux_windows=psmux_windows,
         psmux_colors=_psmux_colors,
+        psmux_icons=tuple(_psmux_icons),
         open_titles=tuple(win_snapshot),
         node_projects=tuple(node_projects),
     )
@@ -1636,6 +1666,7 @@ def _dispatch_cli_agent_project(
     targets: list[_Target],
     psmux_windows: list[PsmuxWindowOpts],
     psmux_colors: dict[str, str | None],
+    psmux_icons: list[IconSpec] | None = None,
 ) -> int:
     """Generate this project's window titles, resolve resumable sessions, and
     launch (or collect into the caller-owned `psmux_windows`) each window;
@@ -1716,12 +1747,13 @@ def _dispatch_cli_agent_project(
         if proj_psmux and not running and not opts.dry_run and not opts.tile_only:
             resolved_dir = _resolve_path(proj.path, base_dir)
             if resolved_dir:
-                # Written now, looked up again at attach time
-                # (`_start_psmux_and_upload`): the profile must exist before
-                # the `wt` that names it is spawned.
-                _ensure_tab_profile(
-                    plat, config, tile_key, win_title, proj, resolved_dir
-                )
+                # Collected now, written once with every other window's and
+                # looked up at attach time (`_start_psmux_and_upload`): the
+                # profile must exist before the `wt` that names it is spawned.
+                if psmux_icons is not None:
+                    psmux_icons.append(
+                        _tab_icon_spec(tile_key, win_title, proj, resolved_dir)
+                    )
                 psmux_windows.append(
                     PsmuxWindowOpts(
                         window_name=tile_key,
@@ -1966,12 +1998,16 @@ def _bring_up_node_windows(
     # heavy subsystem: in-body per policy
     from magent import nodes
 
-    for proj in result.node_projects:
-        # The attach window's `wt` (spawn_attach_window) looks its profile up by
-        # sid, so it has to be in the fragment before the bring-up opens it.
-        _ensure_tab_profile(
-            plat, config, nodes.node_sid(proj), nodes.project_name(proj), proj, None
-        )
+    # The attach window's `wt` (spawn_attach_window) looks its profile up by
+    # sid, so they all have to be in the fragment before the bring-up opens one.
+    _sync_tab_profiles(
+        plat,
+        config,
+        [
+            _tab_icon_spec(nodes.node_sid(p), nodes.project_name(p), p, None)
+            for p in result.node_projects
+        ],
+    )
     outcomes = _run_node_bring_ups(
         config, list(result.node_projects), allow_dirty=opts.allow_dirty, window=True
     )
@@ -2024,9 +2060,12 @@ def _start_psmux_and_upload(
         if failed:
             click.echo()
         report_bring_up_casualties(failed)
+        # Every window's profile, in one sync, before the first `wt` names one.
+        _sync_tab_profiles(plat, config, result.psmux_icons)
+        icons_on = _tab_icons_on(plat, config)
         for pw in psmux_windows:
             attach_kwargs: dict[str, str] = {}
-            profile = wt_profiles.profile_for(pw.window_name)
+            profile = wt_profiles.profile_for(pw.window_name) if icons_on else None
             if profile:
                 attach_kwargs["profile"] = profile
             plat.attach_psmux(

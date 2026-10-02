@@ -36,7 +36,7 @@ def _manifest_names() -> list[str]:
     return [p.name for p in wt_profiles.read_fragment()]
 
 
-def _dispatch(fp, proj, cfg, *, psmux=False, opts=None, base_dir=None):
+def _dispatch(fp, proj, cfg, *, psmux=False, opts=None, base_dir=None, icons=None):
     targets: list[_Target] = []
     windows: list[PsmuxWindowOpts] = []
     colors: dict[str, str | None] = {}
@@ -54,6 +54,7 @@ def _dispatch(fp, proj, cfg, *, psmux=False, opts=None, base_dir=None):
         targets,
         windows,
         colors,
+        psmux_icons=icons,
     )
     return targets, windows, colors
 
@@ -155,31 +156,94 @@ class TestTerminalLaunches:
 
 
 class TestPsmuxWindows:
-    def test_collecting_writes_the_profile_under_the_session_name(
+    def test_collecting_queues_a_spec_under_the_session_name_and_writes_nothing(
         self, icons_on, tmp_path
     ):
         fp = FakePlatform(supports_psmux=True, supports_wt_profiles=True)
         proj = ProjectConfig(path=str(tmp_path), tool="claude", title="My Proj")
         cfg = MagentConfig(projects=[proj], settings=Settings(psmux=True))
-        _targets, windows, _colors = _dispatch(fp, proj, cfg, psmux=True)
+        specs: list = []
+        _targets, windows, _colors = _dispatch(fp, proj, cfg, psmux=True, icons=specs)
         (window,) = windows
         # The sanitized session name, not the raw title: that is the window
         # key every later lookup (attach) uses.
         assert window.window_name == "My-Proj"
-        assert _manifest_names() == ["magent: My-Proj"]
+        assert [s.key for s in specs] == ["My-Proj"]
+        assert specs[0].label == "My Proj"
+        # Collected, not written: the one sync happens at attach time.
+        assert _manifest_names() == []
 
     def test_attach_passes_the_profile_when_the_fragment_has_it(self, icons_on):
-        wt_profiles.sync([wt_profiles.IconSpec("a", "a", "#111111")])
-        fp = FakePlatform(supports_psmux=True)
+        fp = FakePlatform(supports_psmux=True, supports_wt_profiles=True)
         windows = [
             PsmuxWindowOpts(window_name="a", cwd="/tmp/a", command="claude"),
             PsmuxWindowOpts(window_name="b", cwd="/tmp/b", command="claude"),
         ]
         result = _LaunchResult(
-            targets=[], psmux_windows=windows, psmux_colors={"a": None, "b": None}
+            targets=[],
+            psmux_windows=windows,
+            psmux_colors={"a": None, "b": None},
+            psmux_icons=(wt_profiles.IconSpec("a", "a", "#111111"),),
         )
         _start_psmux_and_upload(fp, MagentConfig(projects=[]), RunOpts(), result)
         assert fp.attached_profiles == ["magent: a", None]
+
+    def test_every_window_goes_into_the_fragment_in_one_sync(
+        self, icons_on, monkeypatch
+    ):
+        calls: list[list[str]] = []
+        real = wt_profiles.sync
+
+        def spy(specs, **kw):
+            calls.append([s.key for s in specs])
+            return real(specs, **kw)
+
+        monkeypatch.setattr(wt_profiles, "sync", spy)
+        fp = FakePlatform(supports_psmux=True, supports_wt_profiles=True)
+        keys = [f"w{i}" for i in range(6)]
+        result = _LaunchResult(
+            targets=[],
+            psmux_windows=[
+                PsmuxWindowOpts(window_name=k, cwd="/tmp/x", command="claude")
+                for k in keys
+            ],
+            psmux_colors=dict.fromkeys(keys),
+            psmux_icons=tuple(wt_profiles.IconSpec(k, k, "#111111") for k in keys),
+        )
+        _start_psmux_and_upload(fp, MagentConfig(projects=[]), RunOpts(), result)
+        assert calls == [keys]
+        assert fp.attached_profiles == [f"magent: {k}" for k in keys]
+
+    def test_a_stale_fragment_is_not_used_when_the_setting_is_off(self, icons_on):
+        wt_profiles.sync([wt_profiles.IconSpec("a", "a", "#111111")])
+        fp = FakePlatform(supports_psmux=True, supports_wt_profiles=True)
+        result = _LaunchResult(
+            targets=[],
+            psmux_windows=[PsmuxWindowOpts(window_name="a", cwd="/tmp/a", command="c")],
+            psmux_colors={"a": None},
+            psmux_icons=(wt_profiles.IconSpec("a", "a", "#111111"),),
+        )
+        cfg = MagentConfig(projects=[], settings=Settings(terminal_icons=False))
+        _start_psmux_and_upload(fp, cfg, RunOpts(), result)
+        assert fp.attached_profiles == [None]
+
+    def test_no_sync_at_all_on_a_platform_without_windows_terminal(
+        self, icons_on, monkeypatch
+    ):
+        monkeypatch.setattr(
+            wt_profiles,
+            "sync",
+            lambda *a, **k: pytest.fail("synced without Windows Terminal"),
+        )
+        fp = FakePlatform(supports_psmux=True)
+        result = _LaunchResult(
+            targets=[],
+            psmux_windows=[PsmuxWindowOpts(window_name="a", cwd="/tmp/a", command="c")],
+            psmux_colors={"a": None},
+            psmux_icons=(wt_profiles.IconSpec("a", "a", "#111111"),),
+        )
+        _start_psmux_and_upload(fp, MagentConfig(projects=[]), RunOpts(), result)
+        assert fp.attached_profiles == [None]
 
     def test_attach_without_any_fragment_is_the_historical_call(self):
         fp = FakePlatform(supports_psmux=True)
@@ -217,6 +281,33 @@ class TestNodeWindows:
         )
         _bring_up_node_windows(fp, MagentConfig(projects=[proj]), RunOpts(), result)
         assert seen == [[f"magent: {sid}"]]
+
+    def test_all_node_windows_go_in_with_one_sync(self, icons_on, monkeypatch):
+        from magent import nodes
+
+        projs = [
+            ProjectConfig(path=f"/p/api{i}", node="n1", color="#336699")
+            for i in range(4)
+        ]
+        calls: list[int] = []
+        real = wt_profiles.sync
+
+        def spy(specs, **kw):
+            calls.append(len(specs))
+            return real(specs, **kw)
+
+        monkeypatch.setattr(wt_profiles, "sync", spy)
+        monkeypatch.setattr(launch, "_run_node_bring_ups", lambda *a, **k: [])
+        monkeypatch.setattr(
+            launch, "_warn_node_windows_will_not_reconnect", lambda p: None
+        )
+        fp = FakePlatform(supports_wt_profiles=True)
+        result = _LaunchResult(
+            targets=[], psmux_windows=[], psmux_colors={}, node_projects=tuple(projs)
+        )
+        _bring_up_node_windows(fp, MagentConfig(projects=projs), RunOpts(), result)
+        assert calls == [4]
+        assert _manifest_names() == [f"magent: {nodes.node_sid(p)}" for p in projs]
 
 
 class TestTurningTheSettingOff:
