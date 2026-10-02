@@ -3869,16 +3869,34 @@ def _digest_key() -> bytes:
             os.link(tmp, path)
         except OSError:
             # Lost the race (FileExistsError), the name holds a broken key, or
-            # this filesystem has no hard links: take the winner's key if
-            # there is one, else put ours in place.
-            winner = _read_key(path)
-            if winner is not None:
-                return winner
-            _replace_retrying(tmp, path)
+            # this filesystem has no hard links.
+            return _place_key(tmp, path, fresh)
         return fresh
     finally:
         with contextlib.suppress(OSError):
             tmp.unlink()
+
+
+# Serializes the one place a key is put in place by a rename (which clobbers):
+# `_place_key`. `persistent_lock`, the waiting never-deleted sidecar, as
+# `map_lock` uses it.
+CLOUD_KEY_LOCK_NAME = "cloud-digest-key"
+CLOUD_KEY_LOCK_WAIT_S = 10.0
+
+
+def _place_key(tmp: Path, path: Path, fresh: bytes) -> bytes:
+    """The key ``path`` ends up holding, when ``os.link`` could not place
+    ``tmp`` there. A rename is the only other atomic way to publish a complete
+    key (a reader never sees a partial one), but it overwrites, and nothing
+    portable renames without clobbering. So the look and the rename happen
+    under one lock: the first complete key wins, and a creator that waited
+    finds it and returns it instead of replacing it."""
+    with persistent_lock(CLOUD_KEY_LOCK_NAME, wait_s=CLOUD_KEY_LOCK_WAIT_S):
+        winner = _read_key(path)
+        if winner is not None:
+            return winner
+        _replace_retrying(tmp, path)
+    return fresh
 
 
 def _framed(*fields: bytes) -> bytes:
