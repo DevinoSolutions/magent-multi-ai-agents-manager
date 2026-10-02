@@ -70,3 +70,20 @@ paths = [
 ]
 regexTarget = "secret"
 regexes = ['''^-----BEGIN OPENSSH PRIVATE KEY-----\x5cn"\s*f"\{secret\}\x5cn"\s*"-----END OPENSSH PRIVATE KEY-----$''']
+
+# The multi-line-secret tests (tests/unit/test_cloud.py) pin the .env name filter
+# against an unquoted PEM. The block is a list of source lines, two of them the
+# f-string `f"{FRAG}="` -- a reference, not a value -- so no DECOY can sit
+# inside it, and the private-key rule reads the armor around those placeholder
+# lines and the public PKCS#8 prefix line as a key. Content-based, not a
+# .gitleaksignore fingerprint, because a squash or merge re-keys those. Allowed
+# only for that exact shape: armor around the literal {FRAG} placeholders and
+# the one 14-character prefix line, whitespace between; a longer base64 body, or
+# the same block in any other file, still fires.
+[[allowlists]]
+description = "unquoted-PEM test: armor around the literal {FRAG} placeholders and the public PKCS#8 prefix line, no key body"
+condition = "AND"
+targetRules = ["private-key"]
+paths = ['''^tests/unit/test_cloud\.py$''']
+regexTarget = "secret"
+regexes = ['''^-----BEGIN PRIVATE KEY-----",\s*f"\{FRAG\}=",\s*"MIIEvQIBADANBg",\s*f"\{FRAG\}2==",\s*"-----END PRIVATE KEY-----$''']
