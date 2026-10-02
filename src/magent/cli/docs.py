@@ -59,6 +59,18 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "missing file is a warning, not an error."
         ),
     ),
+    (
+        "icon",
+        "string",
+        "auto",
+        (
+            "Image shown on this project's Windows Terminal tab: a PNG or ICO "
+            "(at most 1 MB), relative to the project or absolute. Without it "
+            "magent uses a logo the repo already ships (a favicon or app icon) "
+            "and otherwise draws a badge in the project's tab color. An "
+            "unreadable file is skipped with a warning. Windows Terminal 1.24+."
+        ),
+    ),
 ]
 
 
@@ -107,6 +119,18 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "falls back to exact-title matching. `magent attach` windows always keep "
             "the prefix: there the title carries the psmux session id (P3-01), so it "
             "is load-bearing, not cosmetic."
+        ),
+    ),
+    (
+        "terminalIcons",
+        "boolean",
+        "`true`",
+        (
+            "Give every magent tab a real image icon (Windows Terminal 1.24+): "
+            "magent keeps a hidden profile per project in its own settings "
+            "fragment and opens the tab with it. Set `false` to remove the "
+            "fragment and get Windows Terminal's default icon back. "
+            "`magent terminal status` shows what is installed."
         ),
     ),
     (

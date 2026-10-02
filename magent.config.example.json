@@ -14,6 +14,7 @@
     "uploadServer": false,
     "uploadPort": 8033,
     "windowTitlePrefix": true,
+    "terminalIcons": true,
     "ssh": {
       "shell": "bash -lc"
     },
