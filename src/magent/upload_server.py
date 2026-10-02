@@ -981,6 +981,7 @@ _GET_PATHS: frozenset[str] = frozenset(
         "/",
         "",
         "/api/sessions",
+        "/api/cloud-panes",
         "/api/flash",
         "/install.mobileconfig",
         "/focus",
@@ -1387,6 +1388,21 @@ class UploadHandler(BaseHTTPRequestHandler):
             # count is `session_count` on /health, never overloaded here).
             self._send_bytes(
                 json.dumps({"ok": True, "sessions": self._sessions()}).encode(),
+                "application/json",
+            )
+        elif path == "/api/cloud-panes":
+            # Which panes are cloud ones is a CONFIG fact, so this answers from
+            # the config alone: no psmux probe and no `_sessions_lock`. The
+            # Alt+V listener asks it on every native / local-files press, and
+            # /api/sessions is the wrong place -- a stale snapshot there is a
+            # full has-session sweep (measured ~19s over 46 sockets) and its
+            # list is LIVE-filtered, so a cloud pane whose probe flapped would
+            # read as not-cloud and the press would paste into it.
+            cloud_ids = psmux.cloud_pane_ids(
+                psmux.config_sessions(UploadHandler.config_path)
+            )
+            self._send_bytes(
+                json.dumps({"ok": True, "cloud_panes": sorted(cloud_ids)}).encode(),
                 "application/json",
             )
         elif path == "/api/flash":

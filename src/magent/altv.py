@@ -191,9 +191,11 @@ PHASE_FLASH_MS = 20000
 UPLOAD_HTTP_TIMEOUT_S = 20.0
 
 # How long a LOCAL press waits for serve to say whether its pane is a cloud
-# viewer (``pane_is_cloud``). Short on purpose: the answer is the server's own
-# cached session list, and a press that cannot learn it proceeds as it always
-# did rather than sit on the keypress.
+# viewer (``pane_is_cloud``). Short on purpose: serve answers from its config
+# alone (``/api/cloud-panes`` -- no psmux probe, no lock), so a healthy reply is
+# milliseconds and this bound only matters for a serve that is wedged. A press
+# that cannot learn the answer proceeds as it always did rather than sit on the
+# keypress.
 CLOUD_LOOKUP_TIMEOUT_S = 3.0
 
 _flash_queue: queue.Queue[tuple[str, str, str, int | None, str]] = queue.Queue(
@@ -602,22 +604,23 @@ def pane_is_cloud(server_url: str, project: str) -> bool:
     are the two that never reach ``/upload`` -- the opt-in native Ctrl+V and the
     LOCAL files press, which types the original paths -- so they ask.
 
-    The answer is ``/api/sessions``' ``node`` field read through
-    ``psmux.cloud_pane_ids``, whose FIRST-row-wins rule is the one the create
-    gate uses: in a ``[local, cloud]`` pair for one folder the pane is a local
-    agent's and stays pasteable.
+    The answer is serve's ``/api/cloud-panes``: the ids
+    ``psmux.cloud_pane_ids`` finds in the CONFIG, whose FIRST-row-wins rule is
+    the one the create gate uses (in a ``[local, cloud]`` pair for one folder
+    the pane is a local agent's and stays pasteable). It is deliberately not
+    ``/api/sessions``: that list is live-filtered through a has-session sweep,
+    so it is both the slow endpoint and one that can drop a cloud pane whose
+    probe flapped.
 
     Fails OPEN, on purpose and noisily: these two presses were built to work
     with no server at all, so a lookup that cannot answer (serve down, a stalled
-    reply, a body of the wrong shape) must not turn every local pane's paste
-    into a refusal. It never raises -- a press must not die of a lookup.
+    reply, an older serve that has no such route and answers 404, a body of the
+    wrong shape) must not turn every local pane's paste into a refusal. It never
+    raises -- a press must not die of a lookup.
     """
-    # In-body, as in ``native_paste``: psmux is a leaf over `log`.
-    from magent import psmux
-
     try:
         with urlopen(
-            f"{server_url.rstrip('/')}/api/sessions", timeout=CLOUD_LOOKUP_TIMEOUT_S
+            f"{server_url.rstrip('/')}/api/cloud-panes", timeout=CLOUD_LOOKUP_TIMEOUT_S
         ) as resp:
             payload = json.loads(resp.read())
     except (OSError, ValueError, HTTPException) as exc:
@@ -627,10 +630,8 @@ def pane_is_cloud(server_url: str, project: str) -> bool:
             type(exc).__name__,
         )
         return False
-    rows = payload.get("sessions") if isinstance(payload, dict) else None
-    if not isinstance(rows, list):
-        return False
-    return project in psmux.cloud_pane_ids(row for row in rows if isinstance(row, dict))
+    ids = payload.get("cloud_panes") if isinstance(payload, dict) else None
+    return isinstance(ids, list) and project in ids
 
 
 def native_enabled() -> bool:

@@ -1699,27 +1699,39 @@ class TestARemoteFileThatWillNotRead:
 
 
 class _SessionsServer:
-    """A real HTTP server standing in for `magent serve`'s GET /api/sessions.
+    """A real HTTP server standing in for `magent serve`'s GET /api/cloud-panes.
 
-    ``rows`` is answered as the JSON ``sessions`` list; ``raw=`` answers with
-    those bytes verbatim instead. Every path asked is kept, so a test can
-    prove a press did NOT ask."""
+    ``cloud_panes`` is answered as the JSON ``cloud_panes`` list; ``raw=``
+    answers with those bytes verbatim instead, and ``status=`` answers that
+    HTTP status (an old serve with no such route says 404). The route's REAL
+    shape is pinned against the real handler in
+    ``test_upload_server.TestAPressReadsServesCloudPaneRoute``. Every path
+    asked is kept, so a test can prove a press did NOT ask."""
 
-    def __init__(self, rows: list[dict] | None = None, raw: bytes | None = None):
-        self.rows = rows or []
+    def __init__(
+        self,
+        cloud_panes: list[str] | None = None,
+        raw: bytes | None = None,
+        status: int = 200,
+    ):
+        self.cloud_panes = cloud_panes or []
         self.raw = raw
+        self.status = status
         self.gets: list[str] = []
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 outer.gets.append(self.path)
-                body = (
-                    outer.raw
-                    if outer.raw is not None
-                    else json.dumps({"ok": True, "sessions": outer.rows}).encode()
-                )
-                self.send_response(200)
+                if outer.status != 200:
+                    body = json.dumps({"ok": False, "error": "Not found"}).encode()
+                elif outer.raw is not None:
+                    body = outer.raw
+                else:
+                    body = json.dumps(
+                        {"ok": True, "cloud_panes": outer.cloud_panes}
+                    ).encode()
+                self.send_response(outer.status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -1738,10 +1750,6 @@ class _SessionsServer:
         self.server.server_close()
         self._thread.join(timeout=10)
         assert not self._thread.is_alive(), "the stand-in sessions server never stopped"
-
-
-_CLOUD_ROW = {"name": "api", "session": "api", "node": "cloud"}
-_LOCAL_ROW = {"name": "api", "session": "api", "node": None}
 
 
 class TestACloudPaneTakesNoLocalPaste:
@@ -1796,7 +1804,7 @@ class TestACloudPaneTakesNoLocalPaste:
         return altv.handle_file_press(url, project, lambda: self.paths, local=True)
 
     def test_a_native_press_into_a_cloud_pane_sends_no_key(self):
-        server = _SessionsServer([_CLOUD_ROW])
+        server = _SessionsServer(["api"])
         try:
             outcome = self._native(server.url)
         finally:
@@ -1804,10 +1812,10 @@ class TestACloudPaneTakesNoLocalPaste:
 
         assert outcome == "cloud-pane"
         assert self.sends == []
-        assert server.gets == ["/api/sessions"]
+        assert server.gets == ["/api/cloud-panes"]
 
     def test_a_local_files_press_into_a_cloud_pane_pastes_no_path(self):
-        server = _SessionsServer([_CLOUD_ROW])
+        server = _SessionsServer(["api"])
         try:
             outcome = self._files(server.url)
         finally:
@@ -1818,7 +1826,7 @@ class TestACloudPaneTakesNoLocalPaste:
 
     @pytest.mark.parametrize("press", ["_native", "_files"])
     def test_the_refusal_is_the_last_word_on_the_bar_in_the_error_tint(self, press):
-        server = _SessionsServer([_CLOUD_ROW])
+        server = _SessionsServer(["api"])
         try:
             getattr(self, press)(server.url)
         finally:
@@ -1834,7 +1842,7 @@ class TestACloudPaneTakesNoLocalPaste:
         )
 
     def test_a_refused_files_press_is_logged_by_outcome(self, caplog):
-        server = _SessionsServer([_CLOUD_ROW])
+        server = _SessionsServer(["api"])
         try:
             with caplog.at_level("INFO", logger="magent.hotkey"):
                 self._files(server.url)
@@ -1843,27 +1851,8 @@ class TestACloudPaneTakesNoLocalPaste:
 
         assert "ALTV outcome=cloud-pane project=api" in caplog.text
 
-    def test_a_local_agent_that_shares_the_name_is_still_pasted_into(self):
-        # `[local, cloud]`: the FIRST project owns the name (the same rule as
-        # psmux.cloud_pane_ids), so the pane is a local agent's.
-        server = _SessionsServer([_LOCAL_ROW, _CLOUD_ROW])
-        try:
-            assert self._native(server.url) == "ok-native"
-            assert self._files(server.url) == "ok-paths"
-        finally:
-            server.close()
-
-        assert len(self.sends) == 2
-
-    def test_a_cloud_first_pair_is_a_cloud_pane(self):
-        server = _SessionsServer([_CLOUD_ROW, _LOCAL_ROW])
-        try:
-            assert self._native(server.url) == "cloud-pane"
-        finally:
-            server.close()
-
     def test_another_projects_cloud_row_is_not_this_panes(self):
-        server = _SessionsServer([_CLOUD_ROW, {"name": "web", "session": "web"}])
+        server = _SessionsServer(["api"])
         try:
             assert self._native(server.url, "web") == "ok-native"
         finally:
@@ -1880,7 +1869,13 @@ class TestACloudPaneTakesNoLocalPaste:
 
     @pytest.mark.parametrize(
         "raw",
-        [b"<html>not json</html>", b"[]", b'{"sessions": "api"}', b'{"sessions": [3]}'],
+        [
+            b"<html>not json</html>",
+            b"[]",
+            b'{"cloud_panes": "api"}',
+            b'{"cloud_panes": [3]}',
+            b'{"sessions": [{"name": "api", "node": "cloud"}]}',
+        ],
     )
     def test_a_reply_of_the_wrong_shape_is_not_a_cloud_verdict(self, raw):
         server = _SessionsServer(raw=raw)
@@ -1888,6 +1883,20 @@ class TestACloudPaneTakesNoLocalPaste:
             assert self._native(server.url) == "ok-native"
         finally:
             server.close()
+
+    def test_a_serve_without_the_route_answers_404_and_the_press_proceeds(self):
+        # An older serve (the listener is a long-lived process and can outlive
+        # an upgrade of serve) has no /api/cloud-panes. 404 must take the same
+        # fail-open path as a dead serve, not raise out of the press.
+        server = _SessionsServer(status=404)
+        try:
+            assert self._native(server.url) == "ok-native"
+            assert self._files(server.url) == "ok-paths"
+        finally:
+            server.close()
+
+        assert server.gets == ["/api/cloud-panes", "/api/cloud-panes"]
+        assert len(self.sends) == 2
 
     def test_the_lookup_is_bounded_and_never_blocks_a_press_for_long(self, monkeypatch):
         from urllib.error import URLError
