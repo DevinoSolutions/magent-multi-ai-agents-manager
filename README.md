@@ -365,6 +365,7 @@ Or skip the menu with flags:
 | `magent hotkey [--ssh-host <host>]` | Run the window-hotkey listener standalone (Windows): Alt+V clipboard upload and F2 open-in-VS-Code. `--ssh-host` makes F2 open over Remote-SSH. |
 | `magent hooks install` | Wire the agent lifecycle hooks that feed the session-state store (`magent hooks status` to inspect) — see [Where agent states come from](#where-agent-states-come-from). |
 | `magent terminal install` | Bind Ctrl+Backspace and Shift+Enter in Windows Terminal so they still work inside a psmux pane (`magent terminal status` to inspect) — see [Typing through psmux](#typing-through-psmux). |
+| `magent terminal icons [--remove]` | Show the per-project Windows Terminal tab icons magent writes (or delete them) — see [Tab icons](#tab-icons). |
 | `magent config <subcommand>` | Edit config from the CLI — 17 subcommands incl. `migrate`; see `magent config --help`. |
 | `magent config edit [host]` | Edit the config on **another** machine in your editor over SSH — fetch, edit, validate, push back. Omit the host to reuse your last `attach` target. The host side is `magent config cat` / `magent config put`, which you never run by hand. |
 
@@ -468,6 +469,35 @@ timestamped backup lands beside `settings.json` before any write. If your
 it and prints the exact snippet to paste by hand instead. `magent doctor`
 reports the same per-key state under `wt-keys` — as a warning, never a failure.
 
+### Tab icons
+
+Windows Terminal has no per-tab icon flag: a tab wears the icon of the **profile**
+it was opened with, and until now every magent tab opened with the default
+profile's `>_`. magent now opens each tab with its own hidden profile,
+`magent: <window>`, whose icon is, first match wins:
+
+1. the project's `icon` in the config (a PNG or ICO; relative to the project, or absolute);
+2. a logo the repository already ships (`favicon.png`, `public/icon.png`,
+   `assets/logo.png`, … — roughly square, PNG or ICO, at most 1 MB);
+3. a generated badge: the project's tab colour with its initial on it.
+
+The profiles live in a **fragment** — a folder magent owns outright at
+`%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\magent\` — so your
+`settings.json` is never edited and nothing needs a backup. The fragment is
+written when a window is launched (`--go`, `up`, `attach`), merged rather than
+replaced, and a failure to write it only means that tab opens with the default
+icon, exactly as before.
+
+```
+magent terminal icons            # what is in the fragment, and where each icon came from
+magent terminal icons --remove   # delete the fragment (the next launch writes it again)
+```
+
+Turn it off with `settings.terminalIcons: false` (a launch then also removes a
+fragment left from before) or, for one process tree, `MAGENT_WT_ICONS=0`.
+`magent doctor` reports the state under `wt-icons`, as a warning at worst.
+Relative icon paths in a fragment need Windows Terminal 1.24 or newer.
+
 ### When every psmux command hangs (the wedge)
 
 Rare, and worth knowing before it happens: psmux's control plane can wedge
@@ -500,6 +530,7 @@ Launching, tiling, and the mobile/notification plumbing run on all three OSes. A
 | Idle reaping (`settings.idleReap`) | Yes | No | No |
 | Global Alt+V clipboard image/file hotkey | Yes | No | No |
 | psmux-safe keybindings (`terminal install`) | Yes | No | No |
+| Per-project tab icons (`settings.terminalIcons`) | Yes | No | No |
 | Mobile upload server (`serve` / `mobile`) | Yes | Yes | Yes |
 
 Notes:
@@ -563,6 +594,7 @@ Configs are versioned (`"version": 1`). A config without a current version still
 | `tool` | `defaultTool` | `claude`, `codex`, `cursor-agent`, `agy`, `vscode`, `cursor`, or any custom tool. |
 | `color` | derived | Terminal tab color (`#rrggbb`); auto-derived from the project title/path when unset. |
 | `title` | folder name | Window title for matching. |
+| `icon` | auto | Tab icon (PNG or ICO), relative to the project or absolute; unset uses the repo's own logo, else a generated badge — see [Tab icons](#tab-icons). |
 | `enabled` | `true` | Set `false` to skip without deleting. |
 | `happy` | inherit | Override global Happy setting for this project. |
 | `host` | none | SSH target for remote projects. |
