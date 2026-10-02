@@ -1838,6 +1838,7 @@ def eligible_projects(
     from magent.launch import (
         _expand_base_dir,
         _resolve_path,
+        cloud_command,
         project_for_session,
         twin_session_refusal,
     )
@@ -1883,7 +1884,7 @@ def eligible_projects(
         cmd_why = ""
         if is_cloud(proj):
             pane_tool = tool
-            cmd, cmd_why = _cloud_command(
+            cmd, cmd_why = cloud_command(
                 tool, config.settings.tools.get(tool, ""), proj.cloud_task
             )
         elif (
@@ -1918,27 +1919,6 @@ def eligible_projects(
             row["cmd_why"] = cmd_why
         out.append(row)
     return out
-
-
-def _cloud_command(tool: str, base_cmd: str, task: str | None) -> tuple[str, str]:
-    """``(command, "")`` for a cloud pane, or ``("", why)`` when it has none.
-
-    The same three refusals, in the same order, as the create gate and the
-    launch path (``launch.cloud_tool_refusal``, then the task, then the typing
-    check), so an empty command is never a bare ``bash --cloud "t"`` and no
-    surface words the reason differently."""
-    from magent.launch import NO_CLOUD_TASK, cloud_tool_refusal
-    from magent.sessions.claude import cloud_pane_command
-
-    refusal = cloud_tool_refusal(tool, base_cmd)
-    if refusal:
-        return "", refusal
-    if not task:
-        return "", NO_CLOUD_TASK
-    try:
-        return cloud_pane_command(base_cmd, task), ""
-    except ValueError as exc:
-        return "", str(exc)
 
 
 def _down_reason(binary: str | None, project: dict[str, object]) -> str:

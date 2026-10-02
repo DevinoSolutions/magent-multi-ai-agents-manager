@@ -94,43 +94,31 @@ def _check_agent_tools(cfg: MagentConfig | None) -> CheckResult:
     return (OK, "every configured agent tool resolves on PATH")
 
 
-def _pane_command_refusal(base_cmd: str | None, task: str) -> str | None:
-    """Why the pane's command cannot be typed, or None: the create path's last
-    static step. ``cloud_pane_command`` is what `--go` and `up` build the command
-    with and it says why it will not (the executable, the task), so the words
-    are the ones their SKIP line prints."""
-    # heavy subsystem: in-body per policy
-    from magent.sessions.claude import cloud_pane_command
-
-    try:
-        cloud_pane_command(base_cmd or "", task)
-    except ValueError as exc:
-        return str(exc)
-    return None
-
-
 def _cloud_config_problems(cfg: MagentConfig, cloud: list[ProjectConfig]) -> list[str]:
-    """What the create path would refuse for ``cloud`` from config alone, in its
-    own words and order (tool, task, then the command it would type). No git, no
-    push set, no records, no live-session probe: those are the gate's to ask at
-    create time. Then the pairs for one folder where the first enabled project
-    owns the session name, so the other is never started -- the words `status`
-    uses."""
+    """What the create paths would refuse for ``cloud`` from config alone. Per
+    project, ``launch.cloud_command``'s FIRST reason (tool, task, then the
+    command it would type -- the one ladder ``up`` and ``--go`` both read), then
+    ``--go``'s own skip when it has no psmux pane to put the project in: ``up``
+    ignores ``settings.psmux``, so that is a second surface's problem, said
+    after the first rather than hiding it. No git, no push set, no records, no
+    live-session probe: those are the gate's to ask at create time. Then the
+    pairs for one folder where the first enabled project owns the session name,
+    so the other is never started -- the words `status` uses."""
     from magent import launch, nodes  # heavy subsystem: in-body per policy
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
+    go_has_psmux = launch.launch_uses_psmux(cfg, get_platform())
     problems: list[str] = []
     for proj in cloud:
+        name = nodes.project_name(proj)
         tool = proj.tool or cfg.settings.default_tool
-        base_cmd = cfg.settings.tools.get(tool)
-        refusal = launch.cloud_tool_refusal(tool, base_cmd)
-        if refusal is None:
-            refusal = (
-                _pane_command_refusal(base_cmd, proj.cloud_task)
-                if proj.cloud_task
-                else launch.NO_CLOUD_TASK
-            )
-        if refusal:
-            problems.append(f"{nodes.project_name(proj)}: {refusal}")
+        _cmd, why = launch.cloud_command(
+            tool, cfg.settings.tools.get(tool), proj.cloud_task
+        )
+        if why:
+            problems.append(f"{name}: {why}")
+        if not go_has_psmux:
+            problems.append(f"{name}: --go skips it: {launch.CLOUD_NEEDS_PSMUX}")
     for kind, shadows in (
         ("cloud", launch.shadowed_cloud_projects(cfg)),
         ("local", launch.shadowed_local_projects(cfg)),

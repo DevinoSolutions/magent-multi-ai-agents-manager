@@ -2847,9 +2847,37 @@ class TestTheLaunchPathCreatesACloudPaneOnce:
             [],
             {},
         )
-        assert "cloud projects run in a psmux pane" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        # The words doctor repeats verbatim: one constant, not two copies.
+        assert f"SKIP: api — {launch.CLOUD_NEEDS_PSMUX}" in out
+        assert "cloud projects run in a psmux pane" in launch.CLOUD_NEEDS_PSMUX
         assert fake_platform.launched_terminals == []
         assert fake_platform.psmux_launches == []
+
+    @pytest.mark.parametrize(
+        ("setting", "platform", "skipped"),
+        [
+            (False, True, True),
+            (True, False, True),
+            (False, False, True),
+            (True, True, False),
+        ],
+        ids=["setting-off", "no-platform-psmux", "both-off", "both-on"],
+    )
+    def test_the_launch_loop_needs_the_setting_and_the_platform_for_a_cloud_pane(
+        self, fake_platform, tmp_config, tmp_path, capsys, setting, platform, skipped
+    ):
+        fake_platform._supports_psmux = platform
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path, settings={"psmux": setting}))
+        assert launch.launch_uses_psmux(cfg, fake_platform) is (setting and platform)
+
+        launch._launch_projects(
+            fake_platform, cfg, RunOpts(dry_run=True), cfg.projects, None
+        )
+
+        out = capsys.readouterr().out
+        assert (f"SKIP: api — {launch.CLOUD_NEEDS_PSMUX}" in out) is skipped
+        assert ("would run" in out) is not skipped
 
     def test_a_cloud_project_is_never_typed_a_continue_command(
         self, monkeypatch, fake_platform, tmp_config, tmp_path
@@ -3061,8 +3089,13 @@ class TestACloudProjectOnTheWrongToolIsSkippedOnce:
         assert (n, windows, asked, targets) == (0, [], [], [])
         assert out.count("SKIP:") == 1
         assert "'codex'" in out and "cloudTask" not in out
-        refusal = real_gate(load_config(path), "api") or ""
+        cfg = load_config(path)
+        refusal = real_gate(cfg, "api") or ""
         assert "'codex'" in refusal and refusal != launch.NO_CLOUD_TASK
+        # The project's OWN tool, in the one ladder's words.
+        assert refusal == launch.cloud_tool_refusal(
+            "codex", cfg.settings.tools.get("codex")
+        )
 
     @pytest.mark.parametrize("dry_run", [False, True])
     @pytest.mark.parametrize(
@@ -3173,6 +3206,86 @@ class TestTheCloudToolRule:
         refusal = launch.cloud_tool_refusal(tool, "claude")
         assert refusal is not None and repr(tool) in refusal
         assert "claude --cloud" in refusal
+
+
+class TestTheOneCloudCommandLadder:
+    """``launch.cloud_command`` is the ONE ladder -- tool, then task, then the
+    command a pane can safely be typed -- that ``--go``, ``up`` and `doctor` all
+    read, so no surface words a refusal or orders two of them differently."""
+
+    TOOL_REFUSAL = launch.cloud_tool_refusal("codex", "codex")
+
+    def test_a_good_cloud_project_gets_its_pane_command_and_no_reason(self):
+        assert launch.cloud_command("claude", "claude --continue", "Fix it") == (
+            'claude --cloud "Fix it"',
+            "",
+        )
+
+    def test_the_tool_is_asked_first_whatever_else_is_missing(self):
+        assert self.TOOL_REFUSAL is not None
+        assert launch.cloud_command("codex", "codex", None) == (
+            "",
+            self.TOOL_REFUSAL,
+        )
+
+    @pytest.mark.parametrize("command", [None, "", "  "])
+    def test_a_tool_with_no_command_is_the_unknown_tool_reason(self, command):
+        cmd, why = launch.cloud_command("claude", command, "Fix it")
+        assert cmd == "" and "unknown tool 'claude'" in why
+
+    @pytest.mark.parametrize("task", [None, ""])
+    def test_a_missing_task_comes_next_and_before_the_typing_check(self, task):
+        # `~/bin/claude` could not be typed either, but the task is first.
+        assert launch.cloud_command("claude", "claude", task) == (
+            "",
+            launch.NO_CLOUD_TASK,
+        )
+        assert launch.cloud_command("claude", "~/bin/claude", task) == (
+            "",
+            launch.NO_CLOUD_TASK,
+        )
+
+    def test_what_the_pane_cannot_type_is_said_in_the_builders_own_words(self):
+        from magent.sessions.claude import cloud_pane_command
+
+        with pytest.raises(ValueError, match="cannot type claude executable") as exe:
+            cloud_pane_command("~/bin/claude --continue", "Fix it")
+        with pytest.raises(ValueError, match="unsafe cloud task") as task:
+            cloud_pane_command("claude", "fix it; rm everything")
+
+        assert launch.cloud_command("claude", "~/bin/claude --continue", "Fix it") == (
+            "",
+            str(exe.value),
+        )
+        assert launch.cloud_command("claude", "claude", "fix it; rm everything") == (
+            "",
+            str(task.value),
+        )
+
+    def test_the_bring_up_row_carries_the_ladders_answer(self, tmp_config, tmp_path):
+        from magent import psmux
+
+        for tool, task, tools in (
+            ("claude", "Fix it", {"claude": "claude --continue"}),
+            ("claude", None, {"claude": "claude"}),
+            ("claude", "Fix it", {"claude": "~/bin/claude"}),
+            ("claude", "Fix it", {"claude": "bash -c claude"}),
+            # The project's OWN tool is what the ladder is asked about.
+            ("codex", "Fix it", {"claude": "claude", "codex": "codex"}),
+        ):
+            cfg = load_config(
+                _cloud_cfg(
+                    tmp_config,
+                    tmp_path,
+                    cloudTask=task,
+                    tool=tool,
+                    settings={"tools": tools},
+                )
+            )
+            [row] = psmux.eligible_projects(cfg)
+            assert (row["cmd"], row.get("cmd_why", "")) == launch.cloud_command(
+                tool, tools[tool], task
+            )
 
 
 class TestOneSessionNamingRule:
