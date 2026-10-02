@@ -256,3 +256,41 @@ def test_the_node_row_no_longer_calls_cloud_reserved():
     node_row = next(row for row in _PROJECT_FIELD_DOCS if row[0] == "node")
     assert "reserved in this release" not in node_row[3]
     assert "cloudTask" in node_row[3]
+
+
+class TestTheCloudPaneCommand:
+    def test_it_is_the_configured_claude_executable_with_the_quoted_task(self):
+        from magent.sessions.claude import cloud_pane_command
+
+        assert cloud_pane_command("claude --continue", "Fix the login bug") == (
+            'claude --cloud "Fix the login bug"'
+        )
+
+    def test_it_keeps_a_path_to_the_executable(self):
+        from magent.sessions.claude import cloud_pane_command
+
+        assert cloud_pane_command(r"C:\tools\claude.exe --continue", "t") == (
+            r'C:\tools\claude.exe --cloud "t"'
+        )
+
+    def test_it_drops_every_other_configured_flag(self):
+        # --continue/--resume make no sense for a NEW cloud session.
+        from magent.sessions.claude import cloud_pane_command
+
+        assert (
+            cloud_pane_command("claude --continue --model opus", "t")
+            == 'claude --cloud "t"'
+        )
+
+    @pytest.mark.parametrize("base", ["", r'"C:\Program Files\claude.exe"', "cl&aude"])
+    def test_an_executable_it_cannot_type_safely_is_refused(self, base):
+        from magent.sessions.claude import cloud_pane_command
+
+        with pytest.raises(ValueError):
+            cloud_pane_command(base, "t")
+
+    def test_an_unsafe_task_is_refused_even_past_config_validation(self):
+        from magent.sessions.claude import cloud_pane_command
+
+        with pytest.raises(ValueError):
+            cloud_pane_command("claude", 'x" & del *')
