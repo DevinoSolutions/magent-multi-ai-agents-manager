@@ -333,6 +333,8 @@ def _no_real_wt_fragment(tmp_path_factory, monkeypatch):
     # folder comes into being only for the few tests that write a fragment.
     root = tmp_path_factory.getbasetemp() / "wt-fragments" / uuid4().hex
     monkeypatch.setattr("magent.wt_profiles.fragments_root", lambda: root)
+    # A lock found held by one test must not mute the next one's syncs.
+    monkeypatch.setattr("magent.wt_profiles._launch.lock_lost", False)
 
 
 @pytest.fixture
