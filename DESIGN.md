@@ -1860,6 +1860,76 @@ other key still installing, the no-op rerun, the backup contents, and the
 off-Windows message. `tests/unit/test_doctor.py::TestCheckWtKeys` pins the
 check's four states and that it never fails a doctor run.
 
+### The tab icon is a profile, and the profile is magent's (2026-10-02)
+
+**Problem.** Every magent tab wore Windows Terminal's default `>_`, so the
+tab strip and the Alt+Tab switcher told twenty projects apart by title text
+alone. There is no per-tab icon flag: the icon belongs to the PROFILE a tab was
+opened with, and `wt` is told which with `-p`.
+
+**Decision.** Per-project hidden profiles shipped in a Windows Terminal
+*fragment* (`%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\magent\`),
+opened with `wt -p "magent: <window>"`. Rejected: writing profiles into the
+user's `settings.json` (the `wt_keys` machinery exists only because that file
+is the user's, JSONC and backed up on every write; icons would have made every
+launch a settings edit), and ANSI/OSC title tricks (no icon channel exists).
+A fragment is the one extension point Windows Terminal gives an app for
+exactly this, and a folder magent owns outright needs no round-trip law.
+
+**The laws, all in `wt_profiles.py`.**
+
+- *Never the reason a launch fails.* Every write is guarded and a failure logs
+  and returns; the spawn site then passes no `-p` and the tab opens as before.
+- *`-p` only for a profile on disk.* `profile_for(key)` reads the manifest the
+  spawn is about to rely on AND requires the icon file to exist, so no tab is
+  opened against a profile Windows Terminal cannot find.
+- *The key is the window's identity.* A launch writes under the psmux session
+  name or the raw title (what `tile_key` is) and hands the name to the spawn
+  through `TerminalLaunchOpts.profile` / `attach_psmux(profile=)`; the attach
+  paths (`attach_client.spawn_attach_window`, `_attach_nomux`) look it up by
+  sid with `profile_for`, after `cli/attach._ensure_attach_profiles` has
+  synced the sessions about to open. No dispatcher signature changed, and an
+  old fake platform that does not take `profile=` is never handed one.
+- *Merge, never replace.* An attach to a host adds its sessions beside a local
+  launch's; the oldest fall off at `MAX_PROFILES`. Content-named icon files
+  (a changed logo is a new path) defeat Windows Terminal's icon cache, and an
+  unchanged icon is not rewritten, so the sync is cheap enough for every launch.
+  Writes are atomic under `persistent_lock`.
+- *`-p` goes in through `args.extend`.* MD006 wants `--suppressApplicationTitle`
+  inside the `wt` literal next to the `"wt"` token; the profile is inserted
+  before the `--` that ends `wt`'s own options at all four spawn sites.
+
+**Icon source, first match wins:** `projects[].icon`; a logo the repo ships
+(27 fixed relative candidates, so a bounded number of stat calls, validated by
+magic bytes, roughly square, capped at 1 MB); a generated badge
+(`icons.render_badge`: the project's tab colour, its initial in a stroke font
+with signed-distance antialiasing so it stays crisp at 16 px and at high DPI).
+Profile names have `;` (Windows Terminal's command separator) and quotes
+replaced.
+
+**Switches.** `settings.terminalIcons` (default on; turning it off makes the
+next launch remove the fragment) and `MAGENT_WT_ICONS=0`. The env var is the
+SIXTH test-isolation opt-out and, like the others, is a law and not a
+preference: a fragment is read by the user's real Windows Terminal, which no
+HOME redirect contains. Two layers hold it: `tests/conftest.py` pins it to 0
+for every tier and every fixture that builds an explicit child `env=` carries
+it, and an autouse guard points `wt_profiles.fragments_root` (THE seam; nothing
+else resolves the folder) at a tmp dir. `tests/unit/test_home_isolation.py`
+pins both, each with a case that goes red if the layer is removed.
+
+**Known unknowns, verified live before release.** Whether `wt -p` still
+launches a profile marked `hidden: true` (`HIDE_PROFILES`; flip to False if it
+does not -- the profiles then show in the new-tab menu), and 16 px crispness of
+the generated badge. Relative `icon` paths in fragments resolve against the
+fragment folder from Windows Terminal 1.24; older versions honour only URLs, so
+`terminal icons` says so.
+
+**Proof.** `tests/unit/test_wt_profiles.py` (fragment merge/prune/atomicity,
+discovery, naming), `test_icons.py` (the badge), `test_wt_profile_spawn.py` (all
+four argv shapes with and without a profile), `test_launch_tab_icons.py` and
+`test_attach_tab_icons.py` (which windows get one), `test_terminal_icons_cmd.py`
+(the command, the status section, the doctor row).
+
 ### Native local paste is opt-in; the pipeline is the default everywhere (2026-08-31)
 
 The Alt+V capture/upload/inject pipeline exists to move an image between
