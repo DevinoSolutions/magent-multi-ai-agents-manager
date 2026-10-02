@@ -14,11 +14,12 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
 
-from magent import launch, nodes, psmux
+from magent import cli, launch, nodes, psmux
 from magent.config import SCHEMA_VERSION, ConfigError, load_config
 from magent.launch import RunOpts
 from magent.lockfile import LockHeld, persistent_lock
@@ -3778,6 +3779,7 @@ class TestACloudFirstTwinNeverReachesTheSessionLists:
         windows: list[psmux.PsmuxWindowOpts] = []
         monkeypatch.setattr("magent.platform.get_platform", lambda: fake_platform)
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "live_sessions", lambda names, psmux=None, **kw: [])
         monkeypatch.setattr(
             psmux, "launch_verified", lambda plat, wins: (windows.extend(wins), {})[1]
         )
@@ -3811,3 +3813,558 @@ class TestACloudFirstTwinNeverReachesTheSessionLists:
         revived = psmux.revive_sessions(cfg, only=["api"], group="b", vetoed=why)
         assert revived == [] and sent == []
         assert why["api"] == launch.twin_session_refusal("api")
+
+
+# ---------------------------------------------------------------------------
+# J9: the user-facing surfaces tell a cloud pane apart from an agent pane.
+# Every `claude --cloud` typed into a pane starts a NEW billed cloud session
+# the CLI cannot list or stop, so no surface may type into a cloud pane, and
+# each must tell the truth about one.
+# ---------------------------------------------------------------------------
+
+
+def _hermetic_fleet(monkeypatch, *, live: bool = True) -> list[str]:
+    """Every pane-driving seam `send`/`model`/`peek` reach, faked: no test here
+    may touch a real psmux (the box that runs them hosts a live fleet). The
+    returned list records each pane a command WROTE to -- empty means nothing
+    was typed."""
+    typed: list[str] = []
+    monkeypatch.setattr("magent.psmux.find_psmux", lambda: "psmux")
+    monkeypatch.setattr(
+        "magent.psmux.live_sessions",
+        lambda names, psmux=None: list(names) if live else [],
+    )
+    monkeypatch.setattr(
+        "magent.fleet.paste_and_enter",
+        lambda name, text, psmux_bin=None: typed.append(name) or True,
+    )
+    monkeypatch.setattr(
+        "magent.fleet.switch_model",
+        lambda name, model, effort, psmux_bin=None: typed.append(name) or True,
+    )
+    monkeypatch.setattr(
+        "magent.fleet.read_state",
+        lambda name, psmux_bin=None: {"state": "idle", "model": "m", "effort": "e"},
+    )
+    monkeypatch.setattr(
+        "magent.psmux.read_pane",
+        lambda name, psmux=None: SimpleNamespace(timed_out=False, text=""),
+    )
+    monkeypatch.setattr("magent.psmux.capture_pane", lambda name, psmux=None: "")
+    monkeypatch.setattr("magent.cli.fleet_cmd.time.sleep", lambda s: None)
+    return typed
+
+
+class TestTheSurfacesTellCloudApart:
+    def test_sessions_json_carries_the_node(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        result = runner.invoke(
+            cli.main,
+            ["--config", _cloud_cfg(tmp_config, tmp_path), "sessions", "--json"],
+        )
+        [row] = json.loads(result.stdout)
+        assert row["node"] == "cloud"
+
+    def test_a_live_cloud_row_is_never_read_as_an_idle_agent(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        _hermetic_fleet(monkeypatch)
+        reads: list[str] = []
+        monkeypatch.setattr(
+            "magent.fleet.read_state",
+            lambda name, psmux_bin=None: (
+                reads.append(name) or {"state": "idle", "model": "m", "effort": "e"}
+            ),
+        )
+        result = runner.invoke(
+            cli.main,
+            ["--config", _cloud_cfg(tmp_config, tmp_path), "sessions", "--json"],
+        )
+        [row] = json.loads(result.stdout)
+        # A cloud pane at a bare shell is quiet, and a quiet pane classifies as
+        # "idle": the pane is not read at all, and the row says what it is.
+        assert (row["live"], row["state"], row["node"]) == (True, "cloud", "cloud")
+        assert (row["model"], row["effort"]) == (None, None)
+        assert reads == []
+
+    def test_send_refuses_a_cloud_session_and_names_the_cli_follow_up(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        typed = _hermetic_fleet(monkeypatch)
+        result = runner.invoke(
+            cli.main,
+            ["--config", _cloud_cfg(tmp_config, tmp_path), "send", "api", "hello"],
+        )
+        assert result.exit_code == 2
+        assert "cloud session" in result.stderr
+        # V5: valid ONLY as a follow-up to an existing session id.
+        assert 'claude -p "<msg>" --cloud <session-id>' in result.stderr
+        assert typed == []
+
+    def test_model_refuses_a_cloud_session(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        typed = _hermetic_fleet(monkeypatch)
+        result = runner.invoke(
+            cli.main,
+            ["--config", _cloud_cfg(tmp_config, tmp_path), "model", "api", "opus"],
+        )
+        assert result.exit_code == 2
+        assert "cloud session" in result.stderr
+        assert typed == []
+
+    def test_model_all_and_send_never_see_a_cloud_pane_as_live(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        from magent.cli import fleet_cmd
+
+        (tmp_path / "api").mkdir()
+        (tmp_path / "web").mkdir()
+        cfg = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "projects": [
+                    {"path": str(tmp_path / "api"), "node": "cloud", "cloudTask": "t"},
+                    {"path": str(tmp_path / "web")},
+                ],
+            }
+        )
+        _hermetic_fleet(monkeypatch)
+        assert fleet_cmd._live_names(cfg, "psmux") == ["web"]
+        # peek is read-only, so it keeps the cloud pane in view.
+        assert fleet_cmd._live_names(cfg, "psmux", drivable=False) == ["api", "web"]
+
+    def test_peek_still_reads_a_cloud_pane(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        _hermetic_fleet(monkeypatch)
+        monkeypatch.setattr(
+            "magent.psmux.read_pane",
+            lambda name, psmux=None: SimpleNamespace(
+                timed_out=False, text="provisioning"
+            ),
+        )
+        result = runner.invoke(
+            cli.main, ["--config", _cloud_cfg(tmp_config, tmp_path), "peek", "api"]
+        )
+        assert result.exit_code == 0
+        assert "provisioning" in result.stdout
+
+    def test_down_says_the_cloud_session_keeps_running(self, capsys):
+        from magent.cli.status import _report_shutdown
+
+        _report_shutdown(["api", "web"], [], cloud={"api"})
+        out = capsys.readouterr().out
+        assert "api was a cloud pane" in out
+        assert "keeps running" in out
+        assert "claude.ai/code" in out
+        assert "web was a cloud pane" not in out
+
+    def test_cloud_is_the_fifth_parameter_and_displaces_neither_node_half(self, capsys):
+        from magent.cli.status import _report_shutdown
+
+        _report_shutdown([], [], [], ["web"], cloud={"api"})
+        out = capsys.readouterr().out
+        assert "would NOT stop: web" in out and "nodes.log" in out
+        # api was not stopped here, so nothing is claimed about its cloud session.
+        assert "api was a cloud pane" not in out
+
+    def _stopped_api(self, monkeypatch):
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: (
+                [{"session": "api", "name": "api"}],
+                [],
+                [{"session": "api", "name": "api"}],
+            ),
+        )
+        monkeypatch.setattr(
+            "magent.launch.stop_psmux", lambda targets: (list(targets), [])
+        )
+
+    def test_down_passes_the_cloud_session_ids_to_the_report(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        """`down` and the menu's shut-down both hand the report the cloud set;
+        a call site that forgot it would say nothing about the cloud session."""
+        self._stopped_api(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", _cloud_cfg(tmp_config, tmp_path), "down", "api"]
+        )
+        assert "api was a cloud pane" in result.output
+
+    def test_the_menus_shut_down_passes_them_too(
+        self, monkeypatch, capsys, tmp_config, tmp_path
+    ):
+        from pathlib import Path
+
+        from magent.cli import status as status_mod
+
+        self._stopped_api(monkeypatch)
+        monkeypatch.setattr(status_mod, "_probe_port", lambda port: False)
+        monkeypatch.setattr(status_mod.click, "prompt", lambda *a, **k: "a")
+        monkeypatch.setattr(status_mod.click, "pause", lambda *a, **k: None)
+        status_mod._menu_down(Path(_cloud_cfg(tmp_config, tmp_path)))
+        assert "api was a cloud pane" in capsys.readouterr().out
+
+
+class TestAFleetNameIsJudgedAmongEverythingTheUserCouldMean:
+    """``send``/``model`` must never type into a cloud pane -- and must never
+    quietly pick a LOCAL pane because the cloud one was filtered out before the
+    name was read. A name is resolved among every session the user can see; a
+    cloud winner is refused; an ambiguous one is still ambiguous."""
+
+    def _cfg(self, tmp_config, tmp_path, *titles: str, cloud: str) -> str:
+        projects: list[dict[str, object]] = []
+        for title in titles:
+            folder = tmp_path / title
+            folder.mkdir()
+            entry: dict[str, object] = {"path": str(folder), "title": title}
+            if title == cloud:
+                entry.update(node="cloud", cloudTask="t")
+            projects.append(entry)
+        return tmp_config({"version": SCHEMA_VERSION, "projects": projects})
+
+    def _typed(self, monkeypatch) -> list[str]:
+        return _hermetic_fleet(monkeypatch)
+
+    def test_a_prefix_a_cloud_pane_shares_is_still_ambiguous_not_local(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        typed = self._typed(monkeypatch)
+        cfg = self._cfg(tmp_config, tmp_path, "api-cloud", "api-web", cloud="api-cloud")
+        result = runner.invoke(cli.main, ["--config", cfg, "send", "api", "hello"])
+        assert result.exit_code == 2
+        assert typed == []
+
+    def test_an_exact_local_name_is_not_a_cloud_refusal(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        # `api` is a substring of the cloud pane's name, but it IS a local one.
+        typed = self._typed(monkeypatch)
+        cfg = self._cfg(tmp_config, tmp_path, "api-cloud", "api", cloud="api-cloud")
+        result = runner.invoke(cli.main, ["--config", cfg, "send", "api", "hello"])
+        assert result.exit_code == 0, result.stderr
+        assert typed == ["api"]
+
+    def test_a_unique_cloud_substring_is_refused_even_when_it_is_not_live(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        typed = self._typed(monkeypatch)
+        monkeypatch.setattr("magent.psmux.live_sessions", lambda names, psmux=None: [])
+        cfg = self._cfg(tmp_config, tmp_path, "api-cloud", "web", cloud="api-cloud")
+        result = runner.invoke(cli.main, ["--config", cfg, "send", "cloud", "hello"])
+        assert result.exit_code == 2
+        assert "api-cloud is a cloud session" in result.stderr
+        assert "no live session matches" not in result.stderr
+        assert typed == []
+
+    def test_model_refuses_a_unique_cloud_substring_too(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        typed = self._typed(monkeypatch)
+        cfg = self._cfg(tmp_config, tmp_path, "api-cloud", "web", cloud="api-cloud")
+        result = runner.invoke(cli.main, ["--config", cfg, "model", "cloud", "opus"])
+        assert result.exit_code == 2
+        assert "cloud session" in result.stderr
+        assert typed == []
+
+    def test_the_shadowed_cloud_project_does_not_turn_the_local_pane_cloud(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        # [local, cloud]: the local project owns the name `api`, so the pane IS
+        # a local agent and `send` reaches it; `sessions --json` agrees.
+        typed = self._typed(monkeypatch)
+        cfg = _twin_cfg(tmp_config, tmp_path, cloud_first=False)
+        sent = runner.invoke(cli.main, ["--config", cfg, "send", "api", "hello"])
+        assert sent.exit_code == 0, sent.stderr
+        assert typed == ["api"]
+        listed = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+        assert {row["node"] for row in json.loads(listed.stdout)} == {None}
+
+
+class TestAttachNoMuxNeverTypesACloudCommand:
+    """``--no-mux`` runs ``cd <dir> && <cmd>`` straight over ssh: for a cloud
+    project that is a new billed cloud session per window, on every attach."""
+
+    def _spawned(self, monkeypatch) -> list[list[str]]:
+        from magent.cli import attach
+
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(
+            attach.subprocess, "Popen", lambda argv, *a, **k: spawned.append(argv)
+        )
+        monkeypatch.setattr(attach, "_already_open", lambda sids: set())
+        monkeypatch.setattr(attach, "_tile_titles", lambda titles: None)
+        monkeypatch.setattr(attach, "_reclaim_geometry", lambda titles: None)
+        monkeypatch.setattr(attach.time, "sleep", lambda s: None)
+        return spawned
+
+    def test_attach_no_mux_never_starts_a_cloud_session_over_ssh(
+        self, monkeypatch, capsys
+    ):
+        from magent.cli import attach
+
+        spawned = self._spawned(monkeypatch)
+        status = {
+            "projects": [
+                {
+                    "name": "api",
+                    "session": "api",
+                    "node": "cloud",
+                    "cmd": 'claude --cloud "t"',
+                    "resolved": "/a",
+                },
+            ]
+        }
+        with pytest.raises(SystemExit):
+            attach._attach_nomux("host", status)
+        assert spawned == []
+        assert "cloud" in capsys.readouterr().out
+
+    def test_the_refusal_names_the_project_and_what_to_do_instead(
+        self, monkeypatch, capsys
+    ):
+        from magent.cli import attach
+
+        self._spawned(monkeypatch)
+        status = {
+            "projects": [
+                {
+                    "name": "api",
+                    "session": "api",
+                    "node": "cloud",
+                    "cmd": 'claude --cloud "t"',
+                    "resolved": "/a",
+                },
+            ]
+        }
+        with pytest.raises(SystemExit) as stop:
+            attach._attach_nomux("host", status)
+        out = capsys.readouterr().out
+        assert stop.value.code == 1
+        assert "api" in out
+        assert "a cloud pane is not attachable with --no-mux" in out
+        assert "would start a new cloud session" in out
+        assert "attach without --no-mux" in out and "claude.ai/code" in out
+
+    def test_the_other_projects_of_the_host_still_open(self, monkeypatch, capsys):
+        from magent.cli import attach
+
+        spawned = self._spawned(monkeypatch)
+        status = {
+            "projects": [
+                {
+                    "name": "api",
+                    "session": "api",
+                    "node": "cloud",
+                    "cmd": 'claude --cloud "t"',
+                    "resolved": "/a",
+                },
+                {
+                    "name": "web",
+                    "session": "web",
+                    "node": None,
+                    "cmd": "claude --continue",
+                    "resolved": "/w",
+                },
+            ]
+        }
+        attach._attach_nomux("host", status)
+        [argv] = spawned
+        assert argv[-1] == "cd /w && claude --continue"
+        assert "api" in capsys.readouterr().out
+
+    def test_the_row_decides_not_the_command_text(self, monkeypatch):
+        # A cloud row whose `cmd` reads like any local command is refused all
+        # the same: the guard is the row's node, never a parse of the string.
+        from magent.cli import attach
+
+        spawned = self._spawned(monkeypatch)
+        status = {
+            "projects": [
+                {
+                    "name": "api",
+                    "session": "api",
+                    "node": "cloud",
+                    "cmd": "claude",
+                    "resolved": "/a",
+                },
+            ]
+        }
+        with pytest.raises(SystemExit):
+            attach._attach_nomux("host", status)
+        assert spawned == []
+
+
+class TestALiveCloudPaneIsNeverReadAsDown:
+    """``psmux_status`` used to leave a cloud pane with no command (no task, a
+    tool that is not claude, a local twin's name) unprobed, so a LIVE pane read
+    as "down" -- and `up` would then offer to bring it up. A reason words why
+    nothing would be STARTED; it does not say the pane is not there."""
+
+    def _status(self, monkeypatch, path, live, group=None):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        probed: list[list[str]] = []
+
+        def _live(names, psmux=None, **kw):
+            probed.append(list(names))
+            return [n for n in names if n in live]
+
+        monkeypatch.setattr(psmux, "live_sessions", _live)
+        up, down, rows = psmux.psmux_status(load_config(path), group)
+        return up, down, rows, probed
+
+    def test_a_live_pane_whose_task_was_removed_is_up_and_a_cloud_pane(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        path = _cloud_cfg(tmp_config, tmp_path, cloudTask=None)
+        up, down, _rows, _ = self._status(monkeypatch, path, {"api"})
+        assert [u["session"] for u in up] == ["api"]
+        assert up[0]["node"] == "cloud"
+        assert down == []
+
+    def test_a_live_pane_on_another_tool_is_up(self, monkeypatch, tmp_config, tmp_path):
+        path = _cloud_cfg(tmp_config, tmp_path, tool="codex")
+        up, down, _rows, _ = self._status(monkeypatch, path, {"api"})
+        assert [u["session"] for u in up] == ["api"] and down == []
+
+    def test_a_pane_that_is_not_there_keeps_the_reason_and_the_cloud_mark(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        path = _cloud_cfg(tmp_config, tmp_path, cloudTask=None)
+        up, down, _rows, _ = self._status(monkeypatch, path, set())
+        assert up == []
+        assert [(d["reason"], d["node"]) for d in down] == [
+            (launch.NO_CLOUD_TASK, "cloud")
+        ]
+
+    def test_a_missing_folder_is_never_probed(self, monkeypatch, tmp_config, tmp_path):
+        path = _cloud_cfg(
+            tmp_config, tmp_path, cloudTask=None, path=str(tmp_path / "gone")
+        )
+        up, down, _rows, probed = self._status(monkeypatch, path, {"api"})
+        assert up == [] and [d["reason"] for d in down] == ["folder not found"]
+        assert all(names == [] for names in probed)
+
+    def test_a_local_project_with_no_command_is_still_never_probed(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        path = _cloud_cfg(
+            tmp_config, tmp_path, node=None, cloudTask=None, tool="nosuch"
+        )
+        up, down, _rows, probed = self._status(monkeypatch, path, {"api"})
+        assert up == [] and [d["reason"] for d in down] == ["no agent command"]
+        assert all(names == [] for names in probed)
+        assert "node" not in down[0]
+
+    def test_a_local_twin_on_a_live_cloud_pane_is_that_pane_not_a_down_project(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        # `up -g b`: the cloud project (group a) is filtered out, its pane is
+        # live, and the local twin's row is what `psmux_status` sees.
+        path = _grouped_twin_cfg(tmp_config, tmp_path)
+        up, down, _rows, _ = self._status(monkeypatch, path, {"api"}, group="b")
+        assert down == []
+        [entry] = up
+        assert entry["session"] == "api" and entry["node"] == "cloud"
+        # The live pane is NAMED as the owner, with the cloud project's folder.
+        note = str(entry["note"])
+        assert "live cloud pane" in note and str(tmp_path / "api") in note
+
+    def test_a_local_twin_whose_cloud_pane_is_not_live_stays_a_refusal(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        path = _grouped_twin_cfg(tmp_config, tmp_path)
+        up, down, _rows, _ = self._status(monkeypatch, path, set(), group="b")
+        assert up == []
+        assert [d["reason"] for d in down] == [launch.twin_session_refusal("api")]
+        assert "node" not in down[0]
+
+    def test_bring_up_does_not_count_a_twin_of_a_live_cloud_pane_as_a_casualty(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        windows: list[psmux.PsmuxWindowOpts] = []
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fake_platform)
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux, "live_sessions", lambda names, psmux=None, **kw: list(names)
+        )
+        monkeypatch.setattr(
+            psmux, "launch_verified", lambda plat, wins: (windows.extend(wins), {})[1]
+        )
+        cfg = load_config(_grouped_twin_cfg(tmp_config, tmp_path))
+        up, failed = psmux.bring_up(cfg, group="b")
+        # Nothing was created, and nothing FAILED: the session answers, and it
+        # is the cloud pane. (`status` says so; this is not a casualty.)
+        assert (up, failed, windows) == ([], {}, [])
+
+
+class TestUpNamesTheLiveCloudPaneThatOwnsATwinsName:
+    """`up -g b` while the cloud pane (group a) is live: the pane is up, it is
+    named, its `@cloud` brand survives the re-decoration, and no revive types
+    into it."""
+
+    def test_the_interactive_up_says_who_owns_the_name_and_keeps_the_brand(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        decorated: list[tuple[list[str], dict[str, str]]] = []
+        revive_calls: list[object] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux, "live_sessions", lambda names, psmux=None, **kw: list(names)
+        )
+        monkeypatch.setattr(
+            "magent.launch.revive_psmux",
+            lambda *a, **k: revive_calls.append(a) or [],
+        )
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions",
+            lambda names, **kw: (
+                decorated.append((list(names), kw.get("nicks", {}))) or list(names)
+            ),
+        )
+        monkeypatch.setattr(
+            "magent.cli.attach._maybe_start_upload_server", lambda *a, **k: None
+        )
+        path = _grouped_twin_cfg(tmp_config, tmp_path)
+        result = runner.invoke(cli.main, ["--config", path, "up", "-g", "b"])
+        assert result.exit_code == 0, result.output
+        assert "live cloud pane" in result.output
+        assert str(tmp_path / "api") in result.output
+        assert "failed to come up" not in result.output
+        assert decorated == [(["api"], {"api": "cloud"})]
+
+    def test_the_json_up_entry_is_a_cloud_one(
+        self, runner, monkeypatch, tmp_config, tmp_path
+    ):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux, "live_sessions", lambda names, psmux=None, **kw: list(names)
+        )
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions_async",
+            lambda names, **kw: list(names),
+        )
+        path = _grouped_twin_cfg(tmp_config, tmp_path)
+        result = runner.invoke(cli.main, ["--config", path, "up", "--json", "-g", "b"])
+        [entry] = json.loads(result.stdout)["up"]
+        assert entry["session"] == "api" and entry["node"] == "cloud"
+        assert json.loads(result.stdout)["down"] == []
+
+
+class TestASessionListNamesACloudPaneByItsFirstOwner:
+    def test_the_first_row_for_a_session_name_decides(self):
+        rows = [
+            {"session": "api", "node": None},
+            {"session": "api", "node": "cloud"},
+            {"session": "web", "node": "cloud"},
+            {"session": "web", "node": None},
+            {"name": "docs", "node": "cloud"},
+        ]
+        assert psmux.cloud_pane_ids(rows) == {"web", "docs"}
+
+    def test_a_row_with_no_name_is_ignored(self):
+        assert psmux.cloud_pane_ids([{"node": "cloud"}]) == set()

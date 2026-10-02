@@ -392,6 +392,12 @@ def _emit_sessions_json(config_path: str | None) -> None:
     (see ``_node_session_rows``): its version warning goes to stderr, and a
     config that fails validation answers the ``{"ok": false, "error": ...}``
     envelope with exit 1 instead of an array.
+
+    Every row carries ``node``: ``"cloud"`` for a cloud pane (``None`` for a
+    local one, a node's name on a node row). A LIVE cloud pane is a shell onto a
+    cloud session, so its pane is not read -- ``classify_state`` would call any
+    quiet shell "idle", the one thing a cloud pane never is -- and its state is
+    ``"cloud"``; ``magent send``/``model`` refuse it.
     """
     import json
     from concurrent.futures import ThreadPoolExecutor
@@ -401,6 +407,7 @@ def _emit_sessions_json(config_path: str | None) -> None:
     dicts = psmux.config_sessions(config_path)
     names = [psmux.socket_id(d) for d in dicts]
     resolved = {psmux.socket_id(d): str(d.get("resolved") or "") for d in dicts}
+    cloud = psmux.cloud_pane_ids(dicts)
     binary = psmux.find_psmux()
     live = set(psmux.live_sessions(names, psmux=binary)) if binary and names else set()
 
@@ -411,6 +418,15 @@ def _emit_sessions_json(config_path: str | None) -> None:
                 "cwd": resolved.get(name, ""),
                 "live": False,
                 "state": "dead",
+                "model": None,
+                "effort": None,
+            }
+        if name in cloud:
+            return {
+                "name": name,
+                "cwd": resolved.get(name, ""),
+                "live": True,
+                "state": "cloud",
                 "model": None,
                 "effort": None,
             }
@@ -431,8 +447,8 @@ def _emit_sessions_json(config_path: str | None) -> None:
             for name, row in zip(live_names, pool.map(_row, live_names), strict=True):
                 read[name] = row
     rows = [read[n] if n in read else _row(n) for n in names]
-    for row in rows:
-        row["node"] = None
+    for name, row in zip(names, rows, strict=True):
+        row["node"] = "cloud" if name in cloud else None
     rows += _node_session_rows(config_path)
     click.echo(json.dumps(rows, indent=2))
 
