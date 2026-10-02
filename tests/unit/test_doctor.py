@@ -1545,6 +1545,75 @@ class TestTheCloudCheck:
         assert "codex" in detail
         assert launch.NO_CLOUD_TASK not in detail
 
+    def test_an_executable_the_pane_cannot_type_warns_with_the_create_paths_words(
+        self, ready, tmp_config, tmp_path
+    ):
+        # `~/bin/claude` passes the tool check (its stem IS claude) and then
+        # cannot be typed into a pane safely: `--go` SKIPs with
+        # cloud_pane_command's own words, so doctor must not say OK.
+        from magent.sessions.claude import cloud_pane_command
+
+        base = "~/bin/claude --continue"
+        with pytest.raises(ValueError, match="cannot type claude executable") as why:
+            cloud_pane_command(base, "Fix the login bug")
+        cfg = _cloud_doctor_cfg(
+            tmp_config,
+            _cloud_project(tmp_path),
+            settings={"tools": {"claude": base}},
+        )
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert status == WARN
+        assert f"api: {why.value}" in detail
+
+    def test_a_task_the_pane_cannot_type_warns_with_the_create_paths_words(
+        self, ready, tmp_config, tmp_path
+    ):
+        # Config load refuses such a task, so reach it the way a stale or
+        # hand-built config object would: the command is re-validated at build
+        # time, and `--go` SKIPs on it.
+        from magent.sessions.claude import cloud_pane_command
+
+        cfg = _cloud_doctor_cfg(tmp_config, _cloud_project(tmp_path))
+        cfg.projects[0].cloud_task = "fix it; rm everything"
+        with pytest.raises(ValueError, match="unsafe cloud task") as why:
+            cloud_pane_command("claude --continue", cfg.projects[0].cloud_task)
+
+        status, detail = doctor._check_cloud(cfg)
+
+        assert status == WARN
+        assert f"api: {why.value}" in detail
+
+    def test_a_claude_launcher_given_by_path_with_flags_stays_ok(
+        self, ready, tmp_config, tmp_path
+    ):
+        cfg = _cloud_doctor_cfg(
+            tmp_config,
+            _cloud_project(tmp_path),
+            settings={"tools": {"claude": "/usr/local/bin/claude --continue"}},
+        )
+
+        assert doctor._check_cloud(cfg)[0] == OK
+
+    def test_the_pane_command_is_checked_only_after_the_tool_and_the_task(
+        self, ready, tmp_config, tmp_path
+    ):
+        # First reason per project, in the create path's order: an untypeable
+        # executable behind a missing task is the task's problem first.
+        from magent import launch
+
+        cfg = _cloud_doctor_cfg(
+            tmp_config,
+            _cloud_project(tmp_path, task=None),
+            settings={"tools": {"claude": "~/bin/claude"}},
+        )
+
+        _status, detail = doctor._check_cloud(cfg)
+
+        assert launch.NO_CLOUD_TASK in detail
+        assert "cannot type" not in detail
+
     def test_a_local_then_cloud_pair_names_the_cloud_project_never_started(
         self, ready, tmp_config, tmp_path
     ):
