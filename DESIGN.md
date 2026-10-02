@@ -1890,8 +1890,17 @@ exactly this, and a folder magent owns outright needs no round-trip law.
   sid with `profile_for`, after `cli/attach._ensure_attach_profiles` has
   synced the sessions about to open. No dispatcher signature changed, and an
   old fake platform that does not take `profile=` is never handed one.
+- *One sync per launch phase, and a held lock is not paid per window.* The
+  psmux windows, the node windows and the attach batch each sync once with
+  every spec (the profile name is still looked up per window). Another magent
+  holding the fragment lock costs one `LOCK_WAIT_S` (1s) wait, after which
+  icons are skipped for the rest of that launch (`begin_launch()` resets it).
 - *Merge, never replace.* An attach to a host adds its sessions beside a local
-  launch's; the oldest fall off at `MAX_PROFILES`. Content-named icon files
+  launch's, and an attach spec is `only_if_missing` so a host session that
+  shares a name with a local project cannot swap that tab's icon; an existing
+  entry keeps its place in the manifest and only a new or changed one counts as
+  recent, so a repeated sync leaves the bytes and mtime alone. The oldest fall
+  off at `MAX_PROFILES`. Content-named icon files
   (a changed logo is a new path) defeat Windows Terminal's icon cache, and an
   unchanged icon is not rewritten, so the sync is cheap enough for every launch.
   Writes are atomic under `persistent_lock`.
@@ -1905,10 +1914,17 @@ magic bytes, roughly square, capped at 1 MB); a generated badge
 (`icons.render_badge`: the project's tab colour, its initial in a stroke font
 with signed-distance antialiasing so it stays crisp at 16 px and at high DPI).
 Profile names have `;` (Windows Terminal's command separator) and quotes
-replaced.
+replaced, and a name that sanitizing changed (or emptied) gets a short hash
+suffix so two keys can never collide on one profile. Discovery reads and
+hashes a candidate only when its (path, size, mtime_ns) changed, via an
+`icon-cache.dat` sidecar in the fragment folder (deliberately not `.json`:
+Windows Terminal reads every `.json` there as a fragment). PNG/ICO
+validation checks the whole structure, not just the magic bytes, and an
+unreadable or malformed icon file falls through to the next source.
 
 **Switches.** `settings.terminalIcons` (default on; turning it off makes the
-next launch remove the fragment) and `MAGENT_WT_ICONS=0`. The env var is the
+next `--go` or `attach` remove what magent wrote, under the lock, leaving
+any file that is not magent's and saying so) and `MAGENT_WT_ICONS=0`. The env var is the
 SIXTH test-isolation opt-out and, like the others, is a law and not a
 preference: a fragment is read by the user's real Windows Terminal, which no
 HOME redirect contains. Two layers hold it: `tests/conftest.py` pins it to 0
