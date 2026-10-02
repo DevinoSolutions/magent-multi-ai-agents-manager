@@ -3388,7 +3388,10 @@ drive it.
 
 **Cloud projects need psmux (2026-09-24):** without psmux a plain terminal
 would re-type `claude --cloud` on every launch and create a new session each
-time, so the plain-terminal path skips a cloud project with a reason.
+time, so the plain-terminal path skips a cloud project with a reason. `up`
+always goes through psmux; `--go` and the menu launch use it only when
+`settings.psmux` is on and the platform supports psmux, and otherwise skip the
+project.
 
 **`--cloud` needs a claude.ai login (2026-10-02):** a `claude setup-token`
 token does not authorize it, and it is unavailable on Bedrock, Vertex and

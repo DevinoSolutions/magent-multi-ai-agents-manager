@@ -297,7 +297,7 @@ A `node-map.json` magent cannot read, torn or with one malformed entry, pauses t
 
 ### Cloud sessions
 
-`"node": "cloud"` runs a project's agent in a Claude Code cloud session instead of on a machine you own. magent opens it as a local psmux pane that runs `claude --cloud "<cloudTask>"`, branded `@cloud` in the status bar. The project runs the `claude` tool, needs `cloudTask` (the task the session starts on), and needs psmux (Windows).
+`"node": "cloud"` runs a project's agent in a Claude Code cloud session instead of on a machine you own. magent opens it as a local psmux pane that runs `claude --cloud "<cloudTask>"`, branded `@cloud` in the status bar. The project runs the `claude` tool, needs `cloudTask` (the task the session starts on), and needs psmux (Windows). `magent up` always uses psmux; `magent --go` and the menu launch use it only with `settings.psmux` on, and otherwise skip the project with a reason.
 
 - **One session per create.** `claude --cloud "<task>"` starts a NEW cloud session every time, so magent types the command once: `up` never re-sends it and `revive` skips the pane. `down` closes the local pane only. The cloud session keeps running, then pauses when idle and is reclaimed later; archive or delete it at claude.ai/code.
 - **Git is the truth.** The cloud clones your GitHub remote at the checkout's branch. magent refuses the create for a checkout with no GitHub remote, a detached HEAD, or uncommitted or unpushed work. Untracked files never reach the session.
