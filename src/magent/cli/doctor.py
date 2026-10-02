@@ -374,6 +374,44 @@ def _check_wt_keys() -> CheckResult:
     )
 
 
+def _check_wt_icons(cfg: MagentConfig | None) -> CheckResult:
+    """Will each magent tab carry its own icon? WARN at worst, like `wt-keys`: a
+    tab on the default icon is a cosmetic gap, never a broken fleet. A feature
+    that is off is a choice, so it is OK and names the gate -- through
+    ``terminal_cmd.icons_off_reason``, the translation `terminal status` reads."""
+    from magent import wt_profiles  # heavy subsystem: in-body per policy
+    from magent.cli.terminal_cmd import icons_off_reason
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    if not get_platform().supports_wt_profiles():
+        return (OK, "tab icons not applicable on this OS (Windows Terminal only)")
+    reason = icons_off_reason(cfg.settings.terminal_icons if cfg else True)
+    if reason:
+        return (OK, f"tab icons off ({reason})")
+    directory = wt_profiles.fragment_dir()
+    if directory is None:
+        return (
+            WARN,
+            "no %LOCALAPPDATA% -- Windows Terminal's fragments folder cannot be located",
+        )
+    profiles = wt_profiles.read_fragment(directory)
+    if not profiles:
+        return (
+            OK,
+            "no tab-icon profiles yet -- written when a project window launches",
+        )
+    missing = [p.key for p in profiles if not (directory / p.icon).is_file()]
+    if missing:
+        return (
+            WARN,
+            (
+                f"icon file missing for {', '.join(missing)} -- those tabs fall back "
+                "to the default icon until the next launch rewrites it"
+            ),
+        )
+    return (OK, f"{len(profiles)} tab-icon profile(s) in {directory}")
+
+
 def _writable(d: Path) -> bool:
     try:
         d.mkdir(parents=True, exist_ok=True)
@@ -632,6 +670,7 @@ def _run_checks(config_file: Path) -> list[dict[str, str]]:
         ("hotkey", lambda: _check_hotkey(cfg)),
         ("attention", _check_attention),
         ("wt-keys", _check_wt_keys),
+        ("wt-icons", lambda: _check_wt_icons(cfg)),
         ("logs dir", _check_logs_dir),
         ("state dir", _check_state_dir),
         ("sentry", _check_sentry),

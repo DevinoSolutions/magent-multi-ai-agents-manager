@@ -281,6 +281,7 @@ class _Fleet:
         self.env["MAGENT_PSMUX_BOOST"] = "0"
         self.env["MAGENT_NODE_SYNC"] = "0"
         self.env["MAGENT_IDLE_REAP"] = "0"
+        self.env["MAGENT_WT_ICONS"] = "0"
         self.env["MAGENT_SESSION0_POLICY"] = "allow"
         self.env.update(extra_env)
 

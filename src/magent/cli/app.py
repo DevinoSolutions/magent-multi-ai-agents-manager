@@ -206,7 +206,9 @@ def main(
     )
 
     if attach_host:
-        _attach_flow(attach_host, no_mux=attach_no_mux, group=group)
+        _attach_flow(
+            attach_host, no_mux=attach_no_mux, group=group, config_path=config_path
+        )
         return
 
     config_file = find_config(config_path)
@@ -267,7 +269,7 @@ def main(
             if action == "quit":
                 return
             if action == "attach":
-                _attach_flow(None, no_mux=False)
+                _attach_flow(None, no_mux=False, config_path=config_path)
                 return
             if action == "sessions":
                 _run_sessions_picker(config_file)

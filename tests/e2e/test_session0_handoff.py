@@ -117,6 +117,7 @@ def _child_env(home: Path, bin_dir: Path, **extra: str) -> dict[str, str]:
     env["MAGENT_PSMUX_BOOST"] = "0"
     env["MAGENT_NODE_SYNC"] = "0"
     env["MAGENT_IDLE_REAP"] = "0"
+    env["MAGENT_WT_ICONS"] = "0"
     home.mkdir(parents=True, exist_ok=True)
     home_s = str(home)
     drive, tail = os.path.splitdrive(home_s)

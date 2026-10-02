@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Every magent Windows Terminal tab can wear its own icon.** Windows Terminal
+  has no per-tab icon flag; the icon is the profile's, and magent opened every
+  tab with the default one. A launch (`--go`, `attach`, node windows) now
+  writes a hidden `magent: <window>` profile per window into a fragment folder
+  magent owns (`%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\magent\`,
+  never your `settings.json`) and opens the tab with `-p` -- only when that
+  profile is really in the fragment, so a write failure just means the default
+  icon. The icon is the project's `icon` config key, else a logo the repository
+  ships, else a generated badge in the project's tab colour. `magent terminal
+  icons [--remove]` inspects or deletes the fragment, `magent terminal status`
+  gains an icon section, and `magent doctor` a `wt-icons` row (warn at worst).
+  Opt out with `settings.terminalIcons: false` or `MAGENT_WT_ICONS=0`; the
+  latter is the sixth test-isolation opt-out and is pinned to 0 for every tier.
+  Needs Windows Terminal 1.24+ for relative icon paths; whether `wt -p` still
+  opens a `hidden` profile is verified live before release.
+
 ### Fixed
 
 - **`magent watch` no longer crashes on a digit press when macOS cannot list

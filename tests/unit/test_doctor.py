@@ -1084,6 +1084,7 @@ class TestDoctorCli:
             "hotkey",
             "attention",
             "wt-keys",
+            "wt-icons",
             "logs dir",
             "state dir",
             "sentry",

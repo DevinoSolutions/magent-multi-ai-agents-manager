@@ -746,6 +746,9 @@ class WindowsPlatform(Platform):
     def supports_wt_keybindings(self) -> bool:
         return True
 
+    def supports_wt_profiles(self) -> bool:
+        return True
+
     def supports_attach_windows(self) -> bool:
         return True
 
@@ -803,6 +806,10 @@ class WindowsPlatform(Platform):
         ]
         if opts.color:
             args.extend(["--tabColor", opts.color])
+        if opts.profile:
+            # Appended, not in the literal above: the profile is optional and
+            # only ever names one wt_profiles wrote (see profile_for).
+            args.extend(["-p", opts.profile])
 
         if opts.ssh_host:
             remote_dir = opts.ssh_remote_dir or opts.cwd
@@ -1199,6 +1206,7 @@ class WindowsPlatform(Platform):
         title: str,
         color: str | None = None,
         config_path: str | None = None,
+        profile: str | None = None,
     ) -> None:
         psmux = find_psmux()
         if not psmux:
@@ -1216,6 +1224,8 @@ class WindowsPlatform(Platform):
         ]
         if color:
             args.extend(["--tabColor", color])
+        if profile:
+            args.extend(["-p", profile])
         args.extend(["--", psmux, "-L", session_name, "attach"])
         # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
         from magent.env import attach_client_env

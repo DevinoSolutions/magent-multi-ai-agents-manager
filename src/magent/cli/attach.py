@@ -35,7 +35,7 @@ from magent.cli.config_io import (
 )
 from magent.cli.mobile import _configured_upload_port
 from magent.cli.ui import _banner, _divider, _print_session_overview
-from magent.config import DEFAULT_TOOLS
+from magent.config import DEFAULT_TOOLS, load_config
 from magent.grid import compute_grid
 from magent.log import get_logger
 from magent.paths import find_config
@@ -754,6 +754,40 @@ def _annotate_dead_windows(up: Sequence[dict[str, object]]) -> None:
         )
 
 
+def _ensure_attach_profiles(sids: Sequence[str], config_path: str | None) -> None:
+    """Make the Windows Terminal fragment carry a profile for every attach
+    window about to open, so ``spawn_attach_window`` / ``_attach_nomux`` can
+    pass ``wt -p`` (they look the profile up by session id themselves).
+
+    A remote session has no local project directory to find a logo in and the
+    host's colours are not in its status reply, so each gets the generated
+    badge in its derived colour -- but only where nothing else has described
+    that window yet (``only_if_missing``): a host session that shares its name
+    with one of THIS machine's projects must not take that tab's icon away from
+    the launch's. Reads THIS machine's ``settings.terminalIcons`` tolerantly (no
+    config means "on", like every other default) and, with it off, does what
+    `run_magent` does: removes the fragment, so no `wt -p` is passed from a
+    stale one. One sync for the whole batch. Never raises.
+    """
+    from magent import wt_profiles  # heavy subsystem: in-body per policy
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    if not sids or not get_platform().supports_wt_profiles():
+        return
+    wt_profiles.begin_launch()
+    config_file = find_config(config_path)
+    if config_file.exists():
+        try:
+            if not load_config(str(config_file)).settings.terminal_icons:
+                wt_profiles.sync([], setting=False)
+                return
+        except (ValueError, OSError):
+            pass  # an unreadable config is "no opinion", not a reason to skip
+    wt_profiles.sync(
+        [wt_profiles.IconSpec(key=sid, label=sid, only_if_missing=True) for sid in sids]
+    )
+
+
 def _spawn_windows(
     target: str,
     sids: Sequence[str],
@@ -1071,6 +1105,7 @@ def _attach_flow(
     group: str | None = None,
     yes: bool = False,
     reconnect: bool = True,
+    config_path: str | None = None,
 ) -> None:
     """Remote-PC attach: bring the host's sessions up, then open local windows.
 
@@ -1132,6 +1167,13 @@ def _attach_flow(
     _warn_version_skew(target, status)
 
     if no_mux:
+        _ensure_attach_profiles(
+            [
+                _as_str(p.get("session")) or _as_str(p.get("name"))
+                for p in _project_dicts(status)
+            ],
+            config_path,
+        )
         _attach_nomux(target, status)
         return
 
@@ -1205,6 +1247,7 @@ def _attach_flow(
     # sessions come back out of the spawn loop below; the rest just go away.
     open_already = _sweep_dead_windows(sids)
 
+    _ensure_attach_profiles([s for s in sids if s not in open_already], config_path)
     titles = _spawn_windows(
         target, sids, open_already, _SPAWN_STAGGER_S, reconnect=reconnect
     )
@@ -1296,6 +1339,7 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
 
     # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
     from magent.env import attach_client_env
+    from magent.wt_profiles import profile_for
 
     titles: list[str] = []
     for sid, p in zip(sids, projects, strict=True):
@@ -1311,22 +1355,20 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
         click.echo(f"  {style('o', fg='cyan')} {title}")
         # Same seam as the supervised panes above: strip only a harness-leaked
         # colour override, keep everything else, `None` for a human's shell.
-        subprocess.Popen(
+        wt_args = ["wt", "-w", "new", "--title", title, "--suppressApplicationTitle"]
+        profile = profile_for(sid)
+        if profile:
+            wt_args.extend(["-p", profile])
+        wt_args.extend(
             [
-                "wt",
-                "-w",
-                "new",
-                "--title",
-                title,
-                "--suppressApplicationTitle",
                 "--",
                 attach_client.ssh_program(),
                 "-t",
                 target,
                 f"cd {remote_dir} && {cmd}",
-            ],
-            env=attach_client_env(),
+            ]
         )
+        subprocess.Popen(wt_args, env=attach_client_env())
         titles.append(title)
         time.sleep(_SPAWN_STAGGER_S)
 
@@ -1647,7 +1689,14 @@ def attach_cmd(
     Each pane survives a dropped connection and reattaches on its own once the
     host is reachable again; --no-reconnect restores the old one-shot ssh pane.
     """
-    _attach_flow(host, no_mux=no_mux, group=group, yes=yes, reconnect=not no_reconnect)
+    _attach_flow(
+        host,
+        no_mux=no_mux,
+        group=group,
+        yes=yes,
+        reconnect=not no_reconnect,
+        config_path=ctx.obj.get("config_path"),
+    )
 
 
 @main.command("hotkey")
