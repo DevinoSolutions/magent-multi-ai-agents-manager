@@ -587,7 +587,7 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         "magent node push <project>",
         (
             "Re-ship a project's non-git files (`.env*` etc.) to its running node "
-            "session."
+            "session. A cloud project: hand the push set off by hand."
         ),
     ),
     (
@@ -596,7 +596,8 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "Bring a node session home (`--local` prints the `claude --resume` "
             "to run after a `git pull`) or move it to another node and resume it "
             "there. Pulls once more first; a node that does not answer is "
-            "reported, not fatal."
+            "reported, not fatal. A cloud session comes home by teleport "
+            "(`--local`)."
         ),
     ),
     ("magent config show", "Display current config."),

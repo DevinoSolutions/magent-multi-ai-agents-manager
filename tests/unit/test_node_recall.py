@@ -2962,21 +2962,6 @@ class TestRecallLocal:
         assert result.exit_code == 2
         assert node_answers == []
 
-    def test_a_cloud_project_is_refused_before_anything_is_touched(
-        self, runner, api_repo, tmp_config, node_answers
-    ):
-        cfg = tmp_config(
-            config_json(
-                ("second",), [{"path": str(api_repo), "title": "api", "node": "cloud"}]
-            )
-        )
-
-        result = _recall(runner, cfg, "--local")
-
-        assert result.exit_code == 2
-        assert "runs in the cloud" in result.stderr
-        assert node_answers == []
-
     def test_a_project_that_does_not_run_claude_is_refused(
         self, runner, api_repo, tmp_config, node_answers
     ):
@@ -5688,3 +5673,146 @@ class TestABringUpNeverInventsAResumeId:
         )
 
         assert pipeline[0]["resume_id"] == OLDER_SESSION_ID
+
+
+# --- a cloud session comes home by teleport (plan J, J11m) ----------------------
+
+
+class TestRecallOfACloudSessionIsATeleport:
+    @pytest.fixture
+    def cloud(self, api_repo, tmp_config):
+        return tmp_config(
+            config_json(
+                ("second",),
+                [
+                    {
+                        "path": str(api_repo),
+                        "title": "api",
+                        "node": "cloud",
+                        "cloudTask": "t",
+                    }
+                ],
+            )
+        )
+
+    def _pane(self, monkeypatch, text: str) -> None:
+        monkeypatch.setattr("magent.psmux.capture_pane", lambda name, psmux=None: text)
+
+    def test_local_prints_the_teleport_for_the_id_the_pane_shows(
+        self, runner, cloud, monkeypatch
+    ):
+        self._pane(monkeypatch, "Created cloud session session_01AbCdEfGh12\n")
+        result = _recall(runner, cloud, "--local")
+        assert result.exit_code == 0
+        assert "git pull" in result.stdout
+        assert "    claude --teleport session_01AbCdEfGh12\n" in result.stdout
+
+    def test_the_commands_run_in_the_checkout_and_survive_a_path_with_spaces(
+        self, runner, cloud, api_repo, monkeypatch
+    ):
+        # Two quoted lines, never `cd x && y` (PowerShell 5.1 cannot parse it).
+        self._pane(monkeypatch, "session_01AbCdEfGh12\n")
+        monkeypatch.setattr(node_cmd, "_shell_folder", lambda: api_repo)
+        result = _recall(runner, cloud, "--local")
+        assert f'    cd "{api_repo}"\n    git pull\n' in result.stdout
+        assert "&&" not in result.stdout
+
+    def test_cmd_is_told_to_cd_d_when_the_drive_is_not_known_to_match(
+        self, runner, cloud, api_repo, monkeypatch
+    ):
+        self._pane(monkeypatch, "session_01AbCdEfGh12\n")
+        monkeypatch.setattr(node_cmd, "_shell_folder", lambda: None)
+        result = _recall(runner, cloud, "--local")
+        lines = [line.strip() for line in result.stdout.splitlines()]
+        cd = lines.index(f'cd "{api_repo}"')
+        hint = ["(cmd.exe: use cd /d)"] if api_repo.drive else []
+        assert lines[cd + 1 :][: len(hint) + 1] == [*hint, "git pull"]
+
+    def test_the_pane_is_read_by_the_projects_session_name(
+        self, runner, cloud, monkeypatch
+    ):
+        asked: list[str] = []
+
+        def _capture(name, psmux=None):
+            asked.append(name)
+            return ""
+
+        monkeypatch.setattr("magent.psmux.capture_pane", _capture)
+        _recall(runner, cloud, "--local")
+        assert asked == ["api"]
+
+    @pytest.mark.parametrize(
+        "pane",
+        [
+            "https://claude.ai/code/session_01AbCdEfGh12\n",
+            "id cse_01AbCdEfGh12 started\n",
+        ],
+    )
+    def test_the_other_documented_id_forms_are_found_too(
+        self, runner, cloud, monkeypatch, pane
+    ):
+        self._pane(monkeypatch, pane)
+        result = _recall(runner, cloud, "--local")
+        assert result.exit_code == 0
+        assert re.search(r"claude --teleport (session|cse)_01AbCdEfGh12", result.stdout)
+
+    def test_a_session_id_is_preferred_over_an_env_form_id(
+        self, runner, cloud, monkeypatch
+    ):
+        self._pane(monkeypatch, "cse_01AbCdEfGh12 and later session_09ZyXwVuTs34\n")
+        result = _recall(runner, cloud, "--local")
+        assert "claude --teleport session_09ZyXwVuTs34" in result.stdout
+
+    def test_local_falls_back_to_the_teleport_picker_when_no_id_is_visible(
+        self, runner, cloud, monkeypatch
+    ):
+        self._pane(monkeypatch, "")
+        result = _recall(runner, cloud, "--local")
+        assert "    claude --teleport\n" in result.stdout
+        assert "/teleport" in result.stdout + result.stderr
+
+    def test_a_dirty_tree_is_never_a_reason_to_refuse(self, runner, cloud, monkeypatch):
+        # Teleport itself offers to stash a dirty tree, so magent does not
+        # pre-block on one -- and recall reads no git state at all.
+        self._pane(monkeypatch, "session_01AbCdEfGh12\n")
+        monkeypatch.setattr(
+            "magent.launch.node_git_states",
+            lambda config, proj: pytest.fail("a cloud recall read git state"),
+        )
+        result = _recall(runner, cloud, "--local")
+        assert result.exit_code == 0
+        assert "stash" in result.stdout
+
+    def test_it_never_calls_a_cloud_session_dead(self, runner, cloud, monkeypatch):
+        # An idle cloud VM pauses and is later reclaimed; neither is "gone".
+        self._pane(monkeypatch, "")
+        result = _recall(runner, cloud, "--local")
+        assert "dead" not in (result.stdout + result.stderr).lower()
+        assert "keeps running" in result.stdout
+
+    def test_local_stops_nothing_and_touches_no_node(
+        self, runner, cloud, monkeypatch, node_answers
+    ):
+        # node_answers records every remote step.
+        killed: list[object] = []
+        self._pane(monkeypatch, "")
+        monkeypatch.setattr(
+            "magent.psmux.stop_sessions", lambda *a, **k: killed.append(a) or ([], [])
+        )
+        _recall(runner, cloud, "--local")
+        assert killed == []
+        assert node_answers == []
+
+    def test_to_a_node_is_refused(self, runner, cloud, node_answers):
+        result = _recall(runner, cloud, "--to", "second")
+        assert result.exit_code == 2
+        assert "teleport" in result.stderr
+        assert node_answers == []
+
+    def test_neither_flag_is_still_a_usage_error_for_a_cloud_project(
+        self, runner, cloud, node_answers
+    ):
+        result = _recall(runner, cloud)
+        assert result.exit_code == 2
+        assert "exactly one of" in result.output
+        assert node_answers == []

@@ -3,20 +3,25 @@ then G's surfaces -- the table, plan and push."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
+import re
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
 
+import click
 import pytest
 from click.testing import CliRunner
 
-from magent import cli, env, log, node_sync, nodes, remote_mux
+from magent import cli, env, launch, log, node_sync, nodes, remote_mux
 from magent.cli import node_cmd
 from magent.config import SCHEMA_VERSION, load_config
+from magent.lockfile import LockHeld
 from magent.nodes import LocalGitState
 from magent.remote_mux import ProvisionReport, ScriptLine
 from magent.style import style
@@ -2476,17 +2481,6 @@ class TestNodePush:
         assert result.exit_code == 0
         assert "nothing to ship" in result.stdout
 
-    def test_push_for_a_cloud_project_is_refused_before_any_node_is_touched(
-        self, runner, tmp_config, api_dir, one_repo, shipped
-    ):
-        cfg = tmp_config(config_json(("second",), [_project(api_dir, "cloud")]))
-
-        result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
-
-        assert result.exit_code == 2
-        assert "runs in the cloud" in result.stderr
-        assert shipped == []
-
     def test_push_with_the_node_map_unreadable_is_unknown_not_unplaced(
         self, runner, tmp_config, api_dir, one_repo, shipped, caplog
     ):
@@ -2593,3 +2587,471 @@ class TestNodePush:
         assert result.exit_code == 0
         assert "shipped 2 file(s) to @second: ?[31m.env, ?.env" in result.stdout
         assert "\x1b" not in result.stdout
+
+
+# --- magent node push, for a cloud project (plan J, J11m) -----------------------
+
+# A low-entropy marker no output may ever carry. It sits in a plain value and in
+# a multi-line quoted one, under names that are not credential-shaped, and a
+# line INSIDE the quoted value looks like a variable (INSIDE_THE_VALUE).
+SENTINEL = "SENTINEL_VALUE_DO_NOT_PRINT"
+CLOUD_ENV_TEXT = (
+    f"PLAIN_SETTING={SENTINEL}\n"
+    f'MULTI_LINE="first {SENTINEL}\nINSIDE_THE_VALUE={SENTINEL}\nlast"\n'
+)
+
+
+@pytest.fixture
+def cloud_env(tmp_path, monkeypatch) -> Path:
+    """NODES_DIR (the digest key and the records) and the temp dir (the hand-off
+    file) in tmp. Returns the temp dir, so a test can count what is left in it."""
+    monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    return scratch
+
+
+def _handoffs(scratch: Path) -> list[Path]:
+    return list(scratch.glob("magent-cloud-env-*"))
+
+
+def _clean_state(repo: Path, **overrides: object) -> LocalGitState:
+    base = LocalGitState(
+        path=repo,
+        url="https://github.com/me/api.git",
+        branch="main",
+        dirty=False,
+        unpushed=False,
+        detached=False,
+        ignored=(".env",),
+    )
+    return dataclasses.replace(base, **overrides)
+
+
+@pytest.fixture
+def cloud_project(tmp_path, tmp_config, cloud_env, monkeypatch) -> str:
+    """A clean, pushed GitHub checkout whose gitignored .env holds the sentinel."""
+    repo = tmp_path / "api"
+    repo.mkdir()
+    (repo / ".env").write_text(CLOUD_ENV_TEXT, encoding="utf-8")
+    monkeypatch.setattr(
+        "magent.launch.node_git_states", lambda config, proj: [_clean_state(repo)]
+    )
+    return tmp_config(
+        {
+            "version": SCHEMA_VERSION,
+            "projects": [{"path": str(repo), "node": "cloud", "cloudTask": "t"}],
+        }
+    )
+
+
+def _cloud_push(runner, cfg, *extra, stdin=None):
+    return runner.invoke(
+        cli.main, ["--config", cfg, "node", "push", "api", *extra], input=stdin
+    )
+
+
+def _cloud_gate(cfg):
+    return launch.cloud_refusal(load_config(cfg), "api")
+
+
+def _raises(exc: BaseException):
+    def _raise(*args, **kwargs):
+        raise exc
+
+    return _raise
+
+
+def _logged_text() -> str:
+    """Every rotating log magent wrote under the redirected home."""
+    if not log.LOG_DIR.exists():
+        return ""
+    return "".join(
+        p.read_text(encoding="utf-8", errors="replace")
+        for p in log.LOG_DIR.glob("*.log*")
+    )
+
+
+class TestPushHandsACloudPushSetOffByHand:
+    def test_it_shows_names_and_lengths_never_a_value_and_opens_the_gate(
+        self, runner, cloud_project
+    ):
+        assert _cloud_gate(cloud_project) is not None
+        result = _cloud_push(runner, cloud_project, stdin="y\n")
+        assert result.exit_code == 0
+        assert f"PLAIN_SETTING  ******** ({len(SENTINEL)} chars)" in result.stdout
+        assert "MULTI_LINE  ********" in result.stdout
+        assert SENTINEL not in result.stdout + result.stderr
+        assert _cloud_gate(cloud_project) is None
+
+    def test_a_line_inside_a_multi_line_value_is_never_shown_as_a_name(
+        self, runner, cloud_project
+    ):
+        result = _cloud_push(runner, cloud_project, stdin="y\n")
+        assert "INSIDE_THE_VALUE" not in result.stdout + result.stderr
+
+    def test_the_file_holds_the_values_while_the_prompt_waits_and_is_gone_after(
+        self, runner, cloud_project, cloud_env, monkeypatch
+    ):
+        seen: list[str] = []
+
+        def _confirm(text, **kwargs):
+            [handoff] = _handoffs(cloud_env)
+            seen.append(handoff.read_text(encoding="utf-8"))
+            return True
+
+        monkeypatch.setattr(click, "confirm", _confirm)
+        result = _cloud_push(runner, cloud_project)
+        assert result.exit_code == 0
+        assert len(seen) == 1
+        # Verbatim, the continuation lines of a quoted value included.
+        assert f"INSIDE_THE_VALUE={SENTINEL}" in seen[0]
+        assert re.search(r"magent-cloud-env-\S+\.env", result.stdout)
+        assert _handoffs(cloud_env) == []
+
+    def test_not_confirming_records_nothing_and_leaves_no_file(
+        self, runner, cloud_project, cloud_env
+    ):
+        result = _cloud_push(runner, cloud_project, stdin="n\n")
+        assert result.exit_code == 2
+        assert "nothing recorded" in result.stderr
+        assert _cloud_gate(cloud_project) is not None
+        assert _handoffs(cloud_env) == []
+
+    @pytest.mark.parametrize("how", ["stdin-closed", "ctrl-c"])
+    def test_an_abandoned_prompt_leaves_no_file_and_records_nothing(
+        self, runner, cloud_project, cloud_env, monkeypatch, how
+    ):
+        if how == "ctrl-c":
+            monkeypatch.setattr(click, "confirm", _raises(KeyboardInterrupt()))
+        result = _cloud_push(runner, cloud_project, stdin="")
+        assert result.exit_code == 1
+        assert _handoffs(cloud_env) == []
+        assert _cloud_gate(cloud_project) is not None
+
+    def test_yes_records_at_once_and_keeps_the_file_for_the_user(
+        self, runner, cloud_project, cloud_env
+    ):
+        result = _cloud_push(runner, cloud_project, "--yes")
+        assert result.exit_code == 0
+        [handoff] = _handoffs(cloud_env)
+        assert SENTINEL in handoff.read_text(encoding="utf-8")
+        assert str(handoff) in result.stdout
+        assert f"delete {handoff} once it is pasted" in result.stdout
+        assert _cloud_gate(cloud_project) is None
+
+    def test_what_is_recorded_is_what_was_handed_off_not_what_the_file_became(
+        self, runner, cloud_project, tmp_path, monkeypatch
+    ):
+        # The prompt can wait minutes. An edit made while it waits was never
+        # pasted, so the record must not claim it was: the gate stays shut.
+        def _edit_then_confirm(text, **kwargs):
+            with (tmp_path / "api" / ".env").open("a", encoding="utf-8") as fh:
+                fh.write("ADDED_DURING_THE_PROMPT=1\n")
+            return True
+
+        monkeypatch.setattr(click, "confirm", _edit_then_confirm)
+        assert _cloud_push(runner, cloud_project).exit_code == 0
+        assert _cloud_gate(cloud_project) is not None
+
+    def test_a_dirty_checkout_is_reported_alongside(
+        self, runner, cloud_project, monkeypatch, tmp_path
+    ):
+        dirty = _clean_state(tmp_path / "api", dirty=True)
+        monkeypatch.setattr(
+            "magent.launch.node_git_states", lambda config, proj: [dirty]
+        )
+        result = _cloud_push(runner, cloud_project, stdin="y\n")
+        assert result.exit_code == 0
+        assert "the cloud create is also blocked" in result.stdout
+        assert "uncommitted" in result.stdout  # _note writes to stdout
+
+    def test_a_cloud_push_reaches_no_node(self, runner, cloud_project, monkeypatch):
+        # The other half of the retired refusal pin: a cloud project has no node.
+        monkeypatch.setattr(
+            remote_mux,
+            "push_files",
+            lambda node, recipe: pytest.fail("a cloud push reached a node"),
+        )
+        assert _cloud_push(runner, cloud_project, "--yes").exit_code == 0
+
+
+class TestAColdPushStopsBeforeAnythingIsWritten:
+    def _assert_untouched(self, result, cloud_env):
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert _handoffs(cloud_env) == []
+        assert nodes.read_cloud_record("api") is None
+
+    def test_a_folder_that_is_not_a_repository_is_refused(
+        self, runner, cloud_project, cloud_env, monkeypatch
+    ):
+        monkeypatch.setattr("magent.launch.node_git_states", lambda config, proj: [])
+        result = _cloud_push(runner, cloud_project, "--yes")
+        assert result.exit_code == 2
+        assert "not a git repository" in result.stderr
+        self._assert_untouched(result, cloud_env)
+
+    def test_a_workspace_of_several_repositories_is_refused(
+        self, runner, cloud_project, cloud_env, monkeypatch, tmp_path
+    ):
+        two = [_clean_state(tmp_path / "a"), _clean_state(tmp_path / "b")]
+        monkeypatch.setattr("magent.launch.node_git_states", lambda config, proj: two)
+        result = _cloud_push(runner, cloud_project, "--yes")
+        assert result.exit_code == 2
+        assert "ONE git repository" in result.stderr
+        self._assert_untouched(result, cloud_env)
+
+    def test_a_missing_folder_is_refused(self, runner, tmp_config, tmp_path, cloud_env):
+        cfg = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "projects": [
+                    {
+                        "path": str(tmp_path / "gone"),
+                        "title": "api",
+                        "node": "cloud",
+                        "cloudTask": "t",
+                    }
+                ],
+            }
+        )
+        result = _cloud_push(runner, cfg, "--yes")
+        assert result.exit_code == 2
+        assert "does not exist on this machine" in result.stderr
+        self._assert_untouched(result, cloud_env)
+
+    @pytest.mark.parametrize(
+        ("error", "said"),
+        [
+            (
+                remote_mux.RemoteError(
+                    128, "fatal: detected dubious ownership", ("git", "status")
+                ),
+                "dubious ownership",
+            ),
+            (
+                remote_mux.RemoteError(None, "", ("git", "status"), timed_out=True),
+                "timed out",
+            ),
+        ],
+        ids=["git-said-no", "git-never-answered"],
+    )
+    def test_git_that_fails_is_a_named_exit_not_a_traceback(
+        self, runner, cloud_project, cloud_env, monkeypatch, error, said
+    ):
+        monkeypatch.setattr("magent.launch.node_git_states", _raises(error))
+        result = _cloud_push(runner, cloud_project, "--yes")
+        assert result.exit_code == 1
+        assert "git could not read" in result.stderr
+        assert said in result.stderr
+        self._assert_untouched(result, cloud_env)
+
+
+class TestWhenThereIsNothingToPaste:
+    def _only(self, tmp_path, monkeypatch, *ignored: str):
+        """The repo's ignored files are exactly ``ignored``: the fixture's .env
+        goes, and a file named there is made."""
+        (tmp_path / "api" / ".env").unlink()
+        for name in ignored:
+            (tmp_path / "api" / name).write_text("notes\n", encoding="utf-8")
+        state = _clean_state(tmp_path / "api", ignored=ignored)
+        monkeypatch.setattr(
+            "magent.launch.node_git_states", lambda config, proj: [state]
+        )
+
+    def test_an_empty_push_set_says_so_and_writes_no_hand_off_file(
+        self, runner, cloud_project, cloud_env, tmp_path, monkeypatch
+    ):
+        self._only(tmp_path, monkeypatch)
+        result = _cloud_push(runner, cloud_project)
+        assert result.exit_code == 0
+        assert "nothing inside the project to hand off" in result.stdout
+        assert _handoffs(cloud_env) == []
+        assert _cloud_gate(cloud_project) is None
+
+    def test_a_file_that_cannot_travel_is_named_and_needs_a_yes_not_a_blank_file(
+        self, runner, cloud_project, cloud_env, tmp_path, monkeypatch
+    ):
+        self._only(tmp_path, monkeypatch, "CLAUDE.local.md")
+        result = _cloud_push(runner, cloud_project, stdin="y\n")
+        assert result.exit_code == 0
+        assert "CLAUDE.local.md cannot travel by hand" in result.stdout
+        assert "Paste the contents" not in result.stdout
+        assert _handoffs(cloud_env) == []
+        assert _cloud_gate(cloud_project) is None
+
+    def test_declining_that_records_nothing(
+        self, runner, cloud_project, cloud_env, tmp_path, monkeypatch
+    ):
+        self._only(tmp_path, monkeypatch, "CLAUDE.local.md")
+        result = _cloud_push(runner, cloud_project, stdin="n\n")
+        assert result.exit_code == 2
+        assert nodes.read_cloud_record("api") is None
+
+    def test_a_path_outside_the_project_is_noted_printable_and_still_recorded(
+        self, runner, cloud_project, tmp_path, monkeypatch
+    ):
+        outside = tmp_path / "elsewhere\x1b[31m" / ".env"
+        monkeypatch.setattr(
+            nodes,
+            "cloud_push_set",
+            lambda project_dir, states, **kw: nodes.CloudPushSet(
+                project_dir=project_dir, files=(), outside=(outside,), names=()
+            ),
+        )
+        result = _cloud_push(runner, cloud_project)
+        assert result.exit_code == 0
+        assert "is outside the project" in result.stdout
+        assert "\x1b" not in result.stdout
+        assert nodes.read_cloud_record("api") is not None
+
+
+class TestAFailureIsAWordNeverATraceback:
+    RETRY = "another magent is updating cloud hand-off state; try again"
+
+    @pytest.mark.parametrize(("extra", "text"), [(("--yes",), None), ((), "y\n")])
+    def test_a_held_records_lock_is_a_retry_message_and_the_file_is_gone(
+        self, runner, cloud_project, cloud_env, monkeypatch, extra, text
+    ):
+        monkeypatch.setattr(nodes, "write_cloud_record", _raises(LockHeld("held")))
+        result = _cloud_push(runner, cloud_project, *extra, stdin=text)
+        assert result.exit_code == 1
+        assert self.RETRY in result.stderr
+        assert isinstance(result.exception, SystemExit)
+        assert _handoffs(cloud_env) == []
+
+    def test_a_held_key_lock_stops_before_anything_is_shown_or_written(
+        self, runner, cloud_project, cloud_env, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "push_set_digest", _raises(LockHeld("held")))
+        result = _cloud_push(runner, cloud_project, "--yes")
+        assert result.exit_code == 1
+        assert self.RETRY in result.stderr
+        assert "PLAIN_SETTING" not in result.stdout
+        assert _handoffs(cloud_env) == []
+
+    def test_an_unreadable_file_is_a_refusal_naming_it_and_the_error_class(
+        self, runner, cloud_project, cloud_env, tmp_path, monkeypatch
+    ):
+        real = nodes.cloud_push_set
+
+        def _then_it_vanishes(project_dir, states, **kw):
+            ps = real(project_dir, states, **kw)
+            (tmp_path / "api" / ".env").unlink()
+            return ps
+
+        monkeypatch.setattr(nodes, "cloud_push_set", _then_it_vanishes)
+        result = _cloud_push(runner, cloud_project, "--yes")
+        assert result.exit_code == 1
+        assert ".env cannot be read (FileNotFoundError)" in result.stderr
+        assert "magent node push api" in result.stderr
+        assert "Traceback" not in result.output
+        assert _handoffs(cloud_env) == []
+        assert nodes.read_cloud_record("api") is None
+
+    def test_a_file_that_goes_unreadable_before_the_hand_off_is_the_same_refusal(
+        self, runner, cloud_project, cloud_env, monkeypatch
+    ):
+        monkeypatch.setattr(
+            nodes,
+            "write_manual_handoff",
+            _raises(nodes.PushSetUnreadable(".env", "PermissionError")),
+        )
+        result = _cloud_push(runner, cloud_project, "--yes")
+        assert result.exit_code == 1
+        assert ".env cannot be read (PermissionError)" in result.stderr
+        assert _handoffs(cloud_env) == []
+        assert nodes.read_cloud_record("api") is None
+
+    def test_any_other_os_error_is_its_class_only(
+        self, runner, cloud_project, cloud_env, monkeypatch
+    ):
+        monkeypatch.setattr(
+            nodes,
+            "write_manual_handoff",
+            _raises(PermissionError(13, "denied", "C:/private/place")),
+        )
+        result = _cloud_push(runner, cloud_project, "--yes")
+        assert result.exit_code == 1
+        assert "PermissionError" in result.stderr
+        assert "denied" not in result.stderr and "private" not in result.stderr
+        assert "Traceback" not in result.output
+
+    @pytest.mark.parametrize(("extra", "text"), [(("--yes",), None), ((), "y\n")])
+    def test_an_unexpected_error_after_the_file_exists_still_deletes_it(
+        self, runner, cloud_project, cloud_env, monkeypatch, extra, text
+    ):
+        monkeypatch.setattr(nodes, "write_cloud_record", _raises(RuntimeError("boom")))
+        result = _cloud_push(runner, cloud_project, *extra, stdin=text)
+        assert isinstance(result.exception, RuntimeError)
+        assert _handoffs(cloud_env) == []
+
+    def test_a_file_that_will_not_delete_is_named_not_hidden(
+        self, runner, cloud_project, cloud_env, monkeypatch
+    ):
+        real_unlink = Path.unlink
+
+        def _stuck(self, missing_ok=False):
+            if self.name.startswith("magent-cloud-env-"):
+                raise PermissionError(13, "in use")
+            real_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", _stuck)
+        result = _cloud_push(runner, cloud_project, stdin="y\n")
+        assert result.exit_code == 0
+        assert "could not delete" in result.stdout
+        assert "PermissionError" in result.stdout
+        assert SENTINEL not in result.stdout + result.stderr
+
+
+class TestNoValueEverReachesAScreenOrALog:
+    """Every way the command can end, with the sentinel in the .env: it is in
+    the hand-off file the user asked for and nowhere else."""
+
+    @pytest.mark.parametrize(
+        ("extra", "text", "fault"),
+        [
+            ((), "y\n", None),
+            ((), "n\n", None),
+            ((), "", None),
+            (("--yes",), None, None),
+            (("--yes",), None, "records-lock"),
+            ((), "y\n", "records-lock"),
+            (("--yes",), None, "unreadable"),
+            ((), "y\n", "os-error"),
+        ],
+        ids=[
+            "confirmed",
+            "declined",
+            "stdin-closed",
+            "yes",
+            "yes-lock-held",
+            "confirmed-lock-held",
+            "unreadable",
+            "os-error",
+        ],
+    )
+    def test_the_sentinel_is_in_no_stdout_no_stderr_and_no_log(
+        self, runner, cloud_project, monkeypatch, caplog, extra, text, fault
+    ):
+        caplog.set_level(logging.DEBUG)
+        if fault == "records-lock":
+            monkeypatch.setattr(nodes, "write_cloud_record", _raises(LockHeld("held")))
+        elif fault == "unreadable":
+            monkeypatch.setattr(
+                nodes,
+                "write_manual_handoff",
+                _raises(nodes.PushSetUnreadable(".env", "PermissionError")),
+            )
+        elif fault == "os-error":
+            monkeypatch.setattr(
+                nodes, "write_manual_handoff", _raises(OSError(5, "disk on fire"))
+            )
+        result = _cloud_push(runner, cloud_project, *extra, stdin=text)
+        everything = (
+            result.stdout + result.stderr + result.output + caplog.text + _logged_text()
+        )
+        assert SENTINEL not in everything
+        assert "INSIDE_THE_VALUE" not in everything
