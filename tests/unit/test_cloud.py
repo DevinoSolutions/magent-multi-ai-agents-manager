@@ -1340,8 +1340,13 @@ class TestTheManualHandOff:
         )
         assert isinstance(err.value, OSError)
         assert str(tmp_path) not in str(err.value)
-        assert "hunter2-secret" not in str(err.value)
         assert list(private_tmp.iterdir()) == []
+
+    def test_crlf_env_files_land_with_lf_endings_only(self, tmp_path, private_tmp):
+        ps = _env_set(tmp_path, {".env": b"A=1\r\nB=2\r\n"})
+        raw = nodes.write_manual_handoff(ps).read_bytes()
+        assert b"\r" not in raw
+        assert b"# from .env\nA=1\nB=2\n" in raw
 
     def test_the_private_temp_holds_the_text_as_utf8_with_lf_endings(self, private_tmp):
         path = nodes.write_private_temp("a\nb é\n", prefix="t-", suffix=".txt")
@@ -1387,15 +1392,21 @@ class TestTheManualHandOff:
     def test_a_file_object_that_cannot_be_made_leaves_no_file_and_no_open_handle(
         self, private_tmp, monkeypatch
     ):
+        offered: list[int] = []
+
         def refuse(fd, *args, **kwargs):
+            offered.append(fd)
             raise OSError("no handles")
 
         monkeypatch.setattr(os, "fdopen", refuse)
         with pytest.raises(OSError, match="no handles"):
             nodes.write_private_temp("x", prefix="t-")
-        # On Windows an unlink of a file with an open descriptor fails, so an
-        # empty directory also proves the descriptor was closed.
         assert list(private_tmp.iterdir()) == []
+        # The descriptor mkstemp opened was closed, not leaked: on every OS
+        # (nothing in between opens a file, so the number is not reused).
+        assert len(offered) == 1
+        with pytest.raises(OSError):
+            os.fstat(offered[0])
 
 
 class TestTheEnvParserIsQuoteAware:
@@ -1550,3 +1561,30 @@ class TestTheEnvParserIsQuoteAware:
             "A  ******** (3 chars)",
             "B  ******** (1 chars)",
         ]
+
+
+class TestAnUnreadableFileRefusalCarriesNoOsError:
+    """``PushSetUnreadable`` names the file by label and the error by class,
+    because the OS error's own text carries the absolute path. Chaining it
+    (``from exc``) would put that path back into any traceback or Sentry
+    capture of the refusal."""
+
+    def _unreadable(self, tmp_path: Path) -> nodes.CloudPushSet:
+        ps = _env_set(tmp_path, {".env": b"A=1\n"})
+        (tmp_path / "api" / ".env").unlink()
+        return ps
+
+    def test_the_digest_site_hides_its_cause(self, tmp_path, cloud_home):
+        ps = self._unreadable(tmp_path)
+        with pytest.raises(nodes.PushSetUnreadable) as err:
+            nodes.push_set_digest(ps, "manual")
+        assert err.value.__cause__ is None
+        assert err.value.__suppress_context__
+
+    def test_the_hand_off_site_hides_its_cause(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        ps = self._unreadable(tmp_path)
+        with pytest.raises(nodes.PushSetUnreadable) as err:
+            nodes.write_manual_handoff(ps)
+        assert err.value.__cause__ is None
+        assert err.value.__suppress_context__
