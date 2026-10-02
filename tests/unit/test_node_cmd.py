@@ -2738,7 +2738,15 @@ class TestPushHandsACloudPushSetOffByHand:
         [handoff] = _handoffs(cloud_env)
         assert SENTINEL in handoff.read_text(encoding="utf-8")
         assert str(handoff) in result.stdout
-        assert f"delete {handoff} once it is pasted" in result.stdout
+        # The kept file is plain text the user must delete, and the note says
+        # what will clear it if they forget.
+        assert f"{handoff} holds the values as plain text" in result.stdout
+        assert "delete it as soon as it is pasted" in result.stdout
+        minutes = int(nodes.HANDOFF_STALE_S // 60)
+        assert (
+            "a later `magent node push` of a cloud project also clears hand-off"
+            f" files older than {minutes} minutes"
+        ) in result.stdout
         assert _cloud_gate(cloud_project) is None
 
     def test_what_is_recorded_is_what_was_handed_off_not_what_the_file_became(
@@ -3092,6 +3100,24 @@ class TestAPushClearsWhatAnEarlierPushLeft:
         cfg = tmp_config(config_json(("second",), [_project(api_dir, "second")]))
         result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
         assert result.exit_code == 0
+
+
+@pytest.mark.usefixtures("_node_user")
+@pytest.mark.parametrize(("extra", "noted"), [(("--yes",), True), ((), False)])
+def test_yes_on_a_node_project_says_it_has_no_effect(
+    runner, tmp_config, api_dir, one_repo, monkeypatch, extra, noted
+):
+    monkeypatch.setattr(remote_mux, "push_files", lambda node, recipe: [".env"])
+    cfg = tmp_config(config_json(("second",), [_project(api_dir, "second")]))
+    result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api", *extra])
+    assert result.exit_code == 0
+    assert ("--yes has no effect on a node project" in result.stdout) is noted
+
+
+def test_yes_on_a_cloud_project_is_not_called_ineffective(runner, cloud_project):
+    result = _cloud_push(runner, cloud_project, "--yes")
+    assert result.exit_code == 0
+    assert "no effect" not in result.stdout + result.stderr
 
 
 class TestAHandOffFileThatCannotBePrivateIsNeverWritten:

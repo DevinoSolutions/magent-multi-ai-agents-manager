@@ -29,7 +29,16 @@ from pathlib import Path, PureWindowsPath
 
 import pytest
 
-from magent import attach_client, cli, launch, log, node_sync, nodes, remote_mux
+from magent import (
+    attach_client,
+    cli,
+    launch,
+    log,
+    node_sync,
+    nodes,
+    psmux,
+    remote_mux,
+)
 from magent.cli import node_cmd
 from magent.config import NODE_AUTO, ProjectConfig, load_config
 from magent.json_depth import MAX_JSON_DEPTH, TOO_DEEP
@@ -5695,8 +5704,14 @@ class TestRecallOfACloudSessionIsATeleport:
             )
         )
 
-    def _pane(self, monkeypatch, text: str) -> None:
-        monkeypatch.setattr("magent.psmux.capture_pane", lambda name, psmux=None: text)
+    # What the pane would print if it were echoed: never in any output.
+    PANE_SENTINEL = "SENTINEL_PANE_TEXT_DO_NOT_PRINT"
+
+    def _pane(self, monkeypatch, text: str, *, timed_out: bool = False) -> None:
+        monkeypatch.setattr(
+            "magent.psmux.read_pane",
+            lambda name, binary=None: psmux.PaneCapture(text=text, timed_out=timed_out),
+        )
 
     def test_local_prints_the_teleport_for_the_id_the_pane_shows(
         self, runner, cloud, monkeypatch
@@ -5733,11 +5748,11 @@ class TestRecallOfACloudSessionIsATeleport:
     ):
         asked: list[str] = []
 
-        def _capture(name, psmux=None):
+        def _read(name, binary=None):
             asked.append(name)
-            return ""
+            return psmux.PaneCapture(text="", timed_out=False)
 
-        monkeypatch.setattr("magent.psmux.capture_pane", _capture)
+        monkeypatch.setattr("magent.psmux.read_pane", _read)
         _recall(runner, cloud, "--local")
         assert asked == ["api"]
 
@@ -5770,6 +5785,47 @@ class TestRecallOfACloudSessionIsATeleport:
         result = _recall(runner, cloud, "--local")
         assert "    claude --teleport\n" in result.stdout
         assert "/teleport" in result.stdout + result.stderr
+
+    def test_an_empty_pane_that_answered_is_not_called_a_timeout(
+        self, runner, cloud, monkeypatch
+    ):
+        self._pane(monkeypatch, "")
+        result = _recall(runner, cloud, "--local")
+        assert "no session id is visible in the pane" in result.stdout
+        assert "timed out" not in result.stdout + result.stderr
+
+    def test_a_pane_read_that_timed_out_is_worded_as_a_timeout(
+        self, runner, cloud, monkeypatch
+    ):
+        # A busy session answers slowly: nothing is known about its pane, which
+        # is not the same as a pane with no id in it.
+        self._pane(monkeypatch, "", timed_out=True)
+        result = _recall(runner, cloud, "--local")
+        assert result.exit_code == 0
+        said = result.stdout + result.stderr
+        assert "timed out" in said
+        assert "no session id is visible" not in said
+        assert "dead" not in said.lower()
+        # The way home is still printed: the picker finds the session.
+        assert "    claude --teleport\n" in result.stdout
+
+    @pytest.mark.parametrize(
+        "pane",
+        [
+            "Created cloud session session_01AbCdEfGh12 PANE_SENTINEL\nPANE_SENTINEL\n",
+            "PANE_SENTINEL\nnothing that looks like an id\n",
+        ],
+        ids=["with-an-id", "without-one"],
+    )
+    def test_the_pane_text_is_never_echoed(self, runner, cloud, monkeypatch, pane):
+        # The pane is the cloud page's text: only a matched id may leave it.
+        sentinel = self.PANE_SENTINEL
+        self._pane(monkeypatch, pane.replace("PANE_SENTINEL", sentinel))
+        result = _recall(runner, cloud, "--local")
+        assert result.exit_code == 0
+        assert sentinel not in result.stdout + result.stderr
+        if "session_" in pane:
+            assert "claude --teleport session_01AbCdEfGh12" in result.stdout
 
     def test_a_dirty_tree_is_never_a_reason_to_refuse(self, runner, cloud, monkeypatch):
         # Teleport itself offers to stash a dirty tree, so magent does not

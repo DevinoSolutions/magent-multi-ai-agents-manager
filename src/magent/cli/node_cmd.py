@@ -1675,6 +1675,9 @@ def push_cmd(ctx: click.Context, project: str, yes: bool) -> None:
         # by hand (spec 18.11).
         _push_cloud(cfg, proj, name, yes=yes)
         return
+    if yes:
+        # Only a cloud push asks anything; saying so beats a silent no-op.
+        _note("--yes has no effect on a node project: only a cloud push asks")
     try:
         nick = _current_nick(proj)
     except (OSError, ValueError) as exc:
@@ -1894,7 +1897,13 @@ def _manual_handoff(ps: CloudPushSet, sid: str, name: str, *, yes: bool) -> None
                 )
         if yes:
             if held is not None:
-                _note(f"delete {held} once it is pasted")
+                # Kept by design under --yes: it holds every value as plain text.
+                minutes = int(nodes.HANDOFF_STALE_S // 60)
+                _note(
+                    f"{held} holds the values as plain text: delete it as soon as"
+                    " it is pasted (a later `magent node push` of a cloud project"
+                    f" also clears hand-off files older than {minutes} minutes)"
+                )
         else:
             confirmed = click.confirm(
                 "\n  Done -- let magent create the cloud session?"
@@ -2609,7 +2618,8 @@ def _recall_cloud(
         )
     local_dir = _local_dir(cfg, proj)
     # Only the matched id is ever printed, never the pane: it is the page's text.
-    found = _CLOUD_ID_RE.findall(psmux.capture_pane(nodes.node_sid(proj)))
+    pane = psmux.read_pane(nodes.node_sid(proj))
+    found = _CLOUD_ID_RE.findall(pane.text)
     # Prefer the last `session_` id (the form teleport and the URL use); fall
     # back to the last `cse_` one rather than print nothing.
     ids = [i for i in found if i.startswith("session_")] or found
@@ -2619,10 +2629,17 @@ def _recall_cloud(
         f" {style('(from @cloud)', dim=True)}"
     )
     if not ids:
-        _note(
-            "no session id is visible in the pane; the picker below lists"
-            " your cloud sessions"
-        )
+        if pane.timed_out:
+            # A busy session answers slowly: nothing is known about its pane.
+            _note(
+                "reading the pane timed out, so its session id could not be"
+                " looked for; the picker below lists your cloud sessions"
+            )
+        else:
+            _note(
+                "no session id is visible in the pane; the picker below lists"
+                " your cloud sessions"
+            )
         _note("inside the cloud session, /teleport prints the exact command")
     # No pre-check of the tree: teleport itself offers to stash a dirty one.
     _note(
