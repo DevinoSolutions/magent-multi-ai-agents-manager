@@ -343,6 +343,7 @@ def _linux_child_env(home: Path, restricted_bin: Path) -> dict[str, str]:
     env["XDG_CACHE_HOME"] = str(home / ".cache")
     # The MAGENT_* strip drops conftest's pin: never a child with reaping on.
     env["MAGENT_IDLE_REAP"] = "0"
+    env["MAGENT_WT_ICONS"] = "0"
     # Software rasteriser for the GPU terminals under a GL-less Xvfb.
     env["LIBGL_ALWAYS_SOFTWARE"] = "1"
     env["GALLIUM_DRIVER"] = "llvmpipe"
@@ -662,6 +663,7 @@ def _win_child_env(home: Path, shim_dir: Path, base_path: str) -> dict[str, str]
     env["MAGENT_PSMUX_BOOST"] = "0"
     env["MAGENT_NODE_SYNC"] = "0"
     env["MAGENT_IDLE_REAP"] = "0"
+    env["MAGENT_WT_ICONS"] = "0"
     # ...and the Session-0 hand-off must never fire from a test: a runner
     # (or an ssh-driven leg) is legitimately non-interactive, and the
     # default policy would create a REAL scheduled task on somebody's

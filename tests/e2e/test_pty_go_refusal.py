@@ -62,6 +62,7 @@ def _child_env(home: Path) -> dict[str, str]:
     env["MAGENT_PSMUX_BOOST"] = "0"
     env["MAGENT_NODE_SYNC"] = "0"
     env["MAGENT_IDLE_REAP"] = "0"
+    env["MAGENT_WT_ICONS"] = "0"
     env["MAGENT_SESSION0_POLICY"] = "allow"
     env["APPDATA"] = home_s
     env["LOCALAPPDATA"] = home_s
