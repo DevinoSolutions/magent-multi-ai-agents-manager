@@ -1392,6 +1392,38 @@ class TestAShadowedCloudProjectIsNamedWithItsFix:
         )
         assert "cloud" not in result.stdout
 
+    def test_a_disabled_cloud_project_is_never_reported_as_shadowed(
+        self, tmp_config, tmp_path
+    ):
+        # `up` never reads a disabled entry, so there is nothing it failed to
+        # start. The control proves the SAME pair is reported once enabled.
+        from magent.config import load_config
+
+        folder = tmp_path / "api"
+        folder.mkdir()
+
+        def shadowed(**cloud: object):
+            cfg = load_config(
+                tmp_config(
+                    {
+                        "version": SCHEMA_VERSION,
+                        "projects": [
+                            {"path": str(folder)},
+                            {
+                                "path": str(folder),
+                                "node": "cloud",
+                                "cloudTask": "t",
+                                **cloud,
+                            },
+                        ],
+                    }
+                )
+            )
+            return launch.shadowed_cloud_projects(cfg)
+
+        assert [sid for _p, sid in shadowed()] == ["api"]
+        assert shadowed(enabled=False) == []
+
 
 class TestAShadowedLocalProjectIsNamedWithItsFix:
     """``[cloud, local]`` for one session name -- the mirror: the first-wins
@@ -1513,6 +1545,26 @@ class TestAShadowedLocalProjectIsNamedWithItsFix:
         # namespace there: it never competed for this PC's pane name.
         assert [sid for _p, sid in self._shadowed(tmp_config, tmp_path)] == ["api"]
         assert self._shadowed(tmp_config, tmp_path, title="api", host="devbox") == []
+
+    def test_only_a_cloud_owner_shadows_a_local_project(self, tmp_config, tmp_path):
+        # Two LOCAL projects for one session name are today's first-wins
+        # dedupe, nothing to do with cloud: the second is not "shadowed_local".
+        # The control is the same second project behind a CLOUD owner.
+        from magent.config import load_config
+
+        folder = tmp_path / "api"
+        folder.mkdir()
+        cfg = load_config(
+            tmp_config(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [{"path": str(folder)}, {"path": str(folder)}],
+                }
+            )
+        )
+
+        assert launch.shadowed_local_projects(cfg) == []
+        assert [sid for _p, sid in self._shadowed(tmp_config, tmp_path)] == ["api"]
 
 
 class TestTheStatusMenuNeverRevivesACloudPane:
