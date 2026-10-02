@@ -4,6 +4,7 @@ only after the push set was sealed or handed off."""
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import hmac
@@ -724,6 +725,60 @@ class TestTheDigestKeyIsMadeOnceAndNeverRewritten:
         key = nodes._digest_key()
         assert len(key) == 32
         assert (cloud_home / "cloud-digest.key").read_bytes() == key
+        assert self._names(cloud_home) == ["cloud-digest.key"]
+
+    def test_a_key_that_lands_while_links_fail_is_returned_not_overwritten(
+        self, cloud_home, monkeypatch
+    ):
+        winner = b"W" * 32
+
+        def plant_then_fail(src, dst):
+            with open(dst, "wb") as fh:
+                fh.write(winner)
+            raise PermissionError("hard links are not supported here")
+
+        monkeypatch.setattr(os, "link", plant_then_fail)
+        assert nodes._digest_key() == winner
+        assert (cloud_home / "cloud-digest.key").read_bytes() == winner
+        assert self._names(cloud_home) == ["cloud-digest.key"]
+
+    def test_two_creators_without_hard_links_agree_on_one_key(
+        self, cloud_home, monkeypatch
+    ):
+        # With no hard link the key can only be put in place by a rename, which
+        # clobbers. Hold both creators in the gap between "no key yet" and the
+        # rename: unserialized, both rename and each returns a key the other
+        # destroyed; serialized, the second finds the first's key and returns it.
+        def no_links(src, dst):
+            raise PermissionError("hard links are not supported here")
+
+        in_the_gap = threading.Barrier(2)
+        real_replace = nodes._replace_retrying
+
+        def gap_then_replace(src, dst):
+            with contextlib.suppress(threading.BrokenBarrierError):
+                in_the_gap.wait(timeout=0.5)
+            real_replace(src, dst)
+
+        monkeypatch.setattr(os, "link", no_links)
+        monkeypatch.setattr(nodes, "_replace_retrying", gap_then_replace)
+        keys: list[bytes] = []
+        errors: list[BaseException] = []
+
+        def create() -> None:
+            try:
+                keys.append(nodes._digest_key())
+            except Exception as exc:  # noqa: BLE001  # reason: collected and asserted empty below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=create) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+        assert len(keys) == 2 and keys[0] == keys[1]
+        assert (cloud_home / "cloud-digest.key").read_bytes() == keys[0]
         assert self._names(cloud_home) == ["cloud-digest.key"]
 
     def test_a_planted_symlink_is_replaced_never_written_through(
