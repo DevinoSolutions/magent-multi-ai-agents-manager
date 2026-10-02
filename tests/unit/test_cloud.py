@@ -762,6 +762,36 @@ class TestTheCreateWaitsForThePushSet:
         assert "API_TOKEN" in refusal
         assert "magent node push api" in refusal
 
+    @pytest.mark.parametrize("body", ["", "# only a comment\n", "not a line\n"])
+    def test_an_env_file_with_no_names_is_still_named_by_its_path(
+        self, tmp_path, cloud_home, body
+    ):
+        repo = tmp_path / "api"
+        repo.mkdir()
+        (repo / ".env").write_text(body, encoding="utf-8")
+        ps = nodes.cloud_push_set(
+            repo, [_state(repo, ignored=(".env",))], home=tmp_path / "h"
+        )
+        assert ps.names == () and ps.outside == ()
+        refusal = nodes.cloud_env_refusal("api", "api", ps, recipient=None)
+        assert refusal is not None
+        assert ".env" in refusal
+        assert "0 file(s)" not in refusal
+        assert "magent node push api" in refusal
+
+    def test_only_files_outside_the_project_are_counted(
+        self, tmp_path, cloud_home, monkeypatch
+    ):
+        repo = tmp_path / "api"
+        repo.mkdir()
+        monkeypatch.setattr(
+            nodes, "push_set", lambda *a, **k: [tmp_path / "home" / ".npmrc"]
+        )
+        ps = nodes.cloud_push_set(repo, [_state(repo)], home=tmp_path / "home")
+        assert ps.files == () and len(ps.outside) == 1
+        refusal = nodes.cloud_env_refusal("api", "api", ps, recipient=None)
+        assert refusal is not None and "1 file(s) outside the project" in refusal
+
     def test_a_sealed_push_set_lets_the_create_through(self, tmp_path, cloud_home):
         ps = self._ps(tmp_path)
         nodes.write_cloud_record(

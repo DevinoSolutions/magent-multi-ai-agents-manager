@@ -4107,6 +4107,10 @@ def cloud_env_refusal(
             f"({exc.reason}); fix or remove it, then run: magent node push {name}"
         )
     shown = [*ps.names, *(ps.rel(p) for p in ps.files if not _is_env_file(p.name))]
+    if not ps.names:
+        # Env files that define no name (an empty one) are still files the
+        # user must hand off: name them by path, never "0 file(s) outside".
+        shown = [ps.rel(p) for p in ps.env_files] + shown
     what = ", ".join(shown) or f"{len(ps.outside)} file(s) outside the project"
     return (
         f"the push set ({what}) has not reached the cloud since it last "
