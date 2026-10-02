@@ -63,6 +63,17 @@ def _live_names(
     return psmux.live_sessions(candidates, psmux=psmux_bin)
 
 
+def _live_cloud_names(config_path: str | None, psmux_bin: str) -> list[str]:
+    """The cloud panes that are live, for a command that drives every pane and
+    must say which it left out. Disjoint from ``_live_names``' drivable set by
+    construction (that one drops exactly these ids), so the two sweeps cannot
+    disagree about a pane."""
+    from magent import psmux  # heavy subsystem: in-body per policy
+
+    ids = sorted(_cloud_ids(config_path))
+    return psmux.live_sessions(ids, psmux=psmux_bin) if ids else []
+
+
 def _require_psmux() -> str:
     """Resolve the psmux binary or exit 3 -- there is nothing to talk to
     without it."""
@@ -155,9 +166,11 @@ def _refuse_cloud(name: str, command: str = "send") -> NoReturn:
     A cloud pane is only a viewer onto a cloud session, so what is typed into
     it goes to a shell -- and the one command that does work there, `claude
     --cloud`, starts a NEW billed cloud session each time (spec 18.5)."""
+    # The id is the user's to supply: magent never sees a cloud session's id
+    # (the CLI cannot list them), so this names the form, not where to find it.
     follow_up = (
-        f" To follow up on an existing session, run `{_CLOUD_FOLLOW_UP}`"
-        " (it needs that session's id, which claude.ai/code lists)."
+        f" Outside magent, `{_CLOUD_FOLLOW_UP}` continues an existing cloud"
+        " session, given its id (magent does not track it)."
         if command == "send"
         else ""
     )
@@ -386,7 +399,7 @@ def model_cmd(
     until --max-minutes runs out; the footer is re-read to confirm each switch.
     A per-session table is printed at the end. A node session is refused
     (exit 2): not supported yet; so is a cloud session (it takes no typed
-    input). ``--all`` covers this PC's sessions, cloud panes left out.
+    input). ``--all`` covers this PC's sessions, cloud panes left out (and counted).
     """
     from magent import fleet, psmux  # heavy subsystem: in-body per policy
 
@@ -400,9 +413,11 @@ def model_cmd(
             "usage: magent model <session> <model> [--effort E]  (or --all <model>)"
         )
 
+    skipped: list[str] = []
     if all_:
         psmux_bin = _require_psmux()
         targets = _live_names(ctx.obj.get("config_path"), psmux_bin)
+        skipped = _live_cloud_names(ctx.obj.get("config_path"), psmux_bin)
     else:
         name, node = _resolve_target(
             ctx.obj.get("config_path"), session or "", drives="model"
@@ -412,8 +427,19 @@ def model_cmd(
         psmux_bin = _require_psmux()
         targets = [name]
 
+    if skipped:
+        click.echo(
+            f"  {style('-', dim=True)} skipped {len(skipped)} cloud pane(s): "
+            f"{', '.join(skipped)} (a cloud pane takes no typed input)"
+        )
     if not targets:
-        click.echo(f"  {style('No live sessions.', dim=True)} Run magent up first.")
+        if skipped:
+            click.echo(
+                f"  {style('No drivable sessions.', dim=True)} The only live panes "
+                "are cloud panes."
+            )
+        else:
+            click.echo(f"  {style('No live sessions.', dim=True)} Run magent up first.")
         return
 
     rows: dict[str, dict[str, str]] = {}

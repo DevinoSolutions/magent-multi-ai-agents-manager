@@ -1393,6 +1393,92 @@ class TestAShadowedCloudProjectIsNamedWithItsFix:
         assert "cloud" not in result.stdout
 
 
+class TestAShadowedLocalProjectIsNamedWithItsFix:
+    """``[cloud, local]`` for one session name -- the mirror: the first-wins
+    dedupe keeps the cloud project and silently drops the LOCAL one, so `up`
+    never starts the local agent and nothing says why."""
+
+    def _cfg(self, tmp_config, tmp_path, *, cloud_first=True):
+        folder = tmp_path / "api"
+        folder.mkdir(exist_ok=True)
+        local = {"path": str(folder)}
+        cloud = {"path": str(folder), "node": "cloud", "cloudTask": "Fix the bug"}
+        return tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "projects": [cloud, local] if cloud_first else [local, cloud],
+            }
+        )
+
+    def test_the_human_status_names_the_local_project_and_the_fix(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        _fake_psmux(monkeypatch, [], [])
+        result = runner.invoke(
+            cli.main, ["--config", self._cfg(tmp_config, tmp_path), "status"]
+        )
+        assert result.exit_code == 0
+        out = result.stdout
+        assert f"local project {tmp_path / 'api'} is never started" in out
+        assert "set a title" in out
+        # The cloud project is the one that WON the name: not named as dropped.
+        assert "cloud project" not in out
+
+    def test_the_json_carries_it_only_for_a_cloud_first_pair(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        _fake_psmux(monkeypatch, [], [])
+        shadowed = runner.invoke(
+            cli.main, ["--config", self._cfg(tmp_config, tmp_path), "status", "--json"]
+        )
+        payload = json.loads(shadowed.stdout)
+        [entry] = payload["shadowed_local"]
+        assert entry["session"] == "api"
+        assert entry["path"] == str(tmp_path / "api")
+        assert "set a title" in entry["why"]
+        assert "shadowed_cloud" not in payload
+
+        mirrored = runner.invoke(
+            cli.main,
+            [
+                "--config",
+                self._cfg(tmp_config, tmp_path, cloud_first=False),
+                "status",
+                "--json",
+            ],
+        )
+        payload = json.loads(mirrored.stdout)
+        assert "shadowed_local" not in payload
+        assert [e["session"] for e in payload["shadowed_cloud"]] == ["api"]
+
+    def test_a_disabled_or_unrelated_local_project_is_not_shadowed(
+        self, tmp_config, tmp_path
+    ):
+        from magent.config import load_config
+
+        for name in ("api", "web"):
+            (tmp_path / name).mkdir()
+        cfg = load_config(
+            tmp_config(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [
+                        {
+                            "path": str(tmp_path / "api"),
+                            "node": "cloud",
+                            "cloudTask": "t",
+                        },
+                        {"path": str(tmp_path / "api"), "enabled": False},
+                        {"path": str(tmp_path / "web")},
+                    ],
+                }
+            )
+        )
+        assert launch.shadowed_local_projects(cfg) == []
+
+
 class TestTheStatusMenuNeverRevivesACloudPane:
     """`r<n>` in the status menu is a human asking for a pane's agent back; for
     a cloud pane that is a second billed `claude --cloud`. J8's veto answers,
