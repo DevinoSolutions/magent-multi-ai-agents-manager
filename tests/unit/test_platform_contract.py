@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 
 import pytest
@@ -1264,3 +1265,42 @@ def test_the_fake_platform_reports_what_it_was_given():
 
     assert FakePlatform().supports_attach_windows() is False
     assert FakePlatform(supports_attach_windows=True).supports_attach_windows() is True
+
+
+class TestMacOSWindowProbesDegradeWhenOsascriptCannotAnswer:
+    """`osascript` against System Events needs Automation (TCC) consent, so on a
+    box with no consenting user it blocks until its timeout or is absent. A window
+    probe is a question, not a command: it answers "none", it never raises out of
+    `magent watch`'s digit press or the tiling pass."""
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            subprocess.TimeoutExpired(cmd="osascript", timeout=10),
+            FileNotFoundError("osascript"),
+        ],
+        ids=["timeout", "osascript-missing"],
+    )
+    def test_find_window_returns_none(self, monkeypatch, error):
+        def _raise(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr("magent.platform.macos.subprocess.run", _raise)
+
+        assert MacOSPlatform().find_window("magent:api", "contains") is None
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            subprocess.TimeoutExpired(cmd="osascript", timeout=10),
+            FileNotFoundError("osascript"),
+        ],
+        ids=["timeout", "osascript-missing"],
+    )
+    def test_snapshot_windows_returns_empty(self, monkeypatch, error):
+        def _raise(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr("magent.platform.macos.subprocess.run", _raise)
+
+        assert MacOSPlatform().snapshot_windows() == {}

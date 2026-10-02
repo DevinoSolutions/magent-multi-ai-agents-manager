@@ -50,7 +50,10 @@ if TYPE_CHECKING:
 pytestmark = [pytest.mark.e2e, pytest.mark.pty]
 
 _ROWS, _COLS = 50, 160
-_BUDGET_S = 120.0
+# Room for the worst honest case: a TCC-blocked macOS runner spends two 10s
+# osascript timeouts (the window snapshot, then the title search) on EACH digit
+# press before the miss line appears, twice, on top of interpreter start-up.
+_BUDGET_S = 180.0
 _INTERVAL_S = "1"
 
 _ROW = re.compile(r"^\s*(\d)\s+(\S+)\s+(needs-input|error|done|working|idle|parked)\b")
@@ -251,14 +254,6 @@ def test_a_state_change_reorders_and_a_session_end_removes_a_row_live(rig):
     assert "3 session(s)" in screen.text
 
 
-@pytest.mark.skipif(
-    sys.platform == "darwin",
-    reason=(
-        "the digit press asks System Events for the window list (osascript, "
-        "Automation permission); a hosted macOS runner has no consenting user, so "
-        "that probe is the environment's business, not the table's"
-    ),
-)
 def test_a_digit_routes_to_that_rows_session_and_q_quits_cleanly(rig):
     _seed(rig)
     pty = rig.spawn()
