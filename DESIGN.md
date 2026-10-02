@@ -3119,15 +3119,18 @@ exactly once: `PsmuxWindowOpts.resend=False`, `revive` skips it, `attach
 selects a cloud pane as a candidate, but it still counts one for the
 shared-folder veto, so a local agent in the same folder is not parked from
 under it). `launch.cloud_refusal` is the only create gate. It refuses, in this
-order, a tool that is not `claude`, a project with no `cloudTask`, a checkout
-the cloud could not clone or push back (no GitHub remote, a detached HEAD,
-uncommitted or unpushed work), and a push set that has not been handed off yet
-(spec §18.11). `psmux.bring_up` runs it only for a cloud session that is not
-live, so a live pane is never second-guessed; liveness is asked through
-`psmux.live_sessions` (one call for the cloud and twin session ids together),
-never a per-project probe. A refusal is one more entry in `bring_up`'s
-`failed` dict, so it reaches the user on the line that already reports
-casualties.
+order, a project the one ladder `launch.cloud_command(tool, base_cmd, task)`
+has no pane command for (a tool that is not `claude`, no `cloudTask`, a
+command a pane cannot safely be typed; `--go`, `up`'s
+`psmux.eligible_projects`, the gate and `doctor` all read that ladder, so no
+surface words a refusal differently), a checkout the cloud could not clone or
+push back (no GitHub remote, a detached HEAD, uncommitted or unpushed work),
+and a push set that has not been handed off yet (spec §18.11).
+`psmux.bring_up` runs it only for a cloud session that is not live, so a live
+pane is never second-guessed; liveness is asked through `psmux.live_sessions`
+(one call for the cloud and twin session ids together), never a per-project
+probe. A refusal is one more entry in `bring_up`'s `failed` dict, so it
+reaches the user on the line that already reports casualties.
 
 A session name has one owner, first-wins: `psmux.cloud_pane_ids(rows)` is the
 one answer to "which panes are cloud", `launch.project_for_session(cfg, sid)`
@@ -3390,8 +3393,9 @@ drive it.
 would re-type `claude --cloud` on every launch and create a new session each
 time, so the plain-terminal path skips a cloud project with a reason. `up`
 always goes through psmux; `--go` and the menu launch use it only when
-`settings.psmux` is on and the platform supports psmux, and otherwise skip the
-project.
+`settings.psmux` is on and the platform supports psmux
+(`launch.launch_uses_psmux`, worded once as `launch.CLOUD_NEEDS_PSMUX`), and
+otherwise skip the project.
 
 **`--cloud` needs a claude.ai login (2026-10-02):** a `claude setup-token`
 token does not authorize it, and it is unavailable on Bedrock, Vertex and
@@ -3399,7 +3403,9 @@ third-party providers or when `allow_remote_sessions` is off. magent cannot
 see which of these applies from the PC, so `doctor`'s `cloud` check states
 them and checks only what this PC can see: that `claude` is on PATH and lists
 `--cloud`, and the config problems the create would refuse (a tool that is not
-`claude`, no `cloudTask`, a project left out by a shared session name).
+`claude`, no `cloudTask`, a command a pane cannot safely be typed, a project
+left out by a shared session name), with a warning for a project `--go` would
+skip for lack of `settings.psmux`.
 
 **Cloud projects are unrouted if per-project account routing merges (2026-09-24):**
 account routing is not on main yet. The cloud session runs under the claude.ai
