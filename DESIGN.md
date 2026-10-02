@@ -3377,7 +3377,11 @@ and the first keeps running until the user archives it. The create gate and
 case is a psmux server dying: its cloud pane goes with it, the next `up` sees
 the cloud session as not live, and the gate lets a NEW one through, because
 magent cannot list cloud sessions to see that the first still runs. Check
-claude.ai/code before `magent up` after a crash.
+claude.ai/code before `magent up` after a crash. Two `magent up` runs racing
+from separate processes can each find the session not live and both create,
+because no lock is held across a bring-up; the window is narrow (between the
+`live_sessions` probe and the create) and it is the same residual as magent
+being unable to list cloud sessions.
 
 **Alt+V and the phone page refuse a cloud pane (2026-09-24):** the image would
 land on this PC, not in the cloud VM. `serve` answers 409 and Alt+V narrates
@@ -3440,6 +3444,14 @@ can still show a value fragment as a name: a two-line UNQUOTED multi-line
 value (`KEY=AAAA`, then `bbbb=`), which is not valid dotenv anyway. The digest
 and the hand-off file are unaffected, so the create gate and what the user
 pastes are right; only the printed list can be wrong.
+
+**`attach --no-mux` against an older host cannot tell a cloud row (2026-10-02):**
+a host older than this branch reports no `node` field, so the refusal has
+nothing to read. That is safe: such a host never builds a `--cloud` command.
+
+**The cloud gate's `live_sessions` probe has no overall timeout bound (2026-10-02):**
+the same as the existing sweeps (`status`, `down`, the session picker), which
+call the same function.
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
