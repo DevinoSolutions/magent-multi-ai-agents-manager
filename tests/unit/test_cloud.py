@@ -17,16 +17,24 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from magent import nodes
+from magent import launch, nodes, psmux
 from magent.config import SCHEMA_VERSION, ConfigError, load_config
+from magent.launch import RunOpts
 from magent.lockfile import LockHeld, persistent_lock
 from magent.nodes import LocalGitState
+from magent.remote_mux import RemoteError
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _cloud_cfg(tmp_config, tmp_path: Path, **proj: object) -> str:
+def _cloud_cfg(
+    tmp_config,
+    tmp_path: Path,
+    *,
+    settings: dict[str, object] | None = None,
+    **proj: object,
+) -> str:
     project_dir = tmp_path / "api"
     project_dir.mkdir(exist_ok=True)
     entry: dict[str, object] = {
@@ -35,7 +43,10 @@ def _cloud_cfg(tmp_config, tmp_path: Path, **proj: object) -> str:
         "cloudTask": "Fix the login bug",
     }
     entry.update(proj)
-    return tmp_config({"version": SCHEMA_VERSION, "projects": [entry]})
+    config: dict[str, object] = {"version": SCHEMA_VERSION, "projects": [entry]}
+    if settings is not None:
+        config["settings"] = settings
+    return tmp_config(config)
 
 
 class TestACloudProjectIsValidatedAtLoad:
@@ -1701,3 +1712,692 @@ class TestAnUnreadableFileRefusalCarriesNoOsError:
             nodes.write_manual_handoff(ps)
         assert err.value.__cause__ is None
         assert err.value.__suppress_context__
+
+
+def _dispatch(
+    monkeypatch,
+    fake_platform,
+    cfg_path,
+    *,
+    tool="claude",
+    running=False,
+    live=False,
+    refusal=None,
+    dry_run=False,
+    tile_only=False,
+):
+    cfg = load_config(cfg_path)
+    windows: list = []
+    colors: dict = {}
+    targets: list = []
+    asked: list[str] = []
+    monkeypatch.setattr(
+        "magent.launch.cloud_refusal",
+        lambda config, sid: (asked.append(sid), refusal)[1],
+    )
+    # THE liveness answer (psmux.live_sessions), not a per-project has-session.
+    monkeypatch.setattr(
+        "magent.psmux.live_sessions",
+        lambda names, *a, **kw: list(names) if live else [],
+    )
+    n = launch._dispatch_cli_agent_project(
+        fake_platform,
+        cfg,
+        RunOpts(dry_run=dry_run, tile_only=tile_only),
+        cfg.projects[0],
+        tool,
+        False,
+        None,
+        cfg.settings.tools,
+        True,
+        lambda key, mode: running,
+        targets,
+        windows,
+        colors,
+    )
+    return n, windows, asked, targets, colors
+
+
+class TestTheLaunchPathCreatesACloudPaneOnce:
+    def test_a_new_cloud_project_collects_one_pane_typed_once_and_branded(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        n, windows, _, targets, colors = _dispatch(
+            monkeypatch,
+            fake_platform,
+            _cloud_cfg(tmp_config, tmp_path, color="blue"),
+        )
+        assert n == 1
+        [w] = windows
+        assert w.command == 'claude --cloud "Fix the login bug"'
+        assert (w.resend, w.nick) == (False, "cloud")
+        assert w.window_name == "api" and w.cwd == str(tmp_path / "api")
+        assert colors == {"api": "blue"}
+        [t] = targets
+        assert (t.key, t.is_new) == ("api", True)
+
+    def test_a_windows_list_cannot_make_it_more_than_one_pane(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        # `windows` names several panes of a LOCAL agent project; a cloud
+        # project is one session, named by the project, never by a window.
+        path = _cloud_cfg(tmp_config, tmp_path, windows=["left", "right"])
+        n, windows, _, targets, _ = _dispatch(monkeypatch, fake_platform, path)
+        assert n == 1
+        assert [w.window_name for w in windows] == ["api"]
+        assert [t.key for t in targets] == ["api"]
+
+    def test_a_refused_create_is_skipped_with_its_reason(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys
+    ):
+        n, windows, _, targets, _ = _dispatch(
+            monkeypatch,
+            fake_platform,
+            _cloud_cfg(tmp_config, tmp_path),
+            refusal="main has unpushed commits",
+        )
+        assert (n, windows, targets) == (0, [], [])
+        assert "SKIP: api — main has unpushed commits" in capsys.readouterr().out
+
+    def test_a_live_session_is_reattached_without_asking_the_gate(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        # Closed window + live session: the pane is collected for attach, the
+        # create is skipped by the bring-up's own has-session probe, and
+        # nothing new is created -- so a dirty tree must not stop the user
+        # getting their window back.
+        _, windows, asked, _, _ = _dispatch(
+            monkeypatch,
+            fake_platform,
+            _cloud_cfg(tmp_config, tmp_path),
+            live=True,
+            refusal="dirty",
+        )
+        assert asked == []
+        assert len(windows) == 1
+
+    def test_an_open_window_is_neither_gated_nor_collected(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        n, windows, asked, targets, _ = _dispatch(
+            monkeypatch, fake_platform, _cloud_cfg(tmp_config, tmp_path), running=True
+        )
+        assert (n, windows, asked) == (0, [], [])
+        # Still tiled: it is open, just not created again.
+        assert [(t.key, t.is_new) for t in targets] == [("api", False)]
+
+    def test_a_retile_creates_and_gates_nothing_but_still_tiles(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        _, windows, asked, targets, _ = _dispatch(
+            monkeypatch, fake_platform, _cloud_cfg(tmp_config, tmp_path), tile_only=True
+        )
+        assert (windows, asked) == ([], [])
+        assert len(targets) == 1
+
+    def test_a_dry_run_prints_the_command_and_asks_nothing(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys
+    ):
+        _, windows, asked, _, _ = _dispatch(
+            monkeypatch, fake_platform, _cloud_cfg(tmp_config, tmp_path), dry_run=True
+        )
+        assert (windows, asked) == ([], [])
+        out = capsys.readouterr().out
+        assert 'would run: claude --cloud "Fix the login bug"' in out
+        assert "[@cloud]" in out
+
+    def test_a_dry_run_of_an_open_window_previews_nothing(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys
+    ):
+        # A dry run says what the real run would do: for a window that is
+        # already open that is nothing, and "would run" would read as a second
+        # cloud session.
+        _dispatch(
+            monkeypatch,
+            fake_platform,
+            _cloud_cfg(tmp_config, tmp_path),
+            dry_run=True,
+            running=True,
+        )
+        assert "would run" not in capsys.readouterr().out
+
+    def test_a_cloud_project_with_no_task_is_skipped_by_name(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys
+    ):
+        # It loads (J1), but nothing can be created from it.
+        n, windows, _, _, _ = _dispatch(
+            monkeypatch, fake_platform, _cloud_cfg(tmp_config, tmp_path, cloudTask=None)
+        )
+        assert (n, windows) == (0, [])
+        assert 'no "cloudTask" set' in capsys.readouterr().out
+
+    def test_without_psmux_a_cloud_project_is_skipped_not_opened_in_a_plain_terminal(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys
+    ):
+        # A plain terminal has no has-session dedupe: every --go after the
+        # window was closed would create another cloud session.
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+        launch._dispatch_cli_agent_project(
+            fake_platform,
+            cfg,
+            RunOpts(),
+            cfg.projects[0],
+            "claude",
+            False,
+            None,
+            cfg.settings.tools,
+            False,
+            lambda k, m: False,
+            [],
+            [],
+            {},
+        )
+        assert "cloud projects run in a psmux pane" in capsys.readouterr().out
+        assert fake_platform.launched_terminals == []
+        assert fake_platform.psmux_launches == []
+
+    def test_a_cloud_project_is_never_typed_a_continue_command(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        # The loop is what routes it: a cloud project is not `runs_on_node`, so
+        # without the cloud branch it fell through to the cli-agent dispatch
+        # and was typed `claude --continue`.
+        fake_platform._supports_psmux = True
+        monkeypatch.setattr("magent.launch.cloud_refusal", lambda config, sid: None)
+        monkeypatch.setattr("magent.psmux.live_sessions", lambda names, *a, **kw: [])
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path, settings={"psmux": True}))
+        result = launch._launch_projects(
+            fake_platform, cfg, RunOpts(), cfg.projects, None
+        )
+        assert [w.command for w in result.psmux_windows] == [
+            'claude --cloud "Fix the login bug"'
+        ]
+
+
+class TestACloudProjectOnTheWrongToolIsSkippedOnce:
+    """The gate refuses it too (``TestTheCreateGate``); the launch path must
+    not rely on ``cloud_pane_command`` alone, which would type
+    ``bash --cloud`` for ``bash -c "claude ..."``."""
+
+    def test_another_tool_is_one_skip_line_naming_the_tool(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys
+    ):
+        n, windows, asked, targets, _ = _dispatch(
+            monkeypatch,
+            fake_platform,
+            _cloud_cfg(tmp_config, tmp_path, tool="codex"),
+            tool="codex",
+        )
+        out = capsys.readouterr().out
+        assert (n, windows, asked, targets) == (0, [], [], [])
+        assert out.count("SKIP:") == 1
+        assert "SKIP: api — " in out and "'codex'" in out
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_a_wrapper_around_claude_is_one_skip_line_not_a_bash_pane(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys, dry_run
+    ):
+        path = _cloud_cfg(
+            tmp_config,
+            tmp_path,
+            settings={"tools": {"claude": 'bash -c "claude --continue"'}},
+        )
+        n, windows, asked, targets, _ = _dispatch(
+            monkeypatch, fake_platform, path, dry_run=dry_run
+        )
+        out = capsys.readouterr().out
+        assert (n, windows, asked, targets) == (0, [], [], [])
+        assert out.count("SKIP:") == 1
+        assert "'bash'" in out
+        assert "would run" not in out
+
+    def test_an_executable_it_cannot_type_is_one_skip_line(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys
+    ):
+        # claude by name, but the path holds a cmd.exe metacharacter.
+        path = _cloud_cfg(
+            tmp_config,
+            tmp_path,
+            settings={"tools": {"claude": r"C:\a&b\claude.exe"}},
+        )
+        n, windows, _, _, _ = _dispatch(monkeypatch, fake_platform, path)
+        out = capsys.readouterr().out
+        assert (n, windows) == (0, [])
+        assert out.count("SKIP:") == 1 and "cannot type" in out
+
+    def test_claude_at_a_path_is_accepted(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path
+    ):
+        path = _cloud_cfg(
+            tmp_config,
+            tmp_path,
+            settings={"tools": {"claude": r"C:\tools\Claude.EXE --continue"}},
+        )
+        _, [w], _, _, _ = _dispatch(monkeypatch, fake_platform, path)
+        assert w.command == r'C:\tools\Claude.EXE --cloud "Fix the login bug"'
+
+
+class TestTheCloudToolRule:
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "claude",
+            "claude --continue",
+            "claude.exe",
+            "claude.cmd",
+            "CLAUDE.EXE",
+            "Claude.Cmd --continue",
+            r"C:\tools\claude.exe --continue",
+            r"C:\npm\claude.cmd",
+            "/usr/local/bin/claude --continue",
+            "./claude",
+        ],
+    )
+    def test_claude_by_any_path_case_or_windows_extension_is_accepted(self, command):
+        assert launch.cloud_tool_refusal("claude", command) is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash -c claude",
+            'bash -c "claude --continue"',
+            "cmd /c claude",
+            "node claude.js",
+            "python -m claude",
+            "claude-wrapper",
+            "claudex",
+            "myclaude.exe",
+            "claude.sh",
+            "claude.py",
+            "claude.exe.bak",
+            "claude.exe.cmd",
+            r"C:\tools\notclaude.exe",
+            r"C:\claude\tool.exe",
+            "claude/",
+        ],
+    )
+    def test_anything_else_in_the_executable_slot_is_refused_by_name(self, command):
+        refusal = launch.cloud_tool_refusal("claude", command)
+        assert refusal is not None
+        assert repr(command.split()[0]) in refusal
+
+    @pytest.mark.parametrize("command", [None, "", "   "])
+    def test_a_claude_tool_with_no_command_is_an_unknown_tool(self, command):
+        refusal = launch.cloud_tool_refusal("claude", command)
+        assert refusal is not None and "unknown tool 'claude'" in refusal
+
+    @pytest.mark.parametrize("tool", ["codex", "cursor-agent", "agy", "Claude", "code"])
+    def test_a_tool_that_is_not_claude_is_refused_whatever_its_command(self, tool):
+        # Even `claude` as its command: the tool decides what the project is.
+        refusal = launch.cloud_tool_refusal(tool, "claude")
+        assert refusal is not None and repr(tool) in refusal
+        assert "claude --cloud" in refusal
+
+
+class TestOneSessionNamingRule:
+    """A session id is ``psmux.session_name(title or leaf)``: the rule
+    ``psmux.eligible_projects`` names sessions by. The cloud helpers read it
+    through ``nodes.node_sid`` and never spell it a second time."""
+
+    def _cfg(self, tmp_config, tmp_path: Path):
+        projects = []
+        for i, title in enumerate(("My App v1.2", "a:b c", None)):
+            folder = tmp_path / f"dir{i}"
+            folder.mkdir()
+            entry: dict[str, object] = {"path": str(folder), "node": "cloud"}
+            if title is not None:
+                entry["title"] = title
+            projects.append(entry)
+        return load_config(
+            tmp_config({"version": SCHEMA_VERSION, "projects": projects})
+        )
+
+    def test_the_cloud_sessions_are_the_ones_the_bring_up_names(
+        self, tmp_config, tmp_path
+    ):
+        cfg = self._cfg(tmp_config, tmp_path)
+        rows = psmux.eligible_projects(cfg)
+        assert launch.cloud_session_ids(cfg) == {r["session"] for r in rows}
+        assert launch.cloud_session_ids(cfg) == {"My-App-v1-2", "a-b-c", "dir2"}
+
+    def test_a_session_id_finds_its_project(self, tmp_config, tmp_path):
+        cfg = self._cfg(tmp_config, tmp_path)
+        for row in psmux.eligible_projects(cfg):
+            proj = launch.project_for_session(cfg, str(row["session"]))
+            assert proj is not None and proj.path == row["path"]
+        assert launch.project_for_session(cfg, "nope") is None
+
+    @pytest.mark.parametrize("title", ["My App v1.2", "a:b c", "plain"])
+    def test_the_pane_the_launch_collects_is_named_by_the_same_rule(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, title
+    ):
+        # The dispatch names the window from the title it generated; the gate
+        # looks the project up by `node_sid`. They must agree, or the gate
+        # would be asked about a session no project owns and wave it through.
+        path = _cloud_cfg(tmp_config, tmp_path, title=title)
+        _, [w], asked, _, _ = _dispatch(monkeypatch, fake_platform, path)
+        proj = load_config(path).projects[0]
+        assert w.window_name == nodes.node_sid(proj)
+        assert asked == [w.window_name]
+        assert launch.project_for_session(load_config(path), w.window_name) is not None
+
+    def test_a_config_with_no_cloud_project_has_no_cloud_sessions(
+        self, tmp_config, tmp_path
+    ):
+        folder = tmp_path / "x"
+        folder.mkdir()
+        cfg = load_config(
+            tmp_config({"version": SCHEMA_VERSION, "projects": [{"path": str(folder)}]})
+        )
+        assert launch.cloud_session_ids(cfg) == set()
+
+    def test_a_disabled_project_never_stands_for_the_session(
+        self, tmp_config, tmp_path, monkeypatch
+    ):
+        # The user turns an old entry off and adds a cloud one for the same
+        # folder. The bring-up only ever sees the enabled one, so the gate
+        # must too -- else it would read the old entry, find no cloud project
+        # and let the create through ungated.
+        folder = tmp_path / "api"
+        folder.mkdir()
+        cfg = load_config(
+            tmp_config(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [
+                        {"path": str(folder), "enabled": False},
+                        {"path": str(folder), "node": "cloud", "cloudTask": "t"},
+                    ],
+                }
+            )
+        )
+        proj = launch.project_for_session(cfg, "api")
+        assert proj is not None and proj.node == "cloud"
+        monkeypatch.setattr(
+            "magent.launch.node_git_states",
+            lambda config, p: [_state(folder, dirty=True)],
+        )
+        assert "uncommitted" in (launch.cloud_refusal(cfg, "api") or "")
+
+
+class TestTheCreateGate:
+    def _inputs(self, monkeypatch, tmp_config, tmp_path, *, env=False, **state_kw):
+        """A cloud config and the git read the gate will see: one repo (clean
+        and pushed unless ``state_kw`` says otherwise) and, with ``env``, an
+        ignored ``.env`` holding a secret."""
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+        repo = tmp_path / "api"
+        if env:
+            (repo / ".env").write_text("API_TOKEN=hunter2-secret\n", encoding="utf-8")
+            state_kw.setdefault("ignored", (".env",))
+        state = _state(repo, **state_kw)
+        monkeypatch.setattr(
+            "magent.launch.node_git_states", lambda config, proj: [state]
+        )
+        return cfg, state
+
+    def test_it_reads_the_one_repository_and_refuses_a_dirty_tree(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        cfg, _ = self._inputs(monkeypatch, tmp_config, tmp_path, dirty=True)
+        assert "uncommitted" in (launch.cloud_refusal(cfg, "api") or "")
+
+    @pytest.mark.parametrize(
+        ("kw", "phrase"),
+        [
+            ({"unpushed": True}, "unpushed"),
+            ({"url": "https://gitlab.com/me/api.git"}, "not on GitHub"),
+            ({"url": ""}, "no 'origin' remote"),
+            ({"detached": True}, "detached"),
+            ({"no_commits": True}, "no commits"),
+        ],
+    )
+    def test_each_unclonable_checkout_is_refused_by_the_cloud_check(
+        self, monkeypatch, tmp_config, tmp_path, kw, phrase
+    ):
+        cfg, _ = self._inputs(monkeypatch, tmp_config, tmp_path, **kw)
+        assert phrase in (launch.cloud_refusal(cfg, "api") or "")
+
+    def test_a_workspace_of_several_repositories_is_refused(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+        monkeypatch.setattr(
+            "magent.launch.node_git_states",
+            lambda config, proj: [_state(tmp_path / "a"), _state(tmp_path / "b")],
+        )
+        assert "ONE repository" in (launch.cloud_refusal(cfg, "api") or "")
+
+    def test_a_folder_that_is_not_a_repository_is_refused(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+        monkeypatch.setattr("magent.launch.node_git_states", lambda config, proj: [])
+        assert "not a git repository" in (launch.cloud_refusal(cfg, "api") or "")
+
+    def test_git_that_fails_is_a_named_refusal_not_a_traceback(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+
+        def _git_fails(config, proj):
+            raise RemoteError(
+                128, "fatal: detected dubious ownership", ("git", "status")
+            )
+
+        monkeypatch.setattr("magent.launch.node_git_states", _git_fails)
+        refusal = launch.cloud_refusal(cfg, "api") or ""
+        assert "git could not read" in refusal
+        assert "dubious ownership" in refusal
+
+    def test_git_that_never_answers_is_still_a_named_refusal(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+
+        def _git_hangs(config, proj):
+            raise RemoteError(None, "", ("git", "status"), timed_out=True)
+
+        monkeypatch.setattr("magent.launch.node_git_states", _git_hangs)
+        refusal = launch.cloud_refusal(cfg, "api") or ""
+        assert "git could not read" in refusal and "None" not in refusal
+
+    def test_a_folder_this_user_cannot_read_is_a_named_refusal(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+
+        def _denied(config, proj):
+            raise PermissionError(13, "denied")
+
+        monkeypatch.setattr("magent.launch.node_git_states", _denied)
+        assert "PermissionError" in (launch.cloud_refusal(cfg, "api") or "")
+
+    def test_a_missing_task_is_refused_before_git_is_read(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path, cloudTask=None))
+
+        def _boom(config, proj):
+            raise AssertionError(
+                "git must not be read for a project that cannot be created"
+            )
+
+        monkeypatch.setattr("magent.launch.node_git_states", _boom)
+        assert launch.cloud_refusal(cfg, "api") == launch.NO_CLOUD_TASK
+
+    @pytest.mark.parametrize(
+        ("proj", "settings", "named"),
+        [
+            ({"tool": "codex"}, None, "'codex'"),
+            ({}, {"defaultTool": "codex"}, "'codex'"),
+            ({"tool": "claude"}, {"tools": {"claude": 'bash -c "claude"'}}, "'bash'"),
+            (
+                {},
+                {"tools": {"claude": "claude-wrapper --continue"}},
+                "'claude-wrapper'",
+            ),
+        ],
+        ids=["own-tool", "inherited-default-tool", "wrapper-command", "other-exe"],
+    )
+    def test_a_tool_that_is_not_claude_is_refused_before_git_is_read(
+        self, monkeypatch, tmp_config, tmp_path, proj, settings, named
+    ):
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path, settings=settings, **proj))
+
+        def _boom(config, p):
+            raise AssertionError(
+                "git must not be read for a project that cannot be created"
+            )
+
+        monkeypatch.setattr("magent.launch.node_git_states", _boom)
+        refusal = launch.cloud_refusal(cfg, "api") or ""
+        assert named in refusal and "claude --cloud" in refusal
+
+    def test_claude_at_a_path_is_past_the_tool_check(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        cfg = load_config(
+            _cloud_cfg(
+                tmp_config,
+                tmp_path,
+                settings={"tools": {"claude": r"C:\tools\claude.cmd --continue"}},
+            )
+        )
+        monkeypatch.setattr("magent.launch.node_git_states", lambda config, proj: [])
+        # Past the tool check, it reaches git -- and stops on the empty read.
+        assert "not a git repository" in (launch.cloud_refusal(cfg, "api") or "")
+
+    def test_a_clean_checkout_waits_on_the_push_set(
+        self, monkeypatch, tmp_config, tmp_path, cloud_home
+    ):
+        cfg, _ = self._inputs(monkeypatch, tmp_config, tmp_path, env=True)
+        refusal = launch.cloud_refusal(cfg, "api") or ""
+        assert "magent node push api" in refusal and "API_TOKEN" in refusal
+        assert "hunter2-secret" not in refusal
+
+    def test_a_clean_checkout_with_a_handed_off_push_set_is_let_through(
+        self, monkeypatch, tmp_config, tmp_path, cloud_home
+    ):
+        cfg, state = self._inputs(monkeypatch, tmp_config, tmp_path, env=True)
+        ps = nodes.cloud_push_set(state.path, [state], home=tmp_path / "h")
+        nodes.write_cloud_record(
+            "api", digest=nodes.push_set_digest(ps, "manual"), mode="manual"
+        )
+        assert launch.cloud_refusal(cfg, "api") is None
+
+    def test_a_changed_secret_asks_for_the_hand_off_again(
+        self, monkeypatch, tmp_config, tmp_path, cloud_home
+    ):
+        cfg, state = self._inputs(monkeypatch, tmp_config, tmp_path, env=True)
+        ps = nodes.cloud_push_set(state.path, [state], home=tmp_path / "h")
+        nodes.write_cloud_record(
+            "api", digest=nodes.push_set_digest(ps, "manual"), mode="manual"
+        )
+        (state.path / ".env").write_text("API_TOKEN=rotated\n", encoding="utf-8")
+        assert "magent node push api" in (launch.cloud_refusal(cfg, "api") or "")
+
+    def test_a_clean_checkout_with_nothing_to_hand_off_is_let_through(
+        self, monkeypatch, tmp_config, tmp_path, cloud_home
+    ):
+        cfg, _ = self._inputs(monkeypatch, tmp_config, tmp_path)
+        assert launch.cloud_refusal(cfg, "api") is None
+
+    def test_a_session_that_is_not_cloud_is_never_gated(self, tmp_config, tmp_path):
+        folder = tmp_path / "api"
+        folder.mkdir()
+        cfg = load_config(
+            tmp_config({"version": SCHEMA_VERSION, "projects": [{"path": str(folder)}]})
+        )
+        assert launch.cloud_refusal(cfg, "api") is None
+
+    def test_a_session_no_project_owns_is_never_gated(self, tmp_config, tmp_path):
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+        assert launch.cloud_refusal(cfg, "nobody") is None
+
+
+class TestTheGateNeverRaises:
+    """Every OSError the checks can raise -- a lock that stays taken, a file
+    that cannot be read -- is a refusal that names it, never a traceback out of
+    ``--go`` or ``up``."""
+
+    def _handed_off(self, monkeypatch, tmp_config, tmp_path):
+        """A project with a recorded hand-off, so the gate has to re-digest."""
+        cfg = load_config(_cloud_cfg(tmp_config, tmp_path))
+        repo = tmp_path / "api"
+        (repo / ".env").write_text("API_TOKEN=hunter2-secret\n", encoding="utf-8")
+        state = _state(repo, ignored=(".env",))
+        monkeypatch.setattr(
+            "magent.launch.node_git_states", lambda config, proj: [state]
+        )
+        nodes.write_cloud_record("api", digest="0" * 64, mode="manual")
+        return cfg
+
+    def test_a_lock_that_stays_taken_asks_the_user_to_try_again(
+        self, monkeypatch, tmp_config, tmp_path, cloud_home
+    ):
+        # The digest key is made under a lock (`_place_key`), and the digest is
+        # asked for exactly when a record has to be checked against the files.
+        cfg = self._handed_off(monkeypatch, tmp_config, tmp_path)
+
+        def _busy(*args, **kwargs):
+            raise LockHeld("held by another writer")
+
+        monkeypatch.setattr(nodes, "_digest_key", _busy)
+        refusal = launch.cloud_refusal(cfg, "api") or ""
+        assert "another magent is updating the cloud records; try again" in refusal
+        assert "held by another writer" not in refusal
+
+    def test_an_unreadable_push_file_names_the_file_and_the_repair(
+        self, monkeypatch, tmp_config, tmp_path, cloud_home
+    ):
+        cfg = self._handed_off(monkeypatch, tmp_config, tmp_path)
+
+        def _unreadable(ps, mode):
+            raise nodes.PushSetUnreadable(".env", "PermissionError")
+
+        monkeypatch.setattr(nodes, "push_set_digest", _unreadable)
+        refusal = launch.cloud_refusal(cfg, "api") or ""
+        assert ".env" in refusal and "PermissionError" in refusal
+        assert "magent node push api" in refusal
+        assert "hunter2-secret" not in refusal
+
+    def test_an_unreadable_file_that_escapes_the_check_is_named_too(
+        self, monkeypatch, tmp_config, tmp_path, cloud_home
+    ):
+        cfg = self._handed_off(monkeypatch, tmp_config, tmp_path)
+
+        def _escapes(sid, name, ps, recipient):
+            raise nodes.PushSetUnreadable(".env.local", "PermissionError")
+
+        monkeypatch.setattr(nodes, "cloud_env_refusal", _escapes)
+        refusal = launch.cloud_refusal(cfg, "api") or ""
+        assert ".env.local" in refusal and "PermissionError" in refusal
+        assert "magent node push api" in refusal
+
+    def test_a_folder_the_push_set_cannot_list_is_named(
+        self, monkeypatch, tmp_config, tmp_path, cloud_home
+    ):
+        cfg = self._handed_off(monkeypatch, tmp_config, tmp_path)
+
+        def _cannot_list(*args, **kwargs):
+            raise nodes.NodeConfigError("api: cannot be listed (PermissionError)")
+
+        monkeypatch.setattr(nodes, "cloud_push_set", _cannot_list)
+        assert "cannot be listed (PermissionError)" in (
+            launch.cloud_refusal(cfg, "api") or ""
+        )
+
+    def test_any_other_os_error_is_named_by_class_and_never_by_its_text(
+        self, monkeypatch, tmp_config, tmp_path, cloud_home
+    ):
+        # The OS's own words carry an absolute path (and so a user name).
+        cfg = self._handed_off(monkeypatch, tmp_config, tmp_path)
+
+        def _denied(*args, **kwargs):
+            raise PermissionError(13, "denied", "C:/Users/someone/.magent/key")
+
+        monkeypatch.setattr(nodes, "_digest_key", _denied)
+        refusal = launch.cloud_refusal(cfg, "api") or ""
+        assert "PermissionError" in refusal
+        assert "someone" not in refusal and "denied" not in refusal
