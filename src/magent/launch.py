@@ -1545,6 +1545,35 @@ def shadowed_cloud_projects(config: MagentConfig) -> list[tuple[ProjectConfig, s
     return out
 
 
+def shadowed_local_projects(config: MagentConfig) -> list[tuple[ProjectConfig, str]]:
+    """The mirror of ``shadowed_cloud_projects``: every enabled LOCAL project
+    (one ``eligible_projects`` would list -- no IDE tool, host or node) whose
+    session name an enabled CLOUD project owns, each with that session id.
+
+    In a ``[cloud, local]`` pair for one folder the first-wins dedupe keeps the
+    cloud row and drops the local one without a word, so ``up`` never starts the
+    local agent and nothing says why. Named here for ``status``, with
+    ``twin_session_refusal``'s fix."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    out: list[tuple[ProjectConfig, str]] = []
+    for proj in config.projects:
+        if (
+            not proj.enabled
+            or is_cloud(proj)
+            or proj.host
+            or runs_on_node(proj)
+            or is_ide_tool(proj.tool or config.settings.default_tool)
+        ):
+            continue
+        sid = nodes.node_sid(proj)
+        owner = project_for_session(config, sid)
+        if owner is not None and owner is not proj and is_cloud(owner):
+            out.append((proj, sid))
+    return out
+
+
 def cloud_refusal(config: MagentConfig, sid: str) -> str | None:
     """Why the cloud session for ``sid`` must NOT be created now, or None.
 

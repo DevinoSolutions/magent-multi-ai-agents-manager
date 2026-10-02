@@ -564,20 +564,41 @@ def _shadowed_cloud(cfg: MagentConfig) -> list[dict[str, str]]:
     ]
 
 
+def _shadowed_local(cfg: MagentConfig) -> list[dict[str, str]]:
+    """The mirror of ``_shadowed_cloud``: the enabled LOCAL projects `up` will
+    never start because a cloud project owns their session name -- ``[{session,
+    path, why}]``. In ``[cloud, local]`` the first-wins dedupe keeps the cloud
+    row and drops the local one in silence; same fix text as the cloud half."""
+    from magent.launch import (  # heavy subsystem: in-body per policy
+        shadowed_local_projects,
+        twin_session_refusal,
+    )
+
+    return [
+        {"session": sid, "path": proj.path, "why": twin_session_refusal(sid)}
+        for proj, sid in shadowed_local_projects(cfg)
+    ]
+
+
 def _echo_cloud_notes(cfg: MagentConfig, down: list[dict[str, object]]) -> None:
     """What `status` says about cloud panes beyond the session list. A cloud
     pane that is not there is not simply "down": its cloud session lives on
     (billed, listed only on claude.ai/code), and when nothing will start the
     pane the reason is the news -- one line per such entry. Then one line per
-    cloud project `up` will never start (``_shadowed_cloud``)."""
+    project `up` will never start because the other half of a cloud/local pair
+    for one folder won the name (``_shadowed_cloud``, ``_shadowed_local``)."""
     for entry in down:
         if entry.get("node") == "cloud":
             click.echo(f"  {style(_cloud_down_line(entry), dim=True)}")
-    for shadow in _shadowed_cloud(cfg):
-        click.echo(
-            f"  {style('!', fg='yellow')} cloud project {shadow['path']} is never "
-            f"started: {shadow['why']}"
-        )
+    for kind, shadows in (
+        ("cloud", _shadowed_cloud(cfg)),
+        ("local", _shadowed_local(cfg)),
+    ):
+        for shadow in shadows:
+            click.echo(
+                f"  {style('!', fg='yellow')} {kind} project {shadow['path']} is "
+                f"never started: {shadow['why']}"
+            )
 
 
 def _gather_status(cfg: MagentConfig) -> dict[str, str]:
@@ -907,6 +928,10 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         shadowed = _shadowed_cloud(cfg)
         if shadowed:
             payload["shadowed_cloud"] = shadowed
+        # ...and its mirror: a local project a cloud one's name shadows.
+        shadowed_here = _shadowed_local(cfg)
+        if shadowed_here:
+            payload["shadowed_local"] = shadowed_here
         # Additive too, and for the same reason the human line is on stderr and
         # not in the verdict: a count of psmux servers stranded in logon
         # Session 0 is a fact about the machine, not about magent's daemons, so
@@ -1483,11 +1508,17 @@ def _menu_down(config_file: Path) -> None:
         click.echo(f"  {style('-', dim=True)} Nothing is running.")
     else:
         order, buckets = _grouped(up)
+        # Said BEFORE the confirm, not only after it: stopping a cloud pane
+        # closes the local view and nothing else (see `_report_shutdown`).
+        cloud = _cloud_panes(config_file, up)
+        cloud_notes = dict.fromkeys(
+            cloud, "cloud pane: its cloud session keeps running"
+        )
         for g in order:
             click.echo(
                 f"  {style(g, fg='green', bold=True)}  {style(f'({len(buckets[g])})', dim=True)}"
             )
-            _print_names(buckets[g])
+            _print_names(buckets[g], reasons=cloud_notes)
         pickable = [g for g in order if g != "(no group)"]
         srv_on = _probe_port(cfg.settings.upload_port)
         click.echo()
@@ -1529,7 +1560,7 @@ def _menu_down(config_file: Path) -> None:
         # Same verified report the `down` command gives: the menu used to
         # print the length of the list it had tried, which is the half of
         # NF-S3-001 that survived pass-2 (the server line was fixed then).
-        _report_shutdown(*stop_psmux(targets), cloud=_cloud_panes(config_file, up))
+        _report_shutdown(*stop_psmux(targets), cloud=cloud)
         if also_server:
             from magent.upload_server import (
                 stop_server,  # heavy subsystem: in-body per policy
