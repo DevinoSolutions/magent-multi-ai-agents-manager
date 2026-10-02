@@ -1460,12 +1460,13 @@ def cloud_refusal(config: MagentConfig, sid: str) -> str | None:
     proj = project_for_session(config, sid)
     if proj is None or not is_cloud(proj):
         return None
-    if not proj.cloud_task:
-        return NO_CLOUD_TASK
+    # tool -> task -> git -> push set, the order every surface refuses in.
     tool = proj.tool or config.settings.default_tool
     refusal = cloud_tool_refusal(tool, config.settings.tools.get(tool))
     if refusal:
         return refusal
+    if not proj.cloud_task:
+        return NO_CLOUD_TASK
     try:
         return _cloud_checkout_refusal(config, proj, sid)
     except remote_mux.RemoteError as exc:
@@ -1480,7 +1481,7 @@ def cloud_refusal(config: MagentConfig, sid: str) -> str | None:
         return f"git could not read {proj.path}: {printable(said)}"
     # LockHeld and PushSetUnreadable are OSErrors: they come before it.
     except LockHeld:
-        return "another magent is updating the cloud records; try again"
+        return "another magent is updating cloud hand-off state; try again"
     except nodes.PushSetUnreadable as exc:
         return (
             f"the push set cannot be checked: {printable(exc.label)} cannot be read"
@@ -1881,14 +1882,15 @@ def _dispatch_cloud_project(
             " launch"
         )
         return 0
-    if not proj.cloud_task:
-        click.echo(f"SKIP: {title} — {NO_CLOUD_TASK}")
-        return 0
-    # Before any git read, and before the command is built: the tool decides
+    # tool -> task -> git -> push set, the order every surface refuses in. The
+    # tool is first, before the command is built or any git is read: it decides
     # what the project is.
     refusal = cloud_tool_refusal(tool, base_cmd)
     if refusal:
         click.echo(f"SKIP: {title} — {refusal}")
+        return 0
+    if not proj.cloud_task:
+        click.echo(f"SKIP: {title} — {NO_CLOUD_TASK}")
         return 0
     try:
         cmd = cloud_pane_command(base_cmd, proj.cloud_task)
@@ -1896,6 +1898,17 @@ def _dispatch_cloud_project(
         click.echo(f"SKIP: {title} — {exc}")
         return 0
     tile_key = _psmux_session_name(title)
+    # The gate answers by session name, for the FIRST enabled project that owns
+    # it. If that is another project (a local one listed ahead of this one),
+    # the gate would be reading a project that is not being created: refuse
+    # rather than create ungated. The other project's own dispatch already
+    # tiles and re-attaches that session.
+    if project_for_session(config, tile_key) != proj:
+        click.echo(
+            f"SKIP: {title} — another enabled project uses the session name"
+            f" {tile_key}; rename one (set a title)"
+        )
+        return 0
     running = is_running(tile_key, match_mode)
     if not running and not opts.dry_run and not opts.tile_only:
         resolved_dir = _resolve_path(proj.path, base_dir)
@@ -1927,7 +1940,11 @@ def _dispatch_cloud_project(
     _log_project(title, tool, running, None, psmux=True, node="cloud")
     # A dry run says what the real run would do: for an open window, nothing.
     if opts.dry_run and not running:
-        click.echo(style(f"      would run: {cmd}", dim=True))
+        # The gate reads git and the push set, which a preview must not: say so,
+        # so the line cannot read as an approval.
+        click.echo(
+            style(f"      would run: {cmd} (create gate not consulted)", dim=True)
+        )
     return 0 if running else 1
 
 
