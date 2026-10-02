@@ -2444,6 +2444,37 @@ class TestWhatFollowsAnUnaccountedLine:
         assert names == ("A", "B")
         assert lines == ["A  ******** (1 chars)", "B  ******** (1 chars)"]
 
+    # ---- an opener glued after unquoted text ----------------------------------
+
+    def test_an_opener_glued_after_text_hands_the_doubt_on(self, tmp_path):
+        # `A` is a plain assignment (no reader joins what follows) and stays
+        # shown, but the next line is the block's body and would print as a name.
+        value = "x-----BEGIN X-----"
+        raw = f"A={value}\n{FRAG}=\n-----END X-----\nNEXT=1\n".encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("A", "NEXT")
+        assert lines == [
+            f"A  ******** ({len(value)} chars)",
+            "NEXT  ******** (1 chars)",
+            "(2 line(s) not shown)",
+        ]
+        _no_fragment(names, lines)
+
+    def test_a_base64_body_line_after_a_glued_opener_is_not_a_name(self, tmp_path):
+        body = "Ab3" * 14 + "x"
+        assert len(body) == 43
+        raw = f"A=x-----BEGIN X-----\n{body}=\n-----END X-----\nNEXT=1\n".encode()
+        names, lines = _read_env(tmp_path, raw)
+        assert names == ("A", "NEXT")
+        assert lines[-1] == "(2 line(s) not shown)"
+        assert body[:8] not in "\n".join([*names, *lines])
+
+    def test_a_quoted_value_that_contains_a_marker_hands_no_doubt_on(self, tmp_path):
+        # The quote closes the value: nothing of it can run onto the next line.
+        names, lines = _read_env(tmp_path, b'A="x-----BEGIN"\nDEBUG=\n')
+        assert names == ("A", "DEBUG")
+        assert lines == ["A  ******** (11 chars)", "DEBUG  ******** (0 chars)"]
+
     # ---- lines an open quote or block swallows are counted -------------------
 
     def test_the_lines_an_adjacent_quote_swallows_are_counted(self, tmp_path):

@@ -3861,7 +3861,10 @@ def _dotenv_scan(text: str) -> tuple[list[tuple[str, int]], int]:
     the last line of a base64 body (``AAA=``) reads as a variable with no
     value, and is not one. Every withheld line hands the doubt on; a blank
     line, a comment line or a shown entry ends it, so ``DEBUG=`` after a
-    comment is still listed. A ``-----BEGIN`` ANYWHERE in a line that is not an
+    comment is still listed. (An entry whose unquoted value carries a
+    ``-----BEGIN`` glued after text, ``A=x-----BEGIN X-----``, is shown but
+    does not end it: its body may follow.) A ``-----BEGIN`` ANYWHERE in a line
+    that is not an
     assignment (a JSON string with real newlines carries one mid-line) opens an
     armored block too. The lines a value that never closes swallows (an unmatched
     quote or ``-----BEGIN``) are counted as well, so the count line says the
@@ -3913,15 +3916,19 @@ def _dotenv_scan(text: str) -> tuple[list[tuple[str, int]], int]:
         if not closed:
             withheld += _unshown(lines, first + 1, at)
         at += 1
-        doubt = (
+        hold = (
             len(name) > _DOTENV_NAME_MAX
             or value.startswith("=")
             or (doubt and not quoted and length == 0)
         )
-        if doubt:
+        if hold:
             withheld += 1
         else:
             entries.append((name, length))
+        # An opener glued after unquoted text (`A=x-----BEGIN X-----`) is shown
+        # like any value, but no reader joins what follows it and its body may
+        # be the very next line.
+        doubt = hold or (not quoted and _ARMOR_OPEN in value)
     return entries, withheld
 
 
