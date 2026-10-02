@@ -42,7 +42,7 @@ Four laws:
     (``LOCK_WAIT_S``) and then ``begin_launch``'s flag keeps every later sync of
     that launch from waiting again. Logo discovery is cached by (path, size,
     mtime) in a sidecar, so an unchanged logo costs a ``stat`` -- never a read,
-    which on a OneDrive file would hydrate it on every launch.
+    which on a cloud-synced file would hydrate it on every launch.
 
 A bare relative ``icon`` in a fragment profile resolves against the fragment's
 own folder from Windows Terminal 1.24; older versions honour only web URLs there.
@@ -686,7 +686,7 @@ def _apply_spec(
             data = _icon_bytes(spec, resolved)
         except (OSError, ValueError) as exc:
             # The chosen source went bad between the probe and the read (a
-            # file replaced, a OneDrive placeholder that will not hydrate):
+            # file replaced, a cloud placeholder that will not hydrate):
             # this window gets the badge instead of no icon at all.
             get_logger("launch").warning(
                 "terminal icon: %s unusable (%s); drawing a badge", spec.key, exc
