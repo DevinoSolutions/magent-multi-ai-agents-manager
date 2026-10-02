@@ -98,6 +98,7 @@ _PIN_LAWS = {
     "MAGENT_SESSION0_POLICY": "allow",
     "MAGENT_MCP_RELAY": "0",
     "MAGENT_ACCOUNT_ROUTING": "0",
+    "MAGENT_WT_ICONS": "0",
 }
 # The pins tests/conftest.py also sets for every test: one source of truth.
 _CONFTEST_PINS = (
@@ -107,6 +108,7 @@ _CONFTEST_PINS = (
     "MAGENT_SESSION0_POLICY",
     "MAGENT_NODE_SYNC",
     "MAGENT_IDLE_REAP",
+    "MAGENT_WT_ICONS",
 )
 
 
