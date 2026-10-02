@@ -1,3 +1,4 @@
+import logging
 import os
 import subprocess
 import sys
@@ -1281,13 +1282,16 @@ class TestMacOSWindowProbesDegradeWhenOsascriptCannotAnswer:
         ],
         ids=["timeout", "osascript-missing"],
     )
-    def test_find_window_returns_none(self, monkeypatch, error):
+    def test_find_window_returns_none(self, monkeypatch, caplog, error):
         def _raise(*args, **kwargs):
             raise error
 
         monkeypatch.setattr("magent.platform.macos.subprocess.run", _raise)
 
-        assert MacOSPlatform().find_window("magent:api", "contains") is None
+        with caplog.at_level(logging.WARNING):
+            assert MacOSPlatform().find_window("magent:api", "contains") is None
+
+        assert "window probe" in caplog.text
 
     @pytest.mark.parametrize(
         "error",
@@ -1297,10 +1301,13 @@ class TestMacOSWindowProbesDegradeWhenOsascriptCannotAnswer:
         ],
         ids=["timeout", "osascript-missing"],
     )
-    def test_snapshot_windows_returns_empty(self, monkeypatch, error):
+    def test_snapshot_windows_returns_empty(self, monkeypatch, caplog, error):
         def _raise(*args, **kwargs):
             raise error
 
         monkeypatch.setattr("magent.platform.macos.subprocess.run", _raise)
 
-        assert MacOSPlatform().snapshot_windows() == {}
+        with caplog.at_level(logging.WARNING):
+            assert MacOSPlatform().snapshot_windows() == {}
+
+        assert "window probe" in caplog.text

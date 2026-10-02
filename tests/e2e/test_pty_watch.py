@@ -59,7 +59,9 @@ _INTERVAL_S = "1"
 _ROW = re.compile(r"^\s*(\d)\s+(\S+)\s+(needs-input|error|done|working|idle|parked)\b")
 
 
-def _hook(env: dict[str, str], event: str, cwd: Path, **extra: object) -> None:
+def _hook(
+    budget: Budget, env: dict[str, str], event: str, cwd: Path, **extra: object
+) -> None:
     """One REAL lifecycle event through the shipped writer, stdin-piped."""
     payload = {
         "hook_event_name": event,
@@ -72,7 +74,7 @@ def _hook(env: dict[str, str], event: str, cwd: Path, **extra: object) -> None:
         input=json.dumps(payload),
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=budget.clamp(60.0),
         env=env,
         check=False,
     )
@@ -173,10 +175,11 @@ def rig(tmp_path):
 def _seed(rig) -> None:
     """Four sessions, written OUT of urgency order, by the real writer."""
     env, d = rig.env, rig.dirs
-    _hook(env, "SessionStart", d["nap"])  # idle
-    _hook(env, "UserPromptSubmit", d["grind"])  # working
-    _hook(env, "Stop", d["ship"])  # done
+    _hook(rig.budget, env, "SessionStart", d["nap"])  # idle
+    _hook(rig.budget, env, "UserPromptSubmit", d["grind"])  # working
+    _hook(rig.budget, env, "Stop", d["ship"])  # done
     _hook(
+        rig.budget,
         env,
         "Notification",
         d["ask"],
@@ -195,7 +198,9 @@ def _expected_initial(names):
 
 def _press(pty: Pty, digit: str) -> None:
     # POSIX stdin is line-buffered outside a raw tty ("digits need Enter" in
-    # watch._poll_key's own words); Windows reads the console key directly.
+    # watch._poll_key's own words); Windows reads the console key directly. The
+    # trailing newline after the digit is an expected extra key the watch loop
+    # ignores.
     pty.send_keys(digit if sys.platform == "win32" else digit + "\n")
 
 
@@ -224,6 +229,7 @@ def test_a_state_change_reorders_and_a_session_end_removes_a_row_live(rig):
     # The working session now needs you: equal urgency with `ask`, but newer,
     # so it sorts above it -- and `done` slides to third. No restart, no key.
     _hook(
+        rig.budget,
         rig.env,
         "Notification",
         rig.dirs["grind"],
@@ -243,7 +249,7 @@ def test_a_state_change_reorders_and_a_session_end_removes_a_row_live(rig):
     ], screen.text
 
     # A session ending clears its record, and the row goes with it.
-    _hook(rig.env, "SessionEnd", rig.dirs["nap"])
+    _hook(rig.budget, rig.env, "SessionEnd", rig.dirs["nap"])
     screen = _wait_screen(
         pty,
         rig.budget,

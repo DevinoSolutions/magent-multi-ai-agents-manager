@@ -145,6 +145,21 @@ def _saved(uploads: Path) -> list[Path]:
     )
 
 
+def _assert_still_a_draft(rig, pane: str, name: str) -> None:
+    """Hold the line past a settle window: a product that pastes and then sends
+    Enter a few ms later must not pass because we looked too early."""
+    fleet = rig.fleet
+    read = _wait_until(
+        lambda: bool(fleet.received(pane)), min(1.0, rig.budget.clamp(1.0))
+    )
+    assert not read, (
+        f"the agent read a line -- the paste was submitted: {fleet.received(pane)}"
+    )
+    assert name in _squashed(fleet.capture(pane)), (
+        f"the path left {pane}'s input line:\n{fleet.capture(pane)}"
+    )
+
+
 def test_a_press_puts_the_saved_path_on_the_target_panes_input_line_unsubmitted(rig):
     fleet = rig.fleet
     payload = b"BM" + uuid.uuid4().hex.encode()
@@ -169,7 +184,7 @@ def test_a_press_puts_the_saved_path_on_the_target_panes_input_line_unsubmitted(
     assert saved[0].name not in _squashed(fleet.capture(fleet.beta))
     # An Alt+V paste is a draft for the user to review, never a submission: the
     # agent has read no line at all, on either pane.
-    assert fleet.received(fleet.alpha) == []
+    _assert_still_a_draft(rig, fleet.alpha, saved[0].name)
     assert fleet.received(fleet.beta) == []
 
 
@@ -194,4 +209,4 @@ def test_a_copied_file_of_any_type_takes_the_same_route_into_the_pane(rig):
     ), f"the path never reached {fleet.beta}'s pane:\n{fleet.capture(fleet.beta)}"
     assert saved[0].name not in _squashed(fleet.capture(fleet.alpha))
     assert fleet.received(fleet.alpha) == []
-    assert fleet.received(fleet.beta) == []
+    _assert_still_a_draft(rig, fleet.beta, saved[0].name)

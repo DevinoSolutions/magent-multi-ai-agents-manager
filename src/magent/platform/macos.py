@@ -133,7 +133,8 @@ class MacOSPlatform(Platform):
         # containing ':' or ', ' (every 'magent:' window) parses intact -- unlike
         # find_window's comma/colon split. Requires Automation permission for
         # the invoking process; when TCC blocks it osascript fails and this
-        # returns {} (an osascript timeout or absence too; tiling then no-ops, matching the pre-override default).
+        # returns {} (an osascript timeout or absence too; tiling then no-ops,
+        # matching the pre-override default).
         script = """
         set out to {}
         tell application "System Events"
