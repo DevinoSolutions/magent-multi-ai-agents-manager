@@ -4,11 +4,15 @@ only after the push set was sealed or handed off."""
 
 from __future__ import annotations
 
+import dataclasses
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
 
+from magent import nodes
 from magent.config import SCHEMA_VERSION, ConfigError, load_config
+from magent.nodes import LocalGitState
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -315,3 +319,312 @@ class TestTheCloudPaneCommand:
 
         with pytest.raises(ValueError):
             cloud_pane_command("claude", 'x" & del *')
+
+
+def _state(repo: Path, **kw: object) -> LocalGitState:
+    # dataclasses.replace takes the overrides as keywords: no suppression needed.
+    base = LocalGitState(
+        path=repo,
+        url="https://github.com/me/api.git",
+        branch="main",
+        dirty=False,
+        unpushed=False,
+        detached=False,
+        ignored=(),
+    )
+    return dataclasses.replace(base, **kw)
+
+
+@pytest.fixture
+def cloud_home(tmp_path, monkeypatch) -> Path:
+    """NODES_DIR in tmp (tests/conftest.py already redirects the import-bound
+    constant; this pins it to a path the test can read back). The digest key,
+    the records and the recipient live under ``NODES_DIR/cloud/`` with the
+    ``cloud-`` names."""
+    monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+    return tmp_path / "nodes" / "cloud"
+
+
+class TestTheCloudRefusesACheckoutItCouldNotCloneOrPushBack:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://github.com/me/api.git",
+            "https://me@github.com/me/api.git",
+            "git@github.com:me/api.git",
+            "ssh://git@github.com/me/api.git",
+            "ssh://git@github.com:22/me/api.git",
+        ],
+    )
+    def test_a_clean_pushed_github_branch_is_accepted(self, tmp_path, url):
+        assert nodes.cloud_git_refusal(_state(tmp_path, url=url)) is None
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://gitlab.com/me/api.git",
+            "https://github.com.evil.example/me/api.git",
+            "https://gitlab.com/github.com-x/api.git",
+            "git@github.com.evil.example:me/api.git",
+            "https://evil.example/github.com/me/api.git",
+        ],
+    )
+    def test_the_host_is_parsed_not_substring_matched(self, tmp_path, url):
+        refusal = nodes.cloud_git_refusal(_state(tmp_path, url=url))
+        assert refusal is not None and "not on GitHub" in refusal
+
+    @pytest.mark.parametrize(
+        ("kw", "phrase"),
+        [
+            ({"url": ""}, "no 'origin' remote"),
+            ({"url": "   "}, "no 'origin' remote"),
+            ({"detached": True}, "detached"),
+            ({"branch": ""}, "detached"),
+            ({"no_commits": True}, "no commits"),
+            ({"dirty": True}, "uncommitted"),
+            ({"unpushed": True}, "unpushed"),
+        ],
+    )
+    def test_each_refusal_names_its_reason(self, tmp_path, kw, phrase):
+        refusal = nodes.cloud_git_refusal(_state(tmp_path, **kw))
+        assert refusal is not None and phrase in refusal
+
+    @pytest.mark.parametrize("kw", [{"dirty": True}, {"unpushed": True}])
+    def test_the_repair_never_offers_allow_dirty(self, tmp_path, kw):
+        # `--allow-dirty` is the NODE escape hatch (the node gets origin's
+        # copy). The cloud clone is the same, but magent never offers it:
+        # a cloud session that silently lacks the work is the failure here.
+        refusal = nodes.cloud_git_refusal(_state(tmp_path, **kw))
+        assert refusal is not None and "--allow-dirty" not in refusal
+
+    def test_a_dirty_refusal_says_untracked_files_never_reach_the_session(
+        self, tmp_path
+    ):
+        refusal = nodes.cloud_git_refusal(_state(tmp_path, dirty=True))
+        assert refusal is not None and "untracked" in refusal
+
+    def test_the_structural_refusals_are_the_node_checks_not_a_copy(self, tmp_path):
+        # Composed over `refusal_for`, so the wording cannot drift from the
+        # node path's.
+        for kw in ({"url": ""}, {"detached": True}, {"no_commits": True}):
+            state = _state(tmp_path, **kw)
+            assert nodes.cloud_git_refusal(state) == nodes.refusal_for(
+                state, allow_dirty=True
+            )
+
+
+def _project(tmp_path: Path) -> Path:
+    repo = tmp_path / "api"
+    repo.mkdir(exist_ok=True)
+    (repo / ".env").write_text(
+        "# comment\nexport API_TOKEN=hunter2-secret\nDB_URL = postgres://u:pw@h/db\n\nnot a line\n",
+        encoding="utf-8",
+    )
+    (repo / ".env.local").write_text("EXTRA=1\n", encoding="utf-8")
+    (repo / ".claude").mkdir(exist_ok=True)
+    (repo / ".claude" / "settings.local.json").write_text("{}", encoding="utf-8")
+    return repo
+
+
+_ALL = (".env", ".env.local", ".claude/settings.local.json")
+
+
+class TestThePushSetForTheCloud:
+    def test_dotenv_names_are_the_names_only(self, tmp_path):
+        assert nodes.dotenv_names(_project(tmp_path) / ".env") == (
+            "API_TOKEN",
+            "DB_URL",
+        )
+
+    def test_indented_exported_and_crlf_lines_still_name_their_variable(self, tmp_path):
+        path = tmp_path / ".env"
+        path.write_bytes(b"  export  FOO = 1\r\nBAR=2\r\n\r\n\r\n  \r\n#BAZ=3\r\n")
+        assert nodes.dotenv_names(path) == ("BAR", "FOO")
+
+    def test_an_unreadable_env_file_names_nothing(self, tmp_path):
+        assert nodes.dotenv_names(tmp_path / "missing.env") == ()
+
+    def test_files_inside_the_project_travel_and_names_come_from_env_files(
+        self, tmp_path
+    ):
+        repo = _project(tmp_path)
+        ps = nodes.cloud_push_set(
+            repo, [_state(repo, ignored=_ALL)], home=tmp_path / "home"
+        )
+        assert [ps.rel(p) for p in ps.files] == [
+            ".claude/settings.local.json",
+            ".env",
+            ".env.local",
+        ]
+        assert [ps.rel(p) for p in ps.env_files] == [".env", ".env.local"]
+        assert ps.names == ("API_TOKEN", "DB_URL", "EXTRA")
+        assert ps.outside == ()
+
+    def test_a_file_outside_the_project_is_named_but_never_travels(
+        self, tmp_path, monkeypatch
+    ):
+        repo = _project(tmp_path)
+        outside = tmp_path / "home" / ".npmrc"
+        monkeypatch.setattr(nodes, "push_set", lambda *a, **k: [repo / ".env", outside])
+        ps = nodes.cloud_push_set(repo, [_state(repo)], home=tmp_path / "home")
+        assert ps.files == (repo / ".env",)
+        assert ps.outside == (outside,)
+
+    def test_the_existing_env_file_predicate_is_untouched(self):
+        # J3 must not redefine nodes._is_env_file (it takes a NAME and
+        # `_from_git_listing` depends on that).
+        assert nodes._is_env_file(".env") and nodes._is_env_file(".env.local")
+        assert not nodes._is_env_file("env.txt")
+
+
+class TestTheDigestIsKeyedAndCoversValues:
+    def _ps(self, tmp_path: Path) -> nodes.CloudPushSet:
+        repo = _project(tmp_path)
+        return nodes.cloud_push_set(
+            repo, [_state(repo, ignored=(".env",))], home=tmp_path / "h"
+        )
+
+    def test_a_changed_value_changes_the_digest(self, tmp_path, cloud_home):
+        # A rotated secret must be handed off again, so the digest covers bytes.
+        ps = self._ps(tmp_path)
+        before = nodes.push_set_digest(ps, "manual")
+        (ps.project_dir / ".env").write_text(
+            "API_TOKEN=rotated\nDB_URL=x\n", encoding="utf-8"
+        )
+        assert nodes.push_set_digest(ps, "manual") != before
+
+    def test_the_mode_is_part_of_the_digest(self, tmp_path, cloud_home):
+        ps = self._ps(tmp_path)
+        assert nodes.push_set_digest(ps, "age1one") != nodes.push_set_digest(
+            ps, "age1two"
+        )
+
+    def test_the_key_is_made_once_and_reused(self, tmp_path, cloud_home):
+        ps = self._ps(tmp_path)
+        assert nodes.push_set_digest(ps, "manual") == nodes.push_set_digest(
+            ps, "manual"
+        )
+        assert len((cloud_home / "cloud-digest.key").read_bytes()) == 32
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_the_key_is_private_to_the_user(self, tmp_path, cloud_home):
+        nodes.push_set_digest(self._ps(tmp_path), "manual")
+        assert (cloud_home / "cloud-digest.key").stat().st_mode & 0o077 == 0
+
+
+class TestTheCreateWaitsForThePushSet:
+    def _ps(self, tmp_path: Path) -> nodes.CloudPushSet:
+        repo = tmp_path / "api"
+        repo.mkdir(exist_ok=True)
+        (repo / ".env").write_text("API_TOKEN=hunter2-secret\n", encoding="utf-8")
+        return nodes.cloud_push_set(
+            repo, [_state(repo, ignored=(".env",))], home=tmp_path / "h"
+        )
+
+    def test_an_unhanded_push_set_refuses_and_names_the_repair(
+        self, tmp_path, cloud_home
+    ):
+        refusal = nodes.cloud_env_refusal(
+            "api", "api", self._ps(tmp_path), recipient=None
+        )
+        assert refusal is not None
+        assert "API_TOKEN" in refusal
+        assert "magent node push api" in refusal
+
+    def test_a_sealed_push_set_lets_the_create_through(self, tmp_path, cloud_home):
+        ps = self._ps(tmp_path)
+        nodes.write_cloud_record(
+            "api", digest=nodes.push_set_digest(ps, "age1abc"), mode="age1abc"
+        )
+        assert nodes.cloud_env_refusal("api", "api", ps, recipient="age1abc") is None
+
+    def test_a_rotated_key_asks_for_a_new_seal(self, tmp_path, cloud_home):
+        ps = self._ps(tmp_path)
+        nodes.write_cloud_record(
+            "api", digest=nodes.push_set_digest(ps, "age1old"), mode="age1old"
+        )
+        assert (
+            nodes.cloud_env_refusal("api", "api", ps, recipient="age1new") is not None
+        )
+
+    def test_a_manual_hand_off_holds_whatever_the_key(self, tmp_path, cloud_home):
+        ps = self._ps(tmp_path)
+        nodes.write_cloud_record(
+            "api", digest=nodes.push_set_digest(ps, "manual"), mode="manual"
+        )
+        assert nodes.cloud_env_refusal("api", "api", ps, recipient="age1any") is None
+
+    def test_a_changed_value_asks_again(self, tmp_path, cloud_home):
+        ps = self._ps(tmp_path)
+        nodes.write_cloud_record(
+            "api", digest=nodes.push_set_digest(ps, "manual"), mode="manual"
+        )
+        (ps.project_dir / ".env").write_text("API_TOKEN=rotated\n", encoding="utf-8")
+        assert nodes.cloud_env_refusal("api", "api", ps, recipient=None) is not None
+
+    def test_a_project_with_nothing_to_hand_off_is_never_refused(
+        self, tmp_path, cloud_home
+    ):
+        repo = tmp_path / "bare"
+        repo.mkdir()
+        empty = nodes.cloud_push_set(repo, [_state(repo)], home=tmp_path / "h")
+        assert nodes.cloud_env_refusal("bare", "bare", empty, recipient=None) is None
+
+    def test_no_value_ever_reaches_the_refusal_the_record_or_the_repr(
+        self, tmp_path, cloud_home
+    ):
+        ps = self._ps(tmp_path)
+        refusal = nodes.cloud_env_refusal("api", "api", ps, recipient=None) or ""
+        nodes.write_cloud_record(
+            "api", digest=nodes.push_set_digest(ps, "manual"), mode="manual"
+        )
+        record = (cloud_home / "cloud-records.json").read_text(encoding="utf-8")
+        for text in (refusal, record, repr(ps)):
+            assert "hunter2" not in text
+
+    def test_a_torn_record_file_reads_as_no_record(self, tmp_path, cloud_home):
+        cloud_home.mkdir(parents=True)
+        (cloud_home / "cloud-records.json").write_text("{torn", encoding="utf-8")
+        assert nodes.read_cloud_record("api") is None
+
+    def test_a_deeply_nested_record_file_reads_as_no_record(self, tmp_path, cloud_home):
+        # Every JSON file this module reads is refused past MAX_JSON_DEPTH
+        # before json parses it, so a hostile or corrupt file cannot raise.
+        cloud_home.mkdir(parents=True)
+        (cloud_home / "cloud-records.json").write_text(
+            "[" * 5000 + "]" * 5000, encoding="utf-8"
+        )
+        assert nodes.read_cloud_record("api") is None
+
+    def test_a_record_for_one_project_leaves_the_others_alone(self, cloud_home):
+        nodes.write_cloud_record("api", digest="d1", mode="manual")
+        nodes.write_cloud_record("web", digest="d2", mode="age1abc", commit="c0ffee")
+        assert nodes.read_cloud_record("api") == {
+            "digest": "d1",
+            "mode": "manual",
+            "commit": "",
+        }
+        assert nodes.read_cloud_record("web") == {
+            "digest": "d2",
+            "mode": "age1abc",
+            "commit": "c0ffee",
+        }
+        assert nodes.read_cloud_record("missing") is None
+
+    def test_the_record_files_never_collide_with_the_reserved_names(self, cloud_home):
+        # The cloud dir also holds `<sid>/` mirror dirs; a `cloud-<x>.<ext>`
+        # file name can never be one, and none is a reserved per-node file.
+        nodes.write_cloud_record("api", digest="d", mode="manual")
+        nodes.write_recipient("age1qqqq")
+        for path in cloud_home.iterdir():
+            assert path.name.startswith("cloud-") and "." in path.name
+            assert path.name not in nodes._RESERVED_NAMES
+
+    def test_the_recipient_round_trips_and_rejects_anything_else(self, cloud_home):
+        assert nodes.read_recipient() is None
+        nodes.write_recipient("age1qqqq")
+        assert nodes.read_recipient() == "age1qqqq"
+        (cloud_home / "cloud-recipient.txt").write_text(
+            "AGE-SECRET-KEY-1X", encoding="utf-8"
+        )
+        assert nodes.read_recipient() is None

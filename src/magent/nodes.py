@@ -16,6 +16,7 @@ import copy
 import dataclasses
 import errno
 import hashlib
+import hmac
 import ipaddress
 import json
 import math
@@ -3658,3 +3659,255 @@ def read_repo_record(
         raise ValueError(f"{path}: not a repo record")
     repos = tuple(s for s in (_repo_status(r) for r in rows) if s is not None)
     return RepoRecord(ts=ts, source=source, repos=repos)
+
+
+# --- the cloud backend (spec §18) ------------------------------------------
+
+# A GitHub remote, by HOST: https/ssh/git URLs (with an optional user and port)
+# and scp-style `git@github.com:owner/repo`. The host must END at `/` (or a
+# port), so `github.com.evil.example` and `gitlab.com/github.com-x` fail.
+_GITHUB_REMOTE = re.compile(
+    r"^(?:(?:https?|ssh|git)://(?:[^@/\s]+@)?github\.com(?::\d+)?/"
+    r"|(?:[^@/\s]+@)?github\.com:)",
+    re.IGNORECASE,
+)
+
+
+def cloud_git_refusal(state: LocalGitState) -> str | None:
+    """Why ``claude --cloud`` must not start from this checkout, or None.
+
+    The VM clones the GitHub remote at the checkout's branch and the work
+    comes home by push + teleport (spec §18.3), so anything the clone would
+    not contain, or could not push back to, is refused here. The structural
+    checks (no origin, a detached HEAD, no commits) are ``refusal_for``'s,
+    wording included; the dirty and unpushed checks are re-worded for the
+    cloud, because ``refusal_for`` would offer ``--allow-dirty``, which a
+    cloud create never accepts."""
+    structural = refusal_for(state, allow_dirty=True)
+    if structural is not None:
+        return structural
+    if _GITHUB_REMOTE.match(state.url.strip()) is None:
+        return (
+            "its remote is not on GitHub: a cloud session clones from and "
+            "pushes back to GitHub only"
+        )
+    branch = state.branch
+    if state.dirty:
+        return (
+            f"{branch} has uncommitted or untracked changes: the cloud clones "
+            f"{branch} from GitHub and never receives them, so commit and push first"
+        )
+    if state.unpushed:
+        return (
+            f"{branch} has unpushed commits: the cloud clones {branch} from "
+            "GitHub, so push first"
+        )
+    return None
+
+
+# Horizontal whitespace only (`[ \t]`, not `\s`): `^\s*` would swallow a whole
+# run of blank lines from every line start, quadratic on a file that is mostly
+# blank. The names found are the same, since a name sits on its own line.
+_DOTENV_NAME = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=", re.MULTILINE
+)
+
+
+def dotenv_names(path: Path) -> tuple[str, ...]:
+    """The variable NAMES a ``.env`` file defines, sorted -- never a value.
+
+    Over-listing is the safe direction (a line inside a multi-line quoted value
+    that looks like ``K=v`` adds a name the user can ignore); an unreadable
+    file names nothing."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ()
+    return tuple(sorted(set(_DOTENV_NAME.findall(text))))
+
+
+@dataclass(frozen=True)
+class CloudPushSet:
+    """B's push set, read for a cloud project (spec §18.10-11).
+
+    ``files`` sit inside the project and travel (sealed, or by hand for the
+    ``.env*`` ones); ``outside`` files never reach a cloud session. Paths and
+    names only: no field ever holds a value."""
+
+    project_dir: Path
+    files: tuple[Path, ...]
+    outside: tuple[Path, ...]
+    names: tuple[str, ...]
+
+    @property
+    def env_files(self) -> tuple[Path, ...]:
+        return tuple(p for p in self.files if _is_env_file(p.name))
+
+    @property
+    def empty(self) -> bool:
+        return not self.files and not self.outside
+
+    def rel(self, path: Path) -> str:
+        return path.relative_to(self.project_dir).as_posix()
+
+
+def cloud_push_set(
+    project_dir: Path,
+    states: Sequence[LocalGitState],
+    *,
+    home: Path,
+    extras: Sequence[str] = (),
+) -> CloudPushSet:
+    """Split the push set into what travels and what cannot (spec §18.11)."""
+    inside: list[Path] = []
+    outside: list[Path] = []
+    for path in push_set(project_dir, states, home=home, extras=extras):
+        (inside if path.is_relative_to(project_dir) else outside).append(path)
+    inside.sort(key=lambda p: p.relative_to(project_dir).as_posix())
+    names: set[str] = set()
+    for path in inside:
+        if _is_env_file(path.name):
+            names.update(dotenv_names(path))
+    return CloudPushSet(
+        project_dir=project_dir,
+        files=tuple(inside),
+        outside=tuple(sorted(outside)),
+        names=tuple(sorted(names)),
+    )
+
+
+def _cloud_dir() -> Path:
+    # ``node_dir`` reads NODES_DIR at CALL time, so a test's monkeypatched
+    # NODES_DIR is honoured. "cloud" is a reserved nick, so no pool node can
+    # own this directory. Every file kept here is named `cloud-<x>.<ext>`: the
+    # dot means it can never be a `<sid>/` dir (psmux.session_name turns "."
+    # into "-"), and none of the names is in _RESERVED_NAMES (sessions.json,
+    # load.jsonl, pull.json, node-map.json).
+    return node_dir(NODE_CLOUD)
+
+
+def _digest_key() -> bytes:
+    """A random per-machine key, so a recorded digest is never a plain --
+    and for a short secret, guessable -- hash of the file. Made once, 0600
+    (a POSIX mode; on Windows the profile's own ACL is what protects it)."""
+    path = _cloud_dir() / "cloud-digest.key"
+    try:
+        key = path.read_bytes()
+    except OSError:
+        key = b""
+    if len(key) == 32:
+        return key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = os.urandom(32)
+    # O_BINARY (absent off Windows, hence getattr -- READ_FLAGS' device): a key
+    # byte of 0x0a must not become CRLF on the way to disk.
+    fd = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0),
+        0o600,
+    )
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(key)
+    # An ACL-bearing home (a hosted CI runner's) can widen the creation mode:
+    # chmod explicitly, as the other 0600 writers in this repo do.
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+    return key
+
+
+def push_set_digest(ps: CloudPushSet, mode: str) -> str:
+    """HMAC-SHA256 over every travelling file's path AND bytes, every outside
+    path, and the hand-off ``mode`` (an age recipient, or ``"manual"``).
+
+    A changed value, a new file and a rotated key all change it; the record
+    stores this and nothing else about the files."""
+    mac = hmac.new(_digest_key(), digestmod=hashlib.sha256)
+    mac.update(b"mode:" + mode.encode() + b"\n")
+    for path in ps.files:
+        mac.update(b"f:" + ps.rel(path).encode() + b"\n")
+        try:
+            mac.update(hashlib.sha256(path.read_bytes()).digest())
+        except OSError:
+            mac.update(b"unreadable")
+    for path in ps.outside:
+        mac.update(b"o:" + path.as_posix().encode() + b"\n")
+    return mac.hexdigest()
+
+
+def _records_path() -> Path:
+    return _cloud_dir() / "cloud-records.json"
+
+
+def _read_records() -> dict[str, dict[str, str]]:
+    try:
+        text = _records_path().read_text(encoding="utf-8")
+        # Nested past the bound is no record file, refused before json parses
+        # it (read_sessions' rule); RecursionError is the backstop.
+        data = None if nests_too_deep(text) else json.loads(text)
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    records: dict[str, dict[str, str]] = {}
+    for sid, rec in data.items():
+        if isinstance(sid, str) and isinstance(rec, dict):
+            records[sid] = {
+                k: v
+                for k, v in rec.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
+    return records
+
+
+def read_cloud_record(sid: str) -> dict[str, str] | None:
+    """``{digest, mode, commit}`` of the last hand-off for ``sid``, or None."""
+    return _read_records().get(sid)
+
+
+def write_cloud_record(sid: str, *, digest: str, mode: str, commit: str = "") -> None:
+    """Record a hand-off, through the module's one atomic JSON writer."""
+    records = _read_records()
+    records[sid] = {"digest": digest, "mode": mode, "commit": commit}
+    write_json_atomic(_records_path(), records)
+
+
+def read_recipient() -> str | None:
+    """The age recipient ``magent node cloud-setup`` recorded, or None.
+
+    Anything that is not an ``age1…`` public key -- above all an identity
+    pasted into the wrong file -- reads as no recipient. Phase 1 never writes
+    one, so it always answers None there."""
+    try:
+        text = (
+            (_cloud_dir() / "cloud-recipient.txt").read_text(encoding="utf-8").strip()
+        )
+    except OSError:
+        return None
+    return text if text.startswith("age1") else None
+
+
+def write_recipient(recipient: str) -> None:
+    write_text_atomic(_cloud_dir() / "cloud-recipient.txt", recipient + "\n")
+
+
+def cloud_env_refusal(
+    sid: str, name: str, ps: CloudPushSet, recipient: str | None
+) -> str | None:
+    """Why the create must wait for ``magent node push``, or None (spec §18.11).
+
+    Passes when nothing needs handing off, or when the record matches the
+    CURRENT push set: sealed to the current recipient, or handed off by hand."""
+    if ps.empty:
+        return None
+    rec = read_cloud_record(sid)
+    if rec is not None:
+        mode = rec.get("mode", "")
+        current = mode == "manual" or (recipient is not None and mode == recipient)
+        if current and rec.get("digest") == push_set_digest(ps, mode):
+            return None
+    shown = [*ps.names, *(ps.rel(p) for p in ps.files if not _is_env_file(p.name))]
+    what = ", ".join(shown) or f"{len(ps.outside)} file(s) outside the project"
+    return (
+        f"the push set ({what}) has not reached the cloud since it last "
+        f"changed; run: magent node push {name}"
+    )
