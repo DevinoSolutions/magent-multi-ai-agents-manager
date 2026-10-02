@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1467,6 +1468,23 @@ def up_cmd(
     # moments ago by bring_up_psmux may still be booting its agent, and typing
     # into that pane would double-launch.
     live_ids = [_as_str(d.get("session")) or _as_str(d.get("name")) for d in up]
+    # A cloud pane is branded `@cloud`, and every decoration here re-writes the
+    # status line: one without the nick would overwrite the brand. The nicks are
+    # passed ONLY when a cloud project exists, so every other call stays the
+    # positional one the existing tests fake (`lambda names: names`).
+    nicks = {
+        _as_str(p.get("session")): "cloud" for p in projects if p.get("node") == "cloud"
+    }
+    decorate_async = (
+        partial(decorate_psmux_sessions_async, nicks=nicks)
+        if nicks
+        else decorate_psmux_sessions_async
+    )
+    decorate_sync = (
+        partial(decorate_psmux_sessions, nicks=nicks)
+        if nicks
+        else decorate_psmux_sessions
+    )
 
     if as_json:
         # `up --json` is a pure read by default (attach polls it repeatedly);
@@ -1494,7 +1512,7 @@ def up_cmd(
         # 120s one and re-ran the whole thing. A status query must never wait on
         # a cosmetic status bar; the async variant fires and returns, throttled
         # by a stamp so attach's repeated polls can't pile up processes.
-        decorate_psmux_sessions_async(live_ids)
+        decorate_async(live_ids)
         # deferred: resolving __version__ costs an importlib.metadata import,
         # and only the JSON envelope needs it (see cli/ui.py::_banner).
         from magent import __version__
@@ -1528,6 +1546,8 @@ def up_cmd(
                             "group": p["group"],
                             "resolved": p["resolved"],
                             "cmd": p["cmd"],
+                            # "cloud" for a cloud pane, else None (additive).
+                            "node": p.get("node"),
                         }
                         for p in projects
                     ],
@@ -1611,7 +1631,7 @@ def up_cmd(
     # branch above does the same for its live sessions. Same host-side `code`
     # probe as there: one for the batch, not one per session. Node sessions
     # are left out: they live on their node and were decorated there at birth.
-    decorate_psmux_sessions([*live_ids, *(s for s in created if s not in node_sids)])
+    decorate_sync([*live_ids, *(s for s in created if s not in node_sids)])
 
     if cfg.settings.upload_server:
         _maybe_start_upload_server(cfg.settings.upload_port, str(config_file))
