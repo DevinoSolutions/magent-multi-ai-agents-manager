@@ -31,6 +31,8 @@ from magent import attach_client, env, lockfile, paths, remote_mux
 # PATH resolvers.
 from magent.remote_mux import find_gh as real_find_gh
 from magent.remote_mux import find_ssh as real_find_ssh
+from magent.wt_profiles import IconSpec
+from magent.wt_profiles import fragments_root as real_fragments_root
 from tests.conftest import (
     PLAYWRIGHT_BROWSERS_PATH,
     REAL_APPDATA,
@@ -581,3 +583,37 @@ class TestNoTestResolvesTheRealGh:
             assert remote_mux.find_gh() is None
         finally:
             real_find_gh.cache_clear()
+
+
+class TestNoTestTouchesTheRealWtFragmentFolder:
+    """Windows Terminal reads the Fragments folder under %LOCALAPPDATA%
+    live, and no HOME redirect moves LOCALAPPDATA: a test that synced the tab
+    icons for real would add profiles to the developer's own terminal."""
+
+    def test_the_resolver_is_redirected_into_tmp(self, monkeypatch, tmp_path):
+        # Teeth: aim the REAL resolver at a planted LOCALAPPDATA; it resolves
+        # there, while the guarded module attribute still does not.
+        monkeypatch.setattr(env, "localappdata_dir", lambda: tmp_path / "local")
+        planted = real_fragments_root()
+        assert (
+            planted
+            == tmp_path / "local" / "Microsoft" / "Windows Terminal" / "Fragments"
+        )
+        from magent import wt_profiles
+
+        assert wt_profiles.fragments_root() != planted
+
+    def test_a_sync_lands_only_under_the_redirected_root(self, monkeypatch, tmp_path):
+        from magent import wt_profiles
+
+        monkeypatch.setenv("MAGENT_WT_ICONS", "1")
+        monkeypatch.setattr(env, "_cached_env", None)
+        monkeypatch.setattr(env, "localappdata_dir", lambda: tmp_path / "local")
+        result = wt_profiles.sync([IconSpec("alpha", "Alpha", "#a855f7")])
+        assert result.error is None
+        assert result.directory is not None
+        assert not (tmp_path / "local").exists()
+        assert (tmp_path / "local") not in result.directory.parents
+
+    def test_child_processes_inherit_the_kill_switch(self):
+        assert os.environ["MAGENT_WT_ICONS"] == "0"

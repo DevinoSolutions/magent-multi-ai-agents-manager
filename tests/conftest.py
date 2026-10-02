@@ -247,6 +247,13 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # box's live fleet. Off for every tier; reaper tests turn it on IN PROCESS
     # only (monkeypatch.setenv + resetting env._cached_env).
     monkeypatch.setenv("MAGENT_IDLE_REAP", "0")
+    # ...and a sixth: the tab-icon fragment is written into the REAL
+    # %LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments folder, which no HOME
+    # redirect contains (LOCALAPPDATA is inherited), and Windows Terminal
+    # picks it up live. In-process the `_no_real_wt_fragment` fixture below
+    # re-aims the resolver; this pin covers every CHILD process a test starts.
+    # Tests that are ABOUT the feature turn it on in process.
+    monkeypatch.setenv("MAGENT_WT_ICONS", "0")
     log.reset_logging()
     yield
     log.reset_logging()
@@ -309,6 +316,18 @@ def _no_real_claude(monkeypatch):
     subscription and opens their browser to do it. Same device as
     ``_no_real_gh``; the ``fake_claude`` fixture wins over it."""
     monkeypatch.setattr("magent.node_auth.find_claude", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_wt_fragment(tmp_path_factory, monkeypatch):
+    """No test writes into (or reads from) the REAL Windows Terminal fragments
+    folder. ``wt_profiles.fragments_root`` is re-aimed at a tmp dir for every
+    test, so a spawn path or a ``sync`` that a test reaches by accident lands
+    in tmp. Same device as ``_no_real_ssh``: patched on the MODULE attribute,
+    so ``test_home_isolation`` can still import the real resolver by value.
+    """
+    root = tmp_path_factory.mktemp("wt-fragments")
+    monkeypatch.setattr("magent.wt_profiles.fragments_root", lambda: root)
 
 
 @pytest.fixture
