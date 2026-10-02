@@ -3730,6 +3730,17 @@ _DOTENV_COMMENT = re.compile(r"(?<![ \t])[ \t]+#.*$")
 # The characters that open a quoted value. Backtick is Node dotenv's multi-line
 # form.
 _DOTENV_QUOTES = ('"', "'", "`")
+# The longest NAME that is printed. A variable name is a word; a run of
+# letters longer than this before an ``=`` is a slice of a secret (a base64
+# body line that ends in ``=``), and is never shown.
+_DOTENV_NAME_MAX = 128
+# PEM-style armor. No .env reader joins an unquoted value across lines, but a
+# pasted key or certificate is exactly that, and its body lines end in ``=``
+# often enough to read as variables: so the lines from an opening to its
+# matching close are ONE value, wherever the opening sits.
+_ARMOR_OPEN = "-----BEGIN"
+_ARMOR_CLOSE = "-----END"
+_ARMOR_LABEL = re.compile(r"-----BEGIN ([^-\n]+)-----")
 
 
 def _dotenv_text(path: Path) -> str:
@@ -3746,81 +3757,147 @@ def _dotenv_text(path: Path) -> str:
     return raw.decode(codec, errors="replace")
 
 
-def _quoted_length(first: str, lines: Iterator[str]) -> int:
+def _value_extent(first: str, lines: list[str], at: int) -> tuple[int, int]:
     """The length of the raw text between the quotes of a value that opens with
-    one. ``first`` is the rest of its line from the opening quote; when the
-    value runs on, its further lines are TAKEN from ``lines``, so the caller
-    never parses them.
+    one, and the index of the last line the value occupies. ``first`` is the
+    rest of the line ``lines[at]`` from the opening quote; when the value runs
+    on, its further lines are TAKEN, so the caller never parses them.
 
-    The closing quote is the first one of the SAME type (``"``, ``'`` or a
-    backtick) that does not directly follow a backslash; what follows it on
-    its line is ignored. That holds in every quote type, and whether or not the
-    backslash is itself escaped (``"x\\\\"`` does not close): python-dotenv and
-    Node dotenv read ``\\"`` as an escaped quote however many backslashes
-    precede it, and do it inside ``'`` too, while bash does neither. Where
-    readers disagree the parser takes the rule that closes LATER, because the
-    lines it swallows are never printed (under-listing is the safe direction;
-    the cost is that ``LOG='C:\\logs\\'`` swallows the rest of the file). A
-    newline inside the value counts as one character. An unterminated quote
-    swallows every remaining line."""
-    quote = first[0]
+    The value is one SHELL WORD, so ``'a''b'`` and ``"a"'b'`` are one value: a
+    quote that follows a closing one (directly, or after unquoted text with no
+    blank between) opens the next run, and that run may itself run over lines.
+    A blank outside the quotes ends the word and what follows it is ignored, so
+    the ``# it's`` of a trailing comment opens nothing.
+
+    A run's closing quote is the first one of the SAME type (``"``, ``'`` or a
+    backtick) that does not directly follow a backslash. That holds in every
+    quote type, and whether or not the backslash is itself escaped (``"x\\\\"``
+    does not close): python-dotenv and Node dotenv read ``\\"`` as an escaped
+    quote however many backslashes precede it, and do it inside ``'`` too, while
+    bash does neither. Where readers disagree the parser takes the rule that
+    closes LATER, because the lines it swallows are never printed (under-listing
+    is the safe direction; the cost is that ``LOG='C:\\logs\\'`` swallows the
+    rest of the file). A newline inside a run counts as one character. An
+    unterminated quote swallows every remaining line."""
     length = 0
-    chunk = first[1:]
+    chunk = first
+    quote = ""
+    i = 0
     while True:
-        i = 0
         while i < len(chunk):
             char = chunk[i]
-            if char == quote:
-                return length
-            # A backslash and the quote it escapes are one step (two characters).
-            step = 2 if char == "\\" and chunk[i + 1 : i + 2] == quote else 1
-            length += step
-            i += step
-        following = next(lines, None)
-        if following is None:
-            return length
+            if quote:
+                if char == quote:
+                    quote = ""
+                    i += 1
+                    continue
+                # A backslash and the quote it escapes are one step (two characters).
+                step = 2 if char == "\\" and chunk[i + 1 : i + 2] == quote else 1
+                length += step
+                i += step
+            elif char in _DOTENV_QUOTES:
+                quote = char
+                i += 1
+            elif char in " \t":
+                return length, at
+            else:
+                i += 1
+        if not quote or at + 1 >= len(lines):
+            return length, at
+        at += 1
         length += 1
-        chunk = following
+        chunk = lines[at]
+        i = 0
 
 
-def _dotenv_entries(text: str) -> list[tuple[str, int]]:
-    """``(name, value length)`` per variable a ``.env`` text defines, in file
-    order: the ONE parser behind ``dotenv_names`` and ``masked_lines``.
+def _armored_extent(first: str, lines: list[str], at: int) -> tuple[int, int]:
+    """The length of an armored block (a PEM key or certificate) and the index
+    of the line it ends on. ``first`` is the text of ``lines[at]`` from its
+    ``-----BEGIN``; the block runs to the first line holding the MATCHING
+    ``-----END <label>-----`` (any ``-----END`` when the opening names no
+    label), the matching one because a body that quotes another block's marker
+    is still one value. An unterminated block swallows every remaining line,
+    like an unterminated quote."""
+    label = _ARMOR_LABEL.match(first)
+    close = f"-----END {label[1]}-----" if label else _ARMOR_CLOSE
+    chunk = first
+    length = len(first)
+    while close not in chunk and at + 1 < len(lines):
+        at += 1
+        chunk = lines[at]
+        length += 1 + len(chunk)
+    return length - (len(chunk) - len(chunk.rstrip(" \t"))), at
+
+
+def _dotenv_scan(text: str) -> tuple[list[tuple[str, int]], int]:
+    """``(entries, withheld)`` for a ``.env`` text: ``(name, value length)`` per
+    variable it defines, in file order, and how many lines were NOT accounted
+    for -- the ONE parser behind ``dotenv_names`` and ``masked_lines``.
 
     The names are PRINTED, so this is quote-aware, and under-lists rather than
-    over-lists: a line inside a multi-line quoted value (a PEM key's body) is a
-    slice of a secret, and never comes back as a name or a length. One line
-    model: a line ends at ``\\n`` only (``str.splitlines`` also splits on form
-    feeds and U+2028, which no .env reader does, and would turn the rest of
-    ``SECRET=abc<U+2028>FOO=bar`` into a second variable), minus one trailing
-    ``\\r``.
+    over-lists: a line inside a multi-line value (a PEM key's body, in quotes or
+    in ``-----BEGIN``/``-----END`` armor, which may also stand on its own lines)
+    is a slice of a secret, and never comes back as a name or a length. A name
+    is printed only when it is an identifier (``_DOTENV_LINE``), no longer than
+    ``_DOTENV_NAME_MAX``, and not followed by a value that starts with ``=``
+    (``abc123==`` is a base64 body's last line, not a variable). When in doubt
+    the line is WITHHELD: counted here, never shown. Blank lines and comment
+    lines are neither. One line model: a line ends at ``\\n`` only
+    (``str.splitlines`` also splits on form feeds and U+2028, which no .env
+    reader does, and would turn the rest of ``SECRET=abc<U+2028>FOO=bar`` into a
+    second variable), minus one trailing ``\\r``.
 
     A value that opens with ``"``, ``'`` or a backtick (after blanks) runs to
-    the matching close (see ``_quoted_length``); any other value ends at an
+    its close (see ``_value_extent``); one that opens with ``-----BEGIN`` runs
+    to its matching end (see ``_armored_extent``); any other value ends at an
     inline comment and trailing blanks. A name defined twice appears twice: a
     caller that keeps one keeps the LAST, which is the value an env-file reader
     ends with. Cost is linear in the text."""
-    lines = iter([line.removesuffix("\r") for line in text.split("\n")])
+    lines = [line.removesuffix("\r") for line in text.split("\n")]
     entries: list[tuple[str, int]] = []
-    for line in lines:
+    withheld = 0
+    at = 0
+    while at < len(lines):
+        line = lines[at]
         match = _DOTENV_LINE.match(line)
         if match is None:
+            stripped = line.lstrip(" \t")
+            if stripped.startswith(_ARMOR_OPEN):
+                end = _armored_extent(stripped, lines, at)[1]
+                withheld += end - at + 1
+                at = end
+            elif stripped and not stripped.startswith("#"):
+                withheld += 1
+            at += 1
             continue
         name, rest = match.groups()
         value = rest.lstrip(" \t")
         if value[:1] in _DOTENV_QUOTES:
-            length = _quoted_length(value, lines)
+            length, at = _value_extent(value, lines, at)
+        elif value.startswith(_ARMOR_OPEN):
+            length, at = _armored_extent(value, lines, at)
         else:
             length = len(_DOTENV_COMMENT.sub("", rest).strip(" \t"))
-        entries.append((name, length))
-    return entries
+        at += 1
+        if len(name) > _DOTENV_NAME_MAX or value.startswith("="):
+            withheld += 1
+        else:
+            entries.append((name, length))
+    return entries, withheld
+
+
+def _dotenv_entries(text: str) -> list[tuple[str, int]]:
+    """``(name, value length)`` per variable a ``.env`` text defines, in file
+    order (``_dotenv_scan`` without its count of withheld lines)."""
+    return _dotenv_scan(text)[0]
 
 
 def dotenv_names(path: Path) -> tuple[str, ...]:
     """The variable NAMES a ``.env`` file defines, sorted -- never a value, and
     never a slice of one: the names are printed, so a continuation line of a
-    multi-line quoted value is not a name (``_dotenv_entries``). That means a
-    malformed file can under-list; an unreadable one names nothing."""
+    multi-line value, an over-long name or a body line's padding is not a name
+    (``_dotenv_scan``). That means a malformed file can under-list; an
+    unreadable one names nothing."""
     try:
         text = _dotenv_text(path)
     except OSError:
@@ -4231,24 +4308,31 @@ def masked_lines(ps: CloudPushSet) -> list[str]:
     """``NAME  ******** (n chars)`` per variable, sorted by name, for the
     terminal (spec §18.11c): a length, never a value.
 
-    The names and lengths come from ``_dotenv_entries``, which never reads a
+    The names and lengths come from ``_dotenv_scan``, which never reads a
     multi-line value's continuation lines as variables. A name defined twice
     shows once, with the LAST definition's length (files in ``env_files``
     order, then the order within a file).
 
-    An env file that cannot be read is listed after them as ``<path>  (could
-    not be read)`` -- by its project-relative path, never skipped: the user
-    would paste an environment that silently lacks it."""
+    Lines the scan would not vouch for are not listed, only counted: ONE
+    ``(N line(s) not shown)`` line follows the names, with no fragment of any of
+    them. An env file that cannot be read is listed after that as ``<path>
+    (could not be read)`` -- by its project-relative path, never skipped: the
+    user would paste an environment that silently lacks it."""
     lengths: dict[str, int] = {}
     unreadable: list[str] = []
+    withheld = 0
     for path in ps.env_files:
         try:
             text = _dotenv_text(path)
         except OSError:
             unreadable.append(f"{ps.rel(path)}  (could not be read)")
             continue
-        lengths.update(_dotenv_entries(text))
+        entries, held_back = _dotenv_scan(text)
+        lengths.update(entries)
+        withheld += held_back
     shown = [f"{name}  ******** ({lengths[name]} chars)" for name in sorted(lengths)]
+    if withheld:
+        shown.append(f"({withheld} line(s) not shown)")
     return shown + unreadable
 
 
