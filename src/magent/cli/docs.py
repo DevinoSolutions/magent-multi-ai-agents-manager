@@ -66,8 +66,9 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "none",
         (
             'The task a `"node": "cloud"` project\'s Claude cloud session starts '
-            "on (1-200 chars; letters, digits, spaces, `, . _ / : -`). Without it "
-            "the project loads but its cloud session is never created."
+            "on (1-200 chars; letters, digits, spaces, `, . _ / : -`). A cloud "
+            "project runs the `claude` tool; with another tool, or without a "
+            "task, it loads but its cloud session is never created."
         ),
     ),
 ]
