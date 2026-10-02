@@ -103,6 +103,7 @@ def _child_env(home: Path, shim_dir: Path) -> dict[str, str]:
     env["MAGENT_PSMUX_BOOST"] = "0"
     env["MAGENT_NODE_SYNC"] = "0"
     env["MAGENT_IDLE_REAP"] = "0"
+    env["MAGENT_WT_ICONS"] = "0"
     # ...and the Session-0 hand-off must never fire from a test: a runner
     # (or an ssh-driven leg) is legitimately non-interactive, and the
     # default policy would create a REAL scheduled task on somebody's
