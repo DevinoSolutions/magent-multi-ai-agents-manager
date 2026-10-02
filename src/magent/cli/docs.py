@@ -481,7 +481,19 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
     ),
     (
         "magent terminal status",
-        "Report whether those keybindings are installed, conflicting or missing.",
+        (
+            "Report whether those keybindings are installed, conflicting or "
+            "missing, then list the tab-icon profiles in magent's fragment."
+        ),
+    ),
+    (
+        "magent terminal icons",
+        (
+            "Show the per-project Windows Terminal tab icons magent writes "
+            "(each profile and whether its icon is the config's, the repo's own "
+            "logo or a generated badge). `--remove` deletes the fragment; the "
+            "next launch writes it again unless `settings.terminalIcons` is off."
+        ),
     ),
     ("magent sessions", "List active psmux sessions, pick one to attach."),
     ("magent sessions <name>", "Attach directly to a psmux session by name."),

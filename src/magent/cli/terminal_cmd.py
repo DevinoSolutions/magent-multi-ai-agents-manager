@@ -152,7 +152,7 @@ def _echo_manual_snippet(path: Path, exc: wt_keys.SettingsParseError) -> None:
 
 @main.group("terminal")
 def terminal_group() -> None:
-    """Keyboard fixes for the terminal your psmux sessions run in."""
+    """Windows Terminal keybindings and per-project tab icons."""
 
 
 @terminal_group.command("install")
