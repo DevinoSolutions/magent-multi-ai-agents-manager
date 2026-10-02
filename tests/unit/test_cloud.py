@@ -1993,6 +1993,45 @@ class TestTwoProjectsOneSessionNameNeverLetACloudCreateSlipTheGate:
         assert (n, asked, w.window_name) == (1, ["api-cloud"], "api-cloud")
         assert "SKIP" not in capsys.readouterr().out
 
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_two_identical_cloud_entries_are_one_window_and_one_skip(
+        self, monkeypatch, fake_platform, tmp_config, tmp_path, capsys, dry_run
+    ):
+        # Entries identical down to the colour (load backfills a distinct one
+        # when none is given) compare equal, so the twin check passes both; the
+        # second must still not queue a second `claude --cloud` (a billed
+        # duplicate) under the same session name, nor a second tile target.
+        monkeypatch.setattr("magent.launch.cloud_refusal", lambda config, sid: None)
+        monkeypatch.setattr("magent.psmux.live_sessions", lambda names, *a, **kw: [])
+        fake_platform._supports_psmux = True
+        folder = tmp_path / "api"
+        folder.mkdir()
+        entry = {
+            "path": str(folder),
+            "node": "cloud",
+            "cloudTask": "t",
+            "color": "blue",
+        }
+        cfg = load_config(
+            tmp_config(
+                {
+                    "version": SCHEMA_VERSION,
+                    "settings": {"psmux": True},
+                    "projects": [dict(entry), dict(entry)],
+                }
+            )
+        )
+        result = launch._launch_projects(
+            fake_platform, cfg, RunOpts(dry_run=dry_run), cfg.projects, None
+        )
+        out = capsys.readouterr().out
+        assert out.count("SKIP:") == 1
+        assert "SKIP: api — already queued under session api" in out
+        assert "(duplicate project entry)" in out
+        assert [t.key for t in result.targets] == ["api"]
+        assert len(result.psmux_windows) == (0 if dry_run else 1)
+        assert out.count("would run") == (1 if dry_run else 0)
+
     def test_the_launch_loop_keeps_the_local_pane_and_skips_the_cloud_twin(
         self, fake_platform, tmp_config, tmp_path, capsys
     ):
