@@ -482,17 +482,22 @@ profile's `>_`. magent now opens each tab with its own hidden profile,
 The profiles live in a **fragment** — a folder magent owns outright at
 `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\magent\` — so your
 `settings.json` is never edited and nothing needs a backup. The fragment is
-written when a window is launched (`--go`, `up`, `attach`), merged rather than
-replaced, and a failure to write it only means that tab opens with the default
-icon, exactly as before.
+written once per launch (`--go`, node windows, `attach`; `up` opens no window
+of its own and writes nothing), merged rather than replaced, and a failure to
+write it only means that tab opens with the default icon, exactly as before.
+If another magent is writing the fragment at that moment, this launch waits a
+second, then leaves the icons alone rather than stall every window. Two windows
+whose names sanitize to the same profile name get a short hash suffix, so they
+never share an icon; `attach` fills in a host session's icon only where nothing
+else has described that window, so it cannot take a local project's tab icon.
 
 ```
 magent terminal icons            # what is in the fragment, and where each icon came from
-magent terminal icons --remove   # delete the fragment (the next launch writes it again)
+magent terminal icons --remove   # delete what magent wrote (the next launch writes it again)
 ```
 
-Turn it off with `settings.terminalIcons: false` (a launch then also removes a
-fragment left from before) or, for one process tree, `MAGENT_WT_ICONS=0`.
+Turn it off with `settings.terminalIcons: false` (a `--go` or `attach` then also
+removes a fragment left from before) or, for one process tree, `MAGENT_WT_ICONS=0`.
 `magent doctor` reports the state under `wt-icons`, as a warning at worst.
 Relative icon paths in a fragment need Windows Terminal 1.24 or newer.
 

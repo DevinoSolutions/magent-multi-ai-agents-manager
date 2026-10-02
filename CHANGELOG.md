@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Every magent Windows Terminal tab can wear its own icon.** Windows Terminal
   has no per-tab icon flag; the icon is the profile's, and magent opened every
-  tab with the default one. A launch (`--go`, `up`, `attach`, node windows) now
+  tab with the default one. A launch (`--go`, `attach`, node windows) now
   writes a hidden `magent: <window>` profile per window into a fragment folder
   magent owns (`%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\magent\`,
   never your `settings.json`) and opens the tab with `-p` -- only when that
