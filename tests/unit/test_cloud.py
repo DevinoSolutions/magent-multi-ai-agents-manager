@@ -282,12 +282,33 @@ class TestTheCloudPaneCommand:
             == 'claude --cloud "t"'
         )
 
-    @pytest.mark.parametrize("base", ["", r'"C:\Program Files\claude.exe"', "cl&aude"])
+    @pytest.mark.parametrize(
+        "base",
+        [
+            "",
+            r'"C:\Program Files\claude.exe"',
+            "cl&aude",
+            # a flag is not an executable: it would be typed as `--continue --cloud "t"`
+            "--continue",
+            "-c",
+        ],
+    )
     def test_an_executable_it_cannot_type_safely_is_refused(self, base):
         from magent.sessions.claude import cloud_pane_command
 
         with pytest.raises(ValueError):
             cloud_pane_command(base, "t")
+
+    @pytest.mark.parametrize(
+        "task", ["session_abc", "cse_abc", "https://claude.ai/code/session_1"]
+    )
+    def test_a_task_that_would_attach_instead_of_create_is_refused(self, task):
+        # `claude --cloud <id|url>` ATTACHES. These pass the charset rule, so
+        # only the CLOUD_ID_LIKE check stands between them and the pane.
+        from magent.sessions.claude import cloud_pane_command
+
+        with pytest.raises(ValueError, match="unsafe cloud task"):
+            cloud_pane_command("claude", task)
 
     def test_an_unsafe_task_is_refused_even_past_config_validation(self):
         from magent.sessions.claude import cloud_pane_command

@@ -202,9 +202,11 @@ def claude_fresh_command(
     return fresh
 
 
-# The executable token of a configured claude command, typed into pwsh by
-# psmux: no quotes, no spaces, no metacharacters (a path is fine).
-_EXE_RE = re.compile(r"[A-Za-z0-9_.:\\/-]+")
+# The executable token of a configured claude command. psmux types it into
+# pwsh as `cmd /c <command>`, so cmd.exe reads it too: no quotes, no spaces, no
+# metacharacter of either, and no leading '-' (it would read as a flag). A path
+# is fine.
+_EXE_RE = re.compile(r"[A-Za-z0-9_.:\\/][A-Za-z0-9_.:\\/-]*")
 
 
 def cloud_pane_command(base_cmd: str, task: str) -> str:
@@ -214,7 +216,7 @@ def cloud_pane_command(base_cmd: str, task: str) -> str:
     (``--continue``, ``--resume``, a model) belongs to a LOCAL conversation, and
     ``--cloud`` always starts a new one. Re-validates ``task`` against config's
     rule so no caller can type an unchecked string. Raises ValueError."""
-    # in-body: config imports magent.sessions, so a top-level import cycles
+    # In-body: config pulls in click, and this module is otherwise import-light.
     from magent.config import CLOUD_ID_LIKE, CLOUD_TASK_RE
 
     parts = base_cmd.split()
