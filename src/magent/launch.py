@@ -1747,6 +1747,8 @@ def _dispatch_cli_agent_project(
         )
 
     use_happy = proj.happy if proj.happy is not None else config.settings.happy
+    # Only a config with a cloud project pays for the owner lookup below.
+    has_cloud = any(is_cloud(p) for p in config.projects)
 
     for i, win_title in enumerate(titles):
         win_cfg = windows_cfg[i] if windows_cfg and i < len(windows_cfg) else None
@@ -1802,6 +1804,17 @@ def _dispatch_cli_agent_project(
         # exists ("x ... not found"). Non-psmux windows are titled with the
         # raw title, so they keep keying on it.
         tile_key = _psmux_session_name(win_title) if proj_psmux else win_title
+        # A cloud project that owns this session name owns the pane: a local
+        # window queued under it would be verified, re-sent and revived by
+        # typing `claude --continue` into that `claude --cloud` session. The
+        # cloud entry's own dispatch tiles and re-attaches the pane. (The cloud
+        # twin of an earlier LOCAL project is the other half: it is skipped in
+        # `_dispatch_cloud_project`.) Nothing is created or typed before this.
+        if proj_psmux and has_cloud:
+            owner = project_for_session(config, tile_key)
+            if owner is not None and is_cloud(owner):
+                click.echo(f"SKIP: {win_title} — {twin_session_refusal(tile_key)}")
+                continue
         running = is_running(tile_key, match_mode)
         # Window-level dedupe, the same three-way rule the attach path uses:
         # an already-OPEN window is never collected, because every collected
