@@ -452,16 +452,20 @@ def _scope(
 ) -> tuple[list[dict[str, object]], dict[str, int]]:
     """The in-scope eligible rows (local, not cloud, live, non-IDE, tool has a
     probe) and the per-directory live-session counts for R3, both from ONE
-    eligible read."""
+    eligible read.
+
+    A cloud pane is never a CANDIDATE (it has no local conversation to park, and
+    `--resume` would be a second billed cloud session) but it IS counted: its
+    local `claude --cloud` is a live agent in that folder, so a local session
+    sharing the directory could be handed the cloud pane's process or session
+    file and parked on the wrong idle signal. Counted, it is spared by R3."""
     from magent import psmux
     from magent.sessions import is_ide_tool
 
     eligible = psmux.eligible_projects(cfg)
-    # A cloud pane has no local conversation to park (and `--resume` would be a
-    # second billed cloud session), so it is out of the live-session counts too.
-    local = [r for r in eligible if r["resolved"] and r.get("node") != "cloud"]
-    live = psmux.live_sessions([str(r["session"]) for r in local], psmux=psmux_bin)
-    live_rows = [r for r in local if r["session"] in live]
+    resolved = [r for r in eligible if r["resolved"]]
+    live = psmux.live_sessions([str(r["session"]) for r in resolved], psmux=psmux_bin)
+    live_rows = [r for r in resolved if r["session"] in live]
     counts: dict[str, int] = {}
     for r in live_rows:
         key = agent_state.norm_cwd(str(r["resolved"]))
@@ -469,7 +473,8 @@ def _scope(
     scoped = [
         r
         for r in live_rows
-        if not is_ide_tool(str(r["tool"]))
+        if r.get("node") != "cloud"
+        and not is_ide_tool(str(r["tool"]))
         and tools.get(str(r["tool"])) is not None
         and tools[str(r["tool"])].idle_probe is not None
     ]

@@ -2138,11 +2138,18 @@ def _late_live_once(sid: str) -> str:
     is wrong twice over there: revive never re-types a cloud pane (a second
     ``claude --cloud`` is a new billed session), and an ``up`` that finds the
     session live creates nothing. The advice that works is down, then up --
-    after the user has looked at what the first attempt did."""
+    after the user has looked at what an earlier run did.
+
+    Only a REFUSED window reaches this, and every platform refusal fires before
+    the send-keys (the dedupe or the kill-server got no answer, or the
+    new-session outran its budget), so this bring-up typed nothing. What it
+    cannot know is whether an EARLIER run started a session in that pane; the
+    created-then-lost case is the missing pane's, worded by ``_NOT_RETYPED``."""
     return (
-        "; it answers now, but this bring-up cannot tell whether its command was"
-        " typed, and a cloud pane is never re-typed -- check claude.ai/code, then"
-        f" run `magent down {sid}` and `magent up` to start it afresh"
+        "; it answers now, but this bring-up typed no agent command into it, and"
+        " a cloud pane is never re-typed -- check claude.ai/code for a session an"
+        f" earlier run may have started, then run `magent down {sid}` and"
+        " `magent up` to start it afresh"
     )
 
 
