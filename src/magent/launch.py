@@ -2189,31 +2189,44 @@ def revive_psmux(
 
 
 def decorate_psmux_sessions(
-    names: list[str], code_hint: bool | None = None
+    names: list[str],
+    code_hint: bool | None = None,
+    *,
+    nicks: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Delegate to ``psmux.decorate_sessions``.
 
     ``code_hint`` stays optional here (unlike ``decoration_argv``'s required
     one) so existing callers keep working and get the default "probe on this
     machine" behaviour, which is what every one of them wants.
+
+    ``nicks`` (session name -> brand nick) is keyword-only, and a caller with
+    no nick must not pass it at all: other code fakes this wrapper with a
+    one-argument callable.
     """
     from magent import psmux
 
-    return psmux.decorate_sessions(names, code_hint=code_hint)
+    return psmux.decorate_sessions(names, code_hint=code_hint, nicks=nicks)
 
 
 def decorate_psmux_sessions_async(
-    names: list[str], code_hint: bool | None = None
+    names: list[str],
+    code_hint: bool | None = None,
+    *,
+    nicks: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Delegate to ``psmux.decorate_sessions_async``.
 
     The status-path variant: fires the same commands without waiting, and is
     throttled by a stamp file. `up --json` uses this one so a slow psmux can
     never delay (or fail) a status query -- see the psmux docstring.
+
+    ``nicks`` is keyword-only and passed only by a caller that has one, as in
+    ``decorate_psmux_sessions``.
     """
     from magent import psmux
 
-    return psmux.decorate_sessions_async(names, code_hint=code_hint)
+    return psmux.decorate_sessions_async(names, code_hint=code_hint, nicks=nicks)
 
 
 def stop_psmux(names: list[str]) -> tuple[list[str], list[str]]:
