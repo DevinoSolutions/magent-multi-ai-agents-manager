@@ -34,7 +34,15 @@ Four laws:
   * The fragment is MERGED, not replaced: an attach to a host adds its sessions'
     profiles beside the ones a local launch wrote, and the oldest fall off at
     ``MAX_PROFILES``. Windows Terminal dropping a profile out from under an open
-    tab would be worse than a stale hidden profile.
+    tab would be worse than a stale hidden profile. An entry keeps its place in
+    the file until its content changes, so re-syncing an unchanged window is a
+    no-op on disk (bytes and mtime) however many other profiles sit beside it.
+  * A launch pays for the fragment at most once. Callers hand ``sync`` every
+    window of a phase in ONE call; a held lock costs one bounded wait
+    (``LOCK_WAIT_S``) and then ``begin_launch``'s flag keeps every later sync of
+    that launch from waiting again. Logo discovery is cached by (path, size,
+    mtime) in a sidecar, so an unchanged logo costs a ``stat`` -- never a read,
+    which on a OneDrive file would hydrate it on every launch.
 
 A bare relative ``icon`` in a fragment profile resolves against the fragment's
 own folder from Windows Terminal 1.24; older versions honour only web URLs there.
@@ -53,6 +61,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import struct
 import time
 from dataclasses import dataclass
@@ -74,7 +83,10 @@ MAX_PROFILES = 256
 MAX_ICON_BYTES = 1_000_000
 BADGE_PX = 48
 LOCK_NAME = "wt-profiles"
-LOCK_WAIT_S = 5.0
+# Not ``*.json``: Windows Terminal reads every .json in the folder as a fragment.
+ICON_CACHE_FILE = "icon-cache.dat"
+MAX_CACHE_ENTRIES = 512
+LOCK_WAIT_S = 1.0
 # Bumped when render_badge's output changes, so a stored badge is redrawn.
 BADGE_VERSION = "1"
 
@@ -123,6 +135,7 @@ DISCOVERY_CANDIDATES: tuple[str, ...] = (
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _ICO_MAGIC = b"\x00\x00\x01\x00"
 _MIN_PIXELS = 16
+_MAX_ICO_IMAGES = 256
 _MAX_PIXELS = 2048
 # A wide banner squeezed into a 16px tab is unreadable; only a roughly square
 # discovered logo is used. An explicitly configured icon is never judged on shape.
@@ -132,6 +145,18 @@ _SLUG_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
 _REPLACE_ATTEMPTS = 3
 _REPLACE_RETRY_S = 0.05
 _PRUNED_SUFFIXES = frozenset({".png", ".ico", ".tmp"})
+# Everything magent writes into its folder: the manifest, the sidecar, and the
+# files ``_prune`` owns by suffix. ``remove`` deletes exactly this and no more.
+_OWNED_NAMES = frozenset({FRAGMENT_FILE, ICON_CACHE_FILE})
+
+
+# Set when a sync found the lock held; every later sync of the same launch
+# then skips instead of waiting again (``begin_launch`` clears it).
+class _LaunchState:
+    lock_lost = False
+
+
+_launch = _LaunchState()
 
 
 def fragments_root() -> Path | None:
@@ -170,15 +195,34 @@ def enabled() -> bool:
         return True
 
 
+def begin_launch() -> None:
+    """Start a launch with a clean slate: a lock found held by an earlier launch
+    in this process (the interactive menu runs several) must not mute this one."""
+    _launch.lock_lost = False
+
+
 def profile_name(key: str) -> str:
     """The Windows Terminal profile name for a window key (a psmux session name,
     an attach sid, or a plain window title).
 
     ``;`` is Windows Terminal's own command separator on its command line and a
-    ``"`` would end the quoted ``-p`` value early, so neither survives; the same
+    ``"`` would end the quoted ``-p`` value early, so neither survives. A key
+    the mapping CHANGED also gets a short hash of the original appended, so
+    ``a;b``, ``a"b`` and a real ``a_b`` stay three profiles instead of silently
+    sharing one (and one icon). An untouched key keeps its plain name. The same
     mapping runs on write and on lookup, which is all stability needs.
     """
-    return PROFILE_PREFIX + (_UNSAFE_NAME_CHARS.sub("_", key).strip() or "project")
+    clean = _UNSAFE_NAME_CHARS.sub("_", key).strip()
+    if clean == key and clean:
+        return PROFILE_PREFIX + clean
+    digest = hashlib.sha1(  # reason: a disambiguating suffix, not security
+        key.encode("utf-8", errors="replace")
+    ).hexdigest()[:6]
+    return f"{PROFILE_PREFIX}{clean or 'project'}-{digest}"
+
+
+def _entry_key(key: str) -> str:
+    return profile_name(key)[len(PROFILE_PREFIX) :]
 
 
 def derived_color(key: str) -> str:
@@ -202,6 +246,10 @@ class IconSpec:
     ``label`` is the name the generated badge takes its initial from;
     ``project_dir`` is where to look for a repository logo (None for a project
     that lives on another machine); ``icon`` is the config's explicit path.
+    ``only_if_missing`` is for a spec that is a guess about a window another
+    source already described (an attach sid that equals a local project's
+    window name): it never replaces or re-colours an existing profile, so the
+    two writers cannot take turns changing the same tab's icon.
     """
 
     key: str
@@ -209,6 +257,7 @@ class IconSpec:
     color: str | None = None
     project_dir: Path | None = None
     icon: str | None = None
+    only_if_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -236,11 +285,32 @@ class SyncResult:
 # --- icon sources -------------------------------------------------------------
 
 
-def _png_size(data: bytes) -> tuple[int, int] | None:
-    if len(data) < 24 or data[12:16] != b"IHDR":
+def _png_ok(data: bytes) -> tuple[int, int] | None:
+    """``(width, height)`` of a PNG that is whole enough to draw, else None:
+    a well-formed IHDR up front and an IEND chunk at the end. A download cut
+    short keeps its magic and its IHDR, which is how it used to pass."""
+    if len(data) < 33 or data[8:16] != b"\x00\x00\x00\rIHDR":
+        return None
+    end = data.rfind(b"IEND")
+    if end < 33 or len(data) - end < 8:
         return None
     width, height = struct.unpack(">II", data[16:24])
     return width, height
+
+
+def _ico_ok(data: bytes) -> bool:
+    """An ICO whose directory is sane and whose every image lies inside the file."""
+    if len(data) < 6:
+        return False
+    count = struct.unpack("<H", data[4:6])[0]
+    table_end = 6 + 16 * count
+    if not 1 <= count <= _MAX_ICO_IMAGES or table_end > len(data):
+        return False
+    for i in range(count):
+        size, offset = struct.unpack("<II", data[6 + 16 * i + 8 : 6 + 16 * i + 16])
+        if size == 0 or offset < table_end or offset + size > len(data):
+            return False
+    return True
 
 
 def _classify(data: bytes, *, require_square: bool) -> str | None:
@@ -248,7 +318,7 @@ def _classify(data: bytes, *, require_square: bool) -> str | None:
     None. Magic bytes, never the file's extension: a ``favicon.ico`` that is
     really an SVG is the common lie."""
     if data.startswith(_PNG_MAGIC):
-        size = _png_size(data)
+        size = _png_ok(data)
         if size is None:
             return None
         width, height = size
@@ -257,9 +327,8 @@ def _classify(data: bytes, *, require_square: bool) -> str | None:
         if require_square and max(width, height) / min(width, height) > _MAX_ASPECT:
             return None
         return "png"
-    if data.startswith(_ICO_MAGIC) and len(data) >= 6:
-        count = struct.unpack("<H", data[4:6])[0]
-        return "ico" if count >= 1 else None
+    if data.startswith(_ICO_MAGIC):
+        return "ico" if _ico_ok(data) else None
     return None
 
 
@@ -271,7 +340,7 @@ def _read_icon_file(path: Path, *, require_square: bool) -> tuple[str, bytes] | 
         if not 0 < size <= MAX_ICON_BYTES:
             return None
         data = path.read_bytes()
-    except OSError:
+    except (OSError, ValueError):  # ValueError: an embedded NUL in the path
         return None
     ext = _classify(data, require_square=require_square)
     return None if ext is None else (ext, data)
@@ -286,23 +355,103 @@ def discover_icon(project_dir: Path) -> tuple[str, bytes] | None:
     return None
 
 
-def _configured_icon(spec: IconSpec) -> tuple[str, bytes] | None:
+class _IconCache:
+    """What was learned about candidate files, keyed by (path, size, mtime_ns).
+
+    A hit answers "is this a usable icon, and what is its content stamp" from a
+    ``stat`` alone -- the file is read only when its icon file is not already in
+    the fragment. Invalid files are remembered too (an empty extension), so a
+    ``favicon.ico`` that is really an SVG is not re-read every launch. Lives in
+    a sidecar inside the fragment folder, so it follows ``fragments_root`` (the
+    test seam) and ``remove``; best-effort end to end.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._rows: dict[str, list[object]] = {}
+        self._dirty = False
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            rows = doc.get("rows") if isinstance(doc, dict) else None
+            if isinstance(rows, dict):
+                self._rows = {k: v for k, v in rows.items() if isinstance(v, list)}
+        except (OSError, ValueError):
+            pass
+
+    def get(self, key: str, size: int, mtime_ns: int) -> tuple[str, str] | None:
+        """``(ext, stamp)`` (ext ``""`` = known-unusable) or None for a miss."""
+        row = self._rows.get(key)
+        if (
+            row is not None
+            and len(row) == 4
+            and row[0] == size
+            and row[1] == mtime_ns
+            and isinstance(row[2], str)
+            and isinstance(row[3], str)
+        ):
+            return row[2], row[3]
+        return None
+
+    def put(self, key: str, size: int, mtime_ns: int, ext: str, stamp: str) -> None:
+        self._rows.pop(key, None)
+        self._rows[key] = [size, mtime_ns, ext, stamp]
+        while len(self._rows) > MAX_CACHE_ENTRIES:
+            del self._rows[next(iter(self._rows))]
+        self._dirty = True
+
+    def save(self) -> None:
+        if not self._dirty:
+            return
+        with contextlib.suppress(OSError, ValueError):
+            _atomic_write(self._path, json.dumps({"rows": self._rows}).encode("utf-8"))
+
+
+def _stamp(data: bytes) -> str:
+    return hashlib.sha1(data).hexdigest()[:8]  # reason: content name, not security
+
+
+def _probe(
+    path: Path, *, require_square: bool, cache: _IconCache
+) -> tuple[str, str, bytes | None] | None:
+    """``(ext, stamp, data)`` for a usable icon file, else None. ``data`` is None
+    when the cache answered -- the caller reads the file only if it needs the
+    bytes, and then checks them against the stamp."""
+    try:
+        st = path.stat()
+    except (OSError, ValueError):
+        return None
+    if not stat.S_ISREG(st.st_mode) or not 0 < st.st_size <= MAX_ICON_BYTES:
+        return None
+    key = f"{'sq' if require_square else 'any'}|{path}"
+    hit = cache.get(key, st.st_size, st.st_mtime_ns)
+    if hit is not None:
+        ext, stamp = hit
+        return (ext, stamp, None) if ext else None
+    found = _read_icon_file(path, require_square=require_square)
+    if found is None:
+        cache.put(key, st.st_size, st.st_mtime_ns, "", "")
+        return None
+    ext, data = found
+    stamp = _stamp(data)
+    cache.put(key, st.st_size, st.st_mtime_ns, ext, stamp)
+    return ext, stamp, data
+
+
+def _configured_path(spec: IconSpec) -> Path | None:
     if not spec.icon:
         return None
     path = Path(spec.icon).expanduser()
-    if not path.is_absolute():
-        if spec.project_dir is None:
-            return None
-        path = spec.project_dir / path
-    found = _read_icon_file(path, require_square=False)
-    if found is None:
+    if path.is_absolute():
+        return path
+    if spec.project_dir is None:
         get_logger("launch").warning(
-            "terminal icon: %s is not a readable PNG/ICO under %d bytes; "
-            "using the next source",
-            path,
-            MAX_ICON_BYTES,
+            "terminal icon: %s is relative but %s has no project directory "
+            "(a remote window); using the next source",
+            spec.icon,
+            spec.key,
         )
-    return found
+        return None
+    return spec.project_dir / path
 
 
 @dataclass(frozen=True)
@@ -310,29 +459,59 @@ class _Resolved:
     source: str
     ext: str
     stamp: str
-    data: bytes | None  # None = a badge nobody has drawn yet (drawn on demand)
+    data: bytes | None  # None = not in hand: read ``path``, or draw the badge
+    path: Path | None = None
 
 
-def _resolve(spec: IconSpec) -> _Resolved:
+def _resolve(spec: IconSpec, cache: _IconCache) -> _Resolved:
     """Which source supplies ``spec``'s icon, and a stamp that names its CONTENT."""
-    for source, found in (
-        (SOURCE_CONFIG, _configured_icon(spec)),
-        (
-            SOURCE_DISCOVERED,
-            discover_icon(spec.project_dir) if spec.project_dir else None,
-        ),
-    ):
+    configured = _configured_path(spec)
+    if configured is not None:
+        found = _probe(configured, require_square=False, cache=cache)
         if found is not None:
-            ext, data = found
-            return _Resolved(
-                source, ext, hashlib.sha1(data).hexdigest()[:8], data
-            )  # reason: content name, not security
+            return _Resolved(SOURCE_CONFIG, found[0], found[1], found[2], configured)
+        get_logger("launch").warning(
+            "terminal icon: %s is not a readable PNG/ICO under %d bytes; "
+            "using the next source",
+            configured,
+            MAX_ICON_BYTES,
+        )
+    if spec.project_dir is not None:
+        for rel in DISCOVERY_CANDIDATES:
+            candidate = spec.project_dir / rel
+            found = _probe(candidate, require_square=True, cache=cache)
+            if found is not None:
+                return _Resolved(
+                    SOURCE_DISCOVERED, found[0], found[1], found[2], candidate
+                )
+    return _badge_resolved(spec)
+
+
+def _badge_resolved(spec: IconSpec) -> _Resolved:
     color = spec.color or derived_color(spec.key)
     glyph = icons.badge_glyph(spec.label)
     stamp = hashlib.sha1(  # reason: content name, not security
         f"{BADGE_VERSION}|{BADGE_PX}|{glyph}|{color}".encode()
     ).hexdigest()[:8]
     return _Resolved(SOURCE_GENERATED, "png", stamp, None)
+
+
+def _icon_bytes(spec: IconSpec, resolved: _Resolved) -> bytes:
+    """The bytes to write for ``resolved``. A file the cache vouched for is read
+    now, and refused (ValueError) if it no longer matches the stamp the
+    filename was built from."""
+    if resolved.source == SOURCE_GENERATED:
+        return icons.render_badge(
+            spec.label, spec.color or derived_color(spec.key), BADGE_PX
+        )
+    data = resolved.data
+    if data is None and resolved.path is not None:
+        data = resolved.path.read_bytes()
+        if _stamp(data) != resolved.stamp:
+            raise ValueError(f"{resolved.path} changed while it was being read")
+    if data is None:
+        raise ValueError("no icon bytes")
+    return data
 
 
 def _icon_filename(key: str, resolved: _Resolved) -> str:
@@ -456,6 +635,9 @@ def _prune(directory: Path, keep: set[str]) -> None:
 def sync(specs: list[IconSpec], *, setting: bool = True) -> SyncResult:
     """Make the fragment carry a profile for every spec. Never raises.
 
+    Pass every window of a phase in ONE call: the lock, the manifest read and
+    the prune are paid once, and a held lock costs a single bounded wait.
+
     ``setting`` is ``settings.terminalIcons``: False removes magent's fragment
     (the user turned the feature off, so tabs go back to the default icon)
     instead of writing one. ``MAGENT_WT_ICONS=0`` is the process-wide kill
@@ -468,38 +650,73 @@ def sync(specs: list[IconSpec], *, setting: bool = True) -> SyncResult:
         return SyncResult(directory=None, skipped="no LOCALAPPDATA")
     if not setting:
         return SyncResult(directory=directory, changed=remove(), skipped="disabled")
+    if _launch.lock_lost:
+        return SyncResult(directory=directory, skipped="fragment locked this launch")
     try:
         with persistent_lock(LOCK_NAME, wait_s=LOCK_WAIT_S):
             return _sync_locked(directory, specs)
     except LockHeld:
+        _launch.lock_lost = True
         return SyncResult(directory=directory, error="another magent is updating it")
     except (OSError, ValueError) as exc:
         get_logger("launch").warning("terminal icons: %s", exc)
         return SyncResult(directory=directory, error=str(exc))
 
 
+def _apply_spec(
+    directory: Path,
+    entries: dict[str, FragmentProfile],
+    spec: IconSpec,
+    cache: _IconCache,
+) -> None:
+    """Add (or leave alone) ``spec``'s profile in ``entries``, writing its icon
+    file if it is not there yet. Raises on a failure it cannot recover from;
+    the caller isolates that to this one spec."""
+    key = _entry_key(spec.key)
+    existing = entries.get(key)
+    if spec.only_if_missing and existing is not None:
+        with contextlib.suppress(OSError):
+            if (directory / existing.icon).is_file():
+                return
+    resolved = _resolve(spec, cache)
+    filename = _icon_filename(spec.key, resolved)
+    target = directory / filename
+    if not target.is_file():
+        try:
+            data = _icon_bytes(spec, resolved)
+        except (OSError, ValueError) as exc:
+            # The chosen source went bad between the probe and the read (a
+            # file replaced, a OneDrive placeholder that will not hydrate):
+            # this window gets the badge instead of no icon at all.
+            get_logger("launch").warning(
+                "terminal icon: %s unusable (%s); drawing a badge", spec.key, exc
+            )
+            resolved = _badge_resolved(spec)
+            filename = _icon_filename(spec.key, resolved)
+            target = directory / filename
+            data = None if target.is_file() else _icon_bytes(spec, resolved)
+        if data is not None:
+            _atomic_write(target, data)
+    if existing is not None and existing.icon == filename:
+        return  # unchanged: it keeps its place, so the manifest bytes stay put
+    entries.pop(key, None)  # new or changed: the newest end
+    entries[key] = FragmentProfile(
+        key=key, name=profile_name(spec.key), icon=filename, source=resolved.source
+    )
+
+
 def _sync_locked(directory: Path, specs: list[IconSpec]) -> SyncResult:
     directory.mkdir(parents=True, exist_ok=True)
     entries = {p.key: p for p in read_fragment(directory)}
+    cache = _IconCache(directory / ICON_CACHE_FILE)
     for spec in specs:
-        resolved = _resolve(spec)
-        filename = _icon_filename(spec.key, resolved)
-        target = directory / filename
-        if not target.is_file():
-            data = resolved.data
-            if data is None:
-                data = icons.render_badge(
-                    spec.label, spec.color or derived_color(spec.key), BADGE_PX
-                )
-            _atomic_write(target, data)
-        key = _UNSAFE_NAME_CHARS.sub("_", spec.key).strip() or "project"
-        entries.pop(key, None)  # re-adding moves it to the newest end
-        entries[key] = FragmentProfile(
-            key=key,
-            name=profile_name(spec.key),
-            icon=filename,
-            source=resolved.source,
-        )
+        # One bad spec costs that window its icon, not the batch -- and not the
+        # files the specs before it already wrote.
+        try:
+            _apply_spec(directory, entries, spec, cache)
+        except (OSError, ValueError) as exc:
+            get_logger("launch").warning("terminal icons: %s: %s", spec.key, exc)
+    cache.save()
     profiles = list(entries.values())[-MAX_PROFILES:]
     text = _manifest_text(profiles).encode("utf-8")
     manifest = directory / FRAGMENT_FILE
@@ -513,20 +730,36 @@ def _sync_locked(directory: Path, specs: list[IconSpec]) -> SyncResult:
     return SyncResult(directory=directory, profiles=tuple(profiles), changed=changed)
 
 
+def _owned(child: Path) -> bool:
+    return child.name in _OWNED_NAMES or child.suffix.lower() in _PRUNED_SUFFIXES
+
+
 def remove() -> bool:
-    """Delete magent's fragment folder. True when something was removed."""
+    """Delete what magent wrote into its fragment folder, then the folder.
+
+    True when the folder is gone. Only files magent owns are deleted (the
+    manifest, the sidecar, icon files and temp files -- the same set ``_prune``
+    manages); anything else in there is somebody else's, so the folder stays
+    and this answers False. Under the same lock ``sync`` takes, so it cannot
+    pull files out from under a writer; a lock that stays held answers False.
+    """
     directory = fragment_dir()
     if directory is None or not directory.is_dir():
         return False
-    removed = False
     try:
-        for child in directory.iterdir():
-            if child.is_file():
-                child.unlink()
-                removed = True
-        directory.rmdir()
+        with persistent_lock(LOCK_NAME, wait_s=LOCK_WAIT_S):
+            for child in directory.iterdir():
+                if child.is_file() and _owned(child):
+                    child.unlink()
+            directory.rmdir()
+    except LockHeld:
+        get_logger("launch").warning(
+            "terminal icons: %s is being updated by another magent", directory
+        )
+        return False
     except OSError as exc:
         get_logger("launch").warning(
             "terminal icons: could not remove %s: %s", directory, exc
         )
-    return removed
+        return False
+    return True
