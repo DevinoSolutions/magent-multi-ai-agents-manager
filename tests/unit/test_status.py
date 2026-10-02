@@ -1478,6 +1478,42 @@ class TestAShadowedLocalProjectIsNamedWithItsFix:
         )
         assert launch.shadowed_local_projects(cfg) == []
 
+    def _shadowed(self, tmp_config, tmp_path, **local: object):
+        """``shadowed_local_projects`` for a cloud project plus ONE other
+        project for the same session name (``api``), built from ``local``."""
+        from magent.config import load_config
+
+        (tmp_path / "api").mkdir(exist_ok=True)
+        cfg = load_config(
+            tmp_config(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [
+                        {
+                            "path": str(tmp_path / "api"),
+                            "node": "cloud",
+                            "cloudTask": "t",
+                        },
+                        {"path": str(tmp_path / "api"), **local},
+                    ],
+                }
+            )
+        )
+        return launch.shadowed_local_projects(cfg)
+
+    def test_an_ide_tool_project_is_never_shadowed(self, tmp_config, tmp_path):
+        # An IDE project is a window, not a pane: `up` never started it, so
+        # there is no local agent for the cloud pane to have displaced. The
+        # control proves the same pair WITH an agent tool is reported.
+        assert [sid for _p, sid in self._shadowed(tmp_config, tmp_path)] == ["api"]
+        assert self._shadowed(tmp_config, tmp_path, tool="code") == []
+
+    def test_a_host_project_is_never_shadowed(self, tmp_config, tmp_path):
+        # A host (ssh) project runs on another machine, in its own session
+        # namespace there: it never competed for this PC's pane name.
+        assert [sid for _p, sid in self._shadowed(tmp_config, tmp_path)] == ["api"]
+        assert self._shadowed(tmp_config, tmp_path, title="api", host="devbox") == []
+
 
 class TestTheStatusMenuNeverRevivesACloudPane:
     """`r<n>` in the status menu is a human asking for a pane's agent back; for
