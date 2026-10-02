@@ -1909,6 +1909,17 @@ def _dispatch_cloud_project(
             f" {tile_key}; rename one (set a title)"
         )
         return 0
+    # An entry identical to one already handled (the twin check compares by
+    # value, so it passes both) must not queue a second `claude --cloud` under
+    # the same name: a duplicate is a second billed cloud session, and relying
+    # on the bring-up's has-session timing within one batch is not a guard.
+    # Every path that queues a window or tiles a pane appends a target.
+    if any(t.key == tile_key for t in targets):
+        click.echo(
+            f"SKIP: {title} — already queued under session {tile_key}"
+            " (duplicate project entry)"
+        )
+        return 0
     running = is_running(tile_key, match_mode)
     if not running and not opts.dry_run and not opts.tile_only:
         resolved_dir = _resolve_path(proj.path, base_dir)
