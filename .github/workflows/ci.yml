@@ -58,7 +58,9 @@ jobs:
 
   lint-typecheck-coverage:
     name: "Lint + Type Check + Coverage"
-    timeout-minutes: 10
+    # The full unit suite with coverage runs ~8-8.5 min on ubuntu-latest; 10 left
+    # under 2 min of headroom, so a slow runner cancelled the required check.
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
