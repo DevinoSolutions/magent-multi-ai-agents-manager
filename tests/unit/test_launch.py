@@ -771,7 +771,9 @@ class TestEnsureHotkeyListener:
         monkeypatch.setattr("magent.hotkey.listener_manifest", lambda: manifest)
         monkeypatch.setattr(
             "magent.launch.start_hotkey_listener",
-            lambda url, ssh_host=None: calls.append((url, ssh_host)) or 4242,
+            lambda url, ssh_host=None, watch=None: (
+                calls.append((url, ssh_host)) or 4242
+            ),
         )
         return calls
 
@@ -1060,7 +1062,9 @@ class TestEnsureReplacesAWedgedListener:
         monkeypatch.setattr("magent.launch.retire_wedged_listener", _retire)
         monkeypatch.setattr(
             "magent.launch.start_hotkey_listener",
-            lambda url, ssh_host=None: state["spawns"].append((url, ssh_host)) or 4242,
+            lambda url, ssh_host=None, watch=None: (
+                state["spawns"].append((url, ssh_host)) or 4242
+            ),
         )
         return state
 
