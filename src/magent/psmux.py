@@ -2113,8 +2113,6 @@ def revive_sessions(
     Without a psmux binary nothing is read, so only the names in ``only`` get
     a reason, and a call with no ``only`` leaves ``vetoed`` empty.
     """
-    from concurrent.futures import ThreadPoolExecutor
-
     from magent import agent_state
     from magent.sessions import build_resume_command
 
@@ -2139,14 +2137,15 @@ def revive_sessions(
     if not candidates:
         return []
 
-    def _live(p: dict[str, object]) -> bool:
-        return has_session(_field_str(p, "session"), psmux=binary)
-
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        flags = list(pool.map(_live, candidates))
-    live = [p for p, ok in zip(candidates, flags, strict=True) if ok]
-    for p, ok in zip(candidates, flags, strict=True):
-        if not ok:
+    # The one liveness seam: it re-probes its misses, and a dropped probe here
+    # is the dangerous direction -- a live session read as dead is skipped (a
+    # bare-prompt pane never revived), one read as live-but-idle is not.
+    answered = set(
+        live_sessions([_field_str(p, "session") for p in candidates], psmux=binary)
+    )
+    live = [p for p in candidates if _field_str(p, "session") in answered]
+    for p in candidates:
+        if _field_str(p, "session") not in answered:
             why[_field_str(p, "session")] = "its psmux session did not answer"
     console: dict[str, str] = {}
     idle = idle_sessions(

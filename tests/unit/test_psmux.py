@@ -1063,11 +1063,15 @@ class TestReviveSessions:
         answers=("api", "web"),
         consoles=None,
         tool="claude",
+        probe=None,
     ):
         sent: list[tuple] = []
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
         monkeypatch.setattr(
-            psmux, "has_session", lambda name, psmux=None: name in answers
+            psmux,
+            "_probe_live",
+            probe
+            or (lambda names, binary, timeout: {n for n in names if n in answers}),
         )
         # An idle pane is a pwsh with nothing under it; a busy one runs claude.
         pids = {"api": 100, "web": 200}
@@ -1110,6 +1114,23 @@ class TestReviveSessions:
         assert keys[-1] == "Enter"
         # -t is required: send-keys without it can land in the caller's pane.
         assert target == name
+
+    def test_a_flapping_probe_does_not_hide_a_live_session(self, monkeypatch):
+        # The first has-session probe of `api` is dropped (a loaded host), the
+        # retry answers. Revive shares live_sessions' retry, so the idle pane
+        # is revived instead of being skipped as "did not answer".
+        why: dict[str, str] = {}
+        calls: list[list[str]] = []
+
+        def _flap(names, binary, timeout):
+            calls.append(list(names))
+            return {n for n in names if n != "api" or len(calls) > 1}
+
+        revived, sent = self._run(monkeypatch, idle={"api"}, why=why, probe=_flap)
+        assert revived == ["api"]
+        assert [s[0] for s in sent] == ["api"]
+        assert calls == [["api", "web"], ["api"]]
+        assert "api" not in why
 
     def test_busy_pane_is_left_alone(self, monkeypatch):
         revived, sent = self._run(monkeypatch, idle=set())
@@ -1240,7 +1261,9 @@ class TestReviveNeverTypesIntoALiveAgent:
     def _revive(self, monkeypatch, *, foreground, pids, snapshot, tool="claude"):
         sent: list[tuple[str, tuple[str, ...]]] = []
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
-        monkeypatch.setattr(psmux, "has_session", lambda name, psmux=None: True)
+        monkeypatch.setattr(
+            psmux, "_probe_live", lambda names, binary, timeout: set(names)
+        )
 
         def _fake_send(name, *keys, target=None, psmux=None):
             sent.append((name, keys))
