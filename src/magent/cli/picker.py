@@ -142,14 +142,34 @@ DOWN = "down"
 ENTER = "enter"
 BACKSPACE = "backspace"
 ESC = "esc"
+# Navigation keys the single-select picker has no use for (it ignores any
+# multi-character token it does not know); the multi-select checklist does.
+PGUP = "pgup"
+PGDN = "pgdn"
+HOME = "home"
+END = "end"
+TAB = "tab"
+BTAB = "btab"
+CTRL_A = "ctrl-a"
 IGNORED = ""
 
 # The console-mode escape prefixes Windows uses for a special key: the NEXT
-# read carries the key code itself.
+# read carries the key code itself. Shift+Tab is `\x00` then `\x0f`.
 _WIN_PREFIXES = ("\x00", "\xe0")
-_WIN_SPECIAL = {"H": UP, "P": DOWN}
-# ESC [ A / ESC [ B on POSIX (and anything ConPTY passes through verbatim).
-_CSI_SPECIAL = {"A": UP, "B": DOWN}
+_WIN_SPECIAL = {
+    "H": UP,
+    "P": DOWN,
+    "I": PGUP,
+    "Q": PGDN,
+    "G": HOME,
+    "O": END,
+    "\x0f": BTAB,
+}
+# ESC [ <final> on POSIX (and anything ConPTY passes through verbatim); the
+# same finals follow ESC O in application-cursor mode.
+_CSI_SPECIAL = {"A": UP, "B": DOWN, "H": HOME, "F": END, "Z": BTAB}
+# ESC [ <n> ~ : the VT220 numbered keys.
+_CSI_TILDE = {"1": HOME, "7": HOME, "4": END, "8": END, "5": PGUP, "6": PGDN}
 # Ctrl+P / Ctrl+N: the readline-shaped aliases. They are single bytes, so they
 # survive every terminal layer that might swallow or re-encode an arrow's
 # escape sequence -- which is why the real-PTY tier can drive navigation on
@@ -171,6 +191,10 @@ def _classify(ch: str) -> str:
         raise KeyboardInterrupt
     if ch in _CTRL_ALIASES:
         return _CTRL_ALIASES[ch]
+    if ch == "\t":
+        return TAB
+    if ch == "\x01":
+        return CTRL_A
     if ch == "\x1b":
         return ESC
     if ch >= " " and ch != "\x7f":
@@ -298,11 +322,26 @@ def _read_key_posix() -> str:
         return _classify(ch)
     if not select.select([fd], [], [], _ESC_TAIL_S)[0]:
         return ESC
-    if read_char(fd) != "[":
+    intro = read_char(fd)
+    if intro not in ("[", "O"):
         return IGNORED
-    if not select.select([fd], [], [], _ESC_TAIL_S)[0]:
-        return IGNORED
-    return _CSI_SPECIAL.get(read_char(fd), IGNORED)
+    params = ""
+    while True:
+        if not select.select([fd], [], [], _ESC_TAIL_S)[0]:
+            return IGNORED
+        nxt = read_char(fd)
+        if "@" <= nxt <= "~":  # the final byte ends the sequence
+            return decode_escape(intro, params, nxt)
+        params += nxt
+
+
+def decode_escape(intro: str, params: str, final: str) -> str:
+    """Key token for ``ESC <intro> <params> <final>`` (``intro`` is ``[`` for
+    CSI, ``O`` for SS3). Modifier parameters (``1;5A``) are dropped: Ctrl+Up
+    is still Up."""
+    if final == "~" and intro == "[":
+        return _CSI_TILDE.get(params.split(";")[0], IGNORED)
+    return _CSI_SPECIAL.get(final, IGNORED)
 
 
 def read_key() -> str:
