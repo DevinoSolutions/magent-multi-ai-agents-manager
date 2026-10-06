@@ -4,9 +4,5 @@
   "description": "Placeholder — the official Magent CLI. Coming soon.",
   "license": "AGPL-3.0",
   "homepage": "https://magent.now",
-  "main": "index.js",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/DevinoSolutions/magent-multi-ai-agents-manager.git"
-  }
+  "main": "index.js"
 }
