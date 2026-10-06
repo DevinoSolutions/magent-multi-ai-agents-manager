@@ -1,24 +1,25 @@
-from magent.launch import HAPPY_AGENTS, _psmux_session_name, _wrap_happy
+from magent.launch import _psmux_session_name
+from magent.sessions import HAPPY_AGENTS, wrap_happy
 
 
 class TestWrapHappy:
     def test_wraps_claude_preserves_flags(self):
-        assert _wrap_happy("claude", "claude --continue") == "happy claude --continue"
+        assert wrap_happy("claude", "claude --continue") == "happy claude --continue"
 
     def test_wraps_codex(self):
-        assert _wrap_happy("codex", "codex") == "happy codex"
+        assert wrap_happy("codex", "codex") == "happy codex"
 
     def test_wraps_claude_with_resume_id(self):
         assert (
-            _wrap_happy("claude", "claude --resume abc123")
+            wrap_happy("claude", "claude --resume abc123")
             == "happy claude --resume abc123"
         )
 
     def test_passthrough_unsupported_tool(self):
-        assert _wrap_happy("agy", "agy") == "agy"
+        assert wrap_happy("agy", "agy") == "agy"
 
     def test_passthrough_cursor_agent(self):
-        assert _wrap_happy("cursor-agent", "cursor-agent") == "cursor-agent"
+        assert wrap_happy("cursor-agent", "cursor-agent") == "cursor-agent"
 
     def test_happy_agents_contains_expected(self):
         assert "claude" in HAPPY_AGENTS
