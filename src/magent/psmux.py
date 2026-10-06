@@ -1732,7 +1732,7 @@ def eligible_projects(
     """
     from magent.config import runs_on_node
     from magent.launch import _expand_base_dir, _resolve_path
-    from magent.sessions import build_start_command, is_ide_tool
+    from magent.sessions import is_ide_tool, pane_command
     from magent.titles import get_leaf_name
 
     base_dir = config.base_dir
@@ -1766,20 +1766,26 @@ def eligible_projects(
             continue
         seen.add(sid)
         resolved = _resolve_path(proj.path, base_dir)
+        # The session's pane is the project's first window: the same derivation
+        # `--go` runs, so happy and a per-window tool/command override reach
+        # `up`, revive and status exactly as they reach a launch.
+        pane = pane_command(
+            tool,
+            config.settings.tools,
+            project_dir=resolved,
+            happy=proj.happy if proj.happy is not None else config.settings.happy,
+            window=proj.windows[0] if proj.windows else None,
+            config_dir=config_dirs.get(sid) if config_dirs else None,
+        )
         out.append(
             {
                 "name": leaf,
                 "session": sid,
                 "path": proj.path,
-                "tool": tool,
+                "tool": pane.tool,
                 "group": proj.group,
                 "resolved": resolved,
-                "cmd": build_start_command(
-                    tool,
-                    config.settings.tools.get(tool, ""),
-                    resolved,
-                    config_dir=config_dirs.get(sid) if config_dirs else None,
-                ),
+                "cmd": pane.command,
                 "color": proj.color,
             }
         )

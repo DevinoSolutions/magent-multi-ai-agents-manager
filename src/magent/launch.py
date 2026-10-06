@@ -36,11 +36,10 @@ from magent.procs import (
 )
 from magent.sessions import (
     AGENT_TOOLS,
-    build_resume_command,
-    build_start_command,
     fresh_start_command,
     ide_command,
     is_ide_tool,
+    pane_command,
 )
 from magent.style import style
 from magent.tiling import Placement, magent_window_names, place_windows
@@ -997,11 +996,6 @@ def _get_session_ids(
     return [None] * count
 
 
-HAPPY_AGENTS = {
-    t for t, c in AGENT_TOOLS.items() if c.happy
-}  # derived; name kept for tests
-
-
 def _psmux_session_name(title: str) -> str:
     """Sanitize a window title into a valid psmux/tmux session name.
 
@@ -1011,13 +1005,6 @@ def _psmux_session_name(title: str) -> str:
     from magent.psmux import session_name
 
     return session_name(title)
-
-
-def _wrap_happy(tool: str, cmd: str) -> str:
-    """Wrap a CLI agent command with Happy for mobile/web access."""
-    if tool in HAPPY_AGENTS:
-        return f"happy {cmd}"
-    return cmd
 
 
 def run_magent(config: MagentConfig, opts: RunOpts) -> int:
@@ -1565,47 +1552,21 @@ def _dispatch_cli_agent_project(
 
     for i, win_title in enumerate(titles):
         win_cfg = windows_cfg[i] if windows_cfg and i < len(windows_cfg) else None
-        override = win_cfg.tool if win_cfg and win_cfg.tool else None
-        if override and override != tool:
-            override_cmd = tools.get(override)
-            if override_cmd is None:
-                # An override naming a tool absent from settings.tools can't be
-                # honored -- warn and fall back to the base tool ENTIRELY, so
-                # resume/happy/log all reflect what actually runs.
-                click.echo(
-                    f"WARN: {win_title} — unknown tool '{override}' in windows[{i}]"
-                    f" (add under settings.tools); using '{tool}'"
-                )
-                win_tool, win_base = tool, base_cmd
-            else:
-                win_tool, win_base = override, override_cmd
-        else:
-            win_tool, win_base = tool, base_cmd
-
-        if win_cfg and win_cfg.command:
-            # A per-window `command` is the user's literal command line. It is
-            # never rewritten -- not even to drop a resume flag.
-            cmd = win_cfg.command
-        elif win_tool != tool:
-            # Per-window override: the discovered session ids belong to the
-            # base `tool`, not `win_tool` -- never reuse them for the override.
-            cmd = (
-                build_resume_command(win_tool, win_base, None)
-                if window_count > 1
-                else build_start_command(win_tool, win_base, agent_dir)
+        pane = pane_command(
+            tool,
+            tools,
+            project_dir=agent_dir,
+            happy=use_happy,
+            window=win_cfg,
+            session_id=session_ids[i],
+            multi_window=window_count > 1,
+        )
+        if pane.warning:
+            click.echo(
+                f"WARN: {win_title} — {pane.warning} in windows[{i}]"
+                f" (add under settings.tools); using '{tool}'"
             )
-        elif window_count > 1 and session_ids[i] is not None:
-            cmd = build_resume_command(win_tool, win_base, session_ids[i])
-        elif window_count > 1:
-            cmd = build_resume_command(win_tool, win_base, None)
-        else:
-            # Single window: the configured command runs verbatim, so this is
-            # the one place a bare `claude --continue` reaches a project
-            # directory that may have no conversation to continue.
-            cmd = build_start_command(win_tool, win_base, agent_dir)
-
-        if use_happy:
-            cmd = _wrap_happy(win_tool, cmd)
+        win_tool, cmd = pane.tool, pane.command
 
         proj_psmux = use_psmux and not is_remote
         # A psmux window's REAL title carries the sanitized session name --

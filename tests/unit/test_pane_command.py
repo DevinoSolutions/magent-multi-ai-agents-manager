@@ -4,6 +4,8 @@ three consumers that used to derive it separately."""
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from magent.config import MagentConfig, ProjectConfig, Settings, WindowConfig
@@ -25,6 +27,8 @@ def _no_stored_sessions(monkeypatch):
         lambda project_dir, config_dir=None: False,
     )
     monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+    # --go's per-window launch delay and the tiling retry loop both sleep.
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
 
 def _cfg(tmp_path, project: ProjectConfig, **settings) -> MagentConfig:
@@ -122,3 +126,94 @@ class TestGoPathCommandCharacterization:
             ),
         )
         assert _go_commands(fake_platform, cfg) == ["claude", "codex"]
+
+
+PARITY_PROJECTS = {
+    "plain": ProjectConfig(path="", tool="claude", title="p"),
+    "happy": ProjectConfig(path="", tool="claude", title="p", happy=True),
+    "happy-codex": ProjectConfig(path="", tool="codex", title="p", happy=True),
+    "window-command": ProjectConfig(
+        path="",
+        tool="claude",
+        title="p",
+        happy=True,
+        windows=[WindowConfig(command="claude --model x")],
+    ),
+    "window-tool": ProjectConfig(
+        path="",
+        tool="claude",
+        title="p",
+        happy=True,
+        windows=[WindowConfig(tool="codex")],
+    ),
+    "window-unknown-tool": ProjectConfig(
+        path="", tool="claude", title="p", windows=[WindowConfig(tool="ghost")]
+    ),
+}
+
+
+class TestEveryConsumerRunsTheSamePaneCommand:
+    """`--go`, `up`, revive and status used to derive the pane command in two
+    places; `happy` and per-window overrides reached `--go` only."""
+
+    @pytest.fixture
+    def psmux_platform(self, monkeypatch):
+        from tests.conftest import FakePlatform
+
+        fp = FakePlatform(supports_psmux=True)
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+
+        # The creation verify is not under test here (and would shell out to a
+        # psmux binary): record what was handed to the platform, report no
+        # casualties.
+        def _create(plat, windows):
+            plat.launch_psmux_session(windows)
+            return {}
+
+        monkeypatch.setattr("magent.psmux.launch_verified", _create)
+        return fp
+
+    @pytest.mark.parametrize("case", sorted(PARITY_PROJECTS))
+    def test_go_up_revive_and_status_agree(
+        self, case, psmux_platform, tmp_path, monkeypatch
+    ):
+        from magent import psmux
+
+        def _config() -> MagentConfig:
+            proj = PARITY_PROJECTS[case]
+            return _cfg(tmp_path, ProjectConfig(**vars(proj)), psmux=True)
+
+        assert run_magent(_config(), RunOpts()) == 0
+        [go] = [w.command for w in psmux_platform.launched_psmux]
+
+        [status] = psmux.eligible_projects(_config())
+        assert status["cmd"] == go
+
+        psmux_platform.launched_psmux.clear()
+        assert psmux.bring_up(_config())[0] == ["p"]
+        [up] = [w.command for w in psmux_platform.launched_psmux]
+        assert up == go
+
+        sent: list[str] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux, "_probe_live", lambda names, binary, timeout: set(names)
+        )
+        monkeypatch.setattr(psmux, "idle_sessions", lambda names, **kw: list(names))
+        monkeypatch.setattr(
+            psmux,
+            "send_keys",
+            lambda name, *keys, target=None, psmux=None: sent.append(keys[0]) or True,
+        )
+        assert psmux.revive_sessions(_config()) == ["p"]
+        assert [k.removeprefix("cmd /c ") for k in sent] == [go]
+
+    def test_happy_is_in_the_expected_cases(self, psmux_platform, tmp_path):
+        # Guard against the parity test passing vacuously on all-plain commands.
+        from magent import psmux
+
+        cfg = _cfg(tmp_path, ProjectConfig(**vars(PARITY_PROJECTS["happy"])))
+        assert psmux.eligible_projects(cfg)[0]["cmd"] == "happy claude"
+        cfg = _cfg(tmp_path, ProjectConfig(**vars(PARITY_PROJECTS["window-tool"])))
+        assert psmux.eligible_projects(cfg)[0]["cmd"] == "happy codex"
