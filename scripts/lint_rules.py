@@ -43,6 +43,14 @@ MD007  No psmux argv list/tuple literal outside ``src/magent/psmux.py``. A liter
        ``send_keys_argv``, ``type_command_argv``, ...). No allowlist: there is no
        legitimate exception today.
 
+MD008  No bare process termination outside ``src/magent/procs.py``: no
+       ``os.kill`` / ``os.killpg`` call, no ``"taskkill"`` argv literal, no
+       ``TerminateProcess`` reference. A pid read from a pid file may name a
+       stranger by the time it is acted on; ``procs.terminate_pid`` (via
+       ``pidfile.terminate``) is the one kill that checks it still names the
+       recorded process. Killing a ``Popen`` you hold (``proc.kill()``) is not
+       the hazard and is not flagged.
+
 Scopes: MD001/002/003/006/007 apply to ``src/magent/`` only; MD005 to
 ``src/magent/cli/`` only; MD004 applies to ``src`` + ``scripts`` + ``tests``.
 """
@@ -71,9 +79,7 @@ MD002_ALLOW = {
     "src/magent/discover.py": "session-store paths, path separators, FS case-folding",
     "src/magent/agent_state.py": "state-store path differs per OS",
     "src/magent/launch.py": "Windows job-object breakaway in spawn_detached",
-    "src/magent/upload_server.py": "taskkill vs os.kill process termination",
-    "src/magent/cli/attention_cmd.py": "taskkill vs os.kill process termination",
-    "src/magent/node_sync.py": "taskkill vs os.kill process termination (stop_daemon, the attention_cmd shape)",
+    "src/magent/upload_server.py": "listening-socket exclusivity (SO_EXCLUSIVEADDRUSE vs SO_REUSEADDR) and bind-refusal errno are per-OS",
     "src/magent/cli/watch.py": "non-blocking keypress polling is per-OS (msvcrt vs select)",
     "src/magent/cli/doctor.py": "terminal-emulator candidates are per-OS (wt vs POSIX list)",
     "src/magent/hotkey.py": "module is Windows-only by construction (raises off-win32)",
@@ -91,6 +97,11 @@ MD002_ALLOW = {
     "src/magent/psmux.py": "psmux binary fallback path is per-OS (LOCALAPPDATA on Windows)",
     "src/magent/attach_client.py": "Windows' own OpenSSH is found via GetSystemDirectoryW (ctypes.windll exists only on win32), same primitive split as procs.py",
 }
+
+# MD008: the one file that may end a process by number, and the spellings of it.
+MD008_ALLOW = {"src/magent/procs.py"}
+_MD008_ARGV0 = frozenset({"taskkill", "taskkill.exe"})
+_MD008_OS_KILLS = frozenset({"kill", "killpg"})
 
 # MD003: the only two src files allowed to hold a literal "magent:".
 MD003_ALLOW = {"src/magent/titles.py", "src/magent/cli/attach.py"}
@@ -369,6 +380,24 @@ def _heavy_import_findings(rel: str, tree: ast.Module) -> list[Finding]:
     return out
 
 
+def _is_bare_kill(node: ast.AST) -> bool:
+    """MD008 — ``os.kill(...)``/``os.killpg(...)``, a ``"taskkill"`` string
+    constant, or any ``TerminateProcess`` name/attribute."""
+    if isinstance(node, ast.Call):
+        f = node.func
+        return (
+            isinstance(f, ast.Attribute)
+            and f.attr in _MD008_OS_KILLS
+            and isinstance(f.value, ast.Name)
+            and f.value.id == "os"
+        )
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str) and node.value.lower() in _MD008_ARGV0
+    if isinstance(node, ast.Attribute):
+        return node.attr == "TerminateProcess"
+    return isinstance(node, ast.Name) and node.id == "TerminateProcess"
+
+
 def _ast_rules(rel: str, source: str) -> list[Finding]:
     """MD001/002/003/006/007 (src/magent/) + MD005 (src/magent/cli/)."""
     out: list[Finding] = []
@@ -389,6 +418,7 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
     in_platform = rel.startswith(PLATFORM_PREFIX)
     md002_allowed = in_platform or rel in MD002_ALLOW
     md003_allowed = rel in MD003_ALLOW
+    md008_allowed = rel in MD008_ALLOW
 
     # Constants that are pieces of an f-string are counted via their JoinedStr
     # parent (below), never again as standalone literals — so f"magent:{x}" flags once.
@@ -421,6 +451,16 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
                     col,
                     "MD002",
                     "sys.platform outside platform/ — gate on a Platform.supports_*() probe, or add a reasoned MD002_ALLOW entry if genuinely OS-behavioral",
+                )
+            )
+        if not md008_allowed and _is_bare_kill(node):
+            out.append(
+                Finding(
+                    rel,
+                    line,
+                    col,
+                    "MD008",
+                    "bare process termination (os.kill / taskkill / TerminateProcess) outside procs.py — a pid from a file can name a stranger; use pidfile.terminate / procs.terminate_pid",
                 )
             )
         if (

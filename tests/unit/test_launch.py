@@ -640,6 +640,7 @@ class TestHotkeyRestartReason:
     @pytest.fixture(autouse=True)
     def _pin_version(self, monkeypatch):
         monkeypatch.setattr("magent.__version__", self.CURRENT, raising=False)
+        monkeypatch.setattr("magent.launch.installed_version", lambda: self.CURRENT)
 
     def _manifest(self, **over):
         base = {
@@ -2468,3 +2469,117 @@ class TestUploadServerSupervisor:
             sup.tick()
 
         assert "no pid file" in caplog.text
+
+
+class TestTheSupervisedSkewRestartIsBounded:
+    """serve's supervisor compares the listener's manifest version to what a
+    respawn would actually run (the version on disk), and a skew it cannot clear
+    is restarted a bounded number of times, with one warning naming the repair.
+    The fake hotkey module stands in for the win32-only listener state; nothing
+    here spawns a process."""
+
+    URL = "http://127.0.0.1:8034"
+
+    @pytest.fixture
+    def world(self, monkeypatch):
+        import types
+
+        class World:
+            pid: int | None = 501
+            manifest_version = "1.0.0"
+            disk = "2.0.0"
+            respawns_as = "2.0.0"  # the version a respawned listener reports
+            stops = 0
+            spawns = 0
+            now = 0.0
+
+        w = World()
+        fake = types.ModuleType("magent.hotkey")
+        fake.listener_pid = lambda: w.pid
+        fake.listener_manifest = lambda: {
+            "version": w.manifest_version,
+            "server_url": self.URL,
+            "ssh_host": None,
+        }
+
+        def _stop():
+            w.stops += 1
+            w.pid = None
+            return True
+
+        def _spawn(args, **_k):
+            w.spawns += 1
+            w.pid = 600 + w.spawns
+            w.manifest_version = w.respawns_as
+
+        fake.stop_listener = _stop
+        fake.forget_listener = lambda: None
+        monkeypatch.setitem(sys.modules, "magent.hotkey", fake)
+        monkeypatch.setattr("magent.launch.spawn_detached", _spawn)
+        monkeypatch.setattr(
+            "magent.launch.await_registration",
+            lambda _child, read, not_pid=None: read(),
+        )
+        monkeypatch.setattr("magent.launch.installed_version", lambda: w.disk)
+        monkeypatch.setattr("magent.__version__", "1.0.0", raising=False)
+        plat = FakePlatform(interactive_session=True)
+        monkeypatch.setattr("magent.launch.get_platform", lambda: plat)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: plat)
+        monkeypatch.setattr(
+            "magent.launch.time",
+            types.SimpleNamespace(
+                monotonic=lambda: w.now, time=time.time, sleep=lambda _s: None
+            ),
+        )
+        return w
+
+    def _tick(self, w, watch):
+        launch.ensure_hotkey_listener(self.URL, watch=watch)
+        w.now += 30.0
+
+    def test_a_genuine_skew_restarts_once_and_then_settles(self, world):
+        watch = launch.ListenerWatch()
+        for _ in range(6):
+            self._tick(world, watch)
+        assert world.stops == 1 and world.spawns == 1
+        assert world.manifest_version == "2.0.0"
+
+    def test_an_old_serve_does_not_fight_a_new_listener(self, world, caplog):
+        # serve imported 1.0.0; pip put 2.0.0 on disk and a new-code CLI started
+        # a 2.0.0 listener. The in-memory version must not condemn it.
+        world.manifest_version = "2.0.0"
+        watch = launch.ListenerWatch()
+        with caplog.at_level("INFO", logger="magent.hotkey"):
+            for _ in range(20):
+                self._tick(world, watch)
+        assert world.stops == 0 and world.spawns == 0
+        assert "version skew" not in caplog.text
+
+    def test_a_skew_that_cannot_clear_is_bounded_with_one_warning(self, world, caplog):
+        # Whatever respawns reports 1.5.0 while disk says 2.0.0: no restart can
+        # ever clear it. The cooldown spaces the attempts, the cap ends them.
+        world.respawns_as = "1.5.0"
+        watch = launch.ListenerWatch()
+        with caplog.at_level("INFO", logger="magent.hotkey"):
+            for _ in range(200):  # ~100 minutes of 30s ticks
+                self._tick(world, watch)
+        assert world.stops == launch.SKEW_RESTART_MAX
+        warnings = [r for r in caplog.records if "magent serve" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "persists" in warnings[0].getMessage()
+
+    def test_no_second_restart_inside_the_cooldown(self, world):
+        world.respawns_as = "1.5.0"
+        watch = launch.ListenerWatch()
+        ticks = int(launch.SKEW_RESTART_COOLDOWN_S // 30) - 1
+        for _ in range(ticks):
+            self._tick(world, watch)
+        assert world.stops == 1
+
+    def test_a_target_change_is_not_rate_limited_by_the_skew_budget(self, world):
+        watch = launch.ListenerWatch()
+        watch.skew_restarts = launch.SKEW_RESTART_MAX  # budget spent
+        world.manifest_version = "2.0.0"
+        # a one-shot caller (no watch) asking for another target still restarts
+        launch.start_hotkey_listener("http://other:8034", None)
+        assert world.stops == 1

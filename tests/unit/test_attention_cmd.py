@@ -324,17 +324,14 @@ class TestStopDaemonClearsHeartbeat:
         monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
         # pid 4321 is "alive" until killed, then gone.
         alive = {4321}
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: pid in alive)
         monkeypatch.setattr(attention_cmd, "pid_alive", lambda pid: pid in alive)
-        monkeypatch.setattr(attention_cmd.sys, "platform", "win32")
-
-        class _Result:
-            returncode = 0
 
         def _kill(*_a, **_k):
             alive.discard(4321)
-            return _Result()
+            return "terminated"
 
-        monkeypatch.setattr(attention_cmd.subprocess, "run", _kill)
+        monkeypatch.setattr("magent.pidfile.terminate_pid", _kill)
         log.write_heartbeat(attention_cmd.HEARTBEAT_NAME)
         assert log.heartbeat_age(attention_cmd.HEARTBEAT_NAME) is not None
 
@@ -350,19 +347,16 @@ class TestStopDaemonClearsHeartbeat:
         pid_file.write_text("4321")
         monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
         alive = {4321}
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: pid in alive)
         monkeypatch.setattr(attention_cmd, "pid_alive", lambda pid: pid in alive)
-        monkeypatch.setattr(attention_cmd.sys, "platform", "win32")
         at_kill: list[float | None] = []
-
-        class _Result:
-            returncode = 0
 
         def _kill(*_a, **_k):
             at_kill.append(log.heartbeat_age(attention_cmd.HEARTBEAT_NAME))
             alive.discard(4321)
-            return _Result()
+            return "terminated"
 
-        monkeypatch.setattr(attention_cmd.subprocess, "run", _kill)
+        monkeypatch.setattr("magent.pidfile.terminate_pid", _kill)
         log.write_heartbeat(attention_cmd.HEARTBEAT_NAME)
 
         assert attention_cmd.stop_daemon() is True

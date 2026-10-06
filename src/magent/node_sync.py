@@ -32,8 +32,6 @@ import logging
 import math
 import os
 import re
-import subprocess
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -41,7 +39,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from magent import json_depth, nodes, remote_mux
+from magent import json_depth, nodes, pidfile, remote_mux
 from magent.attach_client import SSH_TRANSPORT_RC
 from magent.config import load_config, runs_on_node
 from magent.env import local_username
@@ -121,26 +119,15 @@ def daemon_pid() -> int | None:
     A live pid is NOT proof of a daemon -- ask ``daemon_running``. Once the
     lock has said a daemon exists, this is its pid: the kill target and the log
     line."""
-    try:
-        pid = int(_PID_PATH.read_text().strip())
-    except (OSError, ValueError):
-        return None
-    if pid_alive(pid):
-        return pid
-    with contextlib.suppress(OSError):
-        _PID_PATH.unlink()
-    return None
+    return pidfile.read(_PID_PATH)
 
 
 def _write_pid() -> None:
-    _PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _PID_PATH.write_text(str(os.getpid()))
+    pidfile.write(_PID_PATH)
 
 
 def _clear_pid() -> None:
-    with contextlib.suppress(OSError):
-        if _PID_PATH.read_text().strip() == str(os.getpid()):
-            _PID_PATH.unlink()
+    pidfile.clear(_PID_PATH)
 
 
 def _write_follows(path: Path) -> None:
@@ -177,26 +164,15 @@ def follows_other(config_file: Path) -> Path | None:
     return None if os.path.normcase(str(followed)) == mine else followed
 
 
-def _kill(pid: int) -> bool:
-    """Ask ``pid`` to die. True when the request was accepted."""
-    if sys.platform == "win32":
-        result = subprocess.run(
-            ["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False
-        )
-        return result.returncode == 0
-    try:
-        os.kill(pid, 15)  # SIGTERM
-    except OSError:
-        return False
-    return True
-
-
 def _clear_leftovers() -> None:
     """Remove the pid file and the heartbeat, so ``status`` reads 'off'."""
     with contextlib.suppress(OSError):
         _PID_PATH.unlink()
     clear_heartbeat(HEARTBEAT_NAME)
 
+
+# ``pidfile.terminate`` outcomes that leave no daemon process behind.
+ENDED = ("terminated", "gone")
 
 # How long stop_daemon waits for a killed daemon to be gone, and how often it
 # looks. SIGTERM is asynchronous on POSIX: the pid still answers for a moment.
@@ -231,7 +207,7 @@ def stop_daemon(
         while pid is None and now() < deadline:
             sleep(STOP_POLL_S)
             pid = daemon_pid()
-    if not pid or not _kill(pid):
+    if not pid or pidfile.terminate(_PID_PATH)[1] not in ENDED:
         return False
     deadline = now() + STOP_SETTLE_S
     while pid_alive(pid):

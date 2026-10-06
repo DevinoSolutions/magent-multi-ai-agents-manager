@@ -24,7 +24,7 @@ import os
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 if TYPE_CHECKING:
     import ctypes  # for the ctypes.CDLL annotation on the win32 helpers below
@@ -931,3 +931,103 @@ def terminate_verified(pid: int, expected: ProcessIdentity) -> int | None:
         return freed
     finally:
         k.CloseHandle(handle)
+
+
+# What ``terminate_pid`` did. ``terminated``: the signal/kill went to the
+# process the caller meant. ``gone``: no such process (nothing to do).
+# ``mismatch``: a process wears the pid, but it started AFTER the caller's
+# record of its target, so it is a stranger that reused the number -- left
+# alone. ``unverifiable``: alive, but its start time cannot be read, so it
+# cannot be told from a stranger -- left alone. ``failed``: the OS refused.
+KillOutcome = Literal["terminated", "gone", "mismatch", "unverifiable", "failed"]
+
+# How much later than the recorded moment a process may have started and still
+# be the one recorded. The record (a pid file) is written by the process after
+# it starts, so the true gap is negative; this only absorbs coarse file-system
+# timestamps. A recycled pid starts after the original died -- far later.
+PID_START_SLACK_S = 2.0
+
+
+def _posix_started_at(pid: int) -> float | None:
+    """Epoch start of a POSIX pid: ``/proc`` on Linux, ``ps etime`` elsewhere."""
+    if sys.platform == "win32":
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as fh:
+            stat = fh.read()
+        with open("/proc/stat", encoding="ascii", errors="replace") as fh:
+            btime = _btime_from_proc_stat(fh.read())
+        # Field 22 (starttime, clock ticks since boot) is index 19 once the
+        # parenthesised command name -- which may contain spaces -- is cut off.
+        ticks = int(stat.rsplit(")", 1)[1].split()[19])
+        if btime is not None:
+            return btime + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, IndexError, ValueError):
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "etime=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout.strip()
+        days, _, clock = out.rpartition("-")
+        parts = [int(x) for x in clock.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        hours, minutes, seconds = parts
+        elapsed = ((int(days or 0) * 24 + hours) * 60 + minutes) * 60 + seconds
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return time.time() - elapsed
+
+
+def process_started_at(pid: int) -> float | None:
+    """When ``pid`` started, in epoch seconds, or None when it is not running
+    or cannot be read."""
+    if not pid or pid < 0:
+        return None
+    if sys.platform == "win32":
+        identity = process_identity(pid)
+        return None if identity is None else filetime_to_epoch(identity.created)
+    return _posix_started_at(pid)
+
+
+def terminate_pid(pid: int, *, started_before: float) -> KillOutcome:
+    """End ``pid`` iff it is demonstrably the process a record was written for.
+
+    ``started_before`` is the moment the record of that process was made (a pid
+    file's mtime: the process writes it after it starts). A process that
+    started later than that is not the recorded one -- it is whatever the OS
+    handed the recycled number to -- and is never touched. A pid whose start
+    time cannot be read is treated the same way: this is the ONE way magent
+    ends a process it knows only by number, and it refuses to guess.
+
+    Windows ends it through ``terminate_verified``, which re-reads the identity
+    through the very handle it kills with, so the check and the kill cannot
+    straddle a reuse. POSIX has no handle to hold: the start-time read and the
+    SIGTERM are two calls (a window of microseconds, on a pid that has to be
+    recycled inside it).
+    """
+    if not pid or pid < 0 or not pid_alive(pid):
+        return "gone"
+    started = process_started_at(pid)
+    if started is None:
+        return "unverifiable"
+    if started > started_before + PID_START_SLACK_S:
+        return "mismatch"
+    if sys.platform == "win32":
+        identity = process_identity(pid)
+        if identity is None:
+            return "unverifiable"
+        return (
+            "terminated" if terminate_verified(pid, identity) is not None else "failed"
+        )
+    try:
+        os.kill(pid, 15)  # SIGTERM
+    except ProcessLookupError:
+        return "gone"
+    except OSError:
+        return "failed"
+    return "terminated"

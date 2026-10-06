@@ -274,3 +274,47 @@ def test_md007_ignores_data_tuples_that_merely_start_with_psmux():
 def test_md007_does_not_apply_outside_src():
     # tests assert on psmux argv shapes on purpose.
     assert _codes("tests/unit/test_x.py", 'a = ["psmux", "-L", n]\n') == []
+
+# ---- MD008: no bare process termination outside procs.py --------------------
+
+
+def test_md007_flags_os_kill():
+    src = "import os\nos.kill(1, 15)\n"
+    assert _codes("src/magent/newthing.py", src) == ["MD008"]
+
+
+def test_md007_flags_os_killpg():
+    src = "import os\nos.killpg(1, 15)\n"
+    assert _codes("src/magent/newthing.py", src) == ["MD008"]
+
+
+def test_md007_flags_a_taskkill_argv():
+    src = 'import subprocess\nsubprocess.run(["taskkill", "/PID", "1", "/F"])\n'
+    assert _codes("src/magent/newthing.py", src) == ["MD008"]
+
+
+def test_md007_flags_terminate_process_in_any_spelling():
+    attr = "k.TerminateProcess(handle, 1)\n"
+    name = "from x import TerminateProcess\nTerminateProcess(handle, 1)\n"
+    assert "MD008" in _codes("src/magent/newthing.py", attr)
+    assert "MD008" in _codes("src/magent/newthing.py", name)
+
+
+def test_md007_allows_procs():
+    src = "import os\nos.kill(1, 15)\nk.TerminateProcess(h, 1)\n"
+    assert _codes("src/magent/procs.py", src) == []
+
+
+def test_md007_ignores_a_popen_kill_and_prose_that_mentions_taskkill():
+    src = 'proc.kill()\nmsg = "stop them with taskkill /F /PID 1"\n'
+    assert _codes("src/magent/newthing.py", src) == []
+
+
+def test_md007_does_not_apply_outside_src_magent():
+    assert _codes("tests/unit/test_x.py", "import os\nos.kill(1, 15)\n") == []
+
+
+def test_md002_no_longer_whitelists_the_kill_recipes():
+    allow = lint_rules.MD002_ALLOW
+    assert "src/magent/cli/attention_cmd.py" not in allow
+    assert "src/magent/node_sync.py" not in allow
