@@ -51,3 +51,10 @@ def test_a_healthy_run_returns_and_restores_the_streams():
     before = (sys.stdout, sys.stderr)
     assert pipeguard.run_guarded(lambda: 7) == 7
     assert (sys.stdout, sys.stderr) == before
+
+
+def test_a_process_without_std_streams_runs_untouched(monkeypatch):
+    """A detached, console-less daemon has stdout/stderr = None."""
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    assert pipeguard.run_guarded(lambda: (sys.stdout, sys.stderr)) == (None, None)

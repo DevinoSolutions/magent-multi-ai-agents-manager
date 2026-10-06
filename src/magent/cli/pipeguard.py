@@ -82,16 +82,24 @@ def run_guarded(run: Callable[[], T]) -> T:
     """``run()`` with stdout/stderr watched: a closed pipe ends the process
     quietly (exit 1); anything else propagates untouched."""
     real_out, real_err = sys.stdout, sys.stderr
-    out, err = _Watched(real_out), _Watched(real_err)
-    sys.stdout, sys.stderr = out, err
+    # A detached/console-less process has NO stdout/stderr (None): leave that
+    # alone -- click and the daemons already treat None as "nowhere to write",
+    # and a proxy over None would turn that into an AttributeError.
+    out = _Watched(real_out) if real_out is not None else None
+    err = _Watched(real_err) if real_err is not None else None
+    sys.stdout = out if out is not None else real_out
+    sys.stderr = err if err is not None else real_err
     try:
         return run()
     except OSError as exc:
-        if not (_is_closed_pipe(exc) and (out.broken or err.broken)):
+        if not (
+            _is_closed_pipe(exc) and any(w is not None and w.broken for w in (out, err))
+        ):
             raise
         sys.stdout, sys.stderr = real_out, real_err
-        _silence(real_out)
-        _silence(real_err)
+        for stream in (real_out, real_err):
+            if stream is not None:
+                _silence(stream)
         raise SystemExit(EXIT_CODE) from None
     finally:
         sys.stdout, sys.stderr = real_out, real_err
