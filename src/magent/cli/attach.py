@@ -1082,6 +1082,18 @@ def _attach_flow(
     the reconnect supervisor or a bare ssh.
     """
 
+    # Before any host contact: the local side is what opens the windows, and
+    # without them the flow would have mutated the host (a remote `up`) and
+    # then failed on its first `wt` spawn.
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    if not get_platform().supports_attach_windows():
+        click.echo(
+            f"  {style('x', fg='red')} magent attach opens local Windows Terminal "
+            "windows and is Windows-only; nothing was contacted."
+        )
+        sys.exit(1)
+
     grp = f' -g "{group}"' if group else ""
 
     if not host:

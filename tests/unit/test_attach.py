@@ -3374,3 +3374,39 @@ class TestUpNamesTheLogThatHoldsEachCasualty:
         assert (
             "(see ~/.magent/logs/launch.log and ~/.magent/logs/nodes.log on the host)"
         ) in out
+
+
+class TestAttachIsGatedOnTheWindowCapability:
+    """`attach` opens local Windows Terminal windows. Off Windows it used to
+    query the host over ssh and offer the remote bring-up before the first
+    `wt` spawn failed -- a mutated host and no windows."""
+
+    def _invoke(self, monkeypatch, runner, *, supports, args):
+        fp = FakePlatform(supports_attach_windows=supports)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        reached: list[object] = []
+
+        def _no_contact(*a, **k):
+            reached.append(a)
+            raise AssertionError("the host was contacted")
+
+        monkeypatch.setattr(subprocess, "run", _no_contact)
+        monkeypatch.setattr(subprocess, "Popen", _no_contact)
+        result = runner.invoke(cli.main, ["attach", *args], input="\n")
+        return result, reached
+
+    @pytest.mark.parametrize("args", [["me@host"], ["--no-mux", "me@host"], []])
+    def test_a_platform_without_attach_windows_exits_before_any_host_contact(
+        self, monkeypatch, runner, args
+    ):
+        result, reached = self._invoke(monkeypatch, runner, supports=False, args=args)
+        assert result.exit_code == 1
+        assert "Windows-only" in result.output
+        assert reached == []
+        # No host prompt either: the gate precedes everything.
+        assert "SSH host" not in result.output
+
+    def test_a_capable_platform_gets_past_the_gate(self, monkeypatch, runner):
+        result, _ = self._invoke(monkeypatch, runner, supports=True, args=[])
+        assert "Windows-only" not in result.output
+        assert "No host provided" in result.output
