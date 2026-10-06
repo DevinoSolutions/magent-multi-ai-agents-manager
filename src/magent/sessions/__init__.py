@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
     from pathlib import Path
 
+    from magent.config import WindowConfig
+
 # Re-exported for the reaper and its tests: the probe's value types live in the
 # `live` leaf only so `claude.py` can import them without a cycle.
 __all__ = ["IdleProbe", "LiveSession", "SessionScan"]
@@ -200,6 +202,78 @@ def build_start_command(
         fresh,
     )
     return fresh
+
+
+HAPPY_AGENTS: frozenset[str] = frozenset(t for t, c in AGENT_TOOLS.items() if c.happy)
+
+
+def wrap_happy(tool: str, cmd: str) -> str:
+    """Wrap a CLI agent command with Happy for mobile/web access."""
+    if cmd and tool in HAPPY_AGENTS:
+        return f"happy {cmd}"
+    return cmd
+
+
+@dataclass(frozen=True)
+class PaneCommand:
+    """What a pane runs: ``tool`` is the tool that ACTUALLY runs (a window
+    override that could not be honored is already folded back to the base
+    tool), ``warning`` names that fallback for the caller to print."""
+
+    tool: str
+    command: str
+    warning: str | None = None
+
+
+def pane_command(
+    tool: str,
+    tools: Mapping[str, str],
+    *,
+    project_dir: str | None,
+    happy: bool = False,
+    window: WindowConfig | None = None,
+    session_id: str | None = None,
+    multi_window: bool = False,
+    config_dir: Path | None = None,
+) -> PaneCommand:
+    """The ONE derivation of the command a pane runs, for ``--go``, ``up``,
+    revive and status alike -- two copies of this had already drifted (``happy``
+    was applied on ``--go`` only).
+
+    ``tool`` is the project's tool and ``tools`` is ``settings.tools``;
+    ``window`` is that pane's per-window override, if any. A window ``command``
+    is the user's literal command line and is never rewritten (not even to drop
+    a resume flag); a window ``tool`` runs ITS command and never reuses
+    ``session_id``, which belongs to the project tool. ``multi_window`` selects
+    the resume form (``session_id`` or a fresh one) over the single-window
+    start form, which is the one place ``build_start_command`` may drop an
+    implicit resume flag -- it stays the only such site, called from here.
+    ``happy`` wraps whatever command results, literal ones included.
+    """
+    win_tool = window.tool if window and window.tool else tool
+    warning: str | None = None
+    if win_tool != tool and win_tool not in tools:
+        # An override naming a tool absent from settings.tools can't be
+        # honored: fall back to the base tool ENTIRELY, so resume/happy/log all
+        # reflect what actually runs.
+        warning = f"unknown tool '{win_tool}'"
+        win_tool = tool
+    base = tools.get(win_tool, "")
+    if window and window.command:
+        cmd = window.command
+    elif win_tool != tool:
+        cmd = (
+            build_resume_command(win_tool, base, None)
+            if multi_window
+            else build_start_command(win_tool, base, project_dir, config_dir=config_dir)
+        )
+    elif multi_window:
+        cmd = build_resume_command(win_tool, base, session_id)
+    else:
+        cmd = build_start_command(win_tool, base, project_dir, config_dir=config_dir)
+    if happy:
+        cmd = wrap_happy(win_tool, cmd)
+    return PaneCommand(win_tool, cmd, warning)
 
 
 def fresh_start_command(tool: str, base_cmd: str) -> str | None:

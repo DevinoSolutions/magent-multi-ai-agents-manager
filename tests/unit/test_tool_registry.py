@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from magent.launch import HAPPY_AGENTS
 from magent.sessions import (
     AGENT_TOOLS,
+    HAPPY_AGENTS,
     IDE_COMMANDS,
     IDE_TOOLS,
     AgentTool,

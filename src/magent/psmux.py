@@ -1732,7 +1732,7 @@ def eligible_projects(
     """
     from magent.config import runs_on_node
     from magent.launch import _expand_base_dir, _resolve_path
-    from magent.sessions import build_start_command, is_ide_tool
+    from magent.sessions import is_ide_tool, pane_command
     from magent.titles import get_leaf_name
 
     base_dir = config.base_dir
@@ -1766,20 +1766,26 @@ def eligible_projects(
             continue
         seen.add(sid)
         resolved = _resolve_path(proj.path, base_dir)
+        # The session's pane is the project's first window: the same derivation
+        # `--go` runs, so happy and a per-window tool/command override reach
+        # `up`, revive and status exactly as they reach a launch.
+        pane = pane_command(
+            tool,
+            config.settings.tools,
+            project_dir=resolved,
+            happy=proj.happy if proj.happy is not None else config.settings.happy,
+            window=proj.windows[0] if proj.windows else None,
+            config_dir=config_dirs.get(sid) if config_dirs else None,
+        )
         out.append(
             {
                 "name": leaf,
                 "session": sid,
                 "path": proj.path,
-                "tool": tool,
+                "tool": pane.tool,
                 "group": proj.group,
                 "resolved": resolved,
-                "cmd": build_start_command(
-                    tool,
-                    config.settings.tools.get(tool, ""),
-                    resolved,
-                    config_dir=config_dirs.get(sid) if config_dirs else None,
-                ),
+                "cmd": pane.command,
                 "color": proj.color,
             }
         )
@@ -2113,8 +2119,6 @@ def revive_sessions(
     Without a psmux binary nothing is read, so only the names in ``only`` get
     a reason, and a call with no ``only`` leaves ``vetoed`` empty.
     """
-    from concurrent.futures import ThreadPoolExecutor
-
     from magent import agent_state
     from magent.sessions import build_resume_command
 
@@ -2139,14 +2143,15 @@ def revive_sessions(
     if not candidates:
         return []
 
-    def _live(p: dict[str, object]) -> bool:
-        return has_session(_field_str(p, "session"), psmux=binary)
-
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        flags = list(pool.map(_live, candidates))
-    live = [p for p, ok in zip(candidates, flags, strict=True) if ok]
-    for p, ok in zip(candidates, flags, strict=True):
-        if not ok:
+    # The one liveness seam: it re-probes its misses, and a dropped probe here
+    # is the dangerous direction -- a live session read as dead is skipped (a
+    # bare-prompt pane never revived), one read as live-but-idle is not.
+    answered = set(
+        live_sessions([_field_str(p, "session") for p in candidates], psmux=binary)
+    )
+    live = [p for p in candidates if _field_str(p, "session") in answered]
+    for p in candidates:
+        if _field_str(p, "session") not in answered:
             why[_field_str(p, "session")] = "its psmux session did not answer"
     console: dict[str, str] = {}
     idle = idle_sessions(

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`up`, revive and status now start the same pane command `--go` does.** The
+  command a pane runs was derived in two places and had drifted: `happy` and
+  per-window `tool`/`command` overrides reached `--go` only, so a `happy`
+  project came back as plain `claude` after `magent up` or a revive. One
+  `sessions.pane_command` now owns it.
+- **Revive no longer misses a live session on a dropped probe.** It ran its own
+  single-shot `has-session` sweep instead of the shared liveness seam that
+  retries misses.
+- **`magent attach` exits up front off Windows.** It used to query the host and
+  offer the remote bring-up before failing on its first Windows Terminal spawn.
+
 - **`magent watch` no longer crashes on a digit press when macOS cannot list
   windows.** The System Events window probes (`find_window`, `snapshot_windows`)
   let an `osascript` timeout, which an Automation (TCC) prompt nobody can answer

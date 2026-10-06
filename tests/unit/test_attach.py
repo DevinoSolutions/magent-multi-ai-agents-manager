@@ -66,6 +66,9 @@ def _fake_platform(monkeypatch, windows=None, **kwargs) -> FakePlatform:
     """Stand in for the platform the attach flow reaches for: the open-window
     snapshot it consults before spawning, the hotkey capability gate, and the
     post-tiling geometry nudge. Returns the double so a test can assert on it."""
+    # `attach` is gated on the window capability up front; every flow test
+    # drives the Windows-shaped path unless it says otherwise.
+    kwargs.setdefault("supports_attach_windows", True)
     fp = FakePlatform(windows=dict(windows or {}), **kwargs)
     monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
     return fp
@@ -248,6 +251,7 @@ class TestLastAttachHost:
     def test_prompt_prefers_last_host_over_config(self, monkeypatch, tmp_path):
         import click
 
+        _fake_platform(monkeypatch)
         attach_mod = self._isolate(monkeypatch, tmp_path)
         attach_mod._remember_last_host("demo@last-used")
         monkeypatch.setattr(attach_mod, "_default_attach_host", lambda: "demo@config")
@@ -3374,3 +3378,39 @@ class TestUpNamesTheLogThatHoldsEachCasualty:
         assert (
             "(see ~/.magent/logs/launch.log and ~/.magent/logs/nodes.log on the host)"
         ) in out
+
+
+class TestAttachIsGatedOnTheWindowCapability:
+    """`attach` opens local Windows Terminal windows. Off Windows it used to
+    query the host over ssh and offer the remote bring-up before the first
+    `wt` spawn failed -- a mutated host and no windows."""
+
+    def _invoke(self, monkeypatch, runner, *, supports, args):
+        fp = FakePlatform(supports_attach_windows=supports)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        reached: list[object] = []
+
+        def _no_contact(*a, **k):
+            reached.append(a)
+            raise AssertionError("the host was contacted")
+
+        monkeypatch.setattr(subprocess, "run", _no_contact)
+        monkeypatch.setattr(subprocess, "Popen", _no_contact)
+        result = runner.invoke(cli.main, ["attach", *args], input="\n")
+        return result, reached
+
+    @pytest.mark.parametrize("args", [["me@host"], ["--no-mux", "me@host"], []])
+    def test_a_platform_without_attach_windows_exits_before_any_host_contact(
+        self, monkeypatch, runner, args
+    ):
+        result, reached = self._invoke(monkeypatch, runner, supports=False, args=args)
+        assert result.exit_code == 1
+        assert "Windows-only" in result.output
+        assert reached == []
+        # No host prompt either: the gate precedes everything.
+        assert "SSH host" not in result.output
+
+    def test_a_capable_platform_gets_past_the_gate(self, monkeypatch, runner):
+        result, _ = self._invoke(monkeypatch, runner, supports=True, args=[])
+        assert "Windows-only" not in result.output
+        assert "No host provided" in result.output

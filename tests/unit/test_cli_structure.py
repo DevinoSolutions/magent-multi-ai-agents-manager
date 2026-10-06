@@ -403,6 +403,9 @@ class TestAttachFlowCharacterization:
         )
 
         class _FakePlat:
+            def supports_attach_windows(self) -> bool:
+                return True
+
             def supports_hotkey(self) -> bool:
                 return True
 
@@ -441,6 +444,12 @@ class TestAttachFlowCharacterization:
         assert tiled == [["magent:myapp"]]
 
     def test_no_host_prompts_then_exits(self, monkeypatch):
+        from tests.conftest import FakePlatform
+
+        monkeypatch.setattr(
+            "magent.platform.get_platform",
+            lambda: FakePlatform(supports_attach_windows=True),
+        )
         monkeypatch.setattr("magent.cli.attach._default_attach_host", lambda: None)
         monkeypatch.setattr("magent.cli.attach._read_last_host", lambda: None)
         prompted = []
