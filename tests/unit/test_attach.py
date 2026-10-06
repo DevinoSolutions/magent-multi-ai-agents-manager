@@ -66,6 +66,9 @@ def _fake_platform(monkeypatch, windows=None, **kwargs) -> FakePlatform:
     """Stand in for the platform the attach flow reaches for: the open-window
     snapshot it consults before spawning, the hotkey capability gate, and the
     post-tiling geometry nudge. Returns the double so a test can assert on it."""
+    # `attach` is gated on the window capability up front; every flow test
+    # drives the Windows-shaped path unless it says otherwise.
+    kwargs.setdefault("supports_attach_windows", True)
     fp = FakePlatform(windows=dict(windows or {}), **kwargs)
     monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
     return fp
