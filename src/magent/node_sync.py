@@ -171,8 +171,20 @@ def _clear_leftovers() -> None:
     clear_heartbeat(HEARTBEAT_NAME)
 
 
-# ``pidfile.terminate`` outcomes that leave no daemon process behind.
-ENDED = ("terminated", "gone")
+def _kill(pid: int) -> bool:
+    """End ``pid`` iff it is the process the pid file was written for (see
+    ``procs.terminate_pid``). True when the request landed or the process is
+    already gone; a stranger wearing the number, or a pid whose start time
+    cannot be read, is left alone and answers False."""
+    try:
+        written = _PID_PATH.stat().st_mtime
+    except OSError:
+        return False
+    return pidfile.terminate_pid(pid, started_before=written) in (
+        "terminated",
+        "gone",
+    )
+
 
 # How long stop_daemon waits for a killed daemon to be gone, and how often it
 # looks. SIGTERM is asynchronous on POSIX: the pid still answers for a moment.
@@ -207,7 +219,7 @@ def stop_daemon(
         while pid is None and now() < deadline:
             sleep(STOP_POLL_S)
             pid = daemon_pid()
-    if not pid or pidfile.terminate(_PID_PATH)[1] not in ENDED:
+    if not pid or not _kill(pid):
         return False
     deadline = now() + STOP_SETTLE_S
     while pid_alive(pid):

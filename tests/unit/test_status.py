@@ -3076,6 +3076,10 @@ def daemons(monkeypatch):
 
     monkeypatch.setattr(node_sync, "_kill", kill)
     monkeypatch.setattr(
+        "magent.pidfile.pid_alive",
+        lambda pid: pid in fakes and not fakes[pid].gone.is_set(),
+    )
+    monkeypatch.setattr(
         node_sync,
         "pid_alive",
         lambda pid: pid in fakes and not fakes[pid].gone.is_set(),
