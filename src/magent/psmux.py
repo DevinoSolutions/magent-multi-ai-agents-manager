@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from magent.config import MagentConfig
     from magent.platform import Platform
 
-from magent.log import get_logger
+from magent.log import get_logger, log_safe
 
 # Every one-shot psmux client this module spawns is a CONTROL or PROBE command
 # whose output is piped or discarded -- no human ever looks at its console. On
@@ -1226,7 +1226,7 @@ def flash_message(
     except (OSError, subprocess.SubprocessError) as exc:
         get_logger("upload").warning(
             "status-line flash failed for project=%s after %.1fs: %s",
-            name,
+            log_safe(name),
             time.monotonic() - started,
             exc,
         )
