@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 from magent import psmux, tailnet
 from magent.icons import render_icon
 from magent.lockfile import LockHeld, exclusive_lock
-from magent.log import get_logger
+from magent.log import get_logger, log_safe
 from magent.procs import predates_boot
 from magent.sessions import (
     FLASH_MSG_MAX,
@@ -1365,7 +1365,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             self._handle_get()
         except Exception:
             log = get_logger("upload")
-            log.exception("GET handler crashed for %s", self.path)
+            log.exception("GET handler crashed for %s", log_safe(self.path))
             with contextlib.suppress(OSError):
                 self._json_response({"ok": False, "error": "internal"}, 500)
 
@@ -1404,7 +1404,7 @@ class UploadHandler(BaseHTTPRequestHandler):
                 # without this "the status isn't showing" is unanswerable after
                 # the fact: this says which phase messages arrived, and when.
                 get_logger("upload").info(
-                    "flash project=%s msg=%r", flash_project, clamped
+                    "flash project=%s msg=%r", log_safe(flash_project), clamped
                 )
                 _flash(
                     None,
@@ -1494,7 +1494,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             self._handle_post()
         except Exception:
             log = get_logger("upload")
-            log.exception("POST handler crashed for %s", self.path)
+            log.exception("POST handler crashed for %s", log_safe(self.path))
             with contextlib.suppress(OSError):
                 self._json_response({"ok": False, "error": "internal"}, 500)
 
@@ -1615,7 +1615,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             elif inject:
                 log.warning(
                     "upload project=%s requested inject but psmux is unavailable",
-                    project,
+                    log_safe(project),
                 )
 
             ok = True
@@ -1639,7 +1639,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             log.info(
                 "upload project=%s ok=%s files=%d bytes=%d injected=%s pending=%s "
                 "suffix=%s",
-                project,
+                log_safe(project),
                 ok,
                 file_count,
                 byte_count,

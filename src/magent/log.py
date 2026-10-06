@@ -292,6 +292,13 @@ class _SharedRotatingFileHandler(logging.handlers.RotatingFileHandler):
                     os.close(fd)
 
 
+def log_safe(value: object) -> str:
+    """``value`` as one log-line-safe string: CR/LF are escaped, so a
+    request-controlled value (a URL path, a project name) cannot forge a
+    second record in the log file."""
+    return str(value).replace("\r", "\\r").replace("\n", "\\n")
+
+
 def get_logger(name: str) -> logging.Logger:
     """Return the ``magent.<name>`` logger, attaching a rotating file
     handler under LOG_DIR on first use. Idempotent -- repeat calls return the
