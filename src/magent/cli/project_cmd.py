@@ -82,9 +82,13 @@ class Removed:
 
 
 def _can_prompt() -> bool:
-    """The one terminal gate: the same ``sys.stdin.isatty()`` question every
-    other interactive list in the CLI asks. A seam so a test can answer it."""
-    return sys.stdin.isatty()
+    """Is a person at this console? The product's one answer
+    (`console.human_at_console`: on Windows a bare ``isatty`` is True for NUL,
+    so a script would "ask" a question nobody can answer). A seam so a test can
+    answer it."""
+    from magent import console
+
+    return console.human_at_console()
 
 
 def _slash(path: str | Path) -> str:

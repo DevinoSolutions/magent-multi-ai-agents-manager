@@ -23,6 +23,7 @@ from pathlib import Path
 
 import click
 
+from magent.cli import project_cmd
 from magent.cli.app import main
 from magent.cli.config_io import (
     _as_dict,
@@ -704,7 +705,11 @@ def config_remove(ctx: click.Context, path: str, stop: bool) -> None:
     config_file = find_config(ctx.obj.get("config_path"))
     try:
         gone = remove_project(
-            config_file, path, loose=False, stop=stop, interactive=sys.stdin.isatty()
+            config_file,
+            path,
+            loose=False,
+            stop=stop,
+            interactive=project_cmd._can_prompt(),
         )
     except ProjectError as exc:
         click.echo(f"  {exc}", err=True)
