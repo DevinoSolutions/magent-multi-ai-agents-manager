@@ -34,8 +34,16 @@ MD006  Every ``wt`` argv literal must carry ``--suppressApplicationTitle``. The
        the tab — Claude Code, a shell prompt, ssh — renames the window out of the
        grammar with one OSC escape and the window becomes invisible to every one
        of those consumers.
+MD007  No psmux argv list/tuple literal outside ``src/magent/psmux.py``. A literal
+       whose first element is a psmux executable (``"psmux"``/``"psmux.exe"``/
+       ``"pmux"``/``"pmux.exe"``, a ``find_psmux()`` call, or a ``psmux``/
+       ``psmux_bin``/``psmux_exe`` name) is a hand-built psmux command; psmux.py
+       is the single owner of every psmux subprocess interaction, so the argv
+       comes from a named builder there (``attach_argv``, ``new_session_argv``,
+       ``send_keys_argv``, ``type_command_argv``, ...). No allowlist: there is no
+       legitimate exception today.
 
-Scopes: MD001/002/003/006 apply to ``src/magent/`` only; MD005 to
+Scopes: MD001/002/003/006/007 apply to ``src/magent/`` only; MD005 to
 ``src/magent/cli/`` only; MD004 applies to ``src`` + ``scripts`` + ``tests``.
 """
 
@@ -121,6 +129,13 @@ WT_TITLE_LOCK_FLAG = "--suppressApplicationTitle"
 # MD006: exec name that identifies a Windows Terminal spawn argv, matched on the
 # FIRST element of a list/tuple display (`["wt", "-w", "new", ...]`).
 WT_EXEC_NAMES = ("wt", "wt.exe")
+
+
+# MD007: the one module that may build a psmux argv, and how a psmux executable
+# is spelled as the FIRST element of an argv literal.
+PSMUX_OWNER = "src/magent/psmux.py"
+PSMUX_EXEC_STRINGS = ("psmux", "psmux.exe", "pmux", "pmux.exe")
+PSMUX_EXEC_NAMES = ("psmux", "psmux_bin", "psmux_exe", "psmux_path")
 
 
 class Finding(NamedTuple):
@@ -228,6 +243,51 @@ def _wt_argv_findings(rel: str, tree: ast.Module) -> list[Finding]:
     return out
 
 
+def _is_psmux_argv(node: ast.List | ast.Tuple) -> bool:
+    """True for a list/tuple display whose first element names a psmux binary."""
+    if not node.elts:
+        return False
+    first = node.elts[0]
+    if isinstance(first, ast.Constant):
+        # A bare "psmux" leading a data tuple (`("psmux", "tmux")`, a docs table
+        # row) is not a command: a psmux argv's next token is always a flag.
+        second = node.elts[1] if len(node.elts) > 1 else None
+        return (
+            isinstance(first.value, str)
+            and first.value.lower() in PSMUX_EXEC_STRINGS
+            and isinstance(second, ast.Constant)
+            and isinstance(second.value, str)
+            and second.value.startswith("-")
+        )
+    if isinstance(first, ast.Name):
+        return first.id in PSMUX_EXEC_NAMES
+    if isinstance(first, ast.Call):
+        func = first.func
+        called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+        return called == "find_psmux"
+    return False
+
+
+def _psmux_argv_findings(rel: str, tree: ast.Module) -> list[Finding]:
+    """MD007 — a hand-built psmux argv outside the psmux module."""
+    out: list[Finding] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.List, ast.Tuple)) and _is_psmux_argv(node):
+            out.append(
+                Finding(
+                    rel,
+                    node.lineno,
+                    node.col_offset + 1,
+                    "MD007",
+                    "psmux argv built outside psmux.py — add or reuse a named "
+                    "builder there (attach_argv, new_session_argv, "
+                    "send_keys_argv, ...); psmux.py owns every psmux subprocess "
+                    "interaction",
+                )
+            )
+    return out
+
+
 def _is_type_checking_guard(test: ast.expr) -> bool:
     """True for an ``if TYPE_CHECKING:`` / ``if typing.TYPE_CHECKING:`` test."""
     if isinstance(test, ast.Name):
@@ -310,7 +370,7 @@ def _heavy_import_findings(rel: str, tree: ast.Module) -> list[Finding]:
 
 
 def _ast_rules(rel: str, source: str) -> list[Finding]:
-    """MD001/002/003/006 (src/magent/) + MD005 (src/magent/cli/)."""
+    """MD001/002/003/006/007 (src/magent/) + MD005 (src/magent/cli/)."""
     out: list[Finding] = []
     try:
         tree = ast.parse(source, filename=rel)
@@ -378,6 +438,8 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
                 )
             )
     out += _wt_argv_findings(rel, tree)
+    if rel != PSMUX_OWNER:
+        out += _psmux_argv_findings(rel, tree)
     if in_cli:
         out += _heavy_import_findings(rel, tree)
     return out
