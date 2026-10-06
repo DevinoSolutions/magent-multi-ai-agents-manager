@@ -71,9 +71,11 @@ class TestTerminate:
         assert _wait_gone(child)
 
     def test_a_recycled_pid_is_not_touched(self, tmp_path, child):
+        # Only seconds older than the child: an hour-old record would predate
+        # a fresh CI runner's boot, which `read` already treats as stale.
         # The record is older than the process now wearing the number: the
         # recorded process died and the OS handed its pid to a stranger.
-        path = _record(tmp_path, child.pid, mtime=time.time() - 3600)
+        path = _record(tmp_path, child.pid, mtime=time.time() - 30)
 
         pid, outcome = pidfile.terminate(path)
 
