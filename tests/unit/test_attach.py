@@ -251,6 +251,7 @@ class TestLastAttachHost:
     def test_prompt_prefers_last_host_over_config(self, monkeypatch, tmp_path):
         import click
 
+        _fake_platform(monkeypatch)
         attach_mod = self._isolate(monkeypatch, tmp_path)
         attach_mod._remember_last_host("demo@last-used")
         monkeypatch.setattr(attach_mod, "_default_attach_host", lambda: "demo@config")
