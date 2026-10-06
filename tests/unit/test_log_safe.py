@@ -2,14 +2,14 @@
 
 from magent.log import log_safe
 
+BACKSLASH = chr(92)
+
 
 def test_crlf_cannot_forge_a_second_record():
-    out = log_safe("a
-INFO forged")
-    assert "
-" not in out
-    assert "" not in out
-    assert out == "a" + chr(92) + "r" + chr(92) + "nINFO forged"
+    out = log_safe("a\r\nINFO forged")
+    assert "\n" not in out
+    assert "\r" not in out
+    assert out == "a" + BACKSLASH + "r" + BACKSLASH + "nINFO forged"
 
 
 def test_plain_text_is_unchanged():
