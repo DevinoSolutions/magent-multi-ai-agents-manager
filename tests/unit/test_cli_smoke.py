@@ -21,6 +21,8 @@ HELP_TARGETS = [
     ["sessions"],
     ["status"],
     ["down"],
+    ["new"],
+    ["remove"],
     ["config", "show"],
     ["config", "migrate"],
     ["config", "layout"],
@@ -132,7 +134,9 @@ def test_config_path(runner, tmp_config):
     assert str(Path(cfgpath)) in result.output
 
 
-def test_config_add_then_remove(runner, tmp_config):
+def test_config_add_then_remove(runner, tmp_config, monkeypatch):
+    # `remove` asks psmux whether the project's session is live: none installed.
+    monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
     cfgpath = tmp_config({"projects": []})
 
     added = runner.invoke(main, ["--config", cfgpath, "config", "add", "myapp"])

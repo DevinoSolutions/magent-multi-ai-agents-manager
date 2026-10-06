@@ -470,6 +470,29 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         ),
     ),
     (
+        "magent new <name> [--in DIR] [-g GROUP] [-t TOOL] [--no-git] [--open|--no-open] [--json]",
+        (
+            "Create `<baseDir>/<name>`, add it to the config and `git init` it (no "
+            "commit, no remote) -- one folder per agent chat, tracked by magent. "
+            "`baseDir` unset: asked once at a terminal and saved; elsewhere it "
+            "refuses naming `--in DIR`. An existing EMPTY folder is fine, a "
+            "non-empty one or a duplicate name is refused before anything is "
+            "written. At a terminal it then asks to open just that project (no "
+            "fleet re-tile); `--open`/`--no-open` skip the question."
+        ),
+    ),
+    (
+        "magent remove <name> [--stop] [--json]",
+        (
+            "Take a project out of the config. NEVER deletes its folder or any "
+            "file. A running session is stopped first (asked at a terminal, or "
+            "`--stop`; refused otherwise) so it is not orphaned -- `down --all` "
+            "only acts on configured sessions. NAME is case-insensitive and a "
+            "unique part is enough; an ambiguous one lists candidates. A project "
+            "placed on a node is refused with a pointer to `magent down <name>`."
+        ),
+    ),
+    (
         "magent send <session> <text>",
         (
             "Paste a prompt into one running agent and press Enter, then confirm it "
@@ -597,7 +620,14 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         "magent config add <path> [-g GROUP] [-t TOOL] [--node NICK|auto]",
         "Add a project (`--node` runs it on a pool node).",
     ),
-    ("magent config remove <path>", "Remove a project."),
+    (
+        "magent config remove <path> [--stop]",
+        (
+            "Remove a project (exact path or folder name only; `magent remove` is "
+            "the fuzzy one). Never deletes the folder; a running session is "
+            "stopped first (asked at a terminal, or `--stop`)."
+        ),
+    ),
     ("magent config enable <path>", "Enable a project."),
     ("magent config disable <path>", "Disable a project."),
     (

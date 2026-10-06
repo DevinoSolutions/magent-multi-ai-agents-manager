@@ -36,6 +36,7 @@ from magent.cli.config_io import (
     _sublist,
     _validate_config_text,
 )
+from magent.cli.project_cmd import ProjectError, remove_project, report_removed
 from magent.cli.ui import (
     _banner,
     _confirm_change,
@@ -688,30 +689,27 @@ def config_add(
 
 @config.command("remove")
 @click.argument("path")
+@click.option(
+    "--stop",
+    is_flag=True,
+    help="Stop its running session first, without asking",
+)
 @click.pass_context
-def config_remove(ctx: click.Context, path: str) -> None:
-    """Remove a project by path (or leaf name)."""
+def config_remove(ctx: click.Context, path: str, stop: bool) -> None:
+    """Remove a project by path (or leaf name). Never deletes its folder.
+
+    The same removal as `magent remove`, minus the fuzzy name match: a running
+    session is stopped first (asked at a terminal, or pass --stop).
+    """
     config_file = find_config(ctx.obj.get("config_path"))
-    data = _load_raw_config(config_file)
-    projects = _project_dicts(data)
-    normalized = path.replace("\\", "/")
-
-    before = len(projects)
-    kept = [
-        p
-        for p in projects
-        if _as_str(p.get("path")) != normalized
-        and Path(_as_str(p.get("path"))).name != path
-    ]
-    data["projects"] = kept
-
-    removed = before - len(kept)
-    if removed == 0:
-        click.echo(f"  No project matching '{path}' found.", err=True)
+    try:
+        gone = remove_project(
+            config_file, path, loose=False, stop=stop, interactive=sys.stdin.isatty()
+        )
+    except ProjectError as exc:
+        click.echo(f"  {exc}", err=True)
         sys.exit(1)
-
-    _save_raw_config(config_file, data)
-    click.echo(f"  Removed {removed} project(s) matching {style(path, fg='cyan')}")
+    report_removed(gone)
 
 
 @config.command("enable")
