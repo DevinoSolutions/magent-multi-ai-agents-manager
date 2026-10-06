@@ -697,9 +697,9 @@ def config_add(
 )
 @click.pass_context
 def config_remove(ctx: click.Context, path: str, stop: bool) -> None:
-    """Remove a project by path (or leaf name). Never deletes its folder.
+    """Remove a project by path, folder name or title. Never deletes its folder.
 
-    The same removal as `magent remove`, minus the fuzzy name match: a running
+    The same removal as `magent remove`, exact matches only: a running
     session is stopped first (asked at a terminal, or pass --stop).
     """
     config_file = find_config(ctx.obj.get("config_path"))
@@ -707,7 +707,6 @@ def config_remove(ctx: click.Context, path: str, stop: bool) -> None:
         gone = remove_project(
             config_file,
             path,
-            loose=False,
             stop=stop,
             interactive=project_cmd._can_prompt(),
         )

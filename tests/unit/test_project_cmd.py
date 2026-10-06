@@ -90,14 +90,29 @@ class TestNameValidation:
             "COM1",
             "lpt9",
             "con.txt",
+            "CON.tar.gz",
             "a\tb",
+            "-rf",
+            "--flag",
+            ".hidden",
+            ".git",
+            "COM\u00b9",
+            "lpt\u00b2.txt",
+            "COM\u00b3",
+            "CONIN$",
+            "conout$",
+            "a\x7fb",
+            "a\x85b",
+            "zero\u200bwidth",
+            "bom\ufeffname",
+            "bidi\u202eevil",
         ],
     )
     def test_refuses(self, name):
         assert project_cmd.name_problem(name)
 
     @pytest.mark.parametrize(
-        "name", ["myapp", "my-app_2", "App.v2", "console", "COM10"]
+        "name", ["myapp", "my-app_2", "App.v2", "console", "COM10", "a-b", "caf\u00e9"]
     )
     def test_accepts(self, name):
         assert project_cmd.name_problem(name) is None
@@ -157,6 +172,22 @@ class TestNew:
             "\\", "/"
         )
 
+    def test_in_stores_absolute_not_resolved(
+        self, runner, tmp_config, base, tmp_path, no_git, monkeypatch
+    ):
+        """`--in rel` is stored as the absolute spelling the user typed under
+        the cwd (forward slashes) -- `.resolve()` would bake a symlink or a
+        junction target into the config."""
+        monkeypatch.chdir(tmp_path)
+        cfg = tmp_config({"baseDir": str(base), "projects": []})
+        result = runner.invoke(
+            cli.main, ["--config", cfg, "new", "beta", "--in", "rel", "--no-open"]
+        )
+        assert result.exit_code == 0, result.output
+        stored = _read(cfg)["projects"][0]["path"]
+        assert stored == (tmp_path / "rel" / "beta").absolute().as_posix()
+        assert "\\" not in stored
+
     def test_an_existing_empty_folder_is_fine(self, runner, tmp_config, base, no_git):
         (base / "alpha").mkdir()
         cfg = tmp_config({"baseDir": str(base), "projects": []})
@@ -186,6 +217,102 @@ class TestNew:
             assert result.exit_code == 1, name
             assert "already a project" in result.stderr
         assert not (base / "beta").exists()
+
+    def test_refuses_a_psmux_session_name_collision(
+        self, runner, tmp_config, base, no_git
+    ):
+        cfg = tmp_config({"baseDir": str(base), "projects": [{"path": "foo-bar"}]})
+        result = runner.invoke(cli.main, ["--config", cfg, "new", "foo bar"])
+        assert result.exit_code == 1
+        assert "session name" in result.stderr
+        assert "foo-bar" in result.stderr
+        assert not (base / "foo bar").exists()
+        assert len(_read(cfg)["projects"]) == 1
+
+    def test_a_failed_config_save_removes_the_folder_this_run_made(
+        self, runner, tmp_config, base, no_git, monkeypatch
+    ):
+        cfg = tmp_config({"baseDir": str(base), "projects": []})
+
+        def _boom(path, data):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(project_cmd, "_save_raw_config", _boom)
+        result = runner.invoke(cli.main, ["--config", cfg, "new", "alpha"])
+        assert result.exit_code == 1
+        assert "disk full" in result.stderr
+        assert not (base / "alpha").exists()
+        assert _read(cfg)["projects"] == []
+
+    def test_a_failed_save_keeps_a_folder_that_was_already_there(
+        self, runner, tmp_config, base, no_git, monkeypatch
+    ):
+        (base / "alpha").mkdir()
+        cfg = tmp_config({"baseDir": str(base), "projects": []})
+
+        def _boom(path, data):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(project_cmd, "_save_raw_config", _boom)
+        result = runner.invoke(cli.main, ["--config", cfg, "new", "alpha"])
+        assert result.exit_code == 1
+        assert (base / "alpha").is_dir()
+
+    def test_git_init_runs_after_the_config_is_saved(
+        self, runner, tmp_config, base, monkeypatch
+    ):
+        order: list[str] = []
+        real_save = project_cmd._save_raw_config
+
+        def _save(path, data):
+            order.append("save")
+            real_save(path, data)
+
+        def _git(folder):
+            order.append("git")
+            return True, ""
+
+        monkeypatch.setattr(project_cmd, "_save_raw_config", _save)
+        monkeypatch.setattr(project_cmd, "_git_init", _git)
+        cfg = tmp_config({"baseDir": str(base), "projects": []})
+        result = runner.invoke(cli.main, ["--config", cfg, "new", "alpha", "--no-open"])
+        assert result.exit_code == 0, result.output
+        assert order == ["save", "git"]
+
+    def test_a_git_failure_after_the_save_is_a_warning_not_a_failure(
+        self, runner, tmp_config, base, monkeypatch
+    ):
+        monkeypatch.setattr(
+            project_cmd, "_git_init", lambda folder: (False, "git init failed: boom")
+        )
+        cfg = tmp_config({"baseDir": str(base), "projects": []})
+        result = runner.invoke(cli.main, ["--config", cfg, "new", "alpha", "--no-open"])
+        assert result.exit_code == 0, result.output
+        assert "git init failed: boom" in result.output
+        assert [p["path"] for p in _read(cfg)["projects"]] == ["alpha"]
+
+    def test_git_init_ignores_an_inherited_git_dir(
+        self, runner, tmp_config, base, tmp_path, monkeypatch
+    ):
+        """Run from inside a git hook, GIT_DIR names the HOOK's repo; `git
+        init` must still land its .git in the new folder."""
+        if not shutil.which("git"):
+            pytest.skip("git not installed")
+        decoy = tmp_path / "decoy.git"
+        decoy.mkdir()
+        for var in (
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+        ):
+            monkeypatch.setenv(var, str(decoy))
+        cfg = tmp_config({"baseDir": str(base), "projects": []})
+        result = runner.invoke(cli.main, ["--config", cfg, "new", "alpha", "--no-open"])
+        assert result.exit_code == 0, result.output
+        assert (base / "alpha" / ".git").is_dir()
+        assert list(decoy.iterdir()) == []
 
     def test_refuses_a_bad_name_before_creating_anything(
         self, runner, tmp_config, base, no_git
@@ -312,7 +439,24 @@ class TestNewOpens:
         assert opts.only == frozenset({"Alpha"})
         assert opts.retile_all is False
         assert opts.tile_only is False
+        assert opts.fill_free_slot is True
         assert opts.config_path == cfg
+
+    def test_open_goes_through_the_node_ready_gate(
+        self, runner, tmp_config, base, no_git, launched, monkeypatch
+    ):
+        asked: list[list[str]] = []
+
+        def _gate(cfg, scope):
+            asked.append([p.path for p in scope])
+            return cfg
+
+        monkeypatch.setattr("magent.cli.node_onboard.ready_gate", _gate)
+        cfg = tmp_config({"baseDir": str(base), "projects": []})
+        result = runner.invoke(cli.main, ["--config", cfg, "new", "alpha", "--open"])
+        assert result.exit_code == 0, result.output
+        assert len(asked) == 1
+        assert len(launched) == 1
 
     def test_at_a_terminal_yes_opens(
         self, runner, tmp_config, base, no_git, launched, monkeypatch
@@ -380,24 +524,89 @@ class TestRemove:
         assert "left in place" in result.output
         assert str(folder).replace("\\", "/") in result.output
 
-    def test_name_is_case_insensitive_and_a_unique_part_is_enough(
-        self, runner, tmp_config, tmp_path, fleet
-    ):
+    def test_name_is_case_insensitive(self, runner, tmp_config, tmp_path, fleet):
         cfg = self._cfg(tmp_config, tmp_path, "Alpha-Service", "beta")
         assert (
-            runner.invoke(cli.main, ["--config", cfg, "remove", "alpha"]).exit_code == 0
+            runner.invoke(
+                cli.main, ["--config", cfg, "remove", "ALPHA-service"]
+            ).exit_code
+            == 0
         )
         assert [p["path"] for p in _read(cfg)["projects"]] == ["beta"]
 
-    def test_ambiguous_lists_candidates_and_refuses(
-        self, runner, tmp_config, tmp_path, fleet
-    ):
-        cfg = self._cfg(tmp_config, tmp_path, "api-one", "api-two")
+    def test_a_title_matches_exactly(self, runner, tmp_config, tmp_path, fleet):
+        cfg = tmp_config(
+            {
+                "baseDir": str(tmp_path),
+                "projects": [{"path": "alpha", "title": "Website"}, {"path": "b"}],
+            }
+        )
+        result = runner.invoke(cli.main, ["--config", cfg, "remove", "website"])
+        assert result.exit_code == 0, result.output
+        assert [p["path"] for p in _read(cfg)["projects"]] == ["b"]
+
+    def test_a_part_of_a_name_never_matches(self, runner, tmp_config, tmp_path, fleet):
+        """A destructive verb does not guess: `alpha` is not `Alpha-Service`."""
+        cfg = self._cfg(tmp_config, tmp_path, "Alpha-Service", "beta")
+        result = runner.invoke(cli.main, ["--config", cfg, "remove", "alpha"])
+        assert result.exit_code == 1
+        assert "No project matching 'alpha'" in result.stderr
+        assert "Alpha-Service" in result.stderr  # offered, never acted on
+        assert len(_read(cfg)["projects"]) == 2
+
+    def test_a_near_miss_lists_closest_names(self, runner, tmp_config, tmp_path, fleet):
+        cfg = self._cfg(tmp_config, tmp_path, "api-one", "api-two", "zzz")
         result = runner.invoke(cli.main, ["--config", cfg, "remove", "api"])
         assert result.exit_code == 1
         assert "api-one" in result.stderr
         assert "api-two" in result.stderr
+        assert len(_read(cfg)["projects"]) == 3
+
+    def test_an_exact_absolute_path_matches(self, runner, tmp_config, tmp_path, fleet):
+        cfg = self._cfg(tmp_config, tmp_path, "alpha", "beta")
+        full = (tmp_path / "alpha").as_posix()
+        result = runner.invoke(cli.main, ["--config", cfg, "remove", full])
+        assert result.exit_code == 0, result.output
+        assert [p["path"] for p in _read(cfg)["projects"]] == ["beta"]
+
+    def test_same_leaf_in_different_folders_is_ambiguous_by_full_path(
+        self, runner, tmp_config, tmp_path, fleet
+    ):
+        one, two = tmp_path / "one" / "app", tmp_path / "two" / "app"
+        cfg = tmp_config(
+            {
+                "baseDir": str(tmp_path),
+                "projects": [{"path": one.as_posix()}, {"path": two.as_posix()}],
+            }
+        )
+        result = runner.invoke(cli.main, ["--config", cfg, "remove", "app"])
+        assert result.exit_code == 1
+        assert "ambiguous" in result.stderr
+        assert one.as_posix() in result.stderr
+        assert two.as_posix() in result.stderr
         assert len(_read(cfg)["projects"]) == 2
+        # the full path disambiguates
+        ok = runner.invoke(cli.main, ["--config", cfg, "remove", two.as_posix()])
+        assert ok.exit_code == 0, ok.output
+        assert [p["path"] for p in _read(cfg)["projects"]] == [one.as_posix()]
+
+    def test_the_same_folder_listed_twice_goes_in_one_removal(
+        self, runner, tmp_config, tmp_path, fleet
+    ):
+        cfg = tmp_config(
+            {
+                "baseDir": str(tmp_path),
+                "projects": [
+                    {"path": "app"},
+                    {"path": (tmp_path / "app").as_posix()},
+                    {"path": "other"},
+                ],
+            }
+        )
+        result = runner.invoke(cli.main, ["--config", cfg, "remove", "app"])
+        assert result.exit_code == 0, result.output
+        assert "2 entries" in result.output
+        assert [p["path"] for p in _read(cfg)["projects"]] == ["other"]
 
     def test_unknown_name_refuses(self, runner, tmp_config, tmp_path, fleet):
         cfg = self._cfg(tmp_config, tmp_path, "alpha")

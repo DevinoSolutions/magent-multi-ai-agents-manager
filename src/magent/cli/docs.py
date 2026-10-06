@@ -487,9 +487,10 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "Take a project out of the config. NEVER deletes its folder or any "
             "file. A running session is stopped first (asked at a terminal, or "
             "`--stop`; refused otherwise) so it is not orphaned -- `down --all` "
-            "only acts on configured sessions. NAME is case-insensitive and a "
-            "unique part is enough; an ambiguous one lists candidates. A project "
-            "placed on a node is refused with a pointer to `magent down <name>`."
+            "only acts on configured sessions. NAME is matched exactly, case-insensitively "
+            "(name, folder name, title or full path; never a part of one -- a near "
+            "miss lists the closest names, two folders sharing a name need the "
+            "full path). A project placed on a node is refused with a pointer to `magent down <name>`."
         ),
     ),
     (
@@ -623,8 +624,8 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
     (
         "magent config remove <path> [--stop]",
         (
-            "Remove a project (exact path or folder name only; `magent remove` is "
-            "the fuzzy one). Never deletes the folder; a running session is "
+            "Remove a project (exact path, folder name or title, like `magent "
+            "remove`). Never deletes the folder; a running session is "
             "stopped first (asked at a terminal, or `--stop`)."
         ),
     ),

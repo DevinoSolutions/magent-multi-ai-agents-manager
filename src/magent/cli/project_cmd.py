@@ -21,11 +21,14 @@ created or written.
 
 from __future__ import annotations
 
+import contextlib
+import difflib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -50,9 +53,9 @@ from magent.titles import get_leaf_name
 # Names Windows refuses as a file or folder, with or without an extension
 # ("CON.txt" is as reserved as "CON").
 _RESERVED_NAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{i}" for i in range(1, 10)}
-    | {f"LPT{i}" for i in range(1, 10)}
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"COM{i}" for i in "123456789\u00b9\u00b2\u00b3"}
+    | {f"LPT{i}" for i in "123456789\u00b9\u00b2\u00b3"}
 )
 _INVALID_NAME_CHARS = frozenset('<>:"/\\|?*')
 _GIT_TIMEOUT_S = 30
@@ -117,12 +120,25 @@ def name_problem(name: str) -> str | None:
         )
     if ".." in name:
         return f"'{name}' cannot contain '..'"
-    bad = sorted({c for c in name if c in _INVALID_NAME_CHARS or ord(c) < 32})
+    # Cc (control) and Cf (format: zero-width, bidi overrides, BOM) are
+    # invisible -- a folder the user cannot see the name of.
+    bad = sorted(
+        {
+            c
+            for c in name
+            if c in _INVALID_NAME_CHARS or unicodedata.category(c) in ("Cc", "Cf")
+        }
+    )
     if bad:
         shown = " ".join(repr(c)[1:-1] for c in bad)
         return f"'{name}' contains characters a folder name cannot have: {shown}"
     if name != name.strip() or name.endswith("."):
         return f"'{name}' cannot start or end with a space, or end with a dot"
+    if name[0] in "-.":
+        return (
+            f"'{name}' cannot start with '{name[0]}' (a flag or a hidden folder, "
+            "not a project name)"
+        )
     if name.split(".")[0].rstrip(" ").upper() in _RESERVED_NAMES:
         return f"'{name}' is a reserved device name on Windows"
     return None
@@ -141,6 +157,9 @@ def _project_folder(data: dict[str, object], entry: dict[str, object]) -> str:
 
 
 def _already_configured(data: dict[str, object], name: str, target: Path) -> str | None:
+    from magent import psmux  # heavy subsystem: in-body per policy
+
+    sid = psmux.session_name(name)
     for entry in _project_dicts(data):
         leaf = get_leaf_name(_as_str(entry.get("path")))
         title = _as_str(entry.get("title"))
@@ -148,6 +167,14 @@ def _already_configured(data: dict[str, object], name: str, target: Path) -> str
             _project_folder(data, entry), target
         ):
             return f"'{name}' is already a project ({_as_str(entry.get('path'))})"
+        # Two projects whose names differ only where psmux rewrites them
+        # (`foo bar` / `foo-bar`) would share ONE session -- the second launch
+        # would attach to the first project's agent.
+        if sid == psmux.session_name(_project_name(entry)):
+            return (
+                f"'{name}' would share the psmux session name '{sid}' with the "
+                f"project '{_project_name(entry)}' ({_as_str(entry.get('path'))})"
+            )
     return None
 
 
@@ -175,6 +202,8 @@ def _choose_base_dir(data: dict[str, object], interactive: bool) -> str:
 def _git_init(folder: Path) -> tuple[bool, str]:
     """``git init`` in FOLDER: ``(done, why-not)``. No commit, no remote. A
     missing git is a dim note, never a failure."""
+    from magent import env  # heavy subsystem: in-body per policy
+
     git = shutil.which("git")
     if not git:
         return False, "git not found on PATH -- skipped git init"
@@ -182,6 +211,9 @@ def _git_init(folder: Path) -> tuple[bool, str]:
         proc = subprocess.run(
             [git, "init", "--quiet"],
             cwd=folder,
+            # Run from a git hook, GIT_DIR/GIT_WORK_TREE name the HOOK's repo
+            # and `git init` would re-initialize that one, not this folder.
+            env=env.git_child_env(),
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_S,
@@ -217,7 +249,7 @@ def create_project(
 
     chosen_base: str | None = None
     if parent:
-        parent_dir = Path(_expand(parent)).resolve()
+        parent_dir = Path(_expand(parent)).absolute()
         stored_base = _as_str(data.get("baseDir"))
         in_base = bool(stored_base) and _same_path(parent_dir, _expand(stored_base))
         stored_path = name if in_base else _slash(parent_dir / name)
@@ -255,12 +287,23 @@ def create_project(
     if why is not None:
         raise ProjectError(f"not saved: {why}")
 
+    made_folder = not target.exists()
     try:
         target.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise ProjectError(f"could not create {_slash(target)}: {exc}") from exc
+    try:
+        _save_raw_config(config_file, data)
+    except OSError as exc:
+        # The entry never landed, so the folder this run made is an orphan --
+        # take it back, but only while it is still empty (never someone's files).
+        if made_folder:
+            with contextlib.suppress(OSError):
+                target.rmdir()
+        raise ProjectError(f"could not save {_slash(config_file)}: {exc}") from exc
+    # git last: the project is already tracked, so a failing `git init` is a
+    # warning about a folder that exists and is configured, never a rollback.
     git_done, git_note = _git_init(target) if use_git else (False, "")
-    _save_raw_config(config_file, data)
     return Created(
         name=title or name,
         folder=_slash(target.resolve()),
@@ -274,18 +317,27 @@ def create_project(
 def _open_only(config_file: Path, name: str) -> int:
     """Bring up ONLY ``name`` through the normal launch path -- the project
     checklist's own selection (``RunOpts.only``). No fleet-wide re-tile."""
+    from magent import nodes  # heavy subsystem: in-body per policy
+    from magent.cli.node_onboard import ready_gate
     from magent.launch import (  # heavy subsystem: in-body per policy
         RunOpts,
         run_magent,
     )
 
     cfg = _load_config_or_exit(config_file)
+    only = frozenset({name})
+    # The same node-readiness gate the menu's and `--go`'s launch path runs.
+    cfg = ready_gate(
+        cfg,
+        [p for p in nodes.node_projects(cfg, None) if nodes.project_name(p) in only],
+    )
     return run_magent(
         cfg,
         RunOpts(
             retile_all=False,
             config_path=str(config_file),
-            only=frozenset({name}),
+            only=only,
+            fill_free_slot=True,
         ),
     )
 
@@ -446,38 +498,62 @@ def _project_name(entry: dict[str, object]) -> str:
     return _as_str(entry.get("title")) or get_leaf_name(_as_str(entry.get("path")))
 
 
-def _match_projects(
-    projects: list[dict[str, object]], query: str, *, loose: bool
-) -> list[dict[str, object]]:
-    """The entries ``query`` names. Always: an exact path, folder name or
-    title (all entries sharing it -- one project listed twice). With ``loose``
-    (``magent remove``): then a case-insensitive exact name, then the fleet's
-    one resolver (unique substring, else unique prefix). A loose match that
-    is not unique raises, naming the candidates."""
-    wanted = _slash(query)
-    exact = [
-        p
-        for p in projects
-        if wanted in (_slash(_as_str(p.get("path"))), _project_name(p))
-        or get_leaf_name(_as_str(p.get("path"))) == query
-    ]
-    if exact or not loose:
-        return exact
-    from magent import fleet  # heavy subsystem: in-body per policy
+def _folder_key(data: dict[str, object], entry: dict[str, object]) -> str:
+    return os.path.normcase(os.path.abspath(_project_folder(data, entry)))
 
-    names = [_project_name(p) for p in projects]
-    folded = [p for p in projects if _project_name(p).casefold() == query.casefold()]
-    if folded:
-        return folded
-    hit = fleet.resolve_session(query, names)
-    if hit is not None:
-        return [p for p in projects if _project_name(p) == hit]
-    near = [n for n in names if query.casefold() in n.casefold()]
-    if len(set(near)) > 1:
+
+def _closest_names(projects: list[dict[str, object]], query: str) -> list[str]:
+    """Up to three configured names resembling ``query`` -- offered in the
+    refusal, never acted on."""
+    names = list(dict.fromkeys(_project_name(p) for p in projects))
+    folded = {n.casefold(): n for n in names}
+    hits = [n for n in names if query.casefold() in n.casefold()]
+    for close in difflib.get_close_matches(query.casefold(), folded, n=3, cutoff=0.5):
+        if folded[close] not in hits:
+            hits.append(folded[close])
+    return hits[:3]
+
+
+def _match_projects(
+    data: dict[str, object], projects: list[dict[str, object]], query: str
+) -> list[dict[str, object]]:
+    """The entries ``query`` names -- EXACTLY, never by a part of a name.
+
+    An absolute ``query`` matches by resolved folder; anything else matches an
+    exact path string, folder name or title, case-insensitively. Several
+    entries on ONE folder are all returned (one project listed twice); entries
+    on DIFFERENT folders raise, naming each full path, because removal does not
+    guess -- the full path then picks one."""
+    wanted = _slash(query).casefold()
+    if os.path.isabs(_expand(query)):
+        key = os.path.normcase(os.path.abspath(_expand(query)))
+        found = [p for p in projects if _folder_key(data, p) == key]
+    else:
+        found = [
+            p
+            for p in projects
+            if wanted
+            in (
+                _slash(_as_str(p.get("path"))).casefold(),
+                _project_name(p).casefold(),
+                get_leaf_name(_as_str(p.get("path"))).casefold(),
+            )
+        ]
+    folders = list(dict.fromkeys(_folder_key(data, p) for p in found))
+    if len(folders) > 1:
+        paths = [
+            _slash(
+                _project_folder(
+                    data, next(p for p in found if _folder_key(data, p) == f)
+                )
+            )
+            for f in folders
+        ]
         raise ProjectError(
-            f"'{query}' is ambiguous: {', '.join(sorted(set(near)))} -- be more specific"
+            f"'{query}' is ambiguous -- {len(paths)} projects match: "
+            f"{', '.join(paths)}. Pass the full path of the one to remove."
         )
-    return []
+    return found
 
 
 def _is_node_project(entry: dict[str, object]) -> bool:
@@ -522,7 +598,6 @@ def remove_project(
     config_file: Path,
     query: str,
     *,
-    loose: bool = True,
     stop: bool = False,
     interactive: bool = False,
 ) -> Removed:
@@ -531,13 +606,17 @@ def remove_project(
     ProjectError (nothing written) on a refusal."""
     data = _load_raw_config(config_file)
     projects = _project_dicts(data)
-    matches = _match_projects(projects, query, loose=loose)
+    matches = _match_projects(data, projects, query)
     if not matches:
-        raise ProjectError(f"No project matching '{query}' found.")
+        close = _closest_names(projects, query)
+        hint = f" Closest: {', '.join(close)}." if close else ""
+        raise ProjectError(f"No project matching '{query}' found.{hint}")
     name = _project_name(matches[0])
     folder = _slash(_project_folder(data, matches[0]))
 
     notes: list[str] = []
+    if len(matches) > 1:
+        notes.append(f"{len(matches)} entries listed this folder; all were removed")
     for entry in matches:
         if _is_node_project(entry):
             placed = _node_placed(entry)
@@ -613,8 +692,10 @@ def report_removed(gone: Removed) -> None:
 def remove_cmd(ctx: click.Context, name: str, stop: bool, as_json: bool) -> None:
     """Remove a project from magent. Never deletes its folder or any file.
 
-    NAME is the project's name, folder name or path (case-insensitive; a
-    unique part of it is enough). A running session is stopped first -- asked
+    NAME is the project's exact name, folder name, title or full path
+    (case-insensitive; never a part of one -- a near miss lists the closest
+    names and removes nothing). Two projects sharing a folder name need the full
+    path. A running session is stopped first -- asked
     at a terminal, or pass --stop -- so it is not left behind with nothing
     tracking it. Exit 0 when removed, 1 when refused (nothing changes then).
     """
@@ -625,7 +706,6 @@ def remove_cmd(ctx: click.Context, name: str, stop: bool, as_json: bool) -> None
         gone = remove_project(
             config_file,
             name,
-            loose=True,
             stop=stop,
             interactive=_can_prompt() and not as_json,
         )
@@ -693,8 +773,6 @@ def menu_remove(config_file: Path) -> None:
     if answer.isdigit() and 1 <= int(answer) <= len(names):
         answer = names[int(answer) - 1]
     try:
-        report_removed(
-            remove_project(config_file, answer, loose=True, interactive=True)
-        )
+        report_removed(remove_project(config_file, answer, interactive=True))
     except ProjectError as exc:
         click.echo(f"  {style('x', fg='red')} {exc}", err=True)

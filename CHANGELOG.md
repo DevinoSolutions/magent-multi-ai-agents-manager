@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`magent config remove` now shares `magent remove`'s implementation**, so it
   also stops a running session first (asked at a terminal, or `--stop`) and
   refuses to orphan one when it cannot ask. It still matches exactly, never fuzzily.
+- **`magent config remove` behavior changes** with that shared code: it now
+  also matches a project's title (case-insensitively, as well as its path
+  and folder name); a running session now makes it refuse, without
+  `--stop`, when there is no terminal to ask at (it used to remove the
+  entry and orphan the session); and an unknown name prints
+  `No project matching 'x' found.` followed by the closest names.
 
 ### Fixed
 
