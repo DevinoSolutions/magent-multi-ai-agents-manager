@@ -71,10 +71,13 @@ Two remote mechanisms exist today and neither fits:
 ```python
 @dataclass(frozen=True)
 class NodeConfig:
-    nick: str                 # key of the dict; ASCII [a-z0-9-], 1..6 chars (status-bar budget)
+    nick: str  # key of the dict; ASCII [a-z0-9-], 1..6 chars (status-bar budget)
     host: str
-    user: str | None = None   # None -> env.local_username() at use time (never persisted)
+    user: str | None = (
+        None  # None -> env.local_username() at use time (never persisted)
+    )
     root: str = "~/magent"
+
 
 @dataclass(frozen=True)
 class NodeSyncConfig:
@@ -82,8 +85,9 @@ class NodeSyncConfig:
     sample_interval_s: int = 60
     history_h: int = 24
 
+
 # ProjectConfig gains:
-node: str | None = None      # a nick, or "auto"
+node: str | None = None  # a nick, or "auto"
 push: list[str] | None = None
 ```
 

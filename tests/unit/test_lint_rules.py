@@ -275,6 +275,7 @@ def test_md007_does_not_apply_outside_src():
     # tests assert on psmux argv shapes on purpose.
     assert _codes("tests/unit/test_x.py", 'a = ["psmux", "-L", n]\n') == []
 
+
 # ---- MD008: no bare process termination outside procs.py --------------------
 
 
