@@ -10,7 +10,6 @@ import os
 import re
 import socket
 import socketserver
-import subprocess
 import sys
 import threading
 import time
@@ -23,11 +22,10 @@ if TYPE_CHECKING:
     import logging
     from collections.abc import Callable, Sequence
 
-from magent import psmux, tailnet
+from magent import pidfile, psmux, tailnet
 from magent.icons import render_icon
 from magent.lockfile import LockHeld, exclusive_lock
-from magent.log import get_logger
-from magent.procs import predates_boot
+from magent.log import get_logger, log_safe
 from magent.sessions import (
     FLASH_MSG_MAX,
     FLASH_TINT_ERR,
@@ -43,54 +41,37 @@ def _pid_path(port: int) -> Path:
 
 
 def server_pid(port: int) -> int | None:
-    """Return the PID of the upload server recorded for this port, if any.
+    """Return the PID of the upload server recorded for this port, if it is
+    running.
 
-    A pid file written before the last boot records no server of ours: a
-    restart kills serve without letting it remove the file, and the OS hands
-    pid numbers out again. It is cleared and reads as None, because every
-    reader acts on the number -- `status` (DEAD vs off), `stop_server` (what to
-    taskkill) and the phone-URL port pick. The attention watchdog reads it for
-    its log line only and decides on the port probe alone.
+    A record of a process that is gone, or that predates the last boot, names
+    no server of ours (the OS hands pid numbers out again) and is cleared -- see
+    ``pidfile.read``. Every reader acts on the number: `status` (DEAD vs off),
+    `stop_server` (what to end) and the phone-URL port pick. The attention
+    watchdog reads it for its log line only and decides on the port probe alone.
     """
-    p = _pid_path(port)
-    if not p.exists():
-        return None
-    try:
-        pid = int(p.read_text().strip())
-        written = p.stat().st_mtime
-    except (ValueError, OSError):
-        return None
-    if predates_boot(written):
-        with contextlib.suppress(OSError):
-            p.unlink()
-        return None
-    return pid
+    return pidfile.read(_pid_path(port))
 
 
 def stop_server(port: int) -> bool:
     """Stop the upload server running on the given port. Returns True only if
-    the kill actually succeeded. On failure the pid file is kept (not
-    unlinked) so `status` or a retry can still find the process."""
+    the process was actually ended. On failure the pid file is kept (not
+    unlinked) so `status` or a retry can still find the process; a pid file
+    whose number now names a different process is cleared and ends nothing."""
     log = get_logger("upload")
-    pid = server_pid(port)
-    if not pid:
-        return False
-    try:
-        if sys.platform == "win32":
-            result = subprocess.run(
-                ["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False
-            )
-            if result.returncode != 0:
-                log.warning("taskkill pid %d failed rc=%d", pid, result.returncode)
-                return False
-        else:
-            os.kill(pid, 15)
-    except OSError:
-        log.warning("failed to stop upload server pid %d", pid)
-        return False
-    with contextlib.suppress(OSError):
-        _pid_path(port).unlink()
-    return True
+    path = _pid_path(port)
+    pid, outcome = pidfile.terminate(path)
+    if outcome == "terminated":
+        pidfile.clear_stale(path)
+        return True
+    if outcome == "mismatch":
+        log.warning(
+            "pid %s is not the upload server that wrote %s; left alone", pid, path.name
+        )
+        pidfile.clear_stale(path)
+    elif outcome in ("failed", "unverifiable"):
+        log.warning("could not stop upload server pid %s (%s)", pid, outcome)
+    return False
 
 
 _UPLOAD_DIR = Path.home() / ".magent" / "uploads"
@@ -1196,10 +1177,46 @@ def _uploaded_what(file_count: int, suffix: str) -> str:
 _FILENAME_RE = re.compile(r'\bfilename="([^"]*)"')
 
 
+_BODY_CHUNK_BYTES = 256 * 1024
+
+
 class UploadIncomplete(Exception):
     """The body ended before its declared length, or before the delimiter that
     closes its last part. What did arrive is not the file the user sent, so
-    nothing of it is saved or pasted."""
+    nothing of it is saved or pasted.
+
+    ``received``/``declared`` carry the byte counts so the one log line the
+    handler writes can say how far the client got before it went away."""
+
+    def __init__(self, reason: str, *, received: int = 0, declared: int = 0) -> None:
+        super().__init__(reason)
+        self.received = received
+        self.declared = declared
+
+
+# Windows socket errors for "the peer went away": WSAECONNABORTED / WSAECONNRESET.
+# Python maps them to ConnectionAbortedError / ConnectionResetError on its own,
+# but an OSError built from a bare errno (a C-level path, a wrapped re-raise)
+# keeps the raw number, so the numbers are checked too.
+_CLIENT_GONE_ERRNOS = frozenset({10053, 10054, errno.EPIPE, errno.ECONNRESET})
+
+
+def _client_went_away(exc: BaseException) -> bool:
+    """True when ``exc`` means the CLIENT hung up mid-request (a phone off wifi,
+    a listener that gave up), not that this server is broken.
+
+    Such a fault is expected traffic: it is logged as one WARNING, never at
+    exception level -- ERROR is what Sentry's logging integration captures, and
+    a vanished peer is not an error in magent.
+    """
+    if isinstance(exc, ConnectionError):  # Aborted, Reset, BrokenPipe, Refused
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return (
+        getattr(exc, "winerror", None) in _CLIENT_GONE_ERRNOS
+        or exc.errno in _CLIENT_GONE_ERRNOS
+    )
 
 
 def _disposition(header_str: str) -> tuple[str, str]:
@@ -1220,7 +1237,7 @@ def _disposition(header_str: str) -> tuple[str, str]:
     return name, filename
 
 
-def _next_delimiter(body: bytes, delim: bytes, start: int) -> int:
+def _next_delimiter(body: bytes | bytearray, delim: bytes, start: int) -> int:
     """Index of the CRLF that opens the next real delimiter at or after
     ``start``, or -1. A delimiter is ``CRLF--boundary`` followed by CRLF (another
     part) or ``--`` (the end); the same bytes followed by anything else are the
@@ -1263,12 +1280,25 @@ def _parse_multipart(
         length = 0
     if length <= 0:
         return {}, {}
+    # Read in chunks (one raw recv each) rather than one rfile.read(length): when
+    # the client vanishes mid-body the exception would carry none of what had
+    # already arrived, and the log line needs the byte count.
+    want = min(length, _request_limit())
+    body = bytearray()
     try:
-        body = handler.rfile.read(min(length, _request_limit()))
+        while len(body) < want:
+            chunk = handler.rfile.read1(min(_BODY_CHUNK_BYTES, want - len(body)))
+            if not chunk:
+                break
+            body += chunk
     except OSError as exc:  # a stalled or reset client, mid-body
-        raise UploadIncomplete(str(exc)) from exc
+        raise UploadIncomplete(str(exc), received=len(body), declared=length) from exc
     if len(body) < length:
-        raise UploadIncomplete(f"{len(body)} of {length} bytes arrived")
+        raise UploadIncomplete(
+            f"{len(body)} of {length} bytes arrived",
+            received=len(body),
+            declared=length,
+        )
 
     view = memoryview(body)
     delim = f"--{boundary}".encode()
@@ -1356,6 +1386,21 @@ class UploadHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def handle_one_request(self) -> None:
+        # A peer that RSTs before (or between) requests raises out of the
+        # request-line read, which is outside do_GET/do_POST's wrappers. The
+        # stdlib would answer it with a traceback on the detached daemon's
+        # invisible stderr; it is not a fault, so say nothing above DEBUG.
+        try:
+            super().handle_one_request()
+        except Exception as exc:
+            if not _client_went_away(exc):
+                raise
+            self.close_connection = True
+            get_logger("upload").debug(
+                "upload client went away between requests: %s", log_safe(repr(exc))
+            )
+
     def do_GET(self) -> None:
         # Any unhandled error in a request handler must land in the "upload"
         # log at ERROR (-> logfile stack + Sentry), never only in the detached
@@ -1363,9 +1408,17 @@ class UploadHandler(BaseHTTPRequestHandler):
         # wrapped, so even the pre-routing setup is covered.
         try:
             self._handle_get()
-        except Exception:
+        except Exception as exc:
             log = get_logger("upload")
-            log.exception("GET handler crashed for %s", self.path)
+            if _client_went_away(exc):
+                self.close_connection = True
+                log.warning(
+                    "upload client went away before the reply to GET %s: %s",
+                    log_safe(self.path),
+                    log_safe(repr(exc)),
+                )
+                return
+            log.exception("GET handler crashed for %s", log_safe(self.path))
             with contextlib.suppress(OSError):
                 self._json_response({"ok": False, "error": "internal"}, 500)
 
@@ -1404,7 +1457,7 @@ class UploadHandler(BaseHTTPRequestHandler):
                 # without this "the status isn't showing" is unanswerable after
                 # the fact: this says which phase messages arrived, and when.
                 get_logger("upload").info(
-                    "flash project=%s msg=%r", flash_project, clamped
+                    "flash project=%s msg=%r", log_safe(flash_project), clamped
                 )
                 _flash(
                     None,
@@ -1492,9 +1545,23 @@ class UploadHandler(BaseHTTPRequestHandler):
         # its inflight-count + outcome INFO line intact (P2-03).
         try:
             self._handle_post()
-        except Exception:
+        except Exception as exc:
             log = get_logger("upload")
-            log.exception("POST handler crashed for %s", self.path)
+            if _client_went_away(exc):
+                # The body was read in full (a mid-body loss is answered inside
+                # _handle_post) so this is the reply write: the upload is on
+                # disk and was pasted, only the answer had nowhere to go. One
+                # WARNING line, no traceback, nothing for Sentry.
+                self.close_connection = True
+                log.warning(
+                    "upload client went away before the reply to POST %s "
+                    "(request body %s bytes): %s",
+                    log_safe(self.path),
+                    log_safe(self.headers.get("Content-Length", "?")),
+                    log_safe(repr(exc)),
+                )
+                return
+            log.exception("POST handler crashed for %s", log_safe(self.path))
             with contextlib.suppress(OSError):
                 self._json_response({"ok": False, "error": "internal"}, 500)
 
@@ -1555,7 +1622,13 @@ class UploadHandler(BaseHTTPRequestHandler):
                 # A short body leaves the connection out of step with HTTP, and
                 # the client may already be gone: close, and answer if it can
                 # still hear.
-                log.warning("upload refused, body incomplete: %s", exc)
+                log.warning(
+                    "upload client went away mid-body on %s after %d of %d bytes: %s",
+                    log_safe(parsed.path),
+                    exc.received,
+                    exc.declared,
+                    log_safe(str(exc)),
+                )
                 self.close_connection = True
                 with contextlib.suppress(OSError):
                     self._json_response(
@@ -1615,7 +1688,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             elif inject:
                 log.warning(
                     "upload project=%s requested inject but psmux is unavailable",
-                    project,
+                    log_safe(project),
                 )
 
             ok = True
@@ -1639,7 +1712,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             log.info(
                 "upload project=%s ok=%s files=%d bytes=%d injected=%s pending=%s "
                 "suffix=%s",
-                project,
+                log_safe(project),
                 ok,
                 file_count,
                 byte_count,
@@ -2287,9 +2360,7 @@ def run_server(
         "listening on %s:%d pid %d", ", ".join(bound_addrs), port, UploadHandler.pid
     )
 
-    pid_file = _pid_path(port)
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(str(os.getpid()))
+    pidfile.write(_pid_path(port))
 
     for s in servers[1:]:
         threading.Thread(target=_serve_bind, args=(s, log), daemon=True).start()
@@ -2370,6 +2441,5 @@ def run_server(
             s.shutdown()  # called from a different thread than its serve_forever -> safe
         for s in servers:
             s.server_close()  # servers[0] exited via KeyboardInterrupt; just closes the socket
-        with contextlib.suppress(OSError):
-            pid_file.unlink()
+        pidfile.clear(_pid_path(port))
         log.info("stopped: %s", reason)

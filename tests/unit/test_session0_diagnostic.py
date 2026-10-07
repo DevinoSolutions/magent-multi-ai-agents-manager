@@ -125,8 +125,9 @@ class TestThePidReadersKeepTheEvidence:
         pid_file = tmp_path / "attention.pid"
         pid_file.write_text("70")
         monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: False)
         monkeypatch.setattr(attention_cmd, "pid_alive", lambda pid: False)
-        monkeypatch.setattr(attention_cmd, "pid_gone", lambda pid: False)
+        monkeypatch.setattr("magent.pidfile.pid_gone", lambda pid: False)
 
         # Not OURS to use (this desktop cannot see or stop it), so None -- but
         # the file is the diagnostic's only way to name it.
@@ -142,8 +143,8 @@ class TestThePidReadersKeepTheEvidence:
         pid_file = tmp_path / "hotkey.pid"
         pid_file.write_text("70")
         monkeypatch.setattr(hotkey, "_PID_PATH", pid_file)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: False)
-        monkeypatch.setattr(hotkey, "pid_gone", lambda pid: False)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: False)
+        monkeypatch.setattr("magent.pidfile.pid_gone", lambda pid: False)
 
         assert hotkey.listener_pid() is None
         assert pid_file.exists()

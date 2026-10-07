@@ -37,6 +37,7 @@ from magent.procs import (
 )
 from magent.psmux import (
     SEND_KEYS_TIMEOUT_S,
+    attach_argv,
     await_clients,
     capture_pane,
     child_env,
@@ -45,7 +46,9 @@ from magent.psmux import (
     decoration_argv,
     idle_sessions,
     image_stem,
+    new_session_argv,
     probe_sessions,
+    type_command_argv,
 )
 
 user32 = windll.user32
@@ -455,16 +458,7 @@ def _send_argv(psmux: str, w: PsmuxWindowOpts) -> list[str]:
     that diverged from the original would resurrect the pane with a command
     the user never configured.
     """
-    return [
-        psmux,
-        "-L",
-        w.window_name,
-        "send-keys",
-        "-t",
-        w.window_name,
-        f"cmd /c {w.command}",
-        "Enter",
-    ]
+    return type_command_argv(psmux, w.window_name, w.command)
 
 
 def _wait_for_panes_ready(
@@ -972,17 +966,7 @@ class WindowsPlatform(Platform):
             # would be a second, unrelated change to a spawn that works.
             creates = [
                 spawn_unjobbed(
-                    [
-                        psmux,
-                        "-L",
-                        w.window_name,
-                        "new-session",
-                        "-d",
-                        "-s",
-                        w.window_name,
-                        "-c",
-                        w.cwd,
-                    ],
+                    new_session_argv(psmux, w.window_name, w.cwd),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     env=child_env(),
@@ -1216,7 +1200,7 @@ class WindowsPlatform(Platform):
         ]
         if color:
             args.extend(["--tabColor", color])
-        args.extend(["--", psmux, "-L", session_name, "attach"])
+        args.extend(["--", *attach_argv(psmux, session_name)])
         # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
         from magent.env import attach_client_env
 

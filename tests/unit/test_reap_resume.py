@@ -65,7 +65,9 @@ class _Fleet:
         # the real psmux off PATH (and ``_no_spawn`` refuses it first).
         missing = str(tmp_path / "no-such-psmux.exe")
         monkeypatch.setattr(psmux, "find_psmux", lambda: missing)
-        monkeypatch.setattr(psmux, "has_session", lambda name, psmux=None: True)
+        monkeypatch.setattr(
+            psmux, "_probe_live", lambda names, binary, timeout: set(names)
+        )
         pids = {"api": 100, "web": 200}
         fake_panes(
             monkeypatch,

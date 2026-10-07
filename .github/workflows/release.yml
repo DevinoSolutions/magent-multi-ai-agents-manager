@@ -125,7 +125,7 @@ jobs:
               sys.exit(1)
           print(f"tag {tag} matches the built version {built} (wheel and sdist)")
           PY
-      - uses: DevinoSolutions/artifact/upload@v1
+      - uses: DevinoSolutions/artifact/upload@739b3abd2f5f7bd4db8106bda6513ae94020c9e6  # v1
         with:
           name: dist
           path: dist/
@@ -144,7 +144,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
-      - uses: DevinoSolutions/artifact/download@v1
+      - uses: DevinoSolutions/artifact/download@739b3abd2f5f7bd4db8106bda6513ae94020c9e6  # v1
         with:
           name: dist
           path: dist
@@ -179,7 +179,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
-      - uses: DevinoSolutions/artifact/download@v1
+      - uses: DevinoSolutions/artifact/download@739b3abd2f5f7bd4db8106bda6513ae94020c9e6  # v1
         with:
           name: dist
           path: dist
@@ -217,7 +217,7 @@ jobs:
     permissions:
       id-token: write  # OIDC token for PyPI Trusted Publishing — no API token or secret in the repo
     steps:
-      - uses: DevinoSolutions/artifact/download@v1
+      - uses: DevinoSolutions/artifact/download@739b3abd2f5f7bd4db8106bda6513ae94020c9e6  # v1
         with:
           name: dist
           path: dist
@@ -237,7 +237,7 @@ jobs:
       id-token: write
       contents: write  # create the GitHub Release and attach the built artifacts
     steps:
-      - uses: DevinoSolutions/artifact/download@v1
+      - uses: DevinoSolutions/artifact/download@739b3abd2f5f7bd4db8106bda6513ae94020c9e6  # v1
         with:
           name: dist
           path: dist

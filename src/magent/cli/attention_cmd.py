@@ -6,9 +6,6 @@ magent.attention, the engine/renderer subsystem it drives.
 
 from __future__ import annotations
 
-import contextlib
-import os
-import subprocess
 import sys
 import threading
 import time
@@ -17,11 +14,12 @@ from typing import TYPE_CHECKING
 
 import click
 
+from magent import pidfile
 from magent.cli.app import main
 from magent.cli.config_io import _load_config_or_exit
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.paths import find_config
-from magent.procs import await_registration, pid_alive, pid_gone, predates_boot
+from magent.procs import await_registration, pid_alive, predates_boot
 from magent.style import style
 from magent.titles import get_leaf_name
 
@@ -44,55 +42,29 @@ _NOTHING_TO_DO = (
 def daemon_pid() -> int | None:
     """PID of the running attention daemon, or None. Clears a stale pid file.
 
-    Three verdicts (the same ones as ``hotkey.listener_pid``):
-
-    - Written before the last boot: stale whatever its pid is doing now. A
-      restart kills the daemon without letting it remove the file, and the OS
-      hands pid numbers out again, so the recorded one can come back on an
-      unrelated process. Believing it would make `status` report a daemon that
-      is not there and make serve's supervisor leave the real one dead.
-      Ignored and cleared.
-    - Alive but not openable (a Session-0 copy an ssh login started): not ours
-      to use, and not stale either -- the file is the only record that names it
-      for `status`/`doctor`. Ignored and KEPT.
-    - Gone (no process and no session): cleared.
+    The three verdicts (pre-boot, alive-but-unopenable, gone) are
+    ``pidfile.read``'s. Believing a recycled pid would make `status` report a
+    daemon that is not there and make serve's supervisor leave the real one
+    dead.
     """
-    try:
-        pid = int(_PID_PATH.read_text().strip())
-        written = _PID_PATH.stat().st_mtime
-    except (OSError, ValueError):
-        return None
-    if predates_boot(written):
-        with contextlib.suppress(OSError):
-            _PID_PATH.unlink()
-        return None
-    if pid_alive(pid):
-        return pid
-    if pid_gone(pid):
-        with contextlib.suppress(OSError):
-            _PID_PATH.unlink()
-    return None
+    return pidfile.read(_PID_PATH)
 
 
 def _write_pid() -> None:
-    _PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _PID_PATH.write_text(str(os.getpid()))
+    pidfile.write(_PID_PATH)
 
 
 def _clear_pid() -> None:
-    with contextlib.suppress(OSError):
-        if _PID_PATH.read_text().strip() == str(os.getpid()):
-            _PID_PATH.unlink()
+    pidfile.clear(_PID_PATH)
 
 
 def stop_daemon() -> bool:
     """Stop the attention daemon; True only if a kill was issued and the
     process is confirmed gone. On failure the pid file is kept so `status`
     keeps reporting the truth."""
-    # A forced kill (taskkill /F, default SIGTERM) doesn't run the daemon's
-    # own finally/except, so this stop path owns the heartbeat cleanup: a clean
-    # stop removes it, which is what distinguishes 'off' from 'crashed' in
-    # status (P6-01).
+    # A forced kill doesn't run the daemon's own finally/except, so this stop
+    # path owns the heartbeat cleanup: a clean stop removes it, which is what
+    # distinguishes 'off' from 'crashed' in status (P6-01).
     from magent.log import clear_heartbeat  # heavy subsystem: in-body per policy
 
     pid = daemon_pid()
@@ -103,23 +75,16 @@ def stop_daemon() -> bool:
     # by one serve tick would turn this deliberate stop into a "crash" serve
     # undoes. Cleared again after the kill, in case the daemon pulsed between.
     clear_heartbeat(HEARTBEAT_NAME)
-    if sys.platform == "win32":
-        result = subprocess.run(
-            ["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False
-        )
-        killed = result.returncode == 0
-    else:
-        try:
-            os.kill(pid, 15)  # SIGTERM
-            killed = True
-        except OSError:
-            killed = False
-    if killed and not pid_alive(pid):
-        with contextlib.suppress(OSError):
-            _PID_PATH.unlink()
+    _, outcome = pidfile.terminate(_PID_PATH)
+    if outcome == "mismatch":
+        # The number names a stranger: the file is stale and nothing was ended.
+        pidfile.clear_stale(_PID_PATH)
+        return False
+    if outcome == "terminated" and not pid_alive(pid):
+        pidfile.clear_stale(_PID_PATH)
         clear_heartbeat(HEARTBEAT_NAME)
         return True
-    return killed and not pid_alive(pid)
+    return False
 
 
 def name_pairs_from_config(cfg: MagentConfig) -> list[tuple[str, str]]:

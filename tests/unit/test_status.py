@@ -3076,6 +3076,10 @@ def daemons(monkeypatch):
 
     monkeypatch.setattr(node_sync, "_kill", kill)
     monkeypatch.setattr(
+        "magent.pidfile.pid_alive",
+        lambda pid: pid in fakes and not fakes[pid].gone.is_set(),
+    )
+    monkeypatch.setattr(
         node_sync,
         "pid_alive",
         lambda pid: pid in fakes and not fakes[pid].gone.is_set(),
@@ -3187,6 +3191,7 @@ class _ClockDaemon:
             lambda: (4243 if self.kills else 4242) if self.running() else None,
         )
         monkeypatch.setattr(node_sync, "_kill", self.kill)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: self.running())
         monkeypatch.setattr(node_sync, "pid_alive", lambda pid: self.running())
 
     def kill(self, pid: int) -> bool:

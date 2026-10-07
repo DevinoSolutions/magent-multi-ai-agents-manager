@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from magent.config import MagentConfig
     from magent.platform import Platform
 
-from magent.log import get_logger
+from magent.log import get_logger, log_safe
 
 # Every one-shot psmux client this module spawns is a CONTROL or PROBE command
 # whose output is piped or discarded -- no human ever looks at its console. On
@@ -717,6 +717,45 @@ def stop_sessions(
 SEND_KEYS_TIMEOUT_S = 20.0
 
 
+def send_keys_argv(
+    binary: str,
+    name: str,
+    *keys: str,
+    target: str | None = None,
+    literal: bool = False,
+) -> list[str]:
+    """The argv for ``send-keys`` on session ``name``'s socket (see ``send_keys``)."""
+    cmd: list[str] = [binary, "-L", name, "send-keys"]
+    if target:
+        cmd += ["-t", target]
+    if literal:
+        cmd.append("-l")
+    cmd.append("--")
+    cmd.extend(keys)
+    return cmd
+
+
+def type_command_argv(binary: str, name: str, command: str) -> list[str]:
+    """The one argv that types a window's agent command into its pane.
+
+    Shared by the bring-up's first send and every re-send: a retry that
+    diverged from the original would resurrect the pane with a command the
+    user never configured. No ``--`` separator, by design (this is the shape
+    the bring-up has always sent).
+    """
+    return [binary, "-L", name, "send-keys", "-t", name, f"cmd /c {command}", "Enter"]
+
+
+def new_session_argv(binary: str, name: str, cwd: str) -> list[str]:
+    """The argv that creates a detached session ``name`` rooted at ``cwd``."""
+    return [binary, "-L", name, "new-session", "-d", "-s", name, "-c", cwd]
+
+
+def attach_argv(binary: str, name: str) -> list[str]:
+    """The argv of the interactive attach client for session ``name``."""
+    return [binary, "-L", name, "attach"]
+
+
 def send_keys(
     name: str,
     *keys: str,
@@ -742,13 +781,7 @@ def send_keys(
     binary = psmux or find_psmux()
     if not binary:
         return False
-    cmd: list[str] = [binary, "-L", name, "send-keys"]
-    if target:
-        cmd += ["-t", target]
-    if literal:
-        cmd.append("-l")
-    cmd.append("--")
-    cmd.extend(keys)
+    cmd = send_keys_argv(binary, name, *keys, target=target, literal=literal)
     started = time.monotonic()
     try:
         result = subprocess.run(
@@ -1226,7 +1259,7 @@ def flash_message(
     except (OSError, subprocess.SubprocessError) as exc:
         get_logger("upload").warning(
             "status-line flash failed for project=%s after %.1fs: %s",
-            name,
+            log_safe(name),
             time.monotonic() - started,
             exc,
         )
@@ -1732,7 +1765,7 @@ def eligible_projects(
     """
     from magent.config import runs_on_node
     from magent.launch import _expand_base_dir, _resolve_path
-    from magent.sessions import build_start_command, is_ide_tool
+    from magent.sessions import is_ide_tool, pane_command
     from magent.titles import get_leaf_name
 
     base_dir = config.base_dir
@@ -1766,20 +1799,26 @@ def eligible_projects(
             continue
         seen.add(sid)
         resolved = _resolve_path(proj.path, base_dir)
+        # The session's pane is the project's first window: the same derivation
+        # `--go` runs, so happy and a per-window tool/command override reach
+        # `up`, revive and status exactly as they reach a launch.
+        pane = pane_command(
+            tool,
+            config.settings.tools,
+            project_dir=resolved,
+            happy=proj.happy if proj.happy is not None else config.settings.happy,
+            window=proj.windows[0] if proj.windows else None,
+            config_dir=config_dirs.get(sid) if config_dirs else None,
+        )
         out.append(
             {
                 "name": leaf,
                 "session": sid,
                 "path": proj.path,
-                "tool": tool,
+                "tool": pane.tool,
                 "group": proj.group,
                 "resolved": resolved,
-                "cmd": build_start_command(
-                    tool,
-                    config.settings.tools.get(tool, ""),
-                    resolved,
-                    config_dir=config_dirs.get(sid) if config_dirs else None,
-                ),
+                "cmd": pane.command,
                 "color": proj.color,
             }
         )
@@ -2113,8 +2152,6 @@ def revive_sessions(
     Without a psmux binary nothing is read, so only the names in ``only`` get
     a reason, and a call with no ``only`` leaves ``vetoed`` empty.
     """
-    from concurrent.futures import ThreadPoolExecutor
-
     from magent import agent_state
     from magent.sessions import build_resume_command
 
@@ -2139,14 +2176,15 @@ def revive_sessions(
     if not candidates:
         return []
 
-    def _live(p: dict[str, object]) -> bool:
-        return has_session(_field_str(p, "session"), psmux=binary)
-
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        flags = list(pool.map(_live, candidates))
-    live = [p for p, ok in zip(candidates, flags, strict=True) if ok]
-    for p, ok in zip(candidates, flags, strict=True):
-        if not ok:
+    # The one liveness seam: it re-probes its misses, and a dropped probe here
+    # is the dangerous direction -- a live session read as dead is skipped (a
+    # bare-prompt pane never revived), one read as live-but-idle is not.
+    answered = set(
+        live_sessions([_field_str(p, "session") for p in candidates], psmux=binary)
+    )
+    live = [p for p in candidates if _field_str(p, "session") in answered]
+    for p in candidates:
+        if _field_str(p, "session") not in answered:
             why[_field_str(p, "session")] = "its psmux session did not answer"
     console: dict[str, str] = {}
     idle = idle_sessions(

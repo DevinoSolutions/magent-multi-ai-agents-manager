@@ -36,11 +36,10 @@ from magent.procs import (
 )
 from magent.sessions import (
     AGENT_TOOLS,
-    build_resume_command,
-    build_start_command,
     fresh_start_command,
     ide_command,
     is_ide_tool,
+    pane_command,
 )
 from magent.style import style
 from magent.tiling import Placement, magent_window_names, place_windows
@@ -274,6 +273,32 @@ def relay_handoff(plat: Platform, argv: list[str], *, timeout_s: float) -> int:
     return result.rc
 
 
+_DIST_NAME = "magent-multi-ai-agents-manager"
+VERSION_SKEW = "version skew"
+
+
+def installed_version() -> str:
+    """The magent version a listener spawned right now would run.
+
+    The listener is ``sys.executable -m magent hotkey``: a fresh process that
+    loads whatever is on disk in this interpreter's site-packages, NOT the code
+    this (possibly long-running) process imported. After ``pip install -U`` a
+    ``serve`` that is still running old code must compare listeners against
+    this, or every respawn -- new code -- reads as skew against serve's
+    in-memory old version and is killed again on the next tick. The dist-info
+    is re-read on each call (importlib.metadata keys its directory cache on the
+    mtime a pip upgrade bumps). Falls back to the in-memory version when no
+    dist is installed (a source tree)."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version(_DIST_NAME)
+    except PackageNotFoundError:
+        from magent import __version__
+
+        return __version__
+
+
 def hotkey_restart_reason(
     manifest: dict[str, str | None] | None,
     server_url: str,
@@ -290,13 +315,12 @@ def hotkey_restart_reason(
     machine when `magent attach` wanted the remote-wired one. A missing or
     unparseable manifest is a pre-3.6.0 listener: stale by definition.
     """
-    from magent import __version__  # PEP 562 lazy: skipped unless a pid is live
-
     if manifest is None:
         return "no manifest (listener predates self-describing listeners)"
     running = manifest.get("version")
-    if running != __version__:
-        return f"version skew (listener {running}, want {__version__})"
+    want = installed_version()
+    if running != want:
+        return f"{VERSION_SKEW} (listener {running}, want {want})"
     if manifest.get("server_url") != server_url:
         return (
             f"target change (server_url {manifest.get('server_url')} -> {server_url})"
@@ -306,7 +330,11 @@ def hotkey_restart_reason(
     return None
 
 
-def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int | None:
+def start_hotkey_listener(
+    server_url: str,
+    ssh_host: str | None = None,
+    watch: ListenerWatch | None = None,
+) -> int | None:
     """Start the window-hotkey (Alt+V paste / F2 open-in-VS-Code) listener
     detached, unless a listener matching this exact version and target is
     already running. Returns its pid, or None if the child never confirmed
@@ -330,6 +358,15 @@ def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int |
     and respawned. Repeat calls with identical arguments are therefore a no-op,
     which matters because `magent attach` re-runs this on every attach.
 
+    With a ``watch`` (the supervisor), a VERSION-SKEW restart is bounded: at
+    most ``SKEW_RESTART_MAX`` per supervisor lifetime, ``SKEW_RESTART_COOLDOWN_S``
+    apart. The skew check compares against the version a respawn would run
+    (``installed_version``), so a skew that survives a restart means the
+    respawn is not the code this process thinks it is; killing it again every
+    tick only churns the keyboard hook. Once the budget is spent the listener is
+    left alone, with ONE warning naming the repair. Target changes, a missing
+    manifest and the wedge path are not bounded here.
+
     Refused in a non-interactive logon session (Session 0), before anything
     else: a keyboard hook there never sees a key typed at the desktop.
     """
@@ -348,6 +385,12 @@ def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int |
         reason = hotkey_restart_reason(listener_manifest(), server_url, ssh_host)
         if reason is None:
             return existing  # same version, same target: nothing to do
+        if (
+            watch is not None
+            and reason.startswith(VERSION_SKEW)
+            and not watch.allow_skew_restart(time.monotonic(), existing, reason)
+        ):
+            return existing
         get_logger("hotkey").info("restarting listener pid=%d: %s", existing, reason)
         # Reuse the taskkill recipe stop_listener already owns; it tolerates a
         # pid that has since died (listener_pid clears the stale file and it
@@ -414,6 +457,13 @@ WEDGED_LISTENER_GRACE_S = 3 * HEARTBEAT_MAX_AGE
 # listener that is broken at birth is not fixed by replacing it faster.
 WEDGED_REPLACE_COOLDOWN_S = 300.0
 
+# Version-skew restarts by a supervisor: a genuine skew (listener older than what
+# is installed) clears with ONE restart, so a second is already suspicious; the
+# cap and the cooldown keep a skew that cannot clear from becoming a kill/respawn
+# every tick. Per supervisor lifetime (``ListenerWatch`` is in-memory).
+SKEW_RESTART_MAX = 2
+SKEW_RESTART_COOLDOWN_S = 300.0
+
 
 @dataclass
 class ListenerWatch:
@@ -427,6 +477,35 @@ class ListenerWatch:
     last_replaced: float | None = None  # time.monotonic() of the last attempt
     cooldown_logged: bool = False
     unverifiable_pid: int | None = None  # the pid we already warned we cannot prove
+    skew_restarts: int = 0  # version-skew restarts this supervisor has issued
+    skew_last: float | None = None  # time.monotonic() of the last one
+    skew_warned: bool = False  # the one "restart magent serve" warning was logged
+
+    def allow_skew_restart(self, mono: float, pid: int, reason: str) -> bool:
+        """True when a version-skew restart may be issued now (and records it).
+
+        False once ``SKEW_RESTART_MAX`` have been spent or one was issued inside
+        ``SKEW_RESTART_COOLDOWN_S``. Running out of budget logs ONE warning,
+        because a skew that outlives its restarts will not clear by itself."""
+        if self.skew_restarts >= SKEW_RESTART_MAX:
+            if not self.skew_warned:
+                self.skew_warned = True
+                get_logger("hotkey").warning(
+                    "listener pid=%d: %s persists after %d restart(s); leaving it "
+                    "running. Restart `magent serve` (and the listener) to clear it.",
+                    pid,
+                    reason,
+                    self.skew_restarts,
+                )
+            return False
+        if (
+            self.skew_last is not None
+            and mono - self.skew_last < SKEW_RESTART_COOLDOWN_S
+        ):
+            return False
+        self.skew_restarts += 1
+        self.skew_last = mono
+        return True
 
     def confirm(self, pid: int, mtime: float) -> bool:
         """True once the SAME pid has shown the SAME last pulse on two ticks.
@@ -585,7 +664,7 @@ def ensure_hotkey_listener(
     url, ssh_host = supervised_hotkey_target(listener_manifest(), default_url)
     if watch is not None:
         retire_wedged_listener(pid, watch, now=time.time(), mono=time.monotonic())
-    return start_hotkey_listener(url, ssh_host)
+    return start_hotkey_listener(url, ssh_host, watch=watch)
 
 
 # --- Upload-server supervision ------------------------------------------------
@@ -997,11 +1076,6 @@ def _get_session_ids(
     return [None] * count
 
 
-HAPPY_AGENTS = {
-    t for t, c in AGENT_TOOLS.items() if c.happy
-}  # derived; name kept for tests
-
-
 def _psmux_session_name(title: str) -> str:
     """Sanitize a window title into a valid psmux/tmux session name.
 
@@ -1011,13 +1085,6 @@ def _psmux_session_name(title: str) -> str:
     from magent.psmux import session_name
 
     return session_name(title)
-
-
-def _wrap_happy(tool: str, cmd: str) -> str:
-    """Wrap a CLI agent command with Happy for mobile/web access."""
-    if tool in HAPPY_AGENTS:
-        return f"happy {cmd}"
-    return cmd
 
 
 def run_magent(config: MagentConfig, opts: RunOpts) -> int:
@@ -1565,47 +1632,21 @@ def _dispatch_cli_agent_project(
 
     for i, win_title in enumerate(titles):
         win_cfg = windows_cfg[i] if windows_cfg and i < len(windows_cfg) else None
-        override = win_cfg.tool if win_cfg and win_cfg.tool else None
-        if override and override != tool:
-            override_cmd = tools.get(override)
-            if override_cmd is None:
-                # An override naming a tool absent from settings.tools can't be
-                # honored -- warn and fall back to the base tool ENTIRELY, so
-                # resume/happy/log all reflect what actually runs.
-                click.echo(
-                    f"WARN: {win_title} — unknown tool '{override}' in windows[{i}]"
-                    f" (add under settings.tools); using '{tool}'"
-                )
-                win_tool, win_base = tool, base_cmd
-            else:
-                win_tool, win_base = override, override_cmd
-        else:
-            win_tool, win_base = tool, base_cmd
-
-        if win_cfg and win_cfg.command:
-            # A per-window `command` is the user's literal command line. It is
-            # never rewritten -- not even to drop a resume flag.
-            cmd = win_cfg.command
-        elif win_tool != tool:
-            # Per-window override: the discovered session ids belong to the
-            # base `tool`, not `win_tool` -- never reuse them for the override.
-            cmd = (
-                build_resume_command(win_tool, win_base, None)
-                if window_count > 1
-                else build_start_command(win_tool, win_base, agent_dir)
+        pane = pane_command(
+            tool,
+            tools,
+            project_dir=agent_dir,
+            happy=use_happy,
+            window=win_cfg,
+            session_id=session_ids[i],
+            multi_window=window_count > 1,
+        )
+        if pane.warning:
+            click.echo(
+                f"WARN: {win_title} — {pane.warning} in windows[{i}]"
+                f" (add under settings.tools); using '{tool}'"
             )
-        elif window_count > 1 and session_ids[i] is not None:
-            cmd = build_resume_command(win_tool, win_base, session_ids[i])
-        elif window_count > 1:
-            cmd = build_resume_command(win_tool, win_base, None)
-        else:
-            # Single window: the configured command runs verbatim, so this is
-            # the one place a bare `claude --continue` reaches a project
-            # directory that may have no conversation to continue.
-            cmd = build_start_command(win_tool, win_base, agent_dir)
-
-        if use_happy:
-            cmd = _wrap_happy(win_tool, cmd)
+        win_tool, cmd = pane.tool, pane.command
 
         proj_psmux = use_psmux and not is_remote
         # A psmux window's REAL title carries the sanitized session name --

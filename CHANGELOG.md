@@ -7,8 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Every psmux argv is now built in `psmux.py`.** The attach, new-session and
+  agent-command send argvs that `platform/windows.py` and the session picker
+  hand-built are named builders there, and custom lint rule MD007 fails the gate
+  if a psmux argv literal reappears elsewhere in `src/`. No behaviour change.
+
 ### Fixed
 
+- **A phone or Alt+V listener hanging up mid-upload is no longer logged as a
+  server crash.** A reset or aborted connection while reading the body or
+  writing the reply is now one warning with the path and byte count, instead of
+  an exception-level traceback that reached Sentry.
+- **`up`, revive and status now start the same pane command `--go` does.** The
+  command a pane runs was derived in two places and had drifted: `happy` and
+  per-window `tool`/`command` overrides reached `--go` only, so a `happy`
+  project came back as plain `claude` after `magent up` or a revive. One
+  `sessions.pane_command` now owns it.
+- **Revive no longer misses a live session on a dropped probe.** It ran its own
+  single-shot `has-session` sweep instead of the shared liveness seam that
+  retries misses.
+- **`magent attach` exits up front off Windows.** It used to query the host and
+  offer the remote bring-up before failing on its first Windows Terminal spawn.
+
+- **`magent down` / `attention --stop` / `node` stop no longer end a process they
+  cannot prove is the daemon.** The upload server's pid reader never checked
+  that the pid was alive, and all four stop paths (upload server, Alt+V
+  listener, attention daemon, node sync) ran a bare `taskkill /PID` on the
+  number in a pid file, so after a crash and a recycled pid an unrelated process
+  could be killed. They now share one `pidfile` leaf and one verified kill
+  (`procs.terminate_pid`): a process that started after its pid file was written
+  is a stranger and is left alone (the stale file is cleared), a pid whose start
+  time cannot be read is left alone, and a dead pid is cleared without a kill.
+  New lint rule MD008 keeps bare `os.kill`/`taskkill`/`TerminateProcess` inside
+  `procs.py`.
+- **A `serve` that outlives `pip install -U magent` no longer restarts the Alt+V
+  listener every 30 seconds.** serve compared the listener's version with its own
+  in-memory (old) version, but every respawn is new code, so the skew never
+  cleared. It now compares with the version a respawn would actually run (read
+  from the installed package), and a skew restart by the supervisor is capped
+  (2 per serve lifetime, 5 minutes apart) with one warning telling you to
+  restart `magent serve` when it cannot clear.
 - **`magent watch` no longer crashes on a digit press when macOS cannot list
   windows.** The System Events window probes (`find_window`, `snapshot_windows`)
   let an `osascript` timeout, which an Automation (TCC) prompt nobody can answer
