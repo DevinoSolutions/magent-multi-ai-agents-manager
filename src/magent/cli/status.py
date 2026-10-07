@@ -29,6 +29,7 @@ from urllib.request import urlopen
 
 import click
 
+from magent import pidfile
 from magent.cli.app import main
 from magent.cli.background import _maybe_start_upload_server, _probe_port
 from magent.cli.config_io import _as_str, _load_config_or_exit
@@ -206,12 +207,7 @@ def _read_pid(path: Path) -> int | None:
     """The pid a daemon's pid file records, read-only (a diagnostic never
     clears). A file written before the last boot records nothing: its pid is
     free for any process now, and Session 0 is full of python-hosted services."""
-    try:
-        pid = int(path.read_text().strip())
-        written = path.stat().st_mtime
-    except (OSError, ValueError):
-        return None
-    return None if predates_boot(written) else pid
+    return pidfile.recorded(path)
 
 
 def _recorded_daemons() -> list[tuple[str, int]]:

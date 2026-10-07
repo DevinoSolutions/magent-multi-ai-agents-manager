@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from magent import agent_state, launch, log, node_sync, nodes, remote_mux
+from magent import agent_state, launch, log, node_sync, nodes, pidfile, remote_mux
 from magent.config import (
     SCHEMA_VERSION,
     MagentConfig,
@@ -363,10 +363,15 @@ class TestTheDaemonsPidFile:
     def test_a_sigterm_is_given_time_to_land(self, daemon_lock, monkeypatch):
         """POSIX SIGTERM is asynchronous: the pid can still answer right after
         the kill. The stop waits for it instead of reporting a failure."""
-        answers = iter([True, True, False])
+        answers = iter([True, False])
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda _pid: True)
         monkeypatch.setattr(node_sync, "pid_alive", lambda _pid: next(answers))
         kills: list[int] = []
-        monkeypatch.setattr(node_sync, "_kill", lambda pid: kills.append(pid) or True)
+        monkeypatch.setattr(
+            pidfile,
+            "terminate_pid",
+            lambda pid, **_k: kills.append(pid) or "terminated",
+        )
         naps: list[float] = []
         _record_pid(424242)
         write_heartbeat(node_sync.HEARTBEAT_NAME)
@@ -378,8 +383,9 @@ class TestTheDaemonsPidFile:
     def test_a_daemon_that_outlives_the_settle_is_not_called_stopped(
         self, daemon_lock, monkeypatch
     ):
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda _pid: True)
         monkeypatch.setattr(node_sync, "pid_alive", lambda _pid: True)
-        monkeypatch.setattr(node_sync, "_kill", lambda _pid: True)
+        monkeypatch.setattr(pidfile, "terminate_pid", lambda _pid, **_k: "terminated")
         clock = iter([0.0, 1.0, node_sync.STOP_SETTLE_S + 0.5])
         _record_pid(424242)
         assert (
@@ -401,10 +407,17 @@ class TestTheDaemonsPidFile:
                 _record_pid(4242)
 
         kills: list[int] = []
+
+        def alive(pid: int) -> bool:
+            return pid == 4242 and not kills
+
+        monkeypatch.setattr(node_sync, "pid_alive", alive)
+        monkeypatch.setattr("magent.pidfile.pid_alive", alive)
         monkeypatch.setattr(
-            node_sync, "pid_alive", lambda pid: pid == 4242 and not kills
+            pidfile,
+            "terminate_pid",
+            lambda pid, **_k: kills.append(pid) or "terminated",
         )
-        monkeypatch.setattr(node_sync, "_kill", lambda pid: kills.append(pid) or True)
         write_heartbeat(node_sync.HEARTBEAT_NAME)
         assert node_sync.stop_daemon(sleep=sleep, now=lambda: sum(naps)) is True
         assert kills == [4242]
@@ -416,7 +429,11 @@ class TestTheDaemonsPidFile:
         self, daemon_lock, monkeypatch
     ):
         kills: list[int] = []
-        monkeypatch.setattr(node_sync, "_kill", lambda pid: kills.append(pid) or True)
+        monkeypatch.setattr(
+            pidfile,
+            "terminate_pid",
+            lambda pid, **_k: kills.append(pid) or "terminated",
+        )
         naps: list[float] = []
         assert node_sync.stop_daemon(sleep=naps.append, now=lambda: sum(naps)) is False
         assert kills == []

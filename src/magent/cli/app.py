@@ -14,6 +14,7 @@ import click
 
 from magent.cli.checklist import ABORT_MESSAGE, choose_projects
 from magent.cli.config_io import _load_config_or_exit
+from magent.cli.pipeguard import run_guarded
 from magent.cli.ui import _open_in_editor
 from magent.init_config import write_config
 from magent.paths import find_config
@@ -89,7 +90,18 @@ def _escape_unencodable_output() -> None:
     reconfigure(errors=OUTPUT_ERRORS)
 
 
-@click.group(invoke_without_command=True)
+class _MagentGroup(click.Group):
+    """The entry-point group: runs under ``pipeguard`` so a closed stdout/stderr
+    pipe ends the process quietly instead of as a traceback (Sentry MAGENT-1).
+    Overriding ``__call__`` -- the one door both the ``magent`` console script
+    and ``python -m magent`` go through -- covers every command without touching
+    any of them (and leaves ``main()``'s click signature alone)."""
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        return run_guarded(lambda: super(_MagentGroup, self).__call__(*args, **kwargs))
+
+
+@click.group(cls=_MagentGroup, invoke_without_command=True)
 @click.option("--go", is_flag=True, help="Skip interactive menu, launch + tile")
 @click.option("--retile-all", is_flag=True, help="Re-tile every matching window")
 @click.option("--dry-run", is_flag=True, hidden=True)
