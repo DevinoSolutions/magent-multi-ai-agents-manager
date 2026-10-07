@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A phone or Alt+V listener hanging up mid-upload is no longer logged as a
+  server crash.** A reset or aborted connection while reading the body or
+  writing the reply is now one warning with the path and byte count, instead of
+  an exception-level traceback that reached Sentry.
 - **`up`, revive and status now start the same pane command `--go` does.** The
   command a pane runs was derived in two places and had drifted: `happy` and
   per-window `tool`/`command` overrides reached `--go` only, so a `happy`

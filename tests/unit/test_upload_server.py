@@ -3293,3 +3293,199 @@ class TestUploadedWhat:
         from magent.upload_server import _uploaded_what
 
         assert _uploaded_what(1, suffix) == "file"
+
+
+class TestAClientThatGoesAwayIsNotACrash:
+    """A phone or the Alt+V listener hanging up mid-POST is expected traffic.
+
+    It is one WARNING line (ERROR is what Sentry captures), it touches no
+    multiplexer, and the server keeps serving the next request.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _server(self, tmp_path, monkeypatch):
+        import magent.psmux as psmux_mod
+        import magent.upload_server as mod
+
+        monkeypatch.setattr(mod, "_UPLOAD_DIR", tmp_path / "uploads")
+        self.upload_dir = tmp_path / "uploads"
+        self.sent: list[tuple] = []
+        monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux_mod, "send_keys", lambda *a, **k: self.sent.append((a, k)) or True
+        )
+        UploadHandler.config_path = None
+        UploadHandler.cached_sessions = [
+            {"name": "marka", "session": "marka", "path": "INTERNAL/marka"},
+        ]
+        UploadHandler.sessions_ts = time.time() + 9999
+
+        from http.server import HTTPServer
+
+        self.server = HTTPServer(("127.0.0.1", 0), UploadHandler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        yield
+        self.server.shutdown()
+        self.server.server_close()
+
+    _BODY = (
+        b"------B\r\n"
+        b'Content-Disposition: form-data; name="project"\r\n\r\nmarka\r\n'
+        b"------B\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="v.bin"\r\n\r\n'
+        + b"A" * 8192
+        + b"\r\n------B--\r\n"
+    )
+
+    def _headers(self) -> bytes:
+        return (
+            b"POST /upload?project=marka HTTP/1.1\r\nHost: x\r\n"
+            b"Content-Type: multipart/form-data; boundary=----B\r\n"
+            + f"Content-Length: {len(self._BODY)}\r\n\r\n".encode()
+        )
+
+    def _wait(self, caplog, text: str) -> None:
+        deadline = time.time() + 5
+        while time.time() < deadline and text not in caplog.text:
+            time.sleep(0.02)
+        assert text in caplog.text
+
+    def _health_ok(self) -> None:
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/health")
+        resp = conn.getresponse()
+        assert resp.status == 200
+        resp.read()
+
+    def _upload_records(self, caplog):
+        return [r for r in caplog.records if r.name == "magent.upload"]
+
+    def test_a_reset_mid_body_leaves_no_error_and_the_server_keeps_serving(
+        self, caplog
+    ):
+        # An RST, the abrupt form of "went away". On Windows an RST also
+        # discards what the server has not read yet, so whether it lands before
+        # or after the request line is a race; every outcome must be quiet.
+        import socket
+        import struct
+
+        with caplog.at_level(logging.DEBUG, logger="magent.upload"):
+            s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            s.sendall(self._headers() + self._BODY[:3000])
+            time.sleep(0.3)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            s.close()
+            time.sleep(0.3)
+            self._health_ok()
+
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert "Traceback" not in caplog.text
+        assert self.sent == []
+        assert not self.upload_dir.exists() or list(self.upload_dir.glob("*")) == []
+
+    def test_a_hangup_mid_body_is_one_warning_naming_path_and_bytes(self, caplog):
+        import socket
+
+        partial = self._BODY[:3000]
+        with caplog.at_level(logging.DEBUG, logger="magent.upload"):
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+                s.sendall(self._headers() + partial)
+                s.shutdown(socket.SHUT_WR)
+                s.recv(65536)
+            self._wait(caplog, "went away mid-body")
+            self._health_ok()
+
+        gone = [
+            r for r in self._upload_records(caplog) if "went away" in r.getMessage()
+        ]
+        assert len(gone) == 1
+        record = gone[0]
+        assert record.levelno == logging.WARNING
+        assert record.exc_info is None
+        message = record.getMessage()
+        assert "/upload" in message
+        assert f"after {len(partial)} of {len(self._BODY)} bytes" in message
+        assert "Traceback" not in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert self.sent == []
+        assert not self.upload_dir.exists() or list(self.upload_dir.glob("*")) == []
+
+    def test_a_reset_while_writing_the_reply_is_one_warning_not_a_crash(
+        self, monkeypatch, caplog
+    ):
+        # The client sent a whole request and left before the answer: the write
+        # of the reply raises ConnectionAbortedError (WinError 10053 -- the
+        # error the real server logged at exception level).
+        import socket
+
+        def _aborted(self, data, status=200):
+            raise ConnectionAbortedError(
+                10053, "An established connection was aborted by the software"
+            )
+
+        real_reply = UploadHandler._json_response
+        monkeypatch.setattr(UploadHandler, "_json_response", _aborted)
+        with caplog.at_level(logging.DEBUG, logger="magent.upload"):
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+                s.sendall(self._headers() + self._BODY)
+                s.shutdown(socket.SHUT_WR)
+                while s.recv(65536):
+                    pass
+            self._wait(caplog, "went away before the reply")
+            monkeypatch.setattr(UploadHandler, "_json_response", real_reply)
+            self._health_ok()
+
+        gone = [
+            r
+            for r in self._upload_records(caplog)
+            if "went away before the reply" in r.getMessage()
+        ]
+        assert len(gone) == 1
+        assert gone[0].levelno == logging.WARNING
+        assert gone[0].exc_info is None
+        assert "Traceback" not in caplog.text
+        assert "crashed" not in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_any_other_fault_still_logs_a_crash_at_error(self, monkeypatch, caplog):
+        import magent.upload_server as mod
+
+        def boom(_handler):
+            raise RuntimeError("not a hangup")
+
+        monkeypatch.setattr(mod, "_parse_multipart", boom)
+        with caplog.at_level(logging.DEBUG, logger="magent.upload"):
+            conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+            conn.request(
+                "POST",
+                "/upload?project=marka",
+                body=self._BODY,
+                headers={
+                    "Content-Type": "multipart/form-data; boundary=----B",
+                    "Content-Length": str(len(self._BODY)),
+                },
+            )
+            assert conn.getresponse().status == 500
+            self._wait(caplog, "POST handler crashed")
+        crashed = [r for r in caplog.records if "crashed" in r.getMessage()]
+        assert crashed[0].levelno == logging.ERROR
+        assert crashed[0].exc_info is not None
+
+    @pytest.mark.parametrize(
+        ("exc", "gone"),
+        [
+            (ConnectionAbortedError(10053, "x"), True),
+            (ConnectionResetError(10054, "x"), True),
+            (BrokenPipeError(32, "x"), True),
+            (OSError(10053, "raw wsa errno"), True),
+            (OSError(10054, "raw wsa errno"), True),
+            (OSError(28, "No space left on device"), False),
+            (RuntimeError("boom"), False),
+            (TimeoutError("stalled"), False),
+        ],
+    )
+    def test_only_a_peer_hangup_counts_as_client_gone(self, exc, gone):
+        from magent.upload_server import _client_went_away
+
+        assert _client_went_away(exc) is gone
