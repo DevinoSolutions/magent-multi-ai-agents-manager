@@ -1670,7 +1670,6 @@ class TestInSessionFeedback:
 
             return R()
 
-        monkeypatch.setattr(mod.subprocess, "run", _rec)
         monkeypatch.setattr(psmux_mod.subprocess, "run", _rec)
 
         UploadHandler.config_path = None
@@ -2163,54 +2162,84 @@ class TestFlashEndpoint:
 
 
 class TestStopServer:
-    """Truthful stop_server: True only when the kill actually succeeded; the
-    pid file survives a failed kill so `status`/a retry can still find it."""
+    """Truthful stop_server: True only when the process was actually ended; the
+    pid file survives a failed kill so `status`/a retry can still find it, and a
+    pid that names a stranger is never touched."""
 
     def test_no_pid_file_returns_false(self, tmp_path, monkeypatch):
-        # Pin: this invariant is unchanged by the taskkill-rc behavior below.
         import magent.upload_server as mod
 
         monkeypatch.setattr(mod, "_pid_path", lambda port: tmp_path / "nonexistent.pid")
         assert mod.stop_server(9999) is False
 
-    def test_keeps_pid_file_when_taskkill_fails(self, tmp_path, monkeypatch):
+    def _file(self, tmp_path, monkeypatch):
         import magent.upload_server as mod
 
         pid_file = tmp_path / "upload_server-9999.pid"
         pid_file.write_text("4321")
         monkeypatch.setattr(mod, "_pid_path", lambda port: pid_file)
-        monkeypatch.setattr(mod.sys, "platform", "win32")
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: True)
+        return mod, pid_file
 
-        class _Result:
-            returncode = 1
-
-        monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: _Result())
+    def test_keeps_pid_file_when_the_kill_fails(self, tmp_path, monkeypatch):
+        mod, pid_file = self._file(tmp_path, monkeypatch)
+        monkeypatch.setattr("magent.pidfile.terminate_pid", lambda pid, **k: "failed")
 
         assert mod.stop_server(9999) is False
         assert pid_file.exists()
 
-    def test_removes_pid_file_when_taskkill_succeeds(self, tmp_path, monkeypatch):
-        import magent.upload_server as mod
+    def test_keeps_pid_file_when_the_process_cannot_be_verified(
+        self, tmp_path, monkeypatch
+    ):
+        mod, pid_file = self._file(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "magent.pidfile.terminate_pid", lambda pid, **k: "unverifiable"
+        )
 
-        pid_file = tmp_path / "upload_server-9999.pid"
-        pid_file.write_text("4321")
-        monkeypatch.setattr(mod, "_pid_path", lambda port: pid_file)
-        monkeypatch.setattr(mod.sys, "platform", "win32")
+        assert mod.stop_server(9999) is False
+        assert pid_file.exists()
 
-        class _Result:
-            returncode = 0
-
-        monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: _Result())
+    def test_removes_pid_file_when_the_kill_lands(self, tmp_path, monkeypatch):
+        mod, pid_file = self._file(tmp_path, monkeypatch)
+        killed = []
+        monkeypatch.setattr(
+            "magent.pidfile.terminate_pid",
+            lambda pid, **k: killed.append(pid) or "terminated",
+        )
 
         assert mod.stop_server(9999) is True
+        assert killed == [4321]
+        assert not pid_file.exists()
+
+    def test_a_recycled_pid_is_left_alone_and_the_stale_file_cleared(
+        self, tmp_path, monkeypatch
+    ):
+        mod, pid_file = self._file(tmp_path, monkeypatch)
+        monkeypatch.setattr("magent.pidfile.terminate_pid", lambda pid, **k: "mismatch")
+
+        assert mod.stop_server(9999) is False
+        assert not pid_file.exists()
+
+    def test_a_dead_pid_is_cleared_without_a_kill(self, tmp_path, monkeypatch):
+        mod, pid_file = self._file(tmp_path, monkeypatch)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: False)
+        monkeypatch.setattr("magent.pidfile.pid_gone", lambda pid: True)
+
+        def _no_kill(pid, **k):
+            raise AssertionError("a dead pid must not be killed")
+
+        monkeypatch.setattr("magent.pidfile.terminate_pid", _no_kill)
+
+        assert mod.server_pid(9999) is None
+        assert mod.stop_server(9999) is False
         assert not pid_file.exists()
 
 
 class TestServerPidAcrossARestart:
     """A restart leaves upload_server-<port>.pid behind and the OS reuses pid
     numbers. server_pid is what `status` (DEAD vs off), `stop_server` (what to
-    taskkill) and the phone-URL port pick all read, so a recycled pid there was
-    a DEAD upload server after every reboot -- and a `down --all` that killed
+    end) and the phone-URL port pick all read, so a recycled pid there was a
+    DEAD upload server after every reboot -- and a `down --all` that killed
     whatever process now wore the old number."""
 
     def _pre_boot(self, tmp_path, monkeypatch, *, boot=5000.0):
@@ -2223,6 +2252,7 @@ class TestServerPidAcrossARestart:
         os.utime(pid_file, (1000.0, 1000.0))
         monkeypatch.setattr(mod, "_pid_path", lambda port: pid_file)
         monkeypatch.setattr("magent.procs.boot_time", lambda: boot)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: True)
         return mod, pid_file
 
     def test_a_pid_file_from_before_the_boot_names_no_server(
@@ -2251,12 +2281,13 @@ class TestServerPidAcrossARestart:
         self, tmp_path, monkeypatch
     ):
         mod, _pid_file = self._pre_boot(tmp_path, monkeypatch)
-        monkeypatch.setattr(mod.sys, "platform", "win32")
-        calls = []
-        monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: calls.append(a))
+
+        def _no_kill(pid, **k):
+            raise AssertionError("a pre-boot pid file must not be acted on")
+
+        monkeypatch.setattr("magent.pidfile.terminate_pid", _no_kill)
 
         assert mod.stop_server(9999) is False
-        assert calls == []
 
 
 class TestBindAddresses:

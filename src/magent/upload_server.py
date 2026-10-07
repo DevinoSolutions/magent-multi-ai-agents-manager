@@ -10,7 +10,6 @@ import os
 import re
 import socket
 import socketserver
-import subprocess
 import sys
 import threading
 import time
@@ -23,11 +22,10 @@ if TYPE_CHECKING:
     import logging
     from collections.abc import Callable, Sequence
 
-from magent import psmux, tailnet
+from magent import pidfile, psmux, tailnet
 from magent.icons import render_icon
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger, log_safe
-from magent.procs import predates_boot
 from magent.sessions import (
     FLASH_MSG_MAX,
     FLASH_TINT_ERR,
@@ -43,54 +41,37 @@ def _pid_path(port: int) -> Path:
 
 
 def server_pid(port: int) -> int | None:
-    """Return the PID of the upload server recorded for this port, if any.
+    """Return the PID of the upload server recorded for this port, if it is
+    running.
 
-    A pid file written before the last boot records no server of ours: a
-    restart kills serve without letting it remove the file, and the OS hands
-    pid numbers out again. It is cleared and reads as None, because every
-    reader acts on the number -- `status` (DEAD vs off), `stop_server` (what to
-    taskkill) and the phone-URL port pick. The attention watchdog reads it for
-    its log line only and decides on the port probe alone.
+    A record of a process that is gone, or that predates the last boot, names
+    no server of ours (the OS hands pid numbers out again) and is cleared -- see
+    ``pidfile.read``. Every reader acts on the number: `status` (DEAD vs off),
+    `stop_server` (what to end) and the phone-URL port pick. The attention
+    watchdog reads it for its log line only and decides on the port probe alone.
     """
-    p = _pid_path(port)
-    if not p.exists():
-        return None
-    try:
-        pid = int(p.read_text().strip())
-        written = p.stat().st_mtime
-    except (ValueError, OSError):
-        return None
-    if predates_boot(written):
-        with contextlib.suppress(OSError):
-            p.unlink()
-        return None
-    return pid
+    return pidfile.read(_pid_path(port))
 
 
 def stop_server(port: int) -> bool:
     """Stop the upload server running on the given port. Returns True only if
-    the kill actually succeeded. On failure the pid file is kept (not
-    unlinked) so `status` or a retry can still find the process."""
+    the process was actually ended. On failure the pid file is kept (not
+    unlinked) so `status` or a retry can still find the process; a pid file
+    whose number now names a different process is cleared and ends nothing."""
     log = get_logger("upload")
-    pid = server_pid(port)
-    if not pid:
-        return False
-    try:
-        if sys.platform == "win32":
-            result = subprocess.run(
-                ["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False
-            )
-            if result.returncode != 0:
-                log.warning("taskkill pid %d failed rc=%d", pid, result.returncode)
-                return False
-        else:
-            os.kill(pid, 15)
-    except OSError:
-        log.warning("failed to stop upload server pid %d", pid)
-        return False
-    with contextlib.suppress(OSError):
-        _pid_path(port).unlink()
-    return True
+    path = _pid_path(port)
+    pid, outcome = pidfile.terminate(path)
+    if outcome == "terminated":
+        pidfile.clear_stale(path)
+        return True
+    if outcome == "mismatch":
+        log.warning(
+            "pid %s is not the upload server that wrote %s; left alone", pid, path.name
+        )
+        pidfile.clear_stale(path)
+    elif outcome in ("failed", "unverifiable"):
+        log.warning("could not stop upload server pid %s (%s)", pid, outcome)
+    return False
 
 
 _UPLOAD_DIR = Path.home() / ".magent" / "uploads"
@@ -2379,9 +2360,7 @@ def run_server(
         "listening on %s:%d pid %d", ", ".join(bound_addrs), port, UploadHandler.pid
     )
 
-    pid_file = _pid_path(port)
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(str(os.getpid()))
+    pidfile.write(_pid_path(port))
 
     for s in servers[1:]:
         threading.Thread(target=_serve_bind, args=(s, log), daemon=True).start()
@@ -2462,6 +2441,5 @@ def run_server(
             s.shutdown()  # called from a different thread than its serve_forever -> safe
         for s in servers:
             s.server_close()  # servers[0] exited via KeyboardInterrupt; just closes the socket
-        with contextlib.suppress(OSError):
-            pid_file.unlink()
+        pidfile.clear(_pid_path(port))
         log.info("stopped: %s", reason)
