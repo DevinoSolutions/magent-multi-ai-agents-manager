@@ -717,6 +717,45 @@ def stop_sessions(
 SEND_KEYS_TIMEOUT_S = 20.0
 
 
+def send_keys_argv(
+    binary: str,
+    name: str,
+    *keys: str,
+    target: str | None = None,
+    literal: bool = False,
+) -> list[str]:
+    """The argv for ``send-keys`` on session ``name``'s socket (see ``send_keys``)."""
+    cmd: list[str] = [binary, "-L", name, "send-keys"]
+    if target:
+        cmd += ["-t", target]
+    if literal:
+        cmd.append("-l")
+    cmd.append("--")
+    cmd.extend(keys)
+    return cmd
+
+
+def type_command_argv(binary: str, name: str, command: str) -> list[str]:
+    """The one argv that types a window's agent command into its pane.
+
+    Shared by the bring-up's first send and every re-send: a retry that
+    diverged from the original would resurrect the pane with a command the
+    user never configured. No ``--`` separator, by design (this is the shape
+    the bring-up has always sent).
+    """
+    return [binary, "-L", name, "send-keys", "-t", name, f"cmd /c {command}", "Enter"]
+
+
+def new_session_argv(binary: str, name: str, cwd: str) -> list[str]:
+    """The argv that creates a detached session ``name`` rooted at ``cwd``."""
+    return [binary, "-L", name, "new-session", "-d", "-s", name, "-c", cwd]
+
+
+def attach_argv(binary: str, name: str) -> list[str]:
+    """The argv of the interactive attach client for session ``name``."""
+    return [binary, "-L", name, "attach"]
+
+
 def send_keys(
     name: str,
     *keys: str,
@@ -742,13 +781,7 @@ def send_keys(
     binary = psmux or find_psmux()
     if not binary:
         return False
-    cmd: list[str] = [binary, "-L", name, "send-keys"]
-    if target:
-        cmd += ["-t", target]
-    if literal:
-        cmd.append("-l")
-    cmd.append("--")
-    cmd.extend(keys)
+    cmd = send_keys_argv(binary, name, *keys, target=target, literal=literal)
     started = time.monotonic()
     try:
         result = subprocess.run(

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Every psmux argv is now built in `psmux.py`.** The attach, new-session and
+  agent-command send argvs that `platform/windows.py` and the session picker
+  hand-built are named builders there, and custom lint rule MD007 fails the gate
+  if a psmux argv literal reappears elsewhere in `src/`. No behaviour change.
+
 ### Fixed
 
 - **`up`, revive and status now start the same pane command `--go` does.** The
