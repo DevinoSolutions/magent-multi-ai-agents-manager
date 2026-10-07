@@ -81,10 +81,7 @@ magent-attach-client = "magent.attach_client:main"
 
 [project.urls]
 Homepage = "https://magent.now"
-Documentation = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager#readme"
-Repository = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager"
-Issues = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/issues"
-Changelog = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/blob/main/CHANGELOG.md"
+Documentation = "https://faq.magent.now"
 
 [build-system]
 # hatchling 1.32.0 (2026-08-11) started emitting Metadata-Version 2.5. The

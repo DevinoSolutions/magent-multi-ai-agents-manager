@@ -22,7 +22,7 @@
 <p align="center">
   <a href="https://pypi.org/project/magent-multi-ai-agents-manager"><img src="https://img.shields.io/pypi/v/magent-multi-ai-agents-manager?color=3776AB&label=pypi" alt="PyPI version" /></a>
   <a href="https://pypi.org/project/magent-multi-ai-agents-manager"><img src="https://img.shields.io/pypi/dm/magent-multi-ai-agents-manager?color=blue" alt="PyPI downloads" /></a>
-  <a href="https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License: AGPL-3.0" /></a>
+  <a href="https://pypi.org/project/magent-multi-ai-agents-manager/"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License: AGPL-3.0" /></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+" /></a>
   <img src="https://img.shields.io/badge/dependencies-click-success" alt="Minimal Dependencies" />
 </p>
@@ -45,8 +45,6 @@
 ```
 
 ## Quick Start
-
-> **Available once `v1.0.0` is published to PyPI.** Until then, [install from source](#install-from-source).
 
 ```bash
 pip install magent-multi-ai-agents-manager          # or: uv tool install magent-multi-ai-agents-manager
@@ -615,7 +613,6 @@ CLI agents run over SSH. VS Code/Cursor projects open via Remote-SSH.
   <thead>
     <tr>
       <th>Job</th>
-      <th align="center" width="180">Live status</th>
       <th>Platforms</th>
       <th>What it verifies</th>
     </tr>
@@ -623,25 +620,21 @@ CLI agents run over SSH. VS Code/Cursor projects open via Remote-SSH.
   <tbody>
     <tr>
       <td><strong>Unit</strong></td>
-      <td align="center"><a href="https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/actions/workflows/ci.yml"><img src="https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a></td>
       <td>Windows / macOS / Linux<br/>Python 3.10 -- 3.14</td>
       <td>Config parsing, grid computation, title generation, session resume, discovery, grouping (15 matrix jobs)</td>
     </tr>
     <tr>
       <td><strong>Platform</strong></td>
-      <td align="center"><a href="https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/actions/workflows/ci.yml"><img src="https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a></td>
       <td>Windows / macOS / Linux</td>
       <td>Real monitor detection (ctypes/Swift/xrandr), real window find+move, real terminal launch, DPI scaling</td>
     </tr>
     <tr>
       <td><strong>E2E</strong></td>
-      <td align="center"><a href="https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/actions/workflows/ci.yml"><img src="https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a></td>
       <td>Windows / macOS / Linux</td>
       <td>Full CLI dry-run, config loading, group filtering, SSH project handling, vscode/cursor tool alias, multi-window</td>
     </tr>
     <tr>
       <td><strong>Packaging</strong></td>
-      <td align="center"><a href="https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/actions/workflows/ci.yml"><img src="https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a></td>
       <td>Windows / macOS / Linux</td>
       <td>Build wheel, install into a pristine no-extras venv, drive the real installed <code>magent</code> entry point: version/help, dev-dep import sweep, virgin first-run, socket-real serve, optional-extra degradation, and a real window spawn (win32)</td>
     </tr>
@@ -670,17 +663,9 @@ A bare `pytest` collects **all** tiers, including tests that enumerate real moni
 | Terminal | Windows Terminal | kitty/iTerm/Terminal.app | kitty/alacritty/gnome-terminal |
 | DPI awareness | Per-Monitor V2 | Native Retina | xrandr DPI |
 
-## Install from source
-
-```bash
-git clone https://github.com/DevinoSolutions/magent-multi-ai-agents-manager.git
-cd magent-multi-ai-agents-manager
-pip install -e .
-```
-
 ## Contributing
 
-Contributions are welcome. Please open an issue first to discuss what you'd like to change.
+Questions and feedback are welcome via [magent.now](https://magent.now).
 
 ## License
 
