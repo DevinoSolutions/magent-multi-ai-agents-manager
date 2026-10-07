@@ -19,7 +19,6 @@ import contextlib
 import ctypes
 import ctypes.wintypes
 import json
-import os
 import shutil
 import struct
 import subprocess
@@ -31,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.request import urlopen
 
+from magent import pidfile
 from magent.altv import (
     ALTV_LOG_PREFIX,
     OUTCOME_REASONS,
@@ -46,7 +46,6 @@ from magent.log import (
     get_logger,
     write_heartbeat,
 )
-from magent.procs import pid_alive, pid_gone, predates_boot
 from magent.sessions import (
     FLASH_TINT_ERR,
     build_code_open_command,
@@ -445,53 +444,32 @@ _MANIFEST_PATH = Path.home() / ".magent" / "hotkey.json"
 def listener_pid() -> int | None:
     """PID of the running Alt+V listener, or None. Clears a stale pid file.
 
-    Three verdicts, and every liveness and kill decision about the listener
-    reads through them:
-
-    - Written before the last boot: stale whatever its pid is doing now. A
-      restart kills the listener without letting it remove the file, and
-      Windows hands pid numbers out again. Believed, the recycled pid is a
-      "running" listener -- serve's supervisor never starts a real one, status
-      calls it STALE, and `down --all` or the wedged-listener replacement would
-      end whatever wears the number. Ignored and cleared.
-    - Alive but not openable (a Session-0 copy an ssh login started): not ours
-      to use, and not stale either -- the file is the only record that names it
-      for `status`/`doctor`. Ignored and KEPT.
-    - Gone (no process and no session): cleared.
+    The three verdicts (pre-boot, alive-but-unopenable, gone) are
+    ``pidfile.read``'s; every liveness and kill decision about the listener
+    reads through them. Believed blindly, a recycled pid is a "running"
+    listener -- serve's supervisor never starts a real one, status calls it
+    STALE, and `down --all` or the wedged-listener replacement would end
+    whatever wears the number.
     """
-    try:
-        pid = int(_PID_PATH.read_text().strip())
-        written = _PID_PATH.stat().st_mtime
-    except (OSError, ValueError):
-        return None
-    if predates_boot(written):
-        with contextlib.suppress(OSError):
-            _PID_PATH.unlink()
-        return None
-    if pid_alive(pid):
-        return pid
-    if pid_gone(pid):
-        with contextlib.suppress(OSError):
-            _PID_PATH.unlink()
-    return None
+    return pidfile.read(_PID_PATH)
 
 
 def stop_listener() -> bool:
-    """Stop the running Alt+V listener. Returns True only if the kill actually
-    succeeded. On failure the pid file is kept (not unlinked) so `status` or a
-    retry can still find the process."""
+    """Stop the running Alt+V listener. Returns True only if the process was
+    actually ended. On failure the pid file is kept (not unlinked) so `status`
+    or a retry can still find the process; a pid file whose number now names a
+    different process is forgotten and ends nothing."""
     log = get_logger("hotkey")
-    pid = listener_pid()
-    if not pid:
-        return False
-    result = subprocess.run(
-        ["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False
-    )
-    if result.returncode != 0:
-        log.warning("taskkill pid %d failed rc=%d", pid, result.returncode)
-        return False
-    forget_listener()
-    return True
+    pid, outcome = pidfile.terminate(_PID_PATH)
+    if outcome == "terminated":
+        forget_listener()
+        return True
+    if outcome == "mismatch":
+        log.warning("pid %s is not the listener that wrote hotkey.pid; left alone", pid)
+        forget_listener()
+    elif outcome in ("failed", "unverifiable"):
+        log.warning("could not stop listener pid %s (%s)", pid, outcome)
+    return False
 
 
 def forget_listener() -> None:
@@ -538,11 +516,8 @@ def listener_manifest() -> dict[str, str | None] | None:
 
 
 def _write_pid() -> None:
-    try:
-        _PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _PID_PATH.write_text(str(os.getpid()))
-    except OSError:
-        pass
+    with contextlib.suppress(OSError):
+        pidfile.write(_PID_PATH)
 
 
 def _write_manifest(server_url: str, ssh_host: str | None) -> None:
@@ -570,11 +545,7 @@ def _write_manifest(server_url: str, ssh_host: str | None) -> None:
 
 
 def _clear_pid() -> None:
-    try:
-        if _PID_PATH.read_text().strip() == str(os.getpid()):
-            _PID_PATH.unlink()
-    except OSError:
-        pass
+    pidfile.clear(_PID_PATH)
 
 
 def _clear_manifest() -> None:

@@ -868,6 +868,10 @@ class TestProcsSpellsTheKillOnlyInTerminateVerified:
         assert _kill_sites(_procs_nodes()) == {
             ("pid_alive", "os.kill(pid, 0)"),  # a liveness probe: signal 0
             ("console_clients", "proc.kill()"),  # the helper procs spawned
+            # POSIX half of terminate_pid: SIGTERM, only after the pid's start
+            # time was read and found no later than its record. (Windows goes
+            # through terminate_verified, behind the guards.)
+            ("terminate_pid", "os.kill(pid, 15)"),
         }
 
     def test_procs_imports_only_the_known_modules(self):
