@@ -21,7 +21,7 @@ FAST_STEPS: list[tuple[str, list[str]]] = [
         ["ruff", "format", "--check", "src", "tests", "scripts"],
     ),
     (
-        "custom lint (MD001-MD007)",
+        "custom lint (MD001-MD008)",
         [sys.executable, "scripts/lint_rules.py"],
     ),
     (

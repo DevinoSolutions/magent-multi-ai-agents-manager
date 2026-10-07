@@ -90,11 +90,13 @@ def _take_exclusive(name: str, path: Path) -> IO[str]:
     no longer names (its holder deleted it after this open) is let go and
     taken again, up to ``_ACQUIRE_ATTEMPTS`` times."""
     for _ in range(_ACQUIRE_ATTEMPTS):
-        fh = open(path, "w", encoding="utf-8")  # noqa: SIM115  # reason: the fd must stay open for the lock duration; a with-block would release too early
+        fh = _open_lock_file(path)
         try:
             if sys.platform == "win32":
                 import msvcrt
 
+                # msvcrt locks from the current position: a fresh open sits
+                # at byte 0, which is what every contender locks.
                 try:
                     msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
                 except OSError as exc:
@@ -114,6 +116,31 @@ def _take_exclusive(name: str, path: Path) -> IO[str]:
         # A contender never deletes: the path may be another holder's now.
         fh.close()
     raise LockHeld(f"{name} lock changed hands under every attempt to take it")
+
+
+def _open_lock_file(path: Path) -> IO[str]:
+    """Open (creating) the lock file. On Windows it is opened WITHOUT
+    truncation, and a PermissionError from the open is a held lock: truncating
+    a file whose byte range another process has locked is refused, and a path
+    its holder just unlinked is delete-pending and refuses every open -- either
+    is contention, not a fault (Sentry MAGENT-2). Other errors still raise."""
+    if sys.platform != "win32":
+        return open(
+            path, "w", encoding="utf-8"
+        )  # reason: the fd must stay open for the lock duration; a with-block would release too early
+    try:
+        return open(
+            path, "r+", encoding="utf-8", opener=_open_untruncated
+        )  # reason: the fd must stay open for the lock duration; a with-block would release too early
+    except PermissionError as exc:
+        raise LockHeld(f"{path.stem} lock is held by another process") from exc
+
+
+def _open_untruncated(path: str, flags: int) -> int:
+    """``open`` opener: create if absent, never truncate (``flags`` is ignored
+    -- ``r+`` would not create, ``w`` would truncate)."""
+    del flags
+    return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
 
 
 def _still_named(path: Path, fh: IO[str]) -> bool:
