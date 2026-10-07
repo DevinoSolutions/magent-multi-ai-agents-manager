@@ -1177,10 +1177,46 @@ def _uploaded_what(file_count: int, suffix: str) -> str:
 _FILENAME_RE = re.compile(r'\bfilename="([^"]*)"')
 
 
+_BODY_CHUNK_BYTES = 256 * 1024
+
+
 class UploadIncomplete(Exception):
     """The body ended before its declared length, or before the delimiter that
     closes its last part. What did arrive is not the file the user sent, so
-    nothing of it is saved or pasted."""
+    nothing of it is saved or pasted.
+
+    ``received``/``declared`` carry the byte counts so the one log line the
+    handler writes can say how far the client got before it went away."""
+
+    def __init__(self, reason: str, *, received: int = 0, declared: int = 0) -> None:
+        super().__init__(reason)
+        self.received = received
+        self.declared = declared
+
+
+# Windows socket errors for "the peer went away": WSAECONNABORTED / WSAECONNRESET.
+# Python maps them to ConnectionAbortedError / ConnectionResetError on its own,
+# but an OSError built from a bare errno (a C-level path, a wrapped re-raise)
+# keeps the raw number, so the numbers are checked too.
+_CLIENT_GONE_ERRNOS = frozenset({10053, 10054, errno.EPIPE, errno.ECONNRESET})
+
+
+def _client_went_away(exc: BaseException) -> bool:
+    """True when ``exc`` means the CLIENT hung up mid-request (a phone off wifi,
+    a listener that gave up), not that this server is broken.
+
+    Such a fault is expected traffic: it is logged as one WARNING, never at
+    exception level -- ERROR is what Sentry's logging integration captures, and
+    a vanished peer is not an error in magent.
+    """
+    if isinstance(exc, ConnectionError):  # Aborted, Reset, BrokenPipe, Refused
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return (
+        getattr(exc, "winerror", None) in _CLIENT_GONE_ERRNOS
+        or exc.errno in _CLIENT_GONE_ERRNOS
+    )
 
 
 def _disposition(header_str: str) -> tuple[str, str]:
@@ -1201,7 +1237,7 @@ def _disposition(header_str: str) -> tuple[str, str]:
     return name, filename
 
 
-def _next_delimiter(body: bytes, delim: bytes, start: int) -> int:
+def _next_delimiter(body: bytes | bytearray, delim: bytes, start: int) -> int:
     """Index of the CRLF that opens the next real delimiter at or after
     ``start``, or -1. A delimiter is ``CRLF--boundary`` followed by CRLF (another
     part) or ``--`` (the end); the same bytes followed by anything else are the
@@ -1244,12 +1280,25 @@ def _parse_multipart(
         length = 0
     if length <= 0:
         return {}, {}
+    # Read in chunks (one raw recv each) rather than one rfile.read(length): when
+    # the client vanishes mid-body the exception would carry none of what had
+    # already arrived, and the log line needs the byte count.
+    want = min(length, _request_limit())
+    body = bytearray()
     try:
-        body = handler.rfile.read(min(length, _request_limit()))
+        while len(body) < want:
+            chunk = handler.rfile.read1(min(_BODY_CHUNK_BYTES, want - len(body)))
+            if not chunk:
+                break
+            body += chunk
     except OSError as exc:  # a stalled or reset client, mid-body
-        raise UploadIncomplete(str(exc)) from exc
+        raise UploadIncomplete(str(exc), received=len(body), declared=length) from exc
     if len(body) < length:
-        raise UploadIncomplete(f"{len(body)} of {length} bytes arrived")
+        raise UploadIncomplete(
+            f"{len(body)} of {length} bytes arrived",
+            received=len(body),
+            declared=length,
+        )
 
     view = memoryview(body)
     delim = f"--{boundary}".encode()
@@ -1337,6 +1386,21 @@ class UploadHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def handle_one_request(self) -> None:
+        # A peer that RSTs before (or between) requests raises out of the
+        # request-line read, which is outside do_GET/do_POST's wrappers. The
+        # stdlib would answer it with a traceback on the detached daemon's
+        # invisible stderr; it is not a fault, so say nothing above DEBUG.
+        try:
+            super().handle_one_request()
+        except Exception as exc:
+            if not _client_went_away(exc):
+                raise
+            self.close_connection = True
+            get_logger("upload").debug(
+                "upload client went away between requests: %s", log_safe(repr(exc))
+            )
+
     def do_GET(self) -> None:
         # Any unhandled error in a request handler must land in the "upload"
         # log at ERROR (-> logfile stack + Sentry), never only in the detached
@@ -1344,8 +1408,16 @@ class UploadHandler(BaseHTTPRequestHandler):
         # wrapped, so even the pre-routing setup is covered.
         try:
             self._handle_get()
-        except Exception:
+        except Exception as exc:
             log = get_logger("upload")
+            if _client_went_away(exc):
+                self.close_connection = True
+                log.warning(
+                    "upload client went away before the reply to GET %s: %s",
+                    log_safe(self.path),
+                    log_safe(repr(exc)),
+                )
+                return
             log.exception("GET handler crashed for %s", log_safe(self.path))
             with contextlib.suppress(OSError):
                 self._json_response({"ok": False, "error": "internal"}, 500)
@@ -1473,8 +1545,22 @@ class UploadHandler(BaseHTTPRequestHandler):
         # its inflight-count + outcome INFO line intact (P2-03).
         try:
             self._handle_post()
-        except Exception:
+        except Exception as exc:
             log = get_logger("upload")
+            if _client_went_away(exc):
+                # The body was read in full (a mid-body loss is answered inside
+                # _handle_post) so this is the reply write: the upload is on
+                # disk and was pasted, only the answer had nowhere to go. One
+                # WARNING line, no traceback, nothing for Sentry.
+                self.close_connection = True
+                log.warning(
+                    "upload client went away before the reply to POST %s "
+                    "(request body %s bytes): %s",
+                    log_safe(self.path),
+                    log_safe(self.headers.get("Content-Length", "?")),
+                    log_safe(repr(exc)),
+                )
+                return
             log.exception("POST handler crashed for %s", log_safe(self.path))
             with contextlib.suppress(OSError):
                 self._json_response({"ok": False, "error": "internal"}, 500)
@@ -1536,7 +1622,13 @@ class UploadHandler(BaseHTTPRequestHandler):
                 # A short body leaves the connection out of step with HTTP, and
                 # the client may already be gone: close, and answer if it can
                 # still hear.
-                log.warning("upload refused, body incomplete: %s", exc)
+                log.warning(
+                    "upload client went away mid-body on %s after %d of %d bytes: %s",
+                    log_safe(parsed.path),
+                    exc.received,
+                    exc.declared,
+                    log_safe(str(exc)),
+                )
                 self.close_connection = True
                 with contextlib.suppress(OSError):
                     self._json_response(
