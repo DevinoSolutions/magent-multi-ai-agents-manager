@@ -5,6 +5,66 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Every psmux argv is now built in `psmux.py`.** The attach, new-session and
+  agent-command send argvs that `platform/windows.py` and the session picker
+  hand-built are named builders there, and custom lint rule MD007 fails the gate
+  if a psmux argv literal reappears elsewhere in `src/`. No behaviour change.
+
+### Fixed
+
+- **A phone or Alt+V listener hanging up mid-upload is no longer logged as a
+  server crash.** A reset or aborted connection while reading the body or
+  writing the reply is now one warning with the path and byte count, instead of
+  an exception-level traceback that reached Sentry.
+- **`up`, revive and status now start the same pane command `--go` does.** The
+  command a pane runs was derived in two places and had drifted: `happy` and
+  per-window `tool`/`command` overrides reached `--go` only, so a `happy`
+  project came back as plain `claude` after `magent up` or a revive. One
+  `sessions.pane_command` now owns it.
+- **Revive no longer misses a live session on a dropped probe.** It ran its own
+  single-shot `has-session` sweep instead of the shared liveness seam that
+  retries misses.
+- **`magent attach` exits up front off Windows.** It used to query the host and
+  offer the remote bring-up before failing on its first Windows Terminal spawn.
+
+- **`magent down` / `attention --stop` / `node` stop no longer end a process they
+  cannot prove is the daemon.** The upload server's pid reader never checked
+  that the pid was alive, and all four stop paths (upload server, Alt+V
+  listener, attention daemon, node sync) ran a bare `taskkill /PID` on the
+  number in a pid file, so after a crash and a recycled pid an unrelated process
+  could be killed. They now share one `pidfile` leaf and one verified kill
+  (`procs.terminate_pid`): a process that started after its pid file was written
+  is a stranger and is left alone (the stale file is cleared), a pid whose start
+  time cannot be read is left alone, and a dead pid is cleared without a kill.
+  New lint rule MD008 keeps bare `os.kill`/`taskkill`/`TerminateProcess` inside
+  `procs.py`.
+- **A `serve` that outlives `pip install -U magent` no longer restarts the Alt+V
+  listener every 30 seconds.** serve compared the listener's version with its own
+  in-memory (old) version, but every respawn is new code, so the skew never
+  cleared. It now compares with the version a respawn would actually run (read
+  from the installed package), and a skew restart by the supervisor is capped
+  (2 per serve lifetime, 5 minutes apart) with one warning telling you to
+  restart `magent serve` when it cannot clear.
+- **`magent watch` no longer crashes on a digit press when macOS cannot list
+  windows.** The System Events window probes (`find_window`, `snapshot_windows`)
+  let an `osascript` timeout, which an Automation (TCC) prompt nobody can answer
+  produces, or a missing `osascript`, raise out of the watch loop. They now log a
+  warning and answer "no windows", so the press reports `no window found` as it
+  does elsewhere.
+- **`magent node doctor` no longer calls an idle node sync stale.** With nothing
+  placed on a node, the sync daemon idle-exits by design, and `magent status`
+  already says `node_sync: off`; the doctor still warned `sync-daemon its
+  heartbeat is stale -- see: magent status` and `snapshot pulled Ns ago, older
+  than 2 x pullIntervalS`, and `magent doctor`'s `nodes` row warned with them.
+  Both rows now follow status's one "is a sync expected" verdict: while it is
+  off they read `not running -- no node sessions to sync` and an informational
+  snapshot age (skip rows, no warning). While a session runs on a node the
+  stale-heartbeat and stale-snapshot warnings are unchanged.
+
 ## [3.20.0] - 2026-10-01
 
 This release rolls up 3.20.0rc1 and rc2 (nodes) and everything since 3.19.4.

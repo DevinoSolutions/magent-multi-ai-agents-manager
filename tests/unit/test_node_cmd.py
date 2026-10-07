@@ -70,14 +70,26 @@ def _doctor(runner, cfg: str, *args: str):
     return runner.invoke(cli.main, ["--config", cfg, "node", "doctor", *args])
 
 
+@pytest.fixture
+def placed_sync(monkeypatch):
+    """Node sync is expected: serve may spawn it (conftest pins the switch to
+    0) and a session is placed on a node."""
+    monkeypatch.setenv("MAGENT_NODE_SYNC", "1")
+    nodes.write_node_map({"api": entry("second", "api")})
+
+
 class TestThisPcsSyncRows:
     def test_a_running_daemon_is_ok(self, tmp_config):
         _heartbeat()
         assert _sync(tmp_config)[0] == ScriptLine("ok", "sync-daemon", "running")
 
-    def test_a_stale_heartbeat_warns(self, tmp_config):
+    def test_a_stale_heartbeat_warns(self, tmp_config, monkeypatch):
+        monkeypatch.setenv("MAGENT_NODE_SYNC", "1")
+        # Sync is expected only while a session is placed on a node; with none
+        # the same leftover heartbeat is idle, not stale (TestAnIdleSyncIsNotStale).
+        nodes.write_node_map({"api": entry("second", "api")})
         _heartbeat(age_s=log.HEARTBEAT_MAX_AGE + 60)
-        assert _sync(tmp_config)[0].status == "warn"
+        assert _sync(tmp_config, projects=[NODE_PROJECT])[0].status == "warn"
 
     def test_a_stopped_daemon_warns_while_a_session_runs_on_a_node(self, tmp_config):
         nodes.write_node_map({"api": entry("second", "api")})
@@ -106,18 +118,20 @@ class TestThisPcsSyncRows:
         assert _sync(tmp_config)[1] == ScriptLine("ok", "snapshot", "pulled 5s ago")
 
     def test_a_snapshot_older_than_two_pulls_warns_and_names_the_limit(
-        self, tmp_config
+        self, tmp_config, placed_sync
     ):
         _snapshot("second", time.time() - 61)
-        row = _sync(tmp_config)[1]
+        row = _sync(tmp_config, projects=[NODE_PROJECT])[1]
         assert row.status == "warn"
         assert "(60s)" in row.detail
 
-    def test_a_snapshot_from_the_future_warns_and_names_the_clock(self, tmp_config):
+    def test_a_snapshot_from_the_future_warns_and_names_the_clock(
+        self, tmp_config, placed_sync
+    ):
         # sessions_stale reads a ts past now + 2 pulls as stale too; the row
         # must not call that "pulled 0s ago, older than ...".
         _snapshot("second", time.time() + 120)
-        row = _sync(tmp_config)[1]
+        row = _sync(tmp_config, projects=[NODE_PROJECT])[1]
         assert row.status == "warn"
         assert "ago" not in row.detail
         assert "in the future" in row.detail
@@ -130,6 +144,97 @@ class TestThisPcsSyncRows:
     def test_a_snapshot_without_a_numeric_ts_is_a_skip(self, tmp_config, ts):
         _snapshot("second", ts)
         assert _sync(tmp_config)[1].status == "skip"
+
+
+class TestAnIdleSyncIsNotStale:
+    """Sync is expected only while a session runs on a node (status's
+    ``node_sync: off`` is the same verdict). With none, the daemon idle-exits
+    by design and its leftover heartbeat / old snapshot are not trouble."""
+
+    @pytest.fixture(autouse=True)
+    def _sync_switch_on(self, monkeypatch):
+        # conftest pins MAGENT_NODE_SYNC=0; status's verdict reads it too.
+        monkeypatch.setenv("MAGENT_NODE_SYNC", "1")
+
+    @staticmethod
+    def _place() -> None:
+        nodes.write_node_map({"api": entry("second", "api")})
+
+    def test_a_switched_off_sync_says_so_instead_of_blaming_missing_sessions(
+        self, tmp_config, monkeypatch
+    ):
+        monkeypatch.setenv("MAGENT_NODE_SYNC", "0")
+        _heartbeat(age_s=log.HEARTBEAT_MAX_AGE + 60)
+        row = _sync(tmp_config, projects=[NODE_PROJECT])[0]
+        assert row.status == "skip"
+        assert "MAGENT_NODE_SYNC=0" in row.detail
+
+    def test_a_leftover_stale_heartbeat_is_not_a_warning_when_nothing_is_placed(
+        self, tmp_config
+    ):
+        _heartbeat(age_s=log.HEARTBEAT_MAX_AGE + 60)
+        row = _sync(tmp_config, projects=[NODE_PROJECT])[0]
+        assert row == ScriptLine(
+            "skip", "sync-daemon", "not running -- no node sessions to sync"
+        )
+        assert "magent status" not in row.detail
+
+    def test_an_old_snapshot_is_not_a_warning_when_nothing_is_placed(self, tmp_config):
+        _snapshot("second", time.time() - 67948)
+        row = _sync(tmp_config, projects=[NODE_PROJECT])[1]
+        assert row.status == "skip"
+        assert "67948s ago" in row.detail
+        assert "stale" not in row.detail
+
+    def test_a_future_snapshot_is_not_a_warning_when_nothing_is_placed(
+        self, tmp_config
+    ):
+        _snapshot("second", time.time() + 120)
+        assert _sync(tmp_config, projects=[NODE_PROJECT])[1].status == "skip"
+
+    def test_a_stale_heartbeat_still_warns_while_a_session_is_placed(self, tmp_config):
+        self._place()
+        _heartbeat(age_s=log.HEARTBEAT_MAX_AGE + 60)
+        row = _sync(tmp_config, projects=[NODE_PROJECT])[0]
+        assert row.status == "warn"
+        assert "heartbeat is stale" in row.detail
+
+    def test_an_old_snapshot_still_warns_while_a_session_is_placed(self, tmp_config):
+        self._place()
+        _snapshot("second", time.time() - 61)
+        row = _sync(tmp_config, projects=[NODE_PROJECT])[1]
+        assert row.status == "warn"
+        assert "(60s)" in row.detail
+
+    def test_a_future_snapshot_still_warns_while_a_session_is_placed(self, tmp_config):
+        self._place()
+        _snapshot("second", time.time() + 120)
+        assert _sync(tmp_config, projects=[NODE_PROJECT])[1].status == "warn"
+
+    def test_the_top_level_doctor_does_not_warn_on_an_idle_sync(
+        self, tmp_config, fake_ssh
+    ):
+        from magent.cli.doctor import _check_nodes
+
+        fake_ssh.set_reply("bash -s", stdout="ok\ttmux\ttmux 3.4\n")
+        _heartbeat(age_s=log.HEARTBEAT_MAX_AGE + 60)
+        _snapshot("second", time.time() - 67948)
+        cfg = load_config(_pool_file(tmp_config, projects=[NODE_PROJECT]))
+        assert _check_nodes(cfg) == ("ok", "1 node(s) healthy")
+
+    def test_the_top_level_doctor_still_warns_on_a_stale_sync_in_use(
+        self, tmp_config, fake_ssh
+    ):
+        from magent.cli.doctor import _check_nodes
+
+        fake_ssh.set_reply("bash -s", stdout="ok\ttmux\ttmux 3.4\n")
+        self._place()
+        _heartbeat(age_s=log.HEARTBEAT_MAX_AGE + 60)
+        _snapshot("second", time.time() - 67948)
+        cfg = load_config(_pool_file(tmp_config, projects=[NODE_PROJECT]))
+        status, detail = _check_nodes(cfg)
+        assert status == "warn"
+        assert "second: sync-daemon, snapshot" in detail
 
 
 class TestNodeDoctor:
@@ -734,10 +839,10 @@ class TestTheSnapshotRow:
             "pulled 0s ago"
         )
 
-    def test_the_future_row_names_how_far_ahead(self, tmp_config):
+    def test_the_future_row_names_how_far_ahead(self, tmp_config, placed_sync):
         now = time.time()
         _snapshot("second", now + 120)
-        cfg = load_config(_pool_file(tmp_config))
+        cfg = load_config(_pool_file(tmp_config, projects=[NODE_PROJECT]))
         assert "stamped 120s in the future" in (
             node_cmd.sync_lines(cfg, "second", now=now)[1].detail
         )

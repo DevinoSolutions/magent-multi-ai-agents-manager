@@ -34,8 +34,24 @@ MD006  Every ``wt`` argv literal must carry ``--suppressApplicationTitle``. The
        the tab — Claude Code, a shell prompt, ssh — renames the window out of the
        grammar with one OSC escape and the window becomes invisible to every one
        of those consumers.
+MD007  No psmux argv list/tuple literal outside ``src/magent/psmux.py``. A literal
+       whose first element is a psmux executable (``"psmux"``/``"psmux.exe"``/
+       ``"pmux"``/``"pmux.exe"``, a ``find_psmux()`` call, or a ``psmux``/
+       ``psmux_bin``/``psmux_exe`` name) is a hand-built psmux command; psmux.py
+       is the single owner of every psmux subprocess interaction, so the argv
+       comes from a named builder there (``attach_argv``, ``new_session_argv``,
+       ``send_keys_argv``, ``type_command_argv``, ...). No allowlist: there is no
+       legitimate exception today.
 
-Scopes: MD001/002/003/006 apply to ``src/magent/`` only; MD005 to
+MD008  No bare process termination outside ``src/magent/procs.py``: no
+       ``os.kill`` / ``os.killpg`` call, no ``"taskkill"`` argv literal, no
+       ``TerminateProcess`` reference. A pid read from a pid file may name a
+       stranger by the time it is acted on; ``procs.terminate_pid`` (via
+       ``pidfile.terminate``) is the one kill that checks it still names the
+       recorded process. Killing a ``Popen`` you hold (``proc.kill()``) is not
+       the hazard and is not flagged.
+
+Scopes: MD001/002/003/006/007 apply to ``src/magent/`` only; MD005 to
 ``src/magent/cli/`` only; MD004 applies to ``src`` + ``scripts`` + ``tests``.
 """
 
@@ -63,9 +79,7 @@ MD002_ALLOW = {
     "src/magent/discover.py": "session-store paths, path separators, FS case-folding",
     "src/magent/agent_state.py": "state-store path differs per OS",
     "src/magent/launch.py": "Windows job-object breakaway in spawn_detached",
-    "src/magent/upload_server.py": "taskkill vs os.kill process termination",
-    "src/magent/cli/attention_cmd.py": "taskkill vs os.kill process termination",
-    "src/magent/node_sync.py": "taskkill vs os.kill process termination (stop_daemon, the attention_cmd shape)",
+    "src/magent/upload_server.py": "listening-socket exclusivity (SO_EXCLUSIVEADDRUSE vs SO_REUSEADDR) and bind-refusal errno are per-OS",
     "src/magent/cli/watch.py": "non-blocking keypress polling is per-OS (msvcrt vs select)",
     "src/magent/cli/doctor.py": "terminal-emulator candidates are per-OS (wt vs POSIX list)",
     "src/magent/hotkey.py": "module is Windows-only by construction (raises off-win32)",
@@ -83,6 +97,11 @@ MD002_ALLOW = {
     "src/magent/psmux.py": "psmux binary fallback path is per-OS (LOCALAPPDATA on Windows)",
     "src/magent/attach_client.py": "Windows' own OpenSSH is found via GetSystemDirectoryW (ctypes.windll exists only on win32), same primitive split as procs.py",
 }
+
+# MD008: the one file that may end a process by number, and the spellings of it.
+MD008_ALLOW = {"src/magent/procs.py"}
+_MD008_ARGV0 = frozenset({"taskkill", "taskkill.exe"})
+_MD008_OS_KILLS = frozenset({"kill", "killpg"})
 
 # MD003: the only two src files allowed to hold a literal "magent:".
 MD003_ALLOW = {"src/magent/titles.py", "src/magent/cli/attach.py"}
@@ -121,6 +140,13 @@ WT_TITLE_LOCK_FLAG = "--suppressApplicationTitle"
 # MD006: exec name that identifies a Windows Terminal spawn argv, matched on the
 # FIRST element of a list/tuple display (`["wt", "-w", "new", ...]`).
 WT_EXEC_NAMES = ("wt", "wt.exe")
+
+
+# MD007: the one module that may build a psmux argv, and how a psmux executable
+# is spelled as the FIRST element of an argv literal.
+PSMUX_OWNER = "src/magent/psmux.py"
+PSMUX_EXEC_STRINGS = ("psmux", "psmux.exe", "pmux", "pmux.exe")
+PSMUX_EXEC_NAMES = ("psmux", "psmux_bin", "psmux_exe", "psmux_path")
 
 
 class Finding(NamedTuple):
@@ -228,6 +254,51 @@ def _wt_argv_findings(rel: str, tree: ast.Module) -> list[Finding]:
     return out
 
 
+def _is_psmux_argv(node: ast.List | ast.Tuple) -> bool:
+    """True for a list/tuple display whose first element names a psmux binary."""
+    if not node.elts:
+        return False
+    first = node.elts[0]
+    if isinstance(first, ast.Constant):
+        # A bare "psmux" leading a data tuple (`("psmux", "tmux")`, a docs table
+        # row) is not a command: a psmux argv's next token is always a flag.
+        second = node.elts[1] if len(node.elts) > 1 else None
+        return (
+            isinstance(first.value, str)
+            and first.value.lower() in PSMUX_EXEC_STRINGS
+            and isinstance(second, ast.Constant)
+            and isinstance(second.value, str)
+            and second.value.startswith("-")
+        )
+    if isinstance(first, ast.Name):
+        return first.id in PSMUX_EXEC_NAMES
+    if isinstance(first, ast.Call):
+        func = first.func
+        called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+        return called == "find_psmux"
+    return False
+
+
+def _psmux_argv_findings(rel: str, tree: ast.Module) -> list[Finding]:
+    """MD007 — a hand-built psmux argv outside the psmux module."""
+    out: list[Finding] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.List, ast.Tuple)) and _is_psmux_argv(node):
+            out.append(
+                Finding(
+                    rel,
+                    node.lineno,
+                    node.col_offset + 1,
+                    "MD007",
+                    "psmux argv built outside psmux.py — add or reuse a named "
+                    "builder there (attach_argv, new_session_argv, "
+                    "send_keys_argv, ...); psmux.py owns every psmux subprocess "
+                    "interaction",
+                )
+            )
+    return out
+
+
 def _is_type_checking_guard(test: ast.expr) -> bool:
     """True for an ``if TYPE_CHECKING:`` / ``if typing.TYPE_CHECKING:`` test."""
     if isinstance(test, ast.Name):
@@ -309,8 +380,26 @@ def _heavy_import_findings(rel: str, tree: ast.Module) -> list[Finding]:
     return out
 
 
+def _is_bare_kill(node: ast.AST) -> bool:
+    """MD008 — ``os.kill(...)``/``os.killpg(...)``, a ``"taskkill"`` string
+    constant, or any ``TerminateProcess`` name/attribute."""
+    if isinstance(node, ast.Call):
+        f = node.func
+        return (
+            isinstance(f, ast.Attribute)
+            and f.attr in _MD008_OS_KILLS
+            and isinstance(f.value, ast.Name)
+            and f.value.id == "os"
+        )
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str) and node.value.lower() in _MD008_ARGV0
+    if isinstance(node, ast.Attribute):
+        return node.attr == "TerminateProcess"
+    return isinstance(node, ast.Name) and node.id == "TerminateProcess"
+
+
 def _ast_rules(rel: str, source: str) -> list[Finding]:
-    """MD001/002/003/006 (src/magent/) + MD005 (src/magent/cli/)."""
+    """MD001/002/003/006/007 (src/magent/) + MD005 (src/magent/cli/)."""
     out: list[Finding] = []
     try:
         tree = ast.parse(source, filename=rel)
@@ -329,6 +418,7 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
     in_platform = rel.startswith(PLATFORM_PREFIX)
     md002_allowed = in_platform or rel in MD002_ALLOW
     md003_allowed = rel in MD003_ALLOW
+    md008_allowed = rel in MD008_ALLOW
 
     # Constants that are pieces of an f-string are counted via their JoinedStr
     # parent (below), never again as standalone literals — so f"magent:{x}" flags once.
@@ -363,6 +453,16 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
                     "sys.platform outside platform/ — gate on a Platform.supports_*() probe, or add a reasoned MD002_ALLOW entry if genuinely OS-behavioral",
                 )
             )
+        if not md008_allowed and _is_bare_kill(node):
+            out.append(
+                Finding(
+                    rel,
+                    line,
+                    col,
+                    "MD008",
+                    "bare process termination (os.kill / taskkill / TerminateProcess) outside procs.py — a pid from a file can name a stranger; use pidfile.terminate / procs.terminate_pid",
+                )
+            )
         if (
             not md003_allowed
             and _starts_title_prefix(node)
@@ -378,6 +478,8 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
                 )
             )
     out += _wt_argv_findings(rel, tree)
+    if rel != PSMUX_OWNER:
+        out += _psmux_argv_findings(rel, tree)
     if in_cli:
         out += _heavy_import_findings(rel, tree)
     return out
