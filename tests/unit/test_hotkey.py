@@ -277,7 +277,7 @@ class TestListenerLifecycle:
         p = tmp_path / "hotkey.pid"
         p.write_text("4321")
         monkeypatch.setattr(hotkey, "_PID_PATH", p)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: pid == 4321)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: pid == 4321)
         assert hotkey.listener_pid() == 4321
 
     def test_pid_clears_stale_file(self, tmp_path, monkeypatch):
@@ -286,7 +286,7 @@ class TestListenerLifecycle:
         p = tmp_path / "hotkey.pid"
         p.write_text("999999")
         monkeypatch.setattr(hotkey, "_PID_PATH", p)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: False)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: False)
         assert hotkey.listener_pid() is None
         assert not p.exists()  # stale pid file is cleaned up
 
@@ -305,7 +305,7 @@ class TestListenerLifecycle:
         p.write_text("4321")
         os.utime(p, (1000.0, 1000.0))
         monkeypatch.setattr(hotkey, "_PID_PATH", p)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)  # recycled
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: True)  # recycled
         monkeypatch.setattr("magent.procs.boot_time", lambda: 5000.0)
 
         assert hotkey.listener_pid() is None
@@ -319,7 +319,7 @@ class TestListenerLifecycle:
         p = tmp_path / "hotkey.pid"
         p.write_text("4321")
         monkeypatch.setattr(hotkey, "_PID_PATH", p)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: True)
         monkeypatch.setattr("magent.procs.boot_time", lambda: 1000.0)
 
         assert hotkey.listener_pid() == 4321
@@ -333,7 +333,7 @@ class TestListenerLifecycle:
         p.write_text("4321")
         os.utime(p, (1000.0, 1000.0))
         monkeypatch.setattr(hotkey, "_PID_PATH", p)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: True)
         monkeypatch.setattr("magent.procs.boot_time", lambda: None)
 
         assert hotkey.listener_pid() == 4321
@@ -344,7 +344,6 @@ class TestListenerLifecycle:
         # `down --all` after a restart must not taskkill whatever process now
         # wears the old listener's pid number.
         import os
-        import subprocess
 
         from magent import hotkey
 
@@ -352,10 +351,12 @@ class TestListenerLifecycle:
         p.write_text("4321")
         os.utime(p, (1000.0, 1000.0))
         monkeypatch.setattr(hotkey, "_PID_PATH", p)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: True)
         monkeypatch.setattr("magent.procs.boot_time", lambda: 5000.0)
         calls = []
-        monkeypatch.setattr(subprocess, "run", lambda *a, **k: calls.append(a))
+        monkeypatch.setattr(
+            "magent.pidfile.terminate_pid", lambda *a, **k: calls.append(a)
+        )
 
         assert hotkey.stop_listener() is False
         assert calls == []
@@ -377,7 +378,7 @@ class TestListenerLifecycle:
         # A manifest that matches exactly, as the dead listener left it: on its
         # own it would make the supervisor keep the recorded pid.
         hotkey._write_manifest("http://127.0.0.1:8034", None)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: True)
         monkeypatch.setattr("magent.procs.boot_time", lambda: 5000.0)
         stopped = []
         monkeypatch.setattr(hotkey, "stop_listener", lambda: stopped.append(1))
@@ -394,26 +395,33 @@ class TestListenerLifecycle:
         assert stopped == []  # nothing of ours to stop: the pid is not ours
 
     def test_stop_kills_and_removes(self, tmp_path, monkeypatch):
-        import subprocess
-
         from magent import hotkey
 
         p = tmp_path / "hotkey.pid"
         p.write_text("4321")
         monkeypatch.setattr(hotkey, "_PID_PATH", p)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: True)
         calls = []
-
-        class _Result:
-            returncode = 0
-
-        def _rec(*a, **k):
-            calls.append(a[0])
-            return _Result()
-
-        monkeypatch.setattr(subprocess, "run", _rec)
+        monkeypatch.setattr(
+            "magent.pidfile.terminate_pid",
+            lambda pid, **k: calls.append(pid) or "terminated",
+        )
         assert hotkey.stop_listener() is True
-        assert calls and calls[0][0] == "taskkill" and "4321" in calls[0]
+        assert calls == [4321]
+        assert not p.exists()
+
+    def test_stop_leaves_a_recycled_pid_alone_and_forgets_the_stale_file(
+        self, tmp_path, monkeypatch
+    ):
+        from magent import hotkey
+
+        p = tmp_path / "hotkey.pid"
+        p.write_text("4321")
+        monkeypatch.setattr(hotkey, "_PID_PATH", p)
+        monkeypatch.setattr(hotkey, "_MANIFEST_PATH", tmp_path / "hotkey.json")
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: True)
+        monkeypatch.setattr("magent.pidfile.terminate_pid", lambda pid, **k: "mismatch")
+        assert hotkey.stop_listener() is False
         assert not p.exists()
 
     def test_forget_drops_every_trace_without_signalling_anything(
@@ -451,22 +459,17 @@ class TestListenerLifecycle:
         monkeypatch.setattr(hotkey, "_PID_PATH", tmp_path / "hotkey.pid")
         assert hotkey.stop_listener() is False
 
-    def test_stop_keeps_pid_file_when_taskkill_fails(self, tmp_path, monkeypatch):
+    def test_stop_keeps_pid_file_when_the_kill_fails(self, tmp_path, monkeypatch):
         # F-IC-006 (honest half): a failed kill returns False and leaves the
         # pid file in place so `status`/a retry can still find the process.
-        import subprocess
-
         from magent import hotkey
 
         p = tmp_path / "hotkey.pid"
         p.write_text("4321")
         monkeypatch.setattr(hotkey, "_PID_PATH", p)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: True)
 
-        class _Result:
-            returncode = 1
-
-        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Result())
+        monkeypatch.setattr("magent.pidfile.terminate_pid", lambda pid, **k: "failed")
         assert hotkey.stop_listener() is False
         assert p.exists()
 
@@ -548,18 +551,14 @@ class TestListenerManifest:
     def test_stop_listener_clears_the_manifest(self, paths, monkeypatch):
         # A killed listener must not leave a manifest vouching for a process
         # that is gone.
-        import subprocess
-
         from magent import hotkey
 
         hotkey._PID_PATH.write_text("4321")
         hotkey._write_manifest("http://host:8034", None)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)
-
-        class _Result:
-            returncode = 0
-
-        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Result())
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: True)
+        monkeypatch.setattr(
+            "magent.pidfile.terminate_pid", lambda pid, **k: "terminated"
+        )
         assert hotkey.stop_listener() is True
         assert hotkey.listener_manifest() is None
 

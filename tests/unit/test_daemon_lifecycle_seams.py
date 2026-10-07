@@ -49,8 +49,9 @@ class TestAPreBootPidFileIsStaleEvenWhenItsPidIsUnopenable:
         pid_file.write_text("70")
         _pre_boot(pid_file)
         monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: False)
         monkeypatch.setattr(attention_cmd, "pid_alive", lambda pid: False)
-        monkeypatch.setattr(attention_cmd, "pid_gone", lambda pid: False)
+        monkeypatch.setattr("magent.pidfile.pid_gone", lambda pid: False)
         monkeypatch.setattr("magent.procs.boot_time", lambda: 5000.0)
 
         assert attention_cmd.daemon_pid() is None
@@ -62,8 +63,9 @@ class TestAPreBootPidFileIsStaleEvenWhenItsPidIsUnopenable:
         pid_file = tmp_path / "attention.pid"
         pid_file.write_text("70")
         monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: False)
         monkeypatch.setattr(attention_cmd, "pid_alive", lambda pid: False)
-        monkeypatch.setattr(attention_cmd, "pid_gone", lambda pid: False)
+        monkeypatch.setattr("magent.pidfile.pid_gone", lambda pid: False)
         monkeypatch.setattr("magent.procs.boot_time", lambda: 1000.0)
 
         assert attention_cmd.daemon_pid() is None
@@ -79,8 +81,8 @@ class TestAPreBootPidFileIsStaleEvenWhenItsPidIsUnopenable:
         pid_file.write_text("70")
         _pre_boot(pid_file)
         monkeypatch.setattr(hotkey, "_PID_PATH", pid_file)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: False)
-        monkeypatch.setattr(hotkey, "pid_gone", lambda pid: False)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: False)
+        monkeypatch.setattr("magent.pidfile.pid_gone", lambda pid: False)
         monkeypatch.setattr("magent.procs.boot_time", lambda: 5000.0)
 
         assert hotkey.listener_pid() is None
@@ -95,8 +97,8 @@ class TestAPreBootPidFileIsStaleEvenWhenItsPidIsUnopenable:
         pid_file = tmp_path / "hotkey.pid"
         pid_file.write_text("70")
         monkeypatch.setattr(hotkey, "_PID_PATH", pid_file)
-        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: False)
-        monkeypatch.setattr(hotkey, "pid_gone", lambda pid: False)
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda pid: False)
+        monkeypatch.setattr("magent.pidfile.pid_gone", lambda pid: False)
         monkeypatch.setattr("magent.procs.boot_time", lambda: 1000.0)
 
         assert hotkey.listener_pid() is None
@@ -346,8 +348,9 @@ class TestServeCannotReviveAttentionMidDown:
         self.pid_file.write_text("4321")
         monkeypatch.setattr(attention_cmd, "_PID_PATH", self.pid_file)
         self.alive = {4321}
+        monkeypatch.setattr("magent.pidfile.pid_alive", lambda p: p in self.alive)
         monkeypatch.setattr(attention_cmd, "pid_alive", lambda p: p in self.alive)
-        monkeypatch.setattr(attention_cmd, "pid_gone", lambda p: p not in self.alive)
+        monkeypatch.setattr("magent.pidfile.pid_gone", lambda p: p not in self.alive)
         monkeypatch.setattr(
             attention_cmd.AttentionDaemonSupervisor, "_has_work", lambda self: True
         )
@@ -361,10 +364,6 @@ class TestServeCannotReviveAttentionMidDown:
 
         sup = attention_cmd.AttentionDaemonSupervisor(None)
         during_kill: list[bool] = []
-        monkeypatch.setattr(attention_cmd.sys, "platform", "win32")
-
-        class _Result:
-            returncode = 0
 
         def _kill(*_a, **_k):
             # The daemon's heartbeat thread pulsed after the withdrawal...
@@ -372,9 +371,9 @@ class TestServeCannotReviveAttentionMidDown:
             self.alive.discard(4321)
             # ...and serve's supervisor ticks before stop_daemon clears again.
             during_kill.append(sup.tick())
-            return _Result()
+            return "terminated"
 
-        monkeypatch.setattr(attention_cmd.subprocess, "run", _kill)
+        monkeypatch.setattr("magent.pidfile.terminate_pid", _kill)
         log.write_heartbeat(attention_cmd.HEARTBEAT_NAME)
 
         assert attention_cmd.stop_daemon() is True

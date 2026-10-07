@@ -34,7 +34,7 @@ concurrency:
 
 jobs:
   build:
-    name: "Build (sdist + wheel)"
+    name: "Build (wheel)"
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -71,11 +71,14 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"prerelease={str(prerelease).lower()}\n")
           PY
-      - name: Build sdist + wheel
-        run: python -m build
+      # Wheel-only by design: the sdist is deliberately never built or published
+      # (hatchling's default sdist ships tests, docs and agent plans, and a PyPI
+      # upload cannot be taken back). See RELEASING.md.
+      - name: Build wheel
+        run: python -m build --wheel
       - name: Validate distribution metadata
         run: twine check --strict dist/*
-      # PyPI gets the version in the BUILT artifacts (pyproject's), never the
+      # PyPI gets the version in the BUILT artifact (pyproject's), never the
       # tag's, and an upload cannot be taken back. So v3.20.0rc1 over a 3.20.0
       # build fails here, before publish. The tag must be exactly "v" + the
       # canonical PEP 440 form of the built version: v3.20.0rc1, never
@@ -93,7 +96,6 @@ jobs:
           import glob
           import os
           import sys
-          import tarfile
           import zipfile
           from email.parser import BytesHeaderParser
           from packaging.version import Version
@@ -101,29 +103,22 @@ jobs:
           def version_of(raw):
               return BytesHeaderParser().parsebytes(raw)["Version"]
 
-          wheels = sorted(glob.glob("dist/*.whl"))
-          sdists = sorted(glob.glob("dist/*.tar.gz"))
-          if len(wheels) != 1 or len(sdists) != 1:
-              print(f"::error::expected exactly one wheel and one sdist in dist/, found {wheels + sdists}")
+          found = sorted(glob.glob("dist/*"))
+          wheels = [p for p in found if p.endswith(".whl")]
+          if len(wheels) != 1 or len(found) != 1:
+              print(f"::error::expected exactly one wheel and nothing else in dist/ (releases are wheel-only), found {found}")
               sys.exit(1)
-          (wheel,), (sdist,) = wheels, sdists
+          (wheel,) = wheels
           with zipfile.ZipFile(wheel) as zf:
               (meta,) = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
               wheel_version = version_of(zf.read(meta))
-          with tarfile.open(sdist) as tf:
-              # The sdist's own PKG-INFO sits at <name>-<version>/PKG-INFO.
-              (info,) = [m for m in tf.getmembers() if m.name.count("/") == 1 and m.name.endswith("/PKG-INFO")]
-              sdist_version = version_of(tf.extractfile(info).read())
 
           tag = os.environ["TAG"]
           built = Version(wheel_version)
-          if built != Version(sdist_version):
-              print(f"::error::wheel is {wheel_version} but sdist is {sdist_version}; they must match")
-              sys.exit(1)
           if tag != f"v{built}":
               print(f"::error::tag {tag} does not match the built version {built} (expected tag v{built}); bump pyproject.toml or retag")
               sys.exit(1)
-          print(f"tag {tag} matches the built version {built} (wheel and sdist)")
+          print(f"tag {tag} matches the built version {built}")
           PY
       - uses: DevinoSolutions/artifact/upload@739b3abd2f5f7bd4db8106bda6513ae94020c9e6  # v1
         with:
@@ -170,39 +165,9 @@ jobs:
           "$BIN/magent$EXE" --version
           "$BIN/magent$EXE" --help
 
-  sdist-smoke:
-    name: "Sdist smoke (ubuntu-latest)"
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
-        with:
-          python-version: "3.12"
-      - uses: DevinoSolutions/artifact/download@739b3abd2f5f7bd4db8106bda6513ae94020c9e6  # v1
-        with:
-          name: dist
-          path: dist
-      # The wheel smoke above proves the built wheel installs; this proves the
-      # SDIST installs too. A source tarball missing files (bad sdist include /
-      # hatch build config) is a classic first-release break the wheel path
-      # hides. ubuntu-only keeps CI minutes down — sdist packaging is OS-agnostic.
-      - name: Install sdist into a clean venv and run the entry point
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m venv .sdist-venv
-          BIN=.sdist-venv/bin
-          "$BIN/python" -m pip install --upgrade pip
-          sdist=$(ls dist/*.tar.gz)
-          echo "Installing $sdist into a pristine venv"
-          "$BIN/python" -m pip install "$sdist"
-          "$BIN/magent" --version
-          "$BIN/magent" --help
-
   publish:
     name: "Publish to PyPI (Trusted Publishing)"
-    needs: [build, smoke, sdist-smoke]
+    needs: [build, smoke]
     # Tag-push ONLY. workflow_dispatch (the dry-run path) is structurally
     # excluded here, so a dispatch can never publish — regardless of the
     # dry_run input. `!inputs.dry_run` is a defensive second gate.
