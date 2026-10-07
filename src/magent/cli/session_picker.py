@@ -34,6 +34,7 @@ from magent.cli.background import _running_upload_port, _tailnet_host
 from magent.cli.config_io import _load_config_or_exit
 from magent.cli.ui import _banner, _divider
 from magent.paths import find_config
+from magent.psmux import attach_argv
 from magent.style import style
 
 # The one answer that is a command rather than a search here, so a session
@@ -191,7 +192,7 @@ def _attach_session(psmux_bin: str, target: str, reset: Callable[[], None]) -> N
     for attempt in (1, 2):
         _set_picker_attached(target)
         try:
-            rc = subprocess.call([psmux_bin, "-L", target, "attach"])
+            rc = subprocess.call(attach_argv(psmux_bin, target))
         finally:
             _set_picker_attached(None)
             reset()

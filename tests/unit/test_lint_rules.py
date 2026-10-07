@@ -1,4 +1,4 @@
-"""Unit tests for scripts/lint_rules.py — the MD001-MD006 custom lint layer.
+"""Unit tests for scripts/lint_rules.py — the MD001-MD007 custom lint layer.
 
 Each rule is proven with a violating snippet (fires) and a conforming snippet
 (silent), plus scope checks (which path prefixes each rule applies to). The
@@ -237,3 +237,40 @@ def test_md006_covers_tuple_argv_shape():
 def test_md006_does_not_apply_outside_src():
     # tests build fake wt argv lines on purpose (test_ssh_real pins one).
     assert _codes("tests/unit/test_x.py", _WT_BARE) == []
+
+
+# ---- MD007: psmux argv is built only in src/magent/psmux.py ---------------
+
+
+def test_md007_flags_a_literal_psmux_string_argv():
+    src = 'subprocess.run(["psmux", "-L", n, "attach"])\n'
+    assert _codes("src/magent/cli/x.py", src) == ["MD007"]
+
+
+def test_md007_flags_name_and_call_spellings():
+    assert _codes("src/magent/x.py", 'a = [psmux, "-L", n, "attach"]\n') == ["MD007"]
+    assert _codes("src/magent/x.py", 'a = [psmux_bin, "-L", n]\n') == ["MD007"]
+    assert _codes("src/magent/x.py", 'a = (find_psmux(), "-L", n)\n') == ["MD007"]
+    assert _codes("src/magent/x.py", 'a = [pm.find_psmux(), "-L", n]\n') == ["MD007"]
+
+
+def test_md007_allows_the_owner_module():
+    src = 'a = ["psmux", "-L", n, "attach"]\n'
+    assert _codes("src/magent/psmux.py", src) == []
+
+
+def test_md007_ignores_other_executables_and_non_leading_psmux():
+    assert _codes("src/magent/x.py", 'a = ["ssh", "-t", "host", "psmux"]\n') == []
+    assert _codes("src/magent/x.py", 'a = [mux, "-L", "magent", "attach"]\n') == []
+    assert _codes("src/magent/x.py", "a = psmux.attach_argv(p, n)\n") == []
+
+
+def test_md007_ignores_data_tuples_that_merely_start_with_psmux():
+    # attach_client.MUXES and a docs table row both lead with the word.
+    assert _codes("src/magent/x.py", 'MUXES = ("psmux", "tmux")\n') == []
+    assert _codes("src/magent/x.py", 'row = ("psmux", "boolean", "`false`")\n') == []
+
+
+def test_md007_does_not_apply_outside_src():
+    # tests assert on psmux argv shapes on purpose.
+    assert _codes("tests/unit/test_x.py", 'a = ["psmux", "-L", n]\n') == []
