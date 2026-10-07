@@ -178,6 +178,22 @@ class MagentEnv(BaseSettings):
     # that FAILS to validate turns reaping OFF, not on (reap.env_enabled):
     # the one supervisor whose verb is destructive fails closed.
     idle_reap: bool = True
+    # Should magent give each project's Windows Terminal tab its own icon?
+    # (default: 1 / on; Windows-only.) When on, a launch writes a magent-owned
+    # Windows Terminal fragment under %LOCALAPPDATA% (one hidden profile per
+    # project, each pointing at an icon file beside it) and spawns the tab with
+    # `-p <profile>`. ``settings.terminalIcons`` is the per-config switch; this
+    # is the process-wide kill switch above it. Set to 0 to write nothing and
+    # pass no `-p` anywhere.
+    #
+    # 0 is also a TEST-ISOLATION law, the sixth member of the family
+    # (hotkey_supervisor / upload_supervisor / psmux_boost / node_sync /
+    # idle_reap): the fragment folder is a real per-user directory that no HOME
+    # redirect contains (it hangs off LOCALAPPDATA), and a child process cannot
+    # be reached by an in-process monkeypatch of the resolver. tests/conftest.py
+    # pins it to 0 for every tier; tests that are ABOUT the fragment turn it on
+    # in process, with the resolver pointed at a tmp dir.
+    wt_icons: bool = True
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:

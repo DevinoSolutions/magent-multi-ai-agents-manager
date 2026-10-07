@@ -166,6 +166,7 @@ class _Serve:
         env["MAGENT_PSMUX_BOOST"] = "0"
         env["MAGENT_NODE_SYNC"] = "0"
         env["MAGENT_IDLE_REAP"] = "0"
+        env["MAGENT_WT_ICONS"] = "0"
         # ...and a real serve supervises the attention daemon: it must never
         # start a real `attention -d` that no teardown knows the pid of.
         env["MAGENT_ATTENTION_SUPERVISOR"] = "0"

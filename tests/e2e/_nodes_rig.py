@@ -103,6 +103,7 @@ PIN_VALUES: dict[str, str] = {
     "MAGENT_SESSION0_POLICY": "allow",
     "MAGENT_MCP_RELAY": "0",
     "MAGENT_ACCOUNT_ROUTING": "0",
+    "MAGENT_WT_ICONS": "0",
 }
 # The pins this tier cannot run without: a schema that lost one of them is a
 # red test, not a quietly dropped pin.
@@ -114,6 +115,7 @@ REQUIRED_PINS = (
     "MAGENT_SESSION0_POLICY",
     "MAGENT_NODE_SYNC",
     "MAGENT_IDLE_REAP",
+    "MAGENT_WT_ICONS",
 )
 # Set in every PC-side child, and never allowed to reach a node pane
 # (remote_mux forwards no environment). MAGENT_* canaries are impossible:

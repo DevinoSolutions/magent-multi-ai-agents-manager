@@ -1,5 +1,6 @@
 """`magent terminal` -- install the Windows Terminal keybindings that keep
-Ctrl+Backspace and Shift+Enter working inside a psmux pane.
+Ctrl+Backspace and Shift+Enter working inside a psmux pane, and inspect or
+remove the per-project tab icons (`magent terminal icons`).
 
 Shaped after `magent hooks`: `install` merges idempotently into the app's own
 settings file, `status` reports what is wired without writing. The heritage is
@@ -7,7 +8,9 @@ Claude Code's `/terminal-setup`, which installs the Shift+Enter half -- but it
 REFUSES to run inside a tmux/psmux pane, which is exactly where magent users
 live, so magent has to ship the equivalent itself (and the Ctrl+Backspace half
 `/terminal-setup` never had). Why these two bytes, and why the fix belongs in
-the terminal rather than the multiplexer: see ``magent.wt_keys``.
+the terminal rather than the multiplexer: see ``magent.wt_keys``. The tab
+icons are a Windows Terminal fragment magent owns outright: see
+``magent.wt_profiles``.
 """
 
 from __future__ import annotations
@@ -16,8 +19,10 @@ from pathlib import Path
 
 import click
 
-from magent import wt_keys
+from magent import wt_keys, wt_profiles
 from magent.cli.app import main
+from magent.config import load_config
+from magent.paths import find_config
 from magent.style import style
 
 _MARKS = {
@@ -28,6 +33,8 @@ _MARKS = {
 }
 
 REPAIR_HINT = "magent terminal install"
+# Removing the fragment is the whole repair: the next launch writes it again.
+ICONS_REPAIR_HINT = "magent terminal icons --remove"
 
 _NOT_WINDOWS = (
     "Windows Terminal keybindings are a Windows-only feature -- this OS has no "
@@ -39,6 +46,69 @@ def _supported() -> bool:
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
     return get_platform().supports_wt_keybindings()
+
+
+def _icons_supported() -> bool:
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    return get_platform().supports_wt_profiles()
+
+
+def icons_off_reason(setting: bool) -> str | None:
+    """Why no tab icon will be written -- the env kill switch outranks the
+    ``settings.terminalIcons`` opt-out -- or None when the feature is on. ONE
+    translation, so ``terminal status`` and ``doctor`` cannot disagree."""
+    if not wt_profiles.enabled():
+        return "MAGENT_WT_ICONS=0"
+    if not setting:
+        return "settings.terminalIcons is false"
+    return None
+
+
+def _icons_setting(config_path: str | None) -> bool:
+    """``settings.terminalIcons`` of the config this invocation would use; on
+    when there is none to read (same tolerant read as `serve`'s port lookup --
+    a cosmetic status line must not become a hard exit over a bad config)."""
+    config_file = find_config(config_path)
+    if not config_file.exists():
+        return True
+    try:
+        return load_config(str(config_file)).settings.terminal_icons
+    except (ValueError, OSError):
+        return True
+
+
+def _echo_icon_status(config_path: str | None) -> None:
+    reason = icons_off_reason(_icons_setting(config_path))
+    state = (
+        style("on", fg="green")
+        if reason is None
+        else style(f"off ({reason})", fg="yellow")
+    )
+    click.echo(f"  {style('Tab icons', bold=True)}  {state}")
+    directory = wt_profiles.fragment_dir()
+    if directory is None:
+        click.echo(
+            f"  {style('No %LOCALAPPDATA% -- Windows Terminal fragments cannot be located.', dim=True)}"
+        )
+        return
+    click.echo(f"  {style(str(directory), dim=True)}")
+    profiles = wt_profiles.read_fragment(directory)
+    if not profiles:
+        click.echo(
+            f"  {style('No profiles yet -- written when a project window is launched.', dim=True)}"
+        )
+        return
+    for entry in profiles:
+        present = (directory / entry.icon).is_file()
+        mark, color = ("=", "green") if present else ("x", "yellow")
+        note = entry.source if present else f"{entry.source}, icon file missing"
+        click.echo(
+            f"  {style(mark, fg=color, bold=True)} {entry.name:<28} {style(note, dim=True)}"
+        )
+    click.echo(
+        f"  {style('Tab icons need Windows Terminal 1.24+ (relative icon paths in fragments).', dim=True)}"
+    )
 
 
 def _resolve(settings_file: Path | None) -> Path | None:
@@ -82,7 +152,7 @@ def _echo_manual_snippet(path: Path, exc: wt_keys.SettingsParseError) -> None:
 
 @main.group("terminal")
 def terminal_group() -> None:
-    """Keyboard fixes for the terminal your psmux sessions run in."""
+    """Windows Terminal keybindings and per-project tab icons."""
 
 
 @terminal_group.command("install")
@@ -145,8 +215,16 @@ def terminal_install_cmd(settings_file: Path | None) -> None:
     default=None,
     help="Windows Terminal settings.json to inspect (default: auto-detected).",
 )
-def terminal_status_cmd(settings_file: Path | None) -> None:
-    """Show whether the psmux-safe keybindings are installed. Writes nothing."""
+@click.pass_context
+def terminal_status_cmd(ctx: click.Context, settings_file: Path | None) -> None:
+    """Show the psmux-safe keybindings and the tab icons. Writes nothing."""
+    _echo_key_status(settings_file)
+    if _icons_supported():
+        click.echo()
+        _echo_icon_status((ctx.obj or {}).get("config_path"))
+
+
+def _echo_key_status(settings_file: Path | None) -> None:
     if not _supported():
         click.echo(f"  {style('-', dim=True)} {_NOT_WINDOWS}")
         return
@@ -185,3 +263,49 @@ def terminal_status_cmd(settings_file: Path | None) -> None:
     if any(o.state != wt_keys.INSTALLED for o in outcomes):
         click.echo()
         click.echo(f"  {style('Repair:', bold=True)} {style(REPAIR_HINT, fg='cyan')}")
+
+
+@terminal_group.command("icons")
+@click.option(
+    "--remove",
+    is_flag=True,
+    help="Delete magent's Windows Terminal fragment (the next launch rewrites it).",
+)
+@click.pass_context
+def terminal_icons_cmd(ctx: click.Context, remove: bool) -> None:
+    """Show the per-project tab icons, or remove them.
+
+    Each magent tab opens with a hidden Windows Terminal profile named
+    `magent: <window>`, whose icon is the project's own logo or a generated
+    badge. They live in a fragment folder magent owns outright
+    (%LOCALAPPDATA%/Microsoft/Windows Terminal/Fragments/magent) and are
+    written when a window is launched -- never into your settings.json.
+    `--remove` deletes that folder; tabs fall back to the default icon until
+    the next launch writes it again (turn that off with
+    `settings.terminalIcons: false` or `MAGENT_WT_ICONS=0`).
+    """
+    if not _icons_supported():
+        click.echo(
+            f"  {style('-', dim=True)} Tab icons are a Windows Terminal feature."
+        )
+        return
+    if not remove:
+        _echo_icon_status((ctx.obj or {}).get("config_path"))
+        return
+    if wt_profiles.remove():
+        click.echo(f"  {style('Removed', bold=True)} {wt_profiles.fragment_dir()}")
+        click.echo(
+            f"  {style('Restart Windows Terminal to drop the profiles.', dim=True)}"
+        )
+    else:
+        directory = wt_profiles.fragment_dir()
+        if directory is not None and directory.is_dir():
+            # What magent wrote is gone (or could not be touched while another
+            # magent held the lock); the folder stays because it still holds
+            # something else.
+            click.echo(
+                f"  {style('Kept', bold=True)} {directory}"
+                f" {style('-- it holds files magent did not write, or another magent is using it.', dim=True)}"
+            )
+        else:
+            click.echo(f"  {style('Nothing to remove.', dim=True)}")

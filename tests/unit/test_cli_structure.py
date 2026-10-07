@@ -35,7 +35,7 @@ def _normalize_help(output: str) -> str:
 
 
 HELP_SNAPSHOTS = {
-    (): "Usage: main [OPTIONS] [COMMAND] [ARGS]...\n\n  Open every project in its own terminal and auto-tile across all monitors.\n\nOptions:\n  --go              Skip interactive menu, launch + tile\n  --retile-all      Re-tile every matching window\n  -a, --all         Launch every enabled project -- skip the project checklist\n  -g, --group TEXT  Launch only projects in this group\n  --init            Re-scan and regenerate config\n  --base-dir PATH   Folder to scan with --init\n  --config PATH     Path to config file\n  --force           With --init, overwrite existing config\n  --edit            Open config in your default editor\n  --attach-to TEXT  Attach to remote psmux sessions (host or user@host)\n  --no-mux          With --attach-to: one plain SSH window per project (no\n                    psmux/tmux)\n  --allow-dirty     Node projects: start despite a dirty or unpushed tree\n  --version         Show the version and exit.\n  --help            Show this message and exit.\n\nCommands:\n  attach     Attach to another machine's magent sessions over SSH.\n  attention  Ambient attention signals for your agent fleet.\n  config     View and modify your magent configuration.\n  docs       Print the full configuration reference (Markdown).\n  doctor     Diagnose the environment: config, env vars, tools, display, dirs.\n  down       Shut down psmux sessions (and optionally the upload server).\n  hooks      Wire agent lifecycle hooks that feed the session-state store.\n  hotkey     Listen for Alt+V to upload clipboard images to psmux sessions.\n  mobile     Show the phone URL + QR for the image-upload app.\n  model      Switch a session's model (and optionally effort), only while...\n  node       Run projects on a pool of Linux machines over ssh.\n  peek       Print the last LINES of a session's pane -- a read-only glance.\n  send       Deliver a prompt to one running agent by name.\n  serve      Start upload server for mobile image transfer.\n  sessions   List psmux sessions or attach to one.\n  status     Show which psmux sessions and services are currently running.\n  terminal   Keyboard fixes for the terminal your psmux sessions run in.\n  termius    Generate SSH config for Termius — one host that opens all...\n  up         Ensure a persistent psmux session per project (host side of...\n  watch      Live view of every agent session — who needs you, sorted first.\n",
+    (): "Usage: main [OPTIONS] [COMMAND] [ARGS]...\n\n  Open every project in its own terminal and auto-tile across all monitors.\n\nOptions:\n  --go              Skip interactive menu, launch + tile\n  --retile-all      Re-tile every matching window\n  -a, --all         Launch every enabled project -- skip the project checklist\n  -g, --group TEXT  Launch only projects in this group\n  --init            Re-scan and regenerate config\n  --base-dir PATH   Folder to scan with --init\n  --config PATH     Path to config file\n  --force           With --init, overwrite existing config\n  --edit            Open config in your default editor\n  --attach-to TEXT  Attach to remote psmux sessions (host or user@host)\n  --no-mux          With --attach-to: one plain SSH window per project (no\n                    psmux/tmux)\n  --allow-dirty     Node projects: start despite a dirty or unpushed tree\n  --version         Show the version and exit.\n  --help            Show this message and exit.\n\nCommands:\n  attach     Attach to another machine's magent sessions over SSH.\n  attention  Ambient attention signals for your agent fleet.\n  config     View and modify your magent configuration.\n  docs       Print the full configuration reference (Markdown).\n  doctor     Diagnose the environment: config, env vars, tools, display, dirs.\n  down       Shut down psmux sessions (and optionally the upload server).\n  hooks      Wire agent lifecycle hooks that feed the session-state store.\n  hotkey     Listen for Alt+V to upload clipboard images to psmux sessions.\n  mobile     Show the phone URL + QR for the image-upload app.\n  model      Switch a session's model (and optionally effort), only while...\n  node       Run projects on a pool of Linux machines over ssh.\n  peek       Print the last LINES of a session's pane -- a read-only glance.\n  send       Deliver a prompt to one running agent by name.\n  serve      Start upload server for mobile image transfer.\n  sessions   List psmux sessions or attach to one.\n  status     Show which psmux sessions and services are currently running.\n  terminal   Windows Terminal keybindings and per-project tab icons.\n  termius    Generate SSH config for Termius — one host that opens all...\n  up         Ensure a persistent psmux session per project (host side of...\n  watch      Live view of every agent session — who needs you, sorted first.\n",
     (
         "attention",
     ): "Usage: main attention [OPTIONS]\n\n  Ambient attention signals for your agent fleet.\n\n  Badges every magent: window title with its session state, flashes the taskbar\n  when an agent needs input or errors, and (when enabled in config) sends a\n  Windows toast and/or an ntfy push. States come from the agent-state store that\n  Claude Code hooks / Codex notify already write.\n\nOptions:\n  -d, --daemon      Run detached\n  --stop            Stop the running daemon\n  --interval FLOAT  Seconds between polls (default: attention.pollIntervalS from\n                    config)\n  --help            Show this message and exit.\n",
@@ -91,7 +91,7 @@ HELP_SNAPSHOTS = {
     ): "Usage: main hooks status [OPTIONS]\n\n  Show which lifecycle hooks are wired and how fresh the state store is.\n\nOptions:\n  --settings-file PATH  Claude Code settings.json to inspect (default:\n                        ~/.claude/settings.json).\n  --help                Show this message and exit.\n",
     (
         "terminal",
-    ): "Usage: main terminal [OPTIONS] COMMAND [ARGS]...\n\n  Keyboard fixes for the terminal your psmux sessions run in.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  install  Bind Ctrl+Backspace and Shift+Enter so they survive psmux.\n  status   Show whether the psmux-safe keybindings are installed.\n",
+    ): "Usage: main terminal [OPTIONS] COMMAND [ARGS]...\n\n  Windows Terminal keybindings and per-project tab icons.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  icons    Show the per-project tab icons, or remove them.\n  install  Bind Ctrl+Backspace and Shift+Enter so they survive psmux.\n  status   Show the psmux-safe keybindings and the tab icons.\n",
     (
         "terminal",
         "install",
@@ -99,7 +99,11 @@ HELP_SNAPSHOTS = {
     (
         "terminal",
         "status",
-    ): "Usage: main terminal status [OPTIONS]\n\n  Show whether the psmux-safe keybindings are installed. Writes nothing.\n\nOptions:\n  --settings-file PATH  Windows Terminal settings.json to inspect (default:\n                        auto-detected).\n  --help                Show this message and exit.\n",
+    ): "Usage: main terminal status [OPTIONS]\n\n  Show the psmux-safe keybindings and the tab icons. Writes nothing.\n\nOptions:\n  --settings-file PATH  Windows Terminal settings.json to inspect (default:\n                        auto-detected).\n  --help                Show this message and exit.\n",
+    (
+        "terminal",
+        "icons",
+    ): "Usage: main terminal icons [OPTIONS]\n\n  Show the per-project tab icons, or remove them.\n\n  Each magent tab opens with a hidden Windows Terminal profile named `magent:\n  <window>`, whose icon is the project's own logo or a generated badge. They\n  live in a fragment folder magent owns outright\n  (%LOCALAPPDATA%/Microsoft/Windows Terminal/Fragments/magent) and are written\n  when a window is launched -- never into your settings.json. `--remove` deletes\n  that folder; tabs fall back to the default icon until the next launch writes\n  it again (turn that off with `settings.terminalIcons: false` or\n  `MAGENT_WT_ICONS=0`).\n\nOptions:\n  --remove  Delete magent's Windows Terminal fragment (the next launch rewrites\n            it).\n  --help    Show this message and exit.\n",
     (
         "config",
         "show",
@@ -229,7 +233,7 @@ TOP_LEVEL_COMMANDS = [
     "up",
     "watch",
 ]
-TERMINAL_SUBCOMMANDS = ["install", "status"]
+TERMINAL_SUBCOMMANDS = ["icons", "install", "status"]
 NODE_SUBCOMMANDS = [
     "add",
     "auth",
@@ -422,6 +426,10 @@ class TestAttachFlowCharacterization:
                 return False
 
             def supports_window_close(self) -> bool:
+                return False
+
+            def supports_wt_profiles(self) -> bool:
+                # Tab icons have their own pins (test_attach_tab_icons.py).
                 return False
 
             def snapshot_windows(self) -> dict[str, int]:

@@ -598,19 +598,25 @@ def spawn_attach_window(
     # harness leaked into us, which would paint this pane monochrome. None
     # when no harness marker is present, i.e. plain inheritance.
     title = make_title(sid)
-    subprocess.Popen(
-        [
-            "wt",
-            "-w",
-            "new",
-            "--title",
-            title,
-            "--suppressApplicationTitle",
-            "--",
-            *pane,
-        ],
-        env=attach_client_env(),
-    )
+    # heavy subsystem: in-body per policy (this leaf's import cost is the
+    # supervisor's start-up cost, and the supervisor never spawns a window).
+    from magent.wt_profiles import profile_for
+
+    args = [
+        "wt",
+        "-w",
+        "new",
+        "--title",
+        title,
+        "--suppressApplicationTitle",
+    ]
+    # The tab icon: only when a launch/attach already wrote this session's
+    # profile (profile_for answers None otherwise -- no -p, default icon).
+    profile = profile_for(sid)
+    if profile:
+        args.extend(["-p", profile])
+    args.extend(["--", *pane])
+    subprocess.Popen(args, env=attach_client_env())
     return title
 
 

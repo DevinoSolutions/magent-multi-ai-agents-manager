@@ -130,6 +130,7 @@ class Settings:
     upload_server: bool = False
     upload_port: int = 8033
     window_title_prefix: bool = True
+    terminal_icons: bool = True
     ssh: SSHConfig = field(default_factory=SSHConfig)
     attention: AttentionSettings = field(default_factory=AttentionSettings)
     nodes: dict[str, NodeConfig] = field(default_factory=dict)
@@ -161,6 +162,7 @@ class ProjectConfig:
     windows: list[WindowConfig] | None = None
     node: str | None = None
     push: list[str] | None = None
+    icon: str | None = None
 
 
 def is_cloud(proj: ProjectConfig) -> bool:
@@ -446,6 +448,7 @@ def _parse_settings(raw: dict[str, object] | None) -> Settings:
         upload_server=_bool(raw, "uploadServer", False),
         upload_port=_int(raw, "uploadPort", 8033),
         window_title_prefix=_bool(raw, "windowTitlePrefix", True),
+        terminal_icons=_bool(raw, "terminalIcons", True),
         ssh=_parse_ssh(_obj(raw, "ssh")),
         attention=_parse_attention(_obj(raw, "attention")),
         nodes=_parse_nodes(_obj(raw, "nodes")),
@@ -482,6 +485,7 @@ def settings_to_dict(settings: Settings) -> dict[str, object]:
         "uploadServer": settings.upload_server,
         "uploadPort": settings.upload_port,
         "windowTitlePrefix": settings.window_title_prefix,
+        "terminalIcons": settings.terminal_icons,
         "ssh": {"shell": settings.ssh.shell},
         "attention": {
             "badge": settings.attention.badge,
@@ -540,6 +544,7 @@ def _parse_project(raw: dict[str, object]) -> ProjectConfig:
         windows=_windows(raw),
         node=_str_or_none(raw, "node"),
         push=_str_list_or_none(raw, "push"),
+        icon=_str_or_none(raw, "icon"),
     )
 
 
@@ -622,6 +627,7 @@ _ALLOWED_SETTINGS_KEYS = {
     "uploadServer",
     "uploadPort",
     "windowTitlePrefix",
+    "terminalIcons",
     "ssh",
     "attention",
     "nodes",
@@ -656,6 +662,7 @@ _ALLOWED_PROJECT_KEYS = {
     "windows",
     "node",
     "push",
+    "icon",
 }
 _ALLOWED_WINDOW_KEYS = {"name", "tool", "command"}
 # The two reserved nicks. `"node": "auto"` is the placement request, not a

@@ -5,6 +5,7 @@ import subprocess
 import sys
 import types
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from click.testing import CliRunner
@@ -247,6 +248,13 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # box's live fleet. Off for every tier; reaper tests turn it on IN PROCESS
     # only (monkeypatch.setenv + resetting env._cached_env).
     monkeypatch.setenv("MAGENT_IDLE_REAP", "0")
+    # ...and a sixth: the tab-icon fragment is written into the REAL
+    # %LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments folder, which no HOME
+    # redirect contains (LOCALAPPDATA is inherited), and Windows Terminal
+    # picks it up live. In-process the `_no_real_wt_fragment` fixture below
+    # re-aims the resolver; this pin covers every CHILD process a test starts.
+    # Tests that are ABOUT the feature turn it on in process.
+    monkeypatch.setenv("MAGENT_WT_ICONS", "0")
     log.reset_logging()
     yield
     log.reset_logging()
@@ -309,6 +317,24 @@ def _no_real_claude(monkeypatch):
     subscription and opens their browser to do it. Same device as
     ``_no_real_gh``; the ``fake_claude`` fixture wins over it."""
     monkeypatch.setattr("magent.node_auth.find_claude", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_wt_fragment(tmp_path_factory, monkeypatch):
+    """No test writes into (or reads from) the REAL Windows Terminal fragments
+    folder. ``wt_profiles.fragments_root`` is re-aimed at a tmp dir for every
+    test, so a spawn path or a ``sync`` that a test reaches by accident lands
+    in tmp. Same device as ``_no_real_ssh``: patched on the MODULE attribute,
+    so ``test_home_isolation`` can still import the real resolver by value.
+    """
+    # A unique PATH, not a directory: `mktemp` numbers its dirs by scanning every
+    # sibling, so one per test (all ~8000 of them, autouse) made the suite
+    # quadratic and pushed the CI quality job past its 10-minute timeout. The
+    # folder comes into being only for the few tests that write a fragment.
+    root = tmp_path_factory.getbasetemp() / "wt-fragments" / uuid4().hex
+    monkeypatch.setattr("magent.wt_profiles.fragments_root", lambda: root)
+    # A lock found held by one test must not mute the next one's syncs.
+    monkeypatch.setattr("magent.wt_profiles._launch.lock_lost", False)
 
 
 @pytest.fixture
@@ -764,6 +790,7 @@ class FakePlatform(Platform):
         supports_attention: bool = False,
         supports_hotkey: bool = False,
         supports_wt_keybindings: bool = False,
+        supports_wt_profiles: bool = False,
         supports_attach_windows: bool = False,
         supports_nudge: bool = False,
         nudge_error: Exception | None = None,
@@ -790,6 +817,7 @@ class FakePlatform(Platform):
         self._supports_attention = supports_attention
         self._supports_hotkey = supports_hotkey
         self._supports_wt_keybindings = supports_wt_keybindings
+        self._supports_wt_profiles = supports_wt_profiles
         self._supports_attach_windows = supports_attach_windows
         self._supports_nudge = supports_nudge
         self._nudge_error = nudge_error
@@ -825,6 +853,7 @@ class FakePlatform(Platform):
         self.psmux_sessions: set[str] = set()
         self.psmux_launches: list[list[str]] = []
         self.attached_psmux: list[tuple] = []
+        self.attached_profiles: list[str | None] = []
         self.moved: list[tuple] = []
         self.nudged: list[list] = []
         self.titles_set: list[tuple] = []
@@ -870,8 +899,11 @@ class FakePlatform(Platform):
             self.psmux_sessions.add(w.window_name)
         return {}
 
-    def attach_psmux(self, session_name, title, color=None, config_path=None) -> None:
+    def attach_psmux(
+        self, session_name, title, color=None, config_path=None, profile=None
+    ) -> None:
         self.attached_psmux.append((session_name, title, color, config_path))
+        self.attached_profiles.append(profile)
 
     def supports_psmux(self) -> bool:
         return self._supports_psmux
@@ -881,6 +913,9 @@ class FakePlatform(Platform):
 
     def supports_wt_keybindings(self) -> bool:
         return self._supports_wt_keybindings
+
+    def supports_wt_profiles(self) -> bool:
+        return self._supports_wt_profiles
 
     def supports_attach_windows(self) -> bool:
         return self._supports_attach_windows

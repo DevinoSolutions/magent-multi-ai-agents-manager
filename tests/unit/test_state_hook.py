@@ -318,6 +318,7 @@ class TestModuleForm:
             "MAGENT_PSMUX_BOOST": "0",
             "MAGENT_NODE_SYNC": "0",
             "MAGENT_IDLE_REAP": "0",
+            "MAGENT_WT_ICONS": "0",
             "MAGENT_SESSION0_POLICY": "allow",
         }
         cwd = str(tmp_path / "proj")

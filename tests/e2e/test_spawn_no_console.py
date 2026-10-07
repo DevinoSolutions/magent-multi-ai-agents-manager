@@ -216,6 +216,7 @@ def fleet(tmp_path, monkeypatch):
     monkeypatch.setenv("MAGENT_PSMUX_BOOST", "0")
     monkeypatch.setenv("MAGENT_NODE_SYNC", "0")
     monkeypatch.setenv("MAGENT_IDLE_REAP", "0")
+    monkeypatch.setenv("MAGENT_WT_ICONS", "0")
     # ...and the Session-0 hand-off must never fire from a test: a runner
     # (or an ssh-driven leg) is legitimately non-interactive, and the
     # default policy would create a REAL scheduled task on somebody's
