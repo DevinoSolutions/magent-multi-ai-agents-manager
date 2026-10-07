@@ -113,16 +113,24 @@ From an up-to-date `main` (or a release branch that will be merged):
 
 That's it. On the tag push the workflow will:
 
-1. **build** — `python -m build` produces the sdist + wheel, `twine check
+1. **build** — `python -m build --wheel` produces the wheel, `twine check
    --strict` validates the metadata, and the tag must be exactly `v` plus the
-   canonical PEP 440 form of the version inside both built artifacts, or the
+   canonical PEP 440 form of the version inside the built wheel, or the
    run stops before anything is published.
 2. **smoke** — installs the built wheel into a clean, no-extras venv on Linux,
    Windows, and macOS and runs `magent --version` / `magent --help`.
-3. **publish** — after any required-reviewer approval, uploads the sdist + wheel
+3. **publish** — after any required-reviewer approval, uploads the wheel
    to PyPI via Trusted Publishing (no token).
 4. **github-release** — creates a GitHub Release for the tag with
    auto-generated notes and the built artifacts attached.
+
+> **Wheel-only releases.** No sdist is built or published, on purpose.
+> hatchling's default sdist ships the whole tree (tests, docs, agent plans), and
+> a PyPI upload can never be taken back, so a private string that reaches an
+> sdist cannot be scrubbed afterwards. Users on a supported platform install the
+> pure-Python wheel; `pip install` on a platform that needs the sdist is not
+> supported. `tests/dist/` still builds an sdist locally to scan it for private
+> strings; that is a test fixture, never an upload.
 
 The `github-release` job publishes GitHub's **auto-generated** notes — no manual
 release step is required. For a curated changelog, edit the Release after the run
@@ -169,7 +177,7 @@ To validate build + smoke without publishing, trigger the workflow manually:
 - **GitHub UI:** *Actions → Release → Run workflow* (leave **dry_run** checked).
 - **CLI:** `gh workflow run release.yml -f dry_run=true`
 
-The `build`, `smoke` and `sdist-smoke` jobs run; `publish` and `github-release`
+The `build` and `smoke` jobs run; `publish` and `github-release`
 are skipped. `workflow_dispatch` can **never** publish — publishing is gated to
 `push` events on `v*` tags — so a dispatch is always safe, whatever the
 `dry_run` value.
