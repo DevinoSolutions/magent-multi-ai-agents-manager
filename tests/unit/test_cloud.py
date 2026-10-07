@@ -3860,7 +3860,7 @@ class TestReviveNeverRetypesACloudPane:
     def sent(self, monkeypatch):
         out: list[str] = []
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
-        monkeypatch.setattr(psmux, "has_session", lambda *a, **k: True)
+        monkeypatch.setattr(psmux, "live_sessions", lambda names, **k: list(names))
         monkeypatch.setattr(psmux, "idle_sessions", lambda names, **k: set(names))
         monkeypatch.setattr(
             psmux, "send_keys", lambda sid, *a, **k: out.append(sid) or True
@@ -4776,7 +4776,7 @@ class TestACloudFirstTwinNeverReachesTheSessionLists:
     def sent(self, monkeypatch):
         out: list[str] = []
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
-        monkeypatch.setattr(psmux, "has_session", lambda *a, **k: True)
+        monkeypatch.setattr(psmux, "live_sessions", lambda names, **k: list(names))
         monkeypatch.setattr(psmux, "idle_sessions", lambda names, **k: set(names))
         monkeypatch.setattr(
             psmux, "send_keys", lambda sid, *a, **k: out.append(sid) or True
