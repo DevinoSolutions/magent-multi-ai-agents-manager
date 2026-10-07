@@ -363,6 +363,8 @@ Or skip the menu with flags:
 | `magent hotkey [--ssh-host <host>]` | Run the window-hotkey listener standalone (Windows): Alt+V clipboard upload and F2 open-in-VS-Code. `--ssh-host` makes F2 open over Remote-SSH. |
 | `magent hooks install` | Wire the agent lifecycle hooks that feed the session-state store (`magent hooks status` to inspect) — see [Where agent states come from](#where-agent-states-come-from). |
 | `magent terminal install` | Bind Ctrl+Backspace and Shift+Enter in Windows Terminal so they still work inside a psmux pane (`magent terminal status` to inspect) — see [Typing through psmux](#typing-through-psmux). |
+| `magent new <name>` | Start a project in its own folder under your projects folder (`baseDir`), tracked by magent — see [Create and remove projects](#create-and-remove-projects). |
+| `magent remove <name>` | Take a project out of magent (stops its running session first; never deletes the folder). |
 | `magent config <subcommand>` | Edit config from the CLI — 17 subcommands incl. `migrate`; see `magent config --help`. |
 | `magent config edit [host]` | Edit the config on **another** machine in your editor over SSH — fetch, edit, validate, push back. Omit the host to reuse your last `attach` target. The host side is `magent config cat` / `magent config put`, which you never run by hand. |
 
@@ -389,6 +391,21 @@ A fleet grows, and most launches want four of its fourteen windows. So `magent -
 Up/Down (or `j`/`k`) move, **Space** toggles the row, **`a`**/**`n`** check or clear everything, **`g`** toggles the whole section the cursor is in, digits **1-9** toggle that numbered row, **Enter** launches the checked set, and **`q`**/Esc walks away with `Nothing launched.` (as does Enter with nothing checked). Projects are grouped by their `group` field; ungrouped ones sit last under `other`.
 
 Off a terminal — a script, cron, CI, anything piped — there is **no prompt at all** and every enabled project launches, exactly as before. `--all` (`-a`) is the same escape hatch when you *are* on a terminal. `-g <group>` narrows the checklist to that group, and `--retile-all` never asks, since it launches nothing.
+
+### Create and remove projects
+
+`magent new <name>` is the clean way to give each agent chat a folder of its own that magent already tracks: it makes `<baseDir>/<name>`, adds the project to your config, runs `git init` in the folder (no commit, no remote; `--no-git` skips it, and a missing `git` is a note, not a failure) and, on a terminal, asks `Open it now?` — a yes brings up **only** that project, without re-tiling the rest of your fleet.
+
+```
+magent new scratch-pad                  # <baseDir>/scratch-pad, config entry, git init, "Open it now? [Y/n]"
+magent new api -g work -t codex         # same options as `magent config add`
+magent new demo --in D:/sandbox         # a different parent, for this one project (stores an absolute path)
+magent new tmp --no-open --json         # scripts: {"ok": true, "name", "path", "git"}
+```
+
+If `baseDir` is not set yet, `magent new` asks once where new projects should live (default `~/projects`) and saves it; with no terminal it refuses in one line naming `--in <dir>` or `magent config base-dir <dir>`. Names must be a single folder name (no path separators or `..`, nothing Windows rejects, no reserved device names like `CON`). A leading `-` or `.`, control and zero-width characters, and `COM¹`/`CONIN$`-style device names are refused too. It refuses a name that is already a project (or whose psmux session name would collide with one, like `foo bar` next to `foo-bar`), and a target folder that exists and is not empty (an existing empty folder is fine) — before anything is created or written.
+
+`magent remove <name>` is the way back out. It matches case-insensitively and exactly (the project's name, folder name, title or full path, never a part of one: a near miss lists the closest names and removes nothing; two projects sharing a folder name stop as ambiguous and need the full path), edits the config, and **never deletes the folder or any file** — it prints where the folder is and that it was left in place. If the project's session is running it asks `Its session is running. Stop it first?` (or pass `--stop`; with no terminal and no `--stop` it refuses), because `magent down --all` only acts on configured sessions and a removed project's session would be orphaned. A project placed on a node is refused with a pointer to `magent down <name>`. `magent config remove` is the same removal, and the menu has matching **New project** and **Remove a project** rows.
 
 ### Driving a session from another shell
 

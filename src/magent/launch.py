@@ -1029,6 +1029,11 @@ class RunOpts:
     # Node projects (PR-D): start one whose local tree is dirty or has
     # unpushed commits anyway -- the node gets origin's copy (D7).
     allow_dirty: bool = False
+    # Place each newly launched window in the first tile the windows already
+    # open do not hold, and never move one of them -- `magent new`'s "open it
+    # now". A plain launch tiles its new windows from slot 0, which is right
+    # for a fresh grid and lands on top of the first window in a live one.
+    fill_free_slot: bool = False
 
 
 @dataclass
@@ -1134,7 +1139,10 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
     targets = (
         _retile_targets(config, opts, result) if opts.retile_all else result.targets
     )
-    _tile_targets(plat, opts, slots, targets)
+    if opts.fill_free_slot and not opts.retile_all:
+        _tile_free_slots(plat, opts, slots, result)
+    else:
+        _tile_targets(plat, opts, slots, targets)
 
     return 0
 
@@ -2088,6 +2096,33 @@ def _tile_targets(
     place_windows(plat, placements, on_placed=_placed, on_missing=_missing)
 
     click.echo(f"\n  {style('Done!', fg='green', bold=True)}")
+
+
+def _tile_free_slots(
+    plat: Platform, opts: RunOpts, slots: list[TileSlot], result: _LaunchResult
+) -> None:
+    """`fill_free_slot`: tile only the new windows, after the tiles the open
+    magent windows hold.
+
+    The Platform has no window-rect API, so "held" is counted, not measured:
+    the open magent windows (the launch phase's own pre-launch snapshot) are
+    taken to fill the grid from slot 0, which is where every magent tiling
+    puts them. A full grid places nothing -- one dim line, no overlap, and
+    nothing is moved."""
+    fresh = {t.key for t in result.targets if t.is_new}
+    held = len([n for n in magent_window_names(result.open_titles) if n not in fresh])
+    free = slots[held:]
+    if not free:
+        click.echo(
+            f"\n  {style('-', dim=True)} "
+            + style(
+                f"No free tile on screen ({held} magent window(s) open); "
+                "the new window was not tiled. Run `magent --retile-all` to re-grid.",
+                dim=True,
+            )
+        )
+        return
+    _tile_targets(plat, opts, free, result.targets)
 
 
 def _log_project(

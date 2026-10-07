@@ -7,12 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`magent new <name>` and `magent remove <name>`.** `new` makes `<baseDir>/<name>`,
+  adds the project to the config (same options as `config add`: `-g`, `-t`, `-c`,
+  `--title`; `--in <dir>` for a different parent), `git init`s the folder
+  (`--no-git` skips) and, at a terminal, offers to open just that project
+  (`--open`/`--no-open`; no fleet re-tile). An unset `baseDir` is asked once at a
+  terminal and saved; without one it refuses naming `--in <dir>`. Bad names,
+  duplicates and non-empty folders are refused before anything is written.
+  `remove` never deletes a file: it stops the project's running session first
+  (asked, or `--stop`; refused with neither) so `down --all` is not left with an
+  orphan, and refuses a node-placed project with a pointer to `magent down`.
+  Both take `--json`, and the menu gains **New project** (`n`) and **Remove a
+  project** (`r`).
+
 ### Changed
 
 - **Every psmux argv is now built in `psmux.py`.** The attach, new-session and
   agent-command send argvs that `platform/windows.py` and the session picker
   hand-built are named builders there, and custom lint rule MD007 fails the gate
   if a psmux argv literal reappears elsewhere in `src/`. No behaviour change.
+- **`magent config remove` now shares `magent remove`'s implementation**, so it
+  also stops a running session first (asked at a terminal, or `--stop`) and
+  refuses to orphan one when it cannot ask. It still matches exactly, never fuzzily.
+- **`magent config remove` behavior changes** with that shared code: it now
+  also matches a project's title (case-insensitively, as well as its path
+  and folder name); a running session now makes it refuse, without
+  `--stop`, when there is no terminal to ask at (it used to remove the
+  entry and orphan the session); and an unknown name prints
+  `No project matching 'x' found.` followed by the closest names.
 
 ### Fixed
 

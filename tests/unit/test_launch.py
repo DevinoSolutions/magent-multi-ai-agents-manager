@@ -2587,3 +2587,63 @@ class TestTheSupervisedSkewRestartIsBounded:
         # a one-shot caller (no watch) asking for another target still restarts
         launch.start_hotkey_listener("http://other:8034", None)
         assert world.stops == 1
+
+
+class TestFillFreeSlot:
+    """`RunOpts.fill_free_slot` -- the one-new-window placement `magent new`
+    uses. It must land in a slot the existing magent windows do not hold and
+    must never move one of them (a plain top-up tiles from slot 0 and would
+    sit on top of the first window)."""
+
+    def _cfg(self, tmp_path):
+        for n in ("a", "b", "fresh"):
+            (tmp_path / n).mkdir()
+        return MagentConfig(
+            projects=[
+                ProjectConfig(path=str(tmp_path / n), tool="claude", title=n)
+                for n in ("a", "b", "fresh")
+            ],
+            settings=Settings(
+                tools={"claude": "claude --continue"}, default_tool="claude"
+            ),
+        )
+
+    def test_new_window_skips_slots_held_by_open_windows(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        fp = FakePlatform(windows={"magent:a": 11, "magent:b": 12})
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = self._cfg(tmp_path)
+        cfg.layout.columns, cfg.layout.rows = 3, 1
+
+        rc = run_magent(cfg, RunOpts(only=frozenset({"fresh"}), fill_free_slot=True))
+
+        assert rc == 0
+        assert [h for h, _ in fp.moved] == [fp._windows["magent:fresh"]]
+        assert fp.moved[0][1] == Rect(x=1280, y=0, w=640, h=1080)
+
+    def test_full_grid_places_nothing_and_says_so(
+        self, monkeypatch, tmp_path, fake_sleep, capsys
+    ):
+        fp = FakePlatform(windows={"magent:a": 11, "magent:b": 12})
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = self._cfg(tmp_path)  # default grid: 2 slots, both held
+
+        rc = run_magent(cfg, RunOpts(only=frozenset({"fresh"}), fill_free_slot=True))
+
+        assert rc == 0
+        assert fp.moved == []
+        assert "No free tile" in capsys.readouterr().out
+
+    def test_without_the_flag_a_top_up_still_starts_at_slot_zero(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        """The menu's own launch path is unchanged -- a documented sibling."""
+        fp = FakePlatform(windows={"magent:a": 11, "magent:b": 12})
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = self._cfg(tmp_path)
+        cfg.layout.columns, cfg.layout.rows = 3, 1
+
+        run_magent(cfg, RunOpts(only=frozenset({"fresh"})))
+
+        assert fp.moved[0][1].x == 0

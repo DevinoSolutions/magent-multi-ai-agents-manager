@@ -16,11 +16,12 @@ things in two places. On a real terminal the picker reads raw keys; off one
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import click
 
-from magent.cli import picker
+from magent.cli import picker, project_cmd
 from magent.cli.config_editor import _config_menu
 from magent.cli.ui import _banner, _divider, _menu_item, _open_in_editor
 from magent.paths import _config_path
@@ -30,7 +31,7 @@ from magent.style import style
 # search: `q` stays Quit on a fleet that also has a project called
 # `queue-worker`. Row numbers need no entry here -- an all-digit query is a row
 # address by construction.
-_MENU_COMMANDS = frozenset("usatdeq")
+_MENU_COMMANDS = frozenset("usatdnreq")
 
 _MENU_PROMPT_DEFAULT = "1"
 
@@ -86,6 +87,13 @@ def _menu_rows(groups: list[str]) -> list[picker.PickerItem]:
             gap_before=True,
         ),
         picker.PickerItem("d", "Shut down sessions", key_fg="yellow"),
+        picker.PickerItem(
+            "n",
+            "New project",
+            extra=style("  (own folder, tracked)", dim=True),
+            gap_before=True,
+        ),
+        picker.PickerItem("r", "Remove a project", key_fg="yellow"),
         picker.PickerItem("e", "Edit config", key_fg="yellow", gap_before=True),
         picker.PickerItem("q", "Quit", key_fg="red"),
     ]
@@ -161,6 +169,17 @@ def _pick_group(groups: list[str]) -> str | None:
     return None
 
 
+def _groups_of(config_file: Path, fallback: list[str]) -> list[str]:
+    """The config's group names after an edit; the old list if it cannot be read."""
+    try:
+        data = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return fallback
+    return sorted(
+        {p.get("group", "") for p in data.get("projects", []) if p.get("group")}
+    )
+
+
 def _show_menu(groups: list[str], config_file: Path | None = None) -> dict[str, object]:
     config_changed = False
     while True:
@@ -199,6 +218,19 @@ def _show_menu(groups: list[str], config_file: Path | None = None) -> dict[str, 
                     "group": picked,
                     "reload": config_changed,
                 }
+        elif choice == "n" and config_file:
+            rc = project_cmd.menu_new(config_file)
+            if rc is not None:
+                # The new project was opened: that was the launch.
+                if rc:
+                    sys.exit(rc)
+                return {"action": "quit", "reload": False}
+            groups = _groups_of(config_file, groups)
+            config_changed = True
+        elif choice == "r" and config_file:
+            project_cmd.menu_remove(config_file)
+            groups = _groups_of(config_file, groups)
+            config_changed = True
         elif choice == "e":
             if config_file and config_file.exists():
                 _config_menu(config_file)
