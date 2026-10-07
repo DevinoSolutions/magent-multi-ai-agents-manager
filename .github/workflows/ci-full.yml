@@ -4,20 +4,21 @@ name: CI Full (macOS + full Windows spread)
 # macOS 10x, so ci.yml (every PR / push to main) runs Linux in full and Windows
 # on the lowest + highest supported Python only. This workflow adds what that
 # trims -- every macOS leg and the middle Windows Pythons -- and runs it only
-# where the cost buys something: a release tag, the nightly schedule, or a
+# where the cost buys something: a release tag, the weekly schedule, or a
 # manual dispatch. It never runs on pull_request or branch pushes.
 #
 # NOT a required check by design. The required check is the ci.yml job named
 # "Lint + Type Check + Coverage"; nothing here can block a merge, so a macOS
-# regression surfaces at the nightly run or at the release tag.
+# regression surfaces at the weekly run or at the release tag.
 
 on:
   push:
     tags:
       - "v*"
   schedule:
-    # 06:00 UTC, an hour before the soak, well clear of the working-day peak.
-    - cron: "0 6 * * *"
+    # Sundays 06:00 UTC. Weekly, not nightly: macOS bills 10x, so a daily run
+    # alone would be about 16,700 billed minutes a month.
+    - cron: "0 6 * * 0"
   workflow_dispatch:
 
 permissions:
