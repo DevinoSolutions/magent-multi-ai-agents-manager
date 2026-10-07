@@ -1088,7 +1088,6 @@ def _psmux_session_name(title: str) -> str:
     return session_name(title)
 
 
-
 def _tab_icons_on(plat: Platform, config: MagentConfig) -> bool:
     """Whether this launch decorates tabs at all (the platform has Windows
     Terminal AND ``settings.terminalIcons`` is on; ``MAGENT_WT_ICONS=0`` is
