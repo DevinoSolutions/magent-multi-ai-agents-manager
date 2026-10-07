@@ -37,7 +37,13 @@ if TYPE_CHECKING:
     from pathlib import PurePath
 
     from magent.config import MagentConfig, ProjectConfig
-    from magent.nodes import Node, NodeMapEntry, Placement, RepoStatus
+    from magent.nodes import (
+        CloudPushSet,
+        Node,
+        NodeMapEntry,
+        Placement,
+        RepoStatus,
+    )
     from magent.remote_mux import ProvisionReport, RemoteError, ScriptLine
 
 # How long `node sync -d` waits for the detached child to record its pid:
@@ -1647,9 +1653,17 @@ def _current_nick(proj: ProjectConfig) -> str | None:
 
 @node_group.command("push")
 @click.argument("project")
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Cloud: record the hand-off without asking.",
+)
 @click.pass_context
-def push_cmd(ctx: click.Context, project: str) -> None:
-    """Re-ship a project's non-git files (.env* etc.) to its node."""
+def push_cmd(ctx: click.Context, project: str, yes: bool) -> None:
+    """Re-ship a project's non-git files (.env* etc.) to its node.
+
+    A cloud project's files are handed off by hand instead.
+    """
     # heavy subsystem: in-body per policy
     from magent import launch, node_sync, nodes, remote_mux
 
@@ -1657,12 +1671,13 @@ def push_cmd(ctx: click.Context, project: str) -> None:
     proj = _node_project_or_exit(cfg, project)
     name = nodes.project_name(proj)
     if is_cloud(proj):
-        # DECISION-15: no node to push to. J11m replaces this refusal with its
-        # by-hand hand-off (_push_cloud).
-        _fail(
-            f"{name} runs in the cloud; there is no node to push its files to",
-            _EXIT_USAGE,
-        )
+        # DECISION-15: a cloud project has no node; its push set is handed off
+        # by hand (spec 18.11).
+        _push_cloud(cfg, proj, name, yes=yes)
+        return
+    if yes:
+        # Only a cloud push asks anything; saying so beats a silent no-op.
+        _note("--yes has no effect on a node project: only a cloud push asks")
     try:
         nick = _current_nick(proj)
     except (OSError, ValueError) as exc:
@@ -1709,6 +1724,203 @@ def push_cmd(ctx: click.Context, project: str) -> None:
     # The names are the node's reply: printable ASCII only on this screen.
     listed = node_sync.printable(", ".join(shipped))
     _ok(f"shipped {len(shipped)} file(s) to @{nick}: {listed}")
+
+
+def _push_cloud(
+    cfg: MagentConfig, proj: ProjectConfig, name: str, *, yes: bool
+) -> None:
+    """Spec 18.11c: hand a cloud project's push set off by hand. The record it
+    writes is what opens the create gate. J11s puts sealing in front of the
+    hand-off, if J0-B lets phase 2 be built (DECISION-18).
+
+    The words for what can go wrong on THIS PC are decided here, so no path
+    out of the hand-off is a traceback: a record or key lock another magent
+    holds is a retry (exit 1), a file that cannot be read is a refusal that
+    names it by its project-relative path and the error CLASS (exit 1), and
+    any other OS error is its class only, the whole error going to nodes.log.
+    Nothing here ever quotes a value.
+
+    First, the hand-off files an earlier push left behind are swept: a terminal
+    closed at the prompt skips the ``finally`` that deletes one, and ``--yes``
+    keeps it for the user. They hold values, so they do not get to pile up."""
+    from magent import node_sync, nodes  # heavy subsystem: in-body per policy
+
+    _sweep_handoffs()
+    try:
+        _hand_off_cloud(cfg, proj, name, yes=yes)
+    except LockHeld as exc:
+        log.get_logger("nodes").warning("push could not take a cloud lock: %s", exc)
+        _fail("another magent is updating cloud hand-off state; try again", 1)
+    except nodes.PushSetUnreadable as exc:
+        # label: a project-relative path from disk; reason: an error class.
+        _fail(
+            f"{node_sync.printable(exc.label)} cannot be read ({exc.reason});"
+            f" fix or remove it, then run: magent node push {name}",
+            1,
+        )
+    except nodes.HandoffNotPrivate as exc:
+        # reason: an error class or "not-private", never a path. Raised before
+        # a byte of the values was written, and before any record.
+        log.get_logger("nodes").warning(
+            "push could not make a private hand-off file for %s: %s", name, exc
+        )
+        _fail(
+            f"could not make a private file for {name}'s values ({exc.reason});"
+            " nothing was written and nothing was recorded."
+            f" Fix the temp dir's permissions, then run: magent node push {name}",
+            1,
+        )
+    except OSError as exc:
+        text = _local_failure(exc, f"push could not hand off {name}'s files")
+        _fail(f"could not hand off {name}'s files ({text})", 1)
+
+
+def _sweep_handoffs() -> None:
+    """One line when an earlier push left hand-off files behind, none when it
+    did not. Counts only: a file's name and content stay out of the line."""
+    from magent import nodes  # heavy subsystem: in-body per policy
+
+    removed, stuck = nodes.sweep_handoff_leftovers()
+    if not removed and not stuck:
+        return
+    parts = []
+    if removed:
+        parts.append(f"cleared {removed} hand-off file(s) an earlier push left behind")
+    if stuck:
+        parts.append(
+            f"{stuck} more could not be deleted: delete them yourself, they hold values"
+        )
+    _note("; ".join(parts))
+
+
+def _hand_off_cloud(
+    cfg: MagentConfig, proj: ProjectConfig, name: str, *, yes: bool
+) -> None:
+    """The checks a hand-off needs, in the order that writes nothing until they
+    pass: the folder, then ONE clean-enough git repository, then the push set."""
+    # heavy subsystem: in-body per policy
+    from magent import launch, node_sync, nodes, remote_mux
+
+    project_dir = _local_dir(cfg, proj)
+    if project_dir is None:
+        _fail(f"{proj.path} does not exist on this machine", _EXIT_USAGE)
+    try:
+        states = launch.node_git_states(cfg, proj)
+    except remote_mux.RemoteError as exc:
+        log.get_logger("nodes").warning(
+            "push could not read %s's git state: %s", name, exc
+        )
+        _fail(f"git could not read {name}'s checkout ({_tail(exc)})", 1)
+    except (OSError, ValueError) as exc:
+        text = _local_failure(exc, f"push could not read {name}'s git state")
+        _fail(f"git could not read {name}'s checkout ({text})", 1)
+    if not states:
+        _fail(
+            f"{name} is not a git repository: a cloud session needs one",
+            _EXIT_USAGE,
+        )
+    if len(states) != 1:
+        _fail(
+            f"a cloud session runs ONE git repository; {proj.path} holds {len(states)}",
+            _EXIT_USAGE,
+        )
+    refusal = nodes.cloud_git_refusal(states[0])
+    if refusal:
+        _note(f"the cloud create is also blocked: {node_sync.printable(refusal)}")
+    ps = nodes.cloud_push_set(
+        project_dir, states, home=Path.home(), extras=proj.push or ()
+    )
+    for path in ps.outside:
+        _note(
+            f"{node_sync.printable(str(path))} is outside the project:"
+            " no path reaches a cloud session"
+        )
+    sid = nodes.node_sid(proj)
+    if not ps.files:
+        nodes.write_cloud_record(
+            sid, digest=nodes.push_set_digest(ps, "manual"), mode="manual"
+        )
+        _ok(f"{name}: nothing inside the project to hand off")
+        return
+    _manual_handoff(ps, sid, name, yes=yes)
+
+
+def _discard_handoff(path: Path | None) -> None:
+    """Delete the hand-off file; a file that will not go is named, never
+    hidden: it holds the values."""
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        _note(
+            f"could not delete {path} ({type(exc).__name__});"
+            " delete it yourself: it holds the values"
+        )
+
+
+def _manual_handoff(ps: CloudPushSet, sid: str, name: str, *, yes: bool) -> None:
+    """Spec 18.11c: names masked on screen, the values in a private temp file.
+
+    The digest is taken BEFORE anything is shown or written, so the record is
+    of the push set that was handed over: a prompt can wait minutes, and a file
+    edited meanwhile was never pasted (the gate then stays shut, which is the
+    safe way to be wrong). It also means a set with an unreadable file is
+    refused here, before a hand-off file exists.
+
+    The file is deleted when the prompt is answered either way, and on Ctrl+C
+    or any error. Under ``--yes`` there is no prompt and the file is the
+    user's to delete once it is pasted: it is kept only after the record is
+    written."""
+    from magent import node_sync, nodes  # heavy subsystem: in-body per policy
+
+    digest = nodes.push_set_digest(ps, "manual")
+    click.echo(f"\n  {style(f'{name} -> cloud, by hand', bold=True)}")
+    for line in nodes.masked_lines(ps):
+        click.echo(f"    {node_sync.printable(line)}")
+    held: Path | None = None
+    try:
+        if ps.env_files:
+            held = nodes.write_manual_handoff(ps)
+            click.echo(
+                f"\n  Paste the contents of\n    {held}\n"
+                "  into claude.ai/code > environment settings > Environment"
+                " variables.\n"
+                "  Use a PERSONAL environment: anyone who uses the environment"
+                " can read the values."
+            )
+        for path in ps.files:
+            if path not in ps.env_files:
+                _note(
+                    f"{node_sync.printable(ps.rel(path))} cannot travel by hand:"
+                    " only .env text can be pasted into an environment"
+                )
+        if yes:
+            if held is not None:
+                # Kept by design under --yes: it holds every value as plain text.
+                minutes = int(nodes.HANDOFF_STALE_S // 60)
+                _note(
+                    f"{held} holds the values as plain text: delete it as soon as"
+                    " it is pasted (a later `magent node push` of a cloud project"
+                    f" also clears hand-off files older than {minutes} minutes)"
+                )
+        else:
+            confirmed = click.confirm(
+                "\n  Done -- let magent create the cloud session?"
+                if held is not None
+                else "\n  Create the cloud session without them?",
+                default=False,
+            )
+            _discard_handoff(held)
+            held = None
+            if not confirmed:
+                _fail("not confirmed; nothing recorded", _EXIT_USAGE)
+        nodes.write_cloud_record(sid, digest=digest, mode="manual")
+        # Recorded: a `--yes` file now belongs to the user.
+        held = None
+    finally:
+        _discard_handoff(held)
+    _ok(f"recorded; magent up {name} will create the cloud session")
 
 
 def _source_node(cfg: MagentConfig, held: NodeMapEntry) -> Node | None:
@@ -2386,6 +2598,68 @@ def _recall_to(
     )
 
 
+# Documented id forms [V1, V40]: `session_...` (transcript URL) and `cse_...`
+# (env var). The charset after the prefix is ASSUMED (plan J, U2).
+_CLOUD_ID_RE = re.compile(r"\b(?:session|cse)_[A-Za-z0-9]{8,}\b")
+
+
+def _recall_cloud(
+    cfg: MagentConfig, proj: ProjectConfig, name: str, *, to_nick: str | None
+) -> None:
+    """Spec 18.9: a cloud session comes home by teleport. Nothing is stopped --
+    the teleported copy is independent and the cloud session keeps running."""
+    from magent import nodes, psmux  # heavy subsystem: in-body per policy
+
+    if to_nick is not None:
+        _fail(
+            f"{name} is a cloud session; it cannot move to @{to_nick}. "
+            "Bring it home with --local (claude --teleport) first",
+            _EXIT_USAGE,
+        )
+    local_dir = _local_dir(cfg, proj)
+    # Only the matched id is ever printed, never the pane: it is the page's text.
+    pane = psmux.read_pane(nodes.node_sid(proj))
+    found = _CLOUD_ID_RE.findall(pane.text)
+    # Prefer the last `session_` id (the form teleport and the URL use); fall
+    # back to the last `cse_` one rather than print nothing.
+    ids = [i for i in found if i.startswith("session_")] or found
+    teleport = f"claude --teleport {ids[-1]}" if ids else "claude --teleport"
+    click.echo(
+        f"\n  {style(f'magent node recall {name}', bold=True)}"
+        f" {style('(from @cloud)', dim=True)}"
+    )
+    if not ids:
+        if pane.timed_out:
+            # A busy session answers slowly: nothing is known about its pane.
+            _note(
+                "reading the pane timed out, so its session id could not be"
+                " looked for; the picker below lists your cloud sessions"
+            )
+        else:
+            _note(
+                "no session id is visible in the pane; the picker below lists"
+                " your cloud sessions"
+            )
+        _note("inside the cloud session, /teleport prints the exact command")
+    # No pre-check of the tree: teleport itself offers to stash a dirty one.
+    _note(
+        "teleport needs this same repository (not a fork), the branch pushed"
+        " and the same claude.ai account; if the tree is dirty it offers to stash"
+    )
+    # Two lines, quoted, and the cmd.exe hint: the same shell rules as --local.
+    target = local_dir or proj.path
+    click.echo(f'\n    cd "{target}"')
+    if _cmd_needs_cd_d(Path(target), _shell_folder()):
+        click.echo(style("    (cmd.exe: use cd /d)", dim=True))
+    click.echo(f"    git pull\n    {teleport}\n")
+    # An idle cloud VM pauses and is later reclaimed: neither means the session
+    # is gone.
+    _note(
+        "the cloud session keeps running; archive it at claude.ai/code when you"
+        " are done"
+    )
+
+
 @node_group.command("recall")
 @click.argument("project")
 @click.option(
@@ -2419,7 +2693,8 @@ def recall_cmd(
     Pulls once more, reports the node's last commit per repo, stops the
     session, installs its conversation and memory where the destination's
     Claude looks, and clears the placement. A node that does not answer is
-    reported, never fatal: what was already pulled is used.
+    reported, never fatal: what was already pulled is used. A cloud session
+    comes home by teleport (`--local` prints the command).
     """
     from magent import nodes  # heavy subsystem: in-body per policy
 
@@ -2433,9 +2708,9 @@ def recall_cmd(
     proj = _node_project_or_exit(cfg, project)
     name = nodes.project_name(proj)
     if is_cloud(proj):
-        # DECISION-15: a cloud session has no node session to recall. J11m
-        # replaces this refusal with its teleport branch (_recall_cloud).
-        _fail(f"{name} runs in the cloud; recall moves node sessions", _EXIT_USAGE)
+        # DECISION-15: a cloud session comes home by teleport (spec 18.9).
+        _recall_cloud(cfg, proj, name, to_nick=to_nick)
+        return
     tool = proj.tool or cfg.settings.default_tool
     if tool != "claude":
         _fail(

@@ -18,6 +18,10 @@ Where the pane lives decides what moves: a LOCAL pane shares this disk, so
 the original paths are pasted and nothing is copied; a REMOTE pane gets every
 file in one upload and the server pastes their saved paths in one line.
 
+A CLOUD pane takes no press at all (``cloud-pane``): it is the local viewer of a
+session that runs in a VM, which cannot read this PC's disk. The server refuses
+every upload to one; the two presses that never upload ask ``pane_is_cloud``.
+
 Two rules hold the design together:
 
 * **Never block the press.** Flashes are queued to one pump thread
@@ -42,6 +46,7 @@ import os
 import queue
 import secrets
 import threading
+from http.client import HTTPException
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
@@ -91,6 +96,7 @@ ALTV_OUTCOMES = (
     "file-missing",  # a copied file is gone (or is not a regular file)
     "file-unreadable",  # a copied file is there but would not be read (locked?)
     "too-large",  # remote files press past MAX_UPLOAD_BYTES; nothing was read
+    "cloud-pane",  # the window is a cloud session's local viewer; nothing sent
     "error",  # anything unforeseen, with a traceback in the log
 )
 
@@ -125,6 +131,7 @@ OUTCOME_REASONS: dict[str, str] = {
     "file-missing": "a copied file no longer exists",
     "file-unreadable": "could not read a copied file - is it open elsewhere?",
     "too-large": f"too large - {upload_limit_text(MAX_UPLOAD_BYTES)} limit",
+    "cloud-pane": "cloud session - paste at claude.ai/code (clipboard kept)",
     "error": "unexpected error - see hotkey.log",
 }
 
@@ -182,6 +189,14 @@ PHASE_FLASH_MS = 20000
 # slow link takes as long as it takes, and only a link that stops moving for
 # this long gives up.
 UPLOAD_HTTP_TIMEOUT_S = 20.0
+
+# How long a LOCAL press waits for serve to say whether its pane is a cloud
+# viewer (``pane_is_cloud``). Short on purpose: serve answers from its config
+# alone (``/api/cloud-panes`` -- no psmux probe, no lock), so a healthy reply is
+# milliseconds and this bound only matters for a serve that is wedged. A press
+# that cannot learn the answer proceeds as it always did rather than sit on the
+# keypress.
+CLOUD_LOOKUP_TIMEOUT_S = 3.0
 
 _flash_queue: queue.Queue[tuple[str, str, str, int | None, str]] = queue.Queue(
     maxsize=FLASH_QUEUE_MAX
@@ -523,6 +538,7 @@ def _send_upload(
     except HTTPError as exc:
         # The server answered and said no -- carry ITS words, not ours.
         detail = ""
+        body_json: object = None
         try:
             body_json = json.loads(exc.read())
             if isinstance(body_json, dict):
@@ -530,6 +546,16 @@ def _send_upload(
                 detail = error if isinstance(error, str) else ""
         except (OSError, ValueError):
             detail = ""
+        # A cloud pane is a local viewer of a session in a VM that cannot read
+        # this PC's disk: the server refused BEFORE writing a byte, and says so
+        # with a flag, so the bar can name the real reason instead of a status.
+        if (
+            exc.code == 409
+            and isinstance(body_json, dict)
+            and body_json.get("cloud") is True
+        ):
+            log.info("upload refused: %s is a cloud pane", project)
+            return ("cloud-pane", OUTCOME_REASONS["cloud-pane"], detail)
         log.warning("upload rejected HTTP %s: %s", exc.code, detail or exc.reason)
         tail = f": {detail}" if detail else ""
         return ("upload-rejected", f"serve said HTTP {exc.code}{tail}", detail)
@@ -566,6 +592,46 @@ def _send_upload(
         # failed" here would send the user hunting for a lost screenshot.
         return ("inject-failed", OUTCOME_REASONS["inject-failed"], "injected=false")
     return ("ok", _SENT_REASON.format(noun), "")
+
+
+def pane_is_cloud(server_url: str, project: str) -> bool:
+    """Whether ``project``'s pane is a CLOUD pane, as ``magent serve`` sees it.
+
+    A cloud pane is the local viewer of a session that runs in a VM, so a paste
+    into it is wrong twice over: a local path means nothing to the VM, and a
+    pane sitting at a bare shell is not a session at all. Every press that
+    UPLOADS is refused by the server itself (its 409, ``_send_upload``); these
+    are the two that never reach ``/upload`` -- the opt-in native Ctrl+V and the
+    LOCAL files press, which types the original paths -- so they ask.
+
+    The answer is serve's ``/api/cloud-panes``: the ids
+    ``psmux.cloud_pane_ids`` finds in the CONFIG, whose FIRST-row-wins rule is
+    the one the create gate uses (in a ``[local, cloud]`` pair for one folder
+    the pane is a local agent's and stays pasteable). It is deliberately not
+    ``/api/sessions``: that list is live-filtered through a has-session sweep,
+    so it is both the slow endpoint and one that can drop a cloud pane whose
+    probe flapped.
+
+    Fails OPEN, on purpose and noisily: these two presses were built to work
+    with no server at all, so a lookup that cannot answer (serve down, a stalled
+    reply, an older serve that has no such route and answers 404, a body of the
+    wrong shape) must not turn every local pane's paste into a refusal. It never
+    raises -- a press must not die of a lookup.
+    """
+    try:
+        with urlopen(
+            f"{server_url.rstrip('/')}/api/cloud-panes", timeout=CLOUD_LOOKUP_TIMEOUT_S
+        ) as resp:
+            payload = json.loads(resp.read())
+    except (OSError, ValueError, HTTPException) as exc:
+        get_logger("hotkey").warning(
+            "cloud-pane lookup unanswered for project=%s (%s): pasting as if local",
+            project,
+            type(exc).__name__,
+        )
+        return False
+    ids = payload.get("cloud_panes") if isinstance(payload, dict) else None
+    return isinstance(ids, list) and project in ids
 
 
 def native_enabled() -> bool:
@@ -655,8 +721,12 @@ def handle_press(
         # socket has stalled a control command past 70s).
         flash_async(server_url, project, FLASH_PREFIX + PHASE_PASTING, PHASE_FLASH_MS)
         try:
-            outcome, reason = native_paste(project)
-            report(server_url, project, outcome, reason)
+            if pane_is_cloud(server_url, project):
+                outcome = "cloud-pane"
+                report(server_url, project, outcome)
+            else:
+                outcome, reason = native_paste(project)
+                report(server_url, project, outcome, reason)
         except Exception:
             log.exception("%s outcome=error project=%s", ALTV_LOG_PREFIX, project)
             flash_async(
@@ -766,6 +836,11 @@ def handle_file_press(
         if not paths:
             report(server_url, project, "clipboard-unreadable", _FILES_UNREADABLE)
             return "clipboard-unreadable"
+        if local and pane_is_cloud(server_url, project):
+            # Before the per-path refusals: whatever is copied, the pane is the
+            # reason. A REMOTE press is refused by the server's 409 instead.
+            report(server_url, project, "cloud-pane")
+            return "cloud-pane"
         refusal = _refusal(paths)
         if refusal:
             report(server_url, project, refusal)

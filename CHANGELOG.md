@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Cloud sessions: `"node": "cloud"`.** A project pinned to the cloud opens
+  as a local psmux pane running `claude --cloud "<cloudTask>"`, branded
+  `@cloud`. It is created once, and only from a clean, pushed GitHub checkout.
+  `magent node push` hands the project's `.env*` files off by hand (names
+  masked, values in a private temp file), and the create waits until it has.
+  `magent node recall --local` prints the `claude --teleport` line. Alt+V, the
+  phone page, `send`, `model` and `attach --no-mux` refuse a cloud pane with a
+  reason, `down` says the cloud session keeps running, and `doctor` has a
+  `cloud` check. A project pinned to the cloud used to run as an ordinary
+  local session; it is now refused until it has a `cloudTask`. The JSON
+  additions are optional keys: `sessions --json` gains the value `"cloud"` for
+  `node` and the state `"cloud"`, `status --json` gains `node` on
+  `psmux_sessions` rows and top-level `shadowed_cloud` / `shadowed_local`, and
+  `up --json` gains `node` (on its up and down entries and on `projects[]`)
+  and `note` (on an up entry). After a psmux crash, check claude.ai/code
+  before `magent up`: magent cannot list cloud sessions, and the next create
+  starts a new one.
+
 ### Changed
 
 - **Every psmux argv is now built in `psmux.py`.** The attach, new-session and

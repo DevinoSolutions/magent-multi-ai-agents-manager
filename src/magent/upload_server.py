@@ -855,7 +855,13 @@ def _discover_sessions(config_path: str | None) -> list[dict[str, object]]:
 
 def _build_html(sessions: list[dict[str, object]]) -> str:
     pills = []
+    cloud = psmux.cloud_pane_ids(sessions)
     for s in sessions:
+        # A cloud pane takes no upload; offering it is a dead end. A cloud row
+        # that SHADOWS a local twin (first-wins gave the pane to the local
+        # agent) is no pill either: the twin's own row is the one pill.
+        if _sid(s) in cloud or s.get("node") == "cloud":
+            continue
         # data-name (the wire value posted back as `project`) is the psmux
         # socket id; the pill text shows the same id (P3-01 keeps the display
         # name only on the JSON surface, not the picker chrome).
@@ -956,6 +962,7 @@ _GET_PATHS: frozenset[str] = frozenset(
         "/",
         "",
         "/api/sessions",
+        "/api/cloud-panes",
         "/api/flash",
         "/install.mobileconfig",
         "/focus",
@@ -1436,6 +1443,21 @@ class UploadHandler(BaseHTTPRequestHandler):
                 json.dumps({"ok": True, "sessions": self._sessions()}).encode(),
                 "application/json",
             )
+        elif path == "/api/cloud-panes":
+            # Which panes are cloud ones is a CONFIG fact, so this answers from
+            # the config alone: no psmux probe and no `_sessions_lock`. The
+            # Alt+V listener asks it on every native / local-files press, and
+            # /api/sessions is the wrong place -- a stale snapshot there is a
+            # full has-session sweep (measured ~19s over 46 sockets) and its
+            # list is LIVE-filtered, so a cloud pane whose probe flapped would
+            # read as not-cloud and the press would paste into it.
+            cloud_ids = psmux.cloud_pane_ids(
+                psmux.config_sessions(UploadHandler.config_path)
+            )
+            self._send_bytes(
+                json.dumps({"ok": True, "cloud_panes": sorted(cloud_ids)}).encode(),
+                "application/json",
+            )
         elif path == "/api/flash":
             # Status-line flash on behalf of a caller that has no screen of its
             # own -- today the hidden Alt+V/F2 listener, whose every failure was
@@ -1576,7 +1598,12 @@ class UploadHandler(BaseHTTPRequestHandler):
         # Discovery is concurrent (sub-second), so validating against the session
         # cache no longer risks timing out the upload. The wire `project` is the
         # psmux socket id (P3-01), so we validate against `session` ids.
-        valid_sessions = {_sid(s) for s in self._sessions()}
+        sessions = self._sessions()
+        valid_sessions = {_sid(s) for s in sessions}
+        # A cloud pane is a local viewer; the agent runs in a VM that cannot
+        # read ~/.magent/uploads on this PC (spec section 18.7). Asked of the
+        # one first-wins answer, so a `[local, cloud]` pair stays a local pane.
+        cloud_sessions = psmux.cloud_pane_ids(sessions)
 
         # ?project= marks an upload that already HAS a narrator: the Alt+V
         # listener flashed "Alt+V: capturing..." before it touched the clipboard
@@ -1645,6 +1672,22 @@ class UploadHandler(BaseHTTPRequestHandler):
                 return
             if project not in valid_sessions:
                 self._json_response({"ok": False, "error": "Unknown project"}, 400)
+                return
+            if project in cloud_sessions:
+                # Refused BEFORE a byte is written, with a flag Alt+V narrates
+                # by name (altv "cloud-pane"). Only a name the server knows can
+                # be a cloud pane, hence after the Unknown-project check.
+                self._json_response(
+                    {
+                        "ok": False,
+                        "cloud": True,
+                        "error": (
+                            "cloud session: attach images at claude.ai/code "
+                            "or in the Claude app"
+                        ),
+                    },
+                    409,
+                )
                 return
 
             parts = files["file"]
@@ -1724,7 +1767,10 @@ class UploadHandler(BaseHTTPRequestHandler):
             # A flagged (Alt+V) upload reports its own, more specific outcome;
             # see the `flagged` note above.
             done = project if project in valid_sessions else flagged
-            if done and not flagged:
+            # Never on a refused cloud pane: the phone page shows the refusal's
+            # own text, and "upload failed" on the pane's bar would call a
+            # deliberate refusal a fault.
+            if done and not flagged and done not in cloud_sessions:
                 if ok:
                     _flash(
                         None,

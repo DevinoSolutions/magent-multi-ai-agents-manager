@@ -2469,7 +2469,7 @@ class TestDecorateSession:
         monkeypatch.setattr(
             psmux,
             "decorate_session",
-            lambda n, psmux=None, code_hint=None: seen.append(n),
+            lambda n, psmux=None, code_hint=None, nick=None: seen.append(n),
         )
         assert psmux.decorate_sessions(["api", "web"]) == ["api", "web"]
         assert sorted(seen) == ["api", "web"]
@@ -2484,7 +2484,7 @@ class TestDecorateSession:
         monkeypatch.setattr(
             psmux,
             "decorate_session",
-            lambda n, psmux=None, code_hint=None: hints.append(code_hint),
+            lambda n, psmux=None, code_hint=None, nick=None: hints.append(code_hint),
         )
         psmux.decorate_sessions(["api", "web", "docs"])
         assert len(probes) == 1
@@ -2501,7 +2501,7 @@ class TestDecorateSession:
         monkeypatch.setattr(
             psmux,
             "decorate_session",
-            lambda n, psmux=None, code_hint=None: hints.append(code_hint),
+            lambda n, psmux=None, code_hint=None, nick=None: hints.append(code_hint),
         )
         psmux.decorate_sessions(["api", "web"], code_hint=False)
         assert hints == [False, False]
@@ -3266,3 +3266,151 @@ class TestANodeProjectIsNotALocalSession:
         )
         [entry] = psmux.config_sessions(str(cfg))
         assert entry["path"] == str(tmp_path / "b" / "api")
+
+
+class TestADecorationCarriesItsNick:
+    def test_no_nick_is_todays_brand_byte_for_byte(self):
+        brand, length = psmux.status_left(None)
+        argv = psmux.decoration_argv("api", "psmux", True)
+        assert ["psmux", "-L", "api", "set", "-g", "status-left", brand] in argv
+        assert ["psmux", "-L", "api", "set", "-g", "status-left-length", length] in argv
+        # ...and the whole argv set is what it was before a nick existed.
+        assert psmux.decoration_argv("api", "psmux", True, nick=None) == argv
+
+    def test_the_cloud_nick_brands_at_cloud(self):
+        brand, length = psmux.status_left("cloud")
+        argv = psmux.decoration_argv("api", "psmux", True, nick="cloud")
+        assert ["psmux", "-L", "api", "set", "-g", "status-left", brand] in argv
+        assert ["psmux", "-L", "api", "set", "-g", "status-left-length", length] in argv
+        assert brand != psmux.status_left(None)[0]
+
+    def test_a_nick_changes_nothing_but_the_brand(self):
+        plain = psmux.decoration_argv("api", "psmux", True)
+        nicked = psmux.decoration_argv("api", "psmux", True, nick="cloud")
+        differing = [p for p, n in zip(plain, nicked, strict=True) if p != n]
+        assert len(plain) == len(nicked)
+        assert {tuple(c[3:6]) for c in differing} == {
+            ("set", "-g", "status-left"),
+            ("set", "-g", "status-left-length"),
+        }
+
+    def test_decorate_session_hands_its_nick_to_the_argv(self, monkeypatch):
+        ran: list[list[str]] = []
+        monkeypatch.setattr(
+            subprocess, "run", lambda cmd, **k: ran.append(cmd) or _FakeCompleted()
+        )
+        psmux.decorate_session("api", psmux="psmux", code_hint=True, nick="cloud")
+        assert ran == psmux.decoration_argv("api", "psmux", True, nick="cloud")
+
+    def test_decorate_sessions_hands_each_name_its_own_nick(self, monkeypatch):
+        seen: dict[str, str | None] = {}
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux,
+            "decorate_session",
+            lambda n, psmux=None, code_hint=None, nick=None: seen.__setitem__(n, nick),
+        )
+        psmux.decorate_sessions(["api", "web"], code_hint=False, nicks={"api": "cloud"})
+        assert seen == {"api": "cloud", "web": None}
+
+    def test_the_async_variant_brands_the_nicked_session_only(self, monkeypatch):
+        fired: list[list[str]] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "_decor_stamp_fresh", lambda: False)
+        monkeypatch.setattr(psmux, "_touch_decor_stamp", lambda: None)
+        monkeypatch.setattr(
+            psmux.subprocess, "Popen", lambda cmd, **kw: fired.append(list(cmd))
+        )
+        psmux.decorate_sessions_async(
+            ["api", "web"], code_hint=False, nicks={"api": "cloud"}
+        )
+        cloud_brand, _ = psmux.status_left("cloud")
+        plain_brand, _ = psmux.status_left(None)
+        assert ["psmux", "-L", "api", "set", "-g", "status-left", cloud_brand] in fired
+        assert ["psmux", "-L", "web", "set", "-g", "status-left", plain_brand] in fired
+
+    def test_the_async_variant_without_nicks_fires_todays_argvs(self, monkeypatch):
+        fired: list[list[str]] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "_decor_stamp_fresh", lambda: False)
+        monkeypatch.setattr(psmux, "_touch_decor_stamp", lambda: None)
+        monkeypatch.setattr(
+            psmux.subprocess, "Popen", lambda cmd, **kw: fired.append(list(cmd))
+        )
+        psmux.decorate_sessions_async(["api"], code_hint=False)
+        assert fired == psmux.decoration_argv("api", "psmux", False)
+
+
+class TestAPaneThatMayRunOnlyOnceIsNeverRespawned:
+    """``launch_verified``'s one respawn goes back through the full launch path,
+    which types the pane's command again. For a cloud pane that is a second
+    billed cloud session the CLI cannot list or stop, and the first attempt may
+    already have typed it (a session that is missing now may have been wedged
+    when probed, or died after the command landed). So a ``resend=False`` window
+    is never respawned: it is reported down, with the reason, and the next
+    ``magent up`` is the user's informed retry.
+    """
+
+    @pytest.fixture
+    def slept(self, monkeypatch):
+        out: list[float] = []
+        monkeypatch.setattr("magent.psmux.time.sleep", out.append)
+        return out
+
+    def _verify(self, monkeypatch, windows, *, failures):
+        from tests.conftest import FakePlatform
+
+        fp = FakePlatform(supports_psmux=True, psmux_launch_failures=set(failures))
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux,
+            "has_session",
+            lambda name, psmux=None, timeout=None: name in fp.psmux_sessions,
+        )
+        return psmux.launch_verified(fp, windows), fp
+
+    @staticmethod
+    def _win(name, **kw):
+        return psmux.PsmuxWindowOpts(
+            window_name=name, cwd=f"/a/{name}", command="claude", **kw
+        )
+
+    def test_a_missing_never_resend_pane_is_not_respawned(self, monkeypatch, slept):
+        failed, fp = self._verify(
+            monkeypatch, [self._win("cl", resend=False)], failures=["cl"]
+        )
+        assert fp.psmux_launches == [["cl"]]
+        assert list(failed) == ["cl"]
+
+    def test_the_casualty_says_why_it_was_not_re_created(self, monkeypatch, slept):
+        failed, _fp = self._verify(
+            monkeypatch, [self._win("cl", resend=False)], failures=["cl"]
+        )
+        assert "at most once" in failed["cl"]
+        assert "magent up" in failed["cl"]
+        assert failed["cl"].isascii()
+
+    def test_a_never_resend_pane_does_not_stop_its_neighbours_respawning(
+        self, monkeypatch, slept
+    ):
+        failed, fp = self._verify(
+            monkeypatch,
+            [self._win("cl", resend=False), self._win("web")],
+            failures=["cl", "web"],
+        )
+        assert fp.psmux_launches == [["cl", "web"], ["web"]]
+        assert list(failed) == ["cl"]
+
+    def test_a_live_never_resend_pane_is_not_a_casualty(self, monkeypatch, slept):
+        failed, fp = self._verify(
+            monkeypatch, [self._win("cl", resend=False)], failures=[]
+        )
+        assert failed == {}
+        assert fp.psmux_launches == [["cl"]]
+
+    def test_an_ordinary_window_is_respawned_exactly_as_before(
+        self, monkeypatch, slept
+    ):
+        failed, fp = self._verify(monkeypatch, [self._win("web")], failures=["web"])
+        assert fp.psmux_launches == [["web"], ["web"]]
+        assert failed == {}

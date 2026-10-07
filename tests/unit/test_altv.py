@@ -267,6 +267,78 @@ class TestFailuresAreSpecific:
         assert outcome == "upload-rejected"
         assert "400" in seen[-1] and "Unknown project" in seen[-1]
 
+    def test_a_cloud_409_is_its_own_outcome_with_its_own_reason(self):
+        server = _Upload(
+            {
+                "ok": False,
+                "cloud": True,
+                "error": "cloud session: attach at claude.ai/code",
+            },
+            status=409,
+        )
+        try:
+            outcome, reason, detail = altv.upload_image(
+                server.url, "api", b"\x89PNG\r\n\x1a\nx"
+            )
+        finally:
+            server.close()
+
+        assert outcome == "cloud-pane"
+        assert reason == altv.OUTCOME_REASONS["cloud-pane"]
+        assert "cloud session" in detail
+        assert "cloud-pane" not in altv.ALTV_SAFE_OUTCOMES
+
+    def test_a_409_without_the_cloud_flag_is_still_a_plain_rejection(self):
+        server = _Upload({"ok": False, "error": "busy"}, status=409)
+        try:
+            outcome, _reason, _detail = altv.upload_image(server.url, "api", b"BM-x")
+        finally:
+            server.close()
+
+        assert outcome == "upload-rejected"
+
+    def test_a_cloud_409_with_an_unreadable_body_is_a_plain_rejection(self):
+        # The flag is read off the JSON body; a 409 whose body is not JSON has
+        # no flag to read, so it must not be promoted to a cloud verdict.
+        server = _Upload(status=409, raw=b"conflict")
+        try:
+            outcome, _reason, _detail = altv.upload_image(server.url, "api", b"BM-x")
+        finally:
+            server.close()
+
+        assert outcome == "upload-rejected"
+
+    def test_a_cloud_press_flashes_the_cloud_reason_in_the_error_tint(
+        self, monkeypatch
+    ):
+        tints: list[object] = []
+        seen: list[str] = []
+        monkeypatch.setattr(
+            altv,
+            "flash_async",
+            lambda url, project, message, duration_ms=None, tint=None: (
+                seen.append(message),
+                tints.append(tint),
+            ),
+        )
+        server = _Upload(
+            {"ok": False, "cloud": True, "error": "cloud session"}, status=409
+        )
+        try:
+            outcome = altv.handle_press(server.url, "api", lambda: b"BMP")
+        finally:
+            server.close()
+
+        assert outcome == "cloud-pane"
+        assert seen[-1] == f"{altv.FLASH_PREFIX}{altv.OUTCOME_REASONS['cloud-pane']}"
+        assert tints[-1] == altv.FLASH_TINT_ERR
+
+    def test_the_cloud_reason_says_the_clipboard_was_kept(self):
+        # True because an Alt+V press only READS the clipboard; the words are
+        # what stop the user hunting for a lost screenshot.
+        reason = altv.OUTCOME_REASONS["cloud-pane"]
+        assert "cloud" in reason and "clipboard kept" in reason
+
     def test_a_stored_but_uninjected_upload_is_not_reported_as_a_failed_upload(
         self, monkeypatch
     ):
@@ -354,6 +426,7 @@ class TestFailuresAreSpecific:
             "native-failed",
             "paths-failed",
             "path-unpasteable",
+            "cloud-pane",
             "error",
         }
         # Every outcome the user can SEE needs words for the bar. The
@@ -673,6 +746,13 @@ class TestNativePress:
     inject -- nothing is ever retried.
     """
 
+    @pytest.fixture(autouse=True)
+    def _no_cloud_lookup(self, monkeypatch):
+        """A local press asks serve whether the pane is a cloud viewer; these
+        tests are about the press, so they answer "no" without a socket. The
+        lookup itself is pinned in TestACloudPaneTakesNoLocalPaste."""
+        monkeypatch.setattr(altv, "pane_is_cloud", lambda *a, **k: False)
+
     def _sends(self, monkeypatch, delivered: bool = True) -> list[tuple]:
         from magent import psmux
 
@@ -922,6 +1002,13 @@ class TestFilePress:
 
         monkeypatch.setattr(psmux, "send_keys", _send_keys)
         return calls
+
+    @pytest.fixture(autouse=True)
+    def _no_cloud_lookup(self, monkeypatch):
+        """A local press asks serve whether the pane is a cloud viewer; these
+        tests are about the press, so they answer "no" without a socket. The
+        lookup itself is pinned in TestACloudPaneTakesNoLocalPaste."""
+        monkeypatch.setattr(altv, "pane_is_cloud", lambda *a, **k: False)
 
     def _no_upload(self, monkeypatch):
         monkeypatch.setattr(
@@ -1609,3 +1696,244 @@ class TestARemoteFileThatWillNotRead:
             server.close()
         assert outcome == "file-unreadable"
         assert seen[-1] == altv.FLASH_PREFIX + altv.OUTCOME_REASONS["file-unreadable"]
+
+
+class _SessionsServer:
+    """A real HTTP server standing in for `magent serve`'s GET /api/cloud-panes.
+
+    ``cloud_panes`` is answered as the JSON ``cloud_panes`` list; ``raw=``
+    answers with those bytes verbatim instead, and ``status=`` answers that
+    HTTP status (an old serve with no such route says 404). The route's REAL
+    shape is pinned against the real handler in
+    ``test_upload_server.TestAPressReadsServesCloudPaneRoute``. Every path
+    asked is kept, so a test can prove a press did NOT ask."""
+
+    def __init__(
+        self,
+        cloud_panes: list[str] | None = None,
+        raw: bytes | None = None,
+        status: int = 200,
+    ):
+        self.cloud_panes = cloud_panes or []
+        self.raw = raw
+        self.status = status
+        self.gets: list[str] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.gets.append(self.path)
+                if outer.status != 200:
+                    body = json.dumps({"ok": False, "error": "Not found"}).encode()
+                elif outer.raw is not None:
+                    body = outer.raw
+                else:
+                    body = json.dumps(
+                        {"ok": True, "cloud_panes": outer.cloud_panes}
+                    ).encode()
+                self.send_response(outer.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self._thread.join(timeout=10)
+        assert not self._thread.is_alive(), "the stand-in sessions server never stopped"
+
+
+class TestACloudPaneTakesNoLocalPaste:
+    """The two presses that never touch `/upload` -- the opt-in native Ctrl+V
+    and the LOCAL files press (original paths pasted as text) -- would type into
+    a cloud pane's local viewer, where a local path means nothing to the VM and
+    a bare shell is not a session at all. They ask serve, which knows the
+    config, whether the pane is a cloud one; the upload paths are refused by the
+    server itself (see TestFailuresAreSpecific)."""
+
+    @pytest.fixture(autouse=True)
+    def _rig(self, monkeypatch, tmp_path):
+        from magent import psmux
+
+        self.flashes: list[tuple[str, object]] = []
+        monkeypatch.setattr(
+            altv,
+            "flash_async",
+            lambda url, project, message, duration_ms=None, tint=None: (
+                self.flashes.append((message, tint))
+            ),
+        )
+        self.sends: list[tuple] = []
+
+        def _send_keys(name, *keys, target=None, literal=False, **kw):
+            self.sends.append((name, keys, target, literal))
+            return True
+
+        monkeypatch.setattr(psmux, "send_keys", _send_keys)
+        monkeypatch.setattr(
+            altv,
+            "upload_files",
+            lambda *a, **k: pytest.fail("a local press must never upload"),
+        )
+        monkeypatch.setattr(
+            altv,
+            "upload_image",
+            lambda *a, **k: pytest.fail("a native press must never upload"),
+        )
+        (tmp_path / "a.py").write_bytes(b"x")
+        self.paths = [str(tmp_path / "a.py")]
+
+    def _native(self, url: str, project: str = "api") -> str:
+        return altv.handle_press(
+            url,
+            project,
+            capture=lambda: pytest.fail("the native path must never capture"),
+            native=True,
+        )
+
+    def _files(self, url: str, project: str = "api") -> str:
+        return altv.handle_file_press(url, project, lambda: self.paths, local=True)
+
+    def test_a_native_press_into_a_cloud_pane_sends_no_key(self):
+        server = _SessionsServer(["api"])
+        try:
+            outcome = self._native(server.url)
+        finally:
+            server.close()
+
+        assert outcome == "cloud-pane"
+        assert self.sends == []
+        assert server.gets == ["/api/cloud-panes"]
+
+    def test_a_local_files_press_into_a_cloud_pane_pastes_no_path(self):
+        server = _SessionsServer(["api"])
+        try:
+            outcome = self._files(server.url)
+        finally:
+            server.close()
+
+        assert outcome == "cloud-pane"
+        assert self.sends == []
+
+    @pytest.mark.parametrize("press", ["_native", "_files"])
+    def test_the_refusal_is_the_last_word_on_the_bar_in_the_error_tint(self, press):
+        server = _SessionsServer(["api"])
+        try:
+            getattr(self, press)(server.url)
+        finally:
+            server.close()
+
+        message, tint = self.flashes[-1]
+        assert message == f"{altv.FLASH_PREFIX}{altv.OUTCOME_REASONS['cloud-pane']}"
+        assert tint == altv.FLASH_TINT_ERR
+        # Acknowledged first, like every press: the bar answers the keypress.
+        assert self.flashes[0][0] in (
+            altv.FLASH_PREFIX + altv.PHASE_PASTING,
+            altv.FLASH_PREFIX + altv.PHASE_CAPTURING,
+        )
+
+    def test_a_refused_files_press_is_logged_by_outcome(self, caplog):
+        server = _SessionsServer(["api"])
+        try:
+            with caplog.at_level("INFO", logger="magent.hotkey"):
+                self._files(server.url)
+        finally:
+            server.close()
+
+        assert "ALTV outcome=cloud-pane project=api" in caplog.text
+
+    def test_another_projects_cloud_row_is_not_this_panes(self):
+        server = _SessionsServer(["api"])
+        try:
+            assert self._native(server.url, "web") == "ok-native"
+        finally:
+            server.close()
+
+    def test_a_serve_that_cannot_answer_does_not_take_a_local_paste_away(self):
+        # Unknown is not cloud: these two presses were built to work with no
+        # server at all (a dead serve costs a press nothing), and a lookup that
+        # cannot answer must not turn every local pane's paste into a refusal.
+        # Port 1 on loopback refuses instantly -- a REAL connection error.
+        assert self._native("http://127.0.0.1:1") == "ok-native"
+        assert self._files("http://127.0.0.1:1") == "ok-paths"
+        assert len(self.sends) == 2
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b"<html>not json</html>",
+            b"[]",
+            b'{"cloud_panes": "api"}',
+            b'{"cloud_panes": [3]}',
+            b'{"sessions": [{"name": "api", "node": "cloud"}]}',
+        ],
+    )
+    def test_a_reply_of_the_wrong_shape_is_not_a_cloud_verdict(self, raw):
+        server = _SessionsServer(raw=raw)
+        try:
+            assert self._native(server.url) == "ok-native"
+        finally:
+            server.close()
+
+    def test_a_serve_without_the_route_answers_404_and_the_press_proceeds(self):
+        # An older serve (the listener is a long-lived process and can outlive
+        # an upgrade of serve) has no /api/cloud-panes. 404 must take the same
+        # fail-open path as a dead serve, not raise out of the press.
+        server = _SessionsServer(status=404)
+        try:
+            assert self._native(server.url) == "ok-native"
+            assert self._files(server.url) == "ok-paths"
+        finally:
+            server.close()
+
+        assert server.gets == ["/api/cloud-panes", "/api/cloud-panes"]
+        assert len(self.sends) == 2
+
+    def test_the_lookup_is_bounded_and_never_blocks_a_press_for_long(self, monkeypatch):
+        from urllib.error import URLError
+
+        seen: list[object] = []
+
+        def _urlopen(url, timeout=None):
+            seen.append(timeout)
+            raise URLError("stalled")
+
+        monkeypatch.setattr(altv, "urlopen", _urlopen)
+
+        assert altv.pane_is_cloud("http://127.0.0.1:9", "api") is False
+        assert seen == [altv.CLOUD_LOOKUP_TIMEOUT_S]
+        assert 0 < altv.CLOUD_LOOKUP_TIMEOUT_S <= 5
+
+    def test_the_upload_presses_leave_the_verdict_to_the_server(self, monkeypatch):
+        # The server owns the answer for every press that uploads (its 409), so
+        # the listener must not ask a second time -- two verdicts could differ.
+        monkeypatch.setattr(
+            altv,
+            "pane_is_cloud",
+            lambda *a, **k: pytest.fail("an uploading press asked in the listener"),
+        )
+        monkeypatch.setattr(
+            altv,
+            "upload_image",
+            lambda *a, **k: ("ok", altv.OUTCOME_REASONS["ok"], ""),
+        )
+        monkeypatch.setattr(
+            altv,
+            "upload_files",
+            lambda *a, **k: ("ok", altv.OUTCOME_REASONS["ok"], ""),
+        )
+
+        assert altv.handle_press("http://x:1", "api", lambda: b"BMP") == "ok"
+        assert (
+            altv.handle_file_press("http://x:1", "api", lambda: self.paths, local=False)
+            == "ok"
+        )

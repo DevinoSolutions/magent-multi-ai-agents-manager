@@ -259,6 +259,7 @@ def _drive_bring_up(
     snapshots: list[int] | None = None,
     consoles: dict[int, frozenset[int] | None] | None = None,
     console_probes: list[list[int]] | None = None,
+    opts: list | None = None,
 ):
     """Drive a real ``launch_psmux_session`` over a fully faked psmux seam.
 
@@ -375,7 +376,11 @@ def _drive_bring_up(
     )
 
     WindowsPlatform().launch_psmux_session(
-        [PsmuxWindowOpts(window_name=n, cwd=f"/a/{n}", command="claude") for n in names]
+        opts
+        or [
+            PsmuxWindowOpts(window_name=n, cwd=f"/a/{n}", command="claude")
+            for n in names
+        ]
     )
     if snapshots is not None:
         snapshots.extend(pane_side.snapshots)
@@ -771,6 +776,96 @@ class TestWindowsSendKeysVerification:
         sends = _sends_for(calls, "api")
         assert all(c == sends[0] for c in sends[1:])
         assert sends[0][-2:] == ["cmd /c claude", "Enter"]
+
+    def test_a_pane_marked_never_resend_is_typed_once_even_at_a_bare_shell(
+        self, monkeypatch
+    ):
+        # A cloud pane: every `claude --cloud` is a NEW cloud session, and the
+        # pane may legitimately be back at pwsh once provisioning is done
+        # (spec §18.5). A re-send here would create a duplicate the CLI cannot
+        # list or stop.
+        from magent.platform import PsmuxWindowOpts
+
+        calls, _ = _drive_bring_up(
+            monkeypatch,
+            windows=["api"],
+            opts=[PsmuxWindowOpts("api", "/a/api", 'claude --cloud "t"', resend=False)],
+            pane_states={"api": ["pwsh"]},
+        )
+        assert len(_sends_for(calls, "api")) == 1
+
+    def test_a_never_resend_pane_does_not_shield_its_neighbours(self, monkeypatch):
+        from magent.platform import PsmuxWindowOpts
+
+        calls, _ = _drive_bring_up(
+            monkeypatch,
+            windows=["cl", "web"],
+            opts=[
+                PsmuxWindowOpts("cl", "/a/cl", 'claude --cloud "t"', resend=False),
+                PsmuxWindowOpts("web", "/a/web", "claude"),
+            ],
+            pane_states={"cl": ["pwsh"], "web": ["pwsh", "claude"]},
+        )
+        assert len(_sends_for(calls, "cl")) == 1
+        assert len(_sends_for(calls, "web")) == 2
+
+    def test_a_pane_with_a_nick_is_branded_with_it_at_birth(self, monkeypatch):
+        from magent.platform import PsmuxWindowOpts
+        from magent.psmux import status_left
+
+        brand, length = status_left("cloud")
+        calls, _ = _drive_bring_up(
+            monkeypatch,
+            windows=["api"],
+            opts=[
+                PsmuxWindowOpts(
+                    "api", "/a/api", 'claude --cloud "t"', resend=False, nick="cloud"
+                )
+            ],
+        )
+        assert ["psmux", "-L", "api", "set", "-g", "status-left", brand] in calls
+        assert [
+            "psmux",
+            "-L",
+            "api",
+            "set",
+            "-g",
+            "status-left-length",
+            length,
+        ] in calls
+        assert length == "17"
+
+    def test_a_pane_without_a_nick_keeps_the_plain_brand_next_to_a_nicked_one(
+        self, monkeypatch
+    ):
+        # The brand is per WINDOW: a cloud pane's nick must not leak onto the
+        # sibling created in the same batch.
+        from magent.platform import PsmuxWindowOpts
+        from magent.psmux import status_left
+
+        cloud_brand, _ = status_left("cloud")
+        plain_brand, plain_len = status_left(None)
+        calls, _ = _drive_bring_up(
+            monkeypatch,
+            windows=["cl", "web"],
+            opts=[
+                PsmuxWindowOpts(
+                    "cl", "/a/cl", 'claude --cloud "t"', resend=False, nick="cloud"
+                ),
+                PsmuxWindowOpts("web", "/a/web", "claude"),
+            ],
+        )
+        assert ["psmux", "-L", "cl", "set", "-g", "status-left", cloud_brand] in calls
+        assert ["psmux", "-L", "web", "set", "-g", "status-left", plain_brand] in calls
+        assert [
+            "psmux",
+            "-L",
+            "web",
+            "set",
+            "-g",
+            "status-left-length",
+            plain_len,
+        ] in calls
 
 
 @pytest.mark.skipif(

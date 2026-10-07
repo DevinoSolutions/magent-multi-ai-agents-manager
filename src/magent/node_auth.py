@@ -39,10 +39,12 @@ import json
 import os
 import queue
 import re
+import secrets
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -346,6 +348,18 @@ def _private_sddl() -> str:
 def _win_write_private(path: Path, body: bytes) -> None:
     """Create ``path`` (it must not exist) with ``_private_sddl`` as its DACL
     from the first instant, then write ``body`` and fsync it."""
+    fd = _win_create_private(path)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(body)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _win_create_private(path: Path) -> int:
+    """Create ``path`` (FileExistsError when it exists) with ``_private_sddl``
+    as its DACL from the first instant, and return a write-only descriptor on
+    it: no byte is ever in a file another user could open. The caller owns the
+    descriptor. Nothing is left behind when this raises."""
     if sys.platform != "win32":
         raise OSError("not Windows")
     import ctypes  # win-only: ctypes.WinDLL/windll exist only on Windows
@@ -403,14 +417,13 @@ def _win_write_private(path: Path, body: bytes) -> None:
     finally:
         kernel32.LocalFree(descriptor)
     try:
-        fd = msvcrt.open_osfhandle(handle, os.O_WRONLY)
+        return msvcrt.open_osfhandle(handle, os.O_WRONLY)
     except OSError:
         kernel32.CloseHandle(handle)
+        # CREATE_NEW made the file: do not leave an empty one behind.
+        with contextlib.suppress(OSError):
+            path.unlink()
         raise
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(body)
-        fh.flush()
-        os.fsync(fh.fileno())
 
 
 def _win_dacl(path: Path) -> str:
@@ -531,6 +544,87 @@ def _win_dacl_is_private(path: Path) -> bool:
     except OSError:
         return False
     return sddl == expected
+
+
+class PrivateFileRefused(OSError):
+    """No file only this user can open could be made, so none was and nothing
+    was written. ``reason`` is an error CLASS name, or ``"not-private"`` when
+    the file came out readable by others: never a path (the OS's own words carry
+    one), and the cause is suppressed where this is raised."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"cannot make a private file ({reason})")
+        self.reason = reason
+
+
+def _discard_new(fd: int, path: Path) -> None:
+    """Close ``fd`` and delete the still-empty file ``path`` it opened."""
+    with contextlib.suppress(OSError):
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        path.unlink()
+
+
+def _create_private_temp_win(prefix: str, suffix: str) -> tuple[int, Path]:
+    for _ in range(8):
+        path = Path(tempfile.gettempdir()) / f"{prefix}{secrets.token_hex(8)}{suffix}"
+        try:
+            # The DACL (this user's SID alone, nothing inherited) is part of
+            # CreateFile itself: the file never exists with %TEMP%'s ACL, which
+            # on a real box grants Modify to other accounts.
+            fd = _win_create_private(path)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise PrivateFileRefused(type(exc).__name__) from None
+        # Read it back before a byte is written: an ACL that is not exactly
+        # ours is a refusal, never a hope.
+        if not _win_dacl_is_private(path):
+            _discard_new(fd, path)
+            raise PrivateFileRefused("not-private")
+        return fd, path
+    raise PrivateFileRefused("FileExistsError")
+
+
+def _create_private_temp_posix(prefix: str, suffix: str) -> tuple[int, Path]:
+    # mkstemp makes it 0600 and it is chmod'd to 0600 again, then the mode is
+    # READ BACK before any byte is written: an ACL-bearing temp dir can widen a
+    # creation mode, and a chmod that fails or does not stick is a refusal.
+    fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix)
+    path = Path(name)
+    try:
+        os.fchmod(fd, 0o600)
+        mode = stat.S_IMODE(os.fstat(fd).st_mode)
+    except OSError as exc:
+        _discard_new(fd, path)
+        raise PrivateFileRefused(type(exc).__name__) from None
+    except BaseException:
+        _discard_new(fd, path)
+        raise
+    if mode & 0o077:
+        _discard_new(fd, path)
+        raise PrivateFileRefused("not-private")
+    return fd, path
+
+
+def create_private_temp(prefix: str, suffix: str) -> tuple[int, Path]:
+    """A new EMPTY file in the temp dir that only this user can open, and a
+    write descriptor on it: the file a secret may be written into, because it
+    is proven private BEFORE a byte is. PrivateFileRefused when that cannot be
+    had; nothing is left behind then. Windows gets a private DACL at creation
+    (``os.chmod`` cannot set one), POSIX a verified 0600."""
+    if sys.platform == "win32":
+        return _create_private_temp_win(prefix, suffix)
+    return _create_private_temp_posix(prefix, suffix)
+
+
+def owned_by_current_user(st: os.stat_result) -> bool:
+    """Whether a ``stat`` result is this user's file. POSIX reads the owner (a
+    shared /tmp holds other accounts' files). Windows has no st_uid to read (it
+    is 0 for everyone); the per-user %TEMP% is its boundary, so it is True."""
+    if sys.platform == "win32":
+        return True
+    return st.st_uid == os.getuid()
 
 
 # -- minting -------------------------------------------------------------------

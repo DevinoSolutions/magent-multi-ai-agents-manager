@@ -14,8 +14,9 @@ from typing import TYPE_CHECKING, Literal
 import click
 
 from magent import attach_client, tailnet
-from magent.config import NODE_AUTO, runs_on_node
+from magent.config import NODE_AUTO, is_cloud, runs_on_node
 from magent.grid import TileSlot, compute_grid
+from magent.lockfile import LockHeld
 from magent.log import HEARTBEAT_MAX_AGE, get_logger, heartbeat_fresh, heartbeat_mtime
 from magent.platform import (
     Platform,
@@ -1443,6 +1444,249 @@ def _retile_targets(
     return [*base, *extras]
 
 
+# The one wording for a cloud project that loads (config accepts it) but has
+# nothing to start a session on. J12's doctor row and J8's bring-up read it too.
+NO_CLOUD_TASK = 'no "cloudTask" set: name the task the cloud session starts on'
+
+# Why ``--go`` and the menu launch skip every cloud project when they have no
+# psmux pane to put it in. `doctor` words the same condition with this constant;
+# ``up`` does not read ``settings.psmux`` and is not subject to it.
+CLOUD_NEEDS_PSMUX = (
+    "cloud projects run in a psmux pane (settings.psmux, Windows); a plain"
+    " terminal would create a new cloud session on every launch"
+)
+
+
+def launch_uses_psmux(config: MagentConfig, plat: Platform) -> bool:
+    """Whether ``--go`` and the menu launch put agents in psmux panes: the
+    setting is on AND this platform has psmux. The one spelling of the
+    condition ``CLOUD_NEEDS_PSMUX`` is about, for the launch loop and `doctor`."""
+    return config.settings.psmux and plat.supports_psmux()
+
+
+# The one tool a cloud session runs: ``claude --cloud``.
+CLOUD_TOOL = "claude"
+
+
+def _exe_stem(exe: str) -> str:
+    """``exe``'s file name without its directory, lower-cased, minus ONE
+    ``.exe``/``.cmd`` (the two ways Windows spells a claude launcher). Either
+    separator splits, whatever the OS: a configured path is typed into a pane,
+    not resolved here."""
+    name = exe.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for suffix in (".exe", ".cmd"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def cloud_tool_refusal(tool: str, base_cmd: str | None) -> str | None:
+    """Why this tool and command cannot start a cloud session, or None.
+
+    ``claude --cloud`` is the only cloud session there is, and
+    ``cloud_pane_command`` keeps just the first token of ``base_cmd``: a
+    wrapper such as ``bash -c "claude ..."`` would be typed as ``bash --cloud``.
+    So the tool must be ``claude`` and its command's executable must be a
+    claude launcher. Read from config alone -- no git, no ssh -- so it can run
+    first."""
+    if tool != CLOUD_TOOL:
+        return (
+            f"a cloud session runs claude --cloud, but this project's tool is {tool!r}"
+        )
+    parts = (base_cmd or "").split()
+    if not parts:
+        return f"unknown tool {tool!r} (add under settings.tools)"
+    if _exe_stem(parts[0]) != CLOUD_TOOL:
+        return (
+            f"a cloud session runs claude --cloud, but the {tool!r} command"
+            f" starts with {parts[0]!r}, which is not claude"
+        )
+    return None
+
+
+def cloud_command(tool: str, base_cmd: str | None, task: str | None) -> tuple[str, str]:
+    """``(command, "")`` for a cloud pane, or ``("", why)`` when it has none.
+
+    THE ladder every surface reads -- ``--go``, ``up``'s bring-up rows, the
+    create gate and `doctor` -- so none words a refusal or orders two of them
+    differently: the tool (``cloud_tool_refusal``), then the task
+    (``NO_CLOUD_TASK``), then the command a pane can safely be typed
+    (``cloud_pane_command``'s own ``ValueError`` text). An empty command is
+    therefore never a bare ``bash --cloud "t"``. From config alone: no git, no
+    ssh, no records."""
+    # heavy subsystem: in-body per policy
+    from magent.sessions.claude import cloud_pane_command
+
+    refusal = cloud_tool_refusal(tool, base_cmd)
+    if refusal:
+        return "", refusal
+    if not task:
+        return "", NO_CLOUD_TASK
+    try:
+        return cloud_pane_command(base_cmd or "", task), ""
+    except ValueError as exc:
+        return "", str(exc)
+
+
+def project_for_session(config: MagentConfig, sid: str) -> ProjectConfig | None:
+    """The project the psmux session ``sid`` belongs to: the FIRST ENABLED one
+    in config order, which is the one ``psmux.eligible_projects`` names the
+    session after (it skips a disabled entry and keeps the first of a duplicate
+    id). The id is ``nodes.node_sid``'s, the one spelling of the title-or-leaf
+    rule."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    for proj in config.projects:
+        if proj.enabled and nodes.node_sid(proj) == sid:
+            return proj
+    return None
+
+
+def twin_session_refusal(sid: str) -> str:
+    """Why a cloud pane cannot be created under session name ``sid`` when the
+    gate would read ANOTHER project: the gate answers by name for the first
+    enabled project that owns it, and creating on that answer would skip the
+    cloud project's own git and ``.env`` checks. The one wording both create
+    paths (``--go`` and ``up``) refuse with."""
+    return (
+        f"another enabled project uses the session name {sid}; rename one (set a title)"
+    )
+
+
+def shadowed_cloud_projects(config: MagentConfig) -> list[tuple[ProjectConfig, str]]:
+    """Every enabled cloud project whose session name ANOTHER enabled project
+    owns, each with that session id: ``(project, sid)``, in config order.
+
+    ``psmux.eligible_projects`` keeps the first of a duplicate id and the create
+    gate reads the first enabled project by name, so a ``[local, cloud]`` pair
+    for one folder silently never starts the cloud entry -- ``up`` says nothing.
+    This is the one place that names it, for ``status`` (and anything else that
+    can say so out loud) to word with ``twin_session_refusal``'s fix."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    out: list[tuple[ProjectConfig, str]] = []
+    for proj in config.projects:
+        if not proj.enabled or not is_cloud(proj):
+            continue
+        sid = nodes.node_sid(proj)
+        owner = project_for_session(config, sid)
+        if owner is not None and owner is not proj:
+            out.append((proj, sid))
+    return out
+
+
+def shadowed_local_projects(config: MagentConfig) -> list[tuple[ProjectConfig, str]]:
+    """The mirror of ``shadowed_cloud_projects``: every enabled LOCAL project
+    (one ``eligible_projects`` would list -- no IDE tool, host or node) whose
+    session name an enabled CLOUD project owns, each with that session id.
+
+    In a ``[cloud, local]`` pair for one folder the first-wins dedupe keeps the
+    cloud row and drops the local one without a word, so ``up`` never starts the
+    local agent and nothing says why. Named here for ``status``, with
+    ``twin_session_refusal``'s fix."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    out: list[tuple[ProjectConfig, str]] = []
+    for proj in config.projects:
+        if (
+            not proj.enabled
+            or is_cloud(proj)
+            or proj.host
+            or runs_on_node(proj)
+            or is_ide_tool(proj.tool or config.settings.default_tool)
+        ):
+            continue
+        sid = nodes.node_sid(proj)
+        owner = project_for_session(config, sid)
+        if owner is not None and owner is not proj and is_cloud(owner):
+            out.append((proj, sid))
+    return out
+
+
+def cloud_refusal(config: MagentConfig, sid: str) -> str | None:
+    """Why the cloud session for ``sid`` must NOT be created now, or None.
+
+    Asked only right before a create -- never for a live session: every
+    ``claude --cloud`` is a NEW cloud session (spec §18.5), so a refused create
+    costs nothing and a wrong one costs a duplicate the CLI cannot list or stop.
+    Gate, not advisory (plan J, "User decision"). Never raises for a reason it
+    can name: a lock that stays taken, an unreadable file or a git that fails
+    each come back as the refusal that says so."""
+    # heavy subsystem: in-body per policy (nodes + the ssh/git layer)
+    from magent import nodes, remote_mux
+    from magent.node_sync import printable
+
+    proj = project_for_session(config, sid)
+    if proj is None or not is_cloud(proj):
+        return None
+    # tool -> task -> typing -> git -> push set, the order every surface
+    # refuses in; the first three are the one ``cloud_command`` ladder.
+    tool = proj.tool or config.settings.default_tool
+    _cmd, why = cloud_command(tool, config.settings.tools.get(tool), proj.cloud_task)
+    if why:
+        return why
+    try:
+        return _cloud_checkout_refusal(config, proj, sid)
+    except remote_mux.RemoteError as exc:
+        lines = exc.row_text.strip().splitlines()
+        if lines:
+            said = lines[-1]
+        elif exc.rc is None:
+            # git never answered: it timed out, or could not be started.
+            said = "no answer"
+        else:
+            said = f"exit {exc.rc}"
+        return f"git could not read {proj.path}: {printable(said)}"
+    # LockHeld and PushSetUnreadable are OSErrors: they come before it.
+    except LockHeld:
+        return "another magent is updating cloud hand-off state; try again"
+    except nodes.PushSetUnreadable as exc:
+        return (
+            f"the push set cannot be checked: {printable(exc.label)} cannot be read"
+            f" ({exc.reason}); fix or remove it, then run: magent node push"
+            f" {nodes.project_name(proj)}"
+        )
+    except nodes.NodeConfigError as exc:
+        return printable(str(exc))
+    except OSError as exc:
+        # The class only: the OS's own words carry an absolute path.
+        get_logger("nodes").warning("cloud gate: %s: %s", sid, exc)
+        return f"{proj.path}: {_local_error_text(exc)}"
+
+
+def _cloud_checkout_refusal(
+    config: MagentConfig, proj: ProjectConfig, sid: str
+) -> str | None:
+    """The git and ``.env`` half of ``cloud_refusal``. It RAISES whatever
+    reading them raises; ``cloud_refusal`` is the one place that becomes words."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    project_dir = _node_project_dir(config, proj)
+    if project_dir is None:
+        return f"{proj.path} was not found on this PC"
+    states = node_git_states(config, proj)
+    if not states:
+        return (
+            f"{proj.path} is not a git repository: a cloud session clones one"
+            " from GitHub"
+        )
+    if len(states) > 1:
+        return f"a cloud session runs ONE repository; {proj.path} holds {len(states)}"
+    refusal = nodes.cloud_git_refusal(states[0])
+    if refusal:
+        return refusal
+    ps = nodes.cloud_push_set(
+        project_dir, states, home=Path.home(), extras=proj.push or ()
+    )
+    return nodes.cloud_env_refusal(
+        sid, nodes.project_name(proj), ps, nodes.read_recipient()
+    )
+
+
 def _launch_projects(
     plat: Platform,
     config: MagentConfig,
@@ -1466,7 +1710,7 @@ def _launch_projects(
     targets: list[_Target] = []
     new_count = 0
     tools = config.settings.tools
-    use_psmux = config.settings.psmux and plat.supports_psmux()
+    use_psmux = launch_uses_psmux(config, plat)
     psmux_windows: list[PsmuxWindowOpts] = []
     node_projects: list[ProjectConfig] = []
     _psmux_colors: dict[str, str | None] = {}
@@ -1493,6 +1737,13 @@ def _launch_projects(
             new_count += _dispatch_node_project(
                 config, opts, proj, tool, _is_running, targets, node_projects, node_map
             )
+            continue
+
+        if is_cloud(proj) and is_ide_tool(tool):
+            # The user asked for a cloud session, and an IDE hosts none: say so
+            # rather than open a local window that is not what they configured.
+            title = proj.title or get_leaf_name(proj.path)
+            click.echo(f"SKIP: {title} — {cloud_tool_refusal(tool, tools.get(tool))}")
             continue
 
         if is_ide_tool(tool):
@@ -1605,7 +1856,7 @@ def _dispatch_cli_agent_project(
     match_mode = "magent-name" if prefix else "exact"
 
     windows_cfg = proj.windows
-    if is_remote or is_ide_tool(tool):
+    if is_remote or is_ide_tool(tool) or is_cloud(proj):
         windows_cfg = None
     titles = generate_titles(proj.title, proj.path, windows_cfg)
     window_count = len(titles)
@@ -1628,7 +1879,26 @@ def _dispatch_cli_agent_project(
         )
         return new_count
 
+    if is_cloud(proj):
+        return _dispatch_cloud_project(
+            config,
+            opts,
+            proj,
+            tool,
+            titles[0],
+            base_cmd,
+            base_dir,
+            use_psmux,
+            is_running,
+            match_mode,
+            targets,
+            psmux_windows,
+            psmux_colors,
+        )
+
     use_happy = proj.happy if proj.happy is not None else config.settings.happy
+    # Only a config with a cloud project pays for the owner lookup below.
+    has_cloud = any(is_cloud(p) for p in config.projects)
 
     for i, win_title in enumerate(titles):
         win_cfg = windows_cfg[i] if windows_cfg and i < len(windows_cfg) else None
@@ -1658,6 +1928,17 @@ def _dispatch_cli_agent_project(
         # exists ("x ... not found"). Non-psmux windows are titled with the
         # raw title, so they keep keying on it.
         tile_key = _psmux_session_name(win_title) if proj_psmux else win_title
+        # A cloud project that owns this session name owns the pane: a local
+        # window queued under it would be verified, re-sent and revived by
+        # typing `claude --continue` into that `claude --cloud` session. The
+        # cloud entry's own dispatch tiles and re-attaches the pane. (The cloud
+        # twin of an earlier LOCAL project is the other half: it is skipped in
+        # `_dispatch_cloud_project`.) Nothing is created or typed before this.
+        if proj_psmux and has_cloud:
+            owner = project_for_session(config, tile_key)
+            if owner is not None and is_cloud(owner):
+                click.echo(f"SKIP: {win_title} — {twin_session_refusal(tile_key)}")
+                continue
         running = is_running(tile_key, match_mode)
         # Window-level dedupe, the same three-way rule the attach path uses:
         # an already-OPEN window is never collected, because every collected
@@ -1717,6 +1998,97 @@ def _dispatch_cli_agent_project(
         )
 
     return new_count
+
+
+def _dispatch_cloud_project(
+    config: MagentConfig,
+    opts: RunOpts,
+    proj: ProjectConfig,
+    tool: str,
+    title: str,
+    base_cmd: str,
+    base_dir: str | None,
+    use_psmux: bool,
+    is_running: Callable[[str, str], bool],
+    match_mode: str,
+    targets: list[_Target],
+    psmux_windows: list[PsmuxWindowOpts],
+    psmux_colors: dict[str, str | None],
+) -> int:
+    """One LOCAL psmux pane running ``claude --cloud "<task>"`` (spec §18.5):
+    typed once, and created only past ``cloud_refusal``. A project that cannot
+    be created is skipped by name, one ``SKIP:`` line; an already-open window or
+    a live session is never gated, only re-tiled or re-attached."""
+    # heavy subsystem: in-body per policy
+    from magent import psmux as psmux_mod
+
+    if not use_psmux:
+        click.echo(f"SKIP: {title} — {CLOUD_NEEDS_PSMUX}")
+        return 0
+    # tool -> task -> typing -> git -> push set, the order every surface refuses
+    # in. The first three are the one ``cloud_command`` ladder, asked before any
+    # git is read: the tool decides what the project is.
+    cmd, why = cloud_command(tool, base_cmd, proj.cloud_task)
+    if why:
+        click.echo(f"SKIP: {title} — {why}")
+        return 0
+    tile_key = _psmux_session_name(title)
+    # The gate answers by session name, for the FIRST enabled project that owns
+    # it. If that is another project (a local one listed ahead of this one),
+    # the gate would be reading a project that is not being created: refuse
+    # rather than create ungated. The other project's own dispatch already
+    # tiles and re-attaches that session.
+    if project_for_session(config, tile_key) != proj:
+        click.echo(f"SKIP: {title} — {twin_session_refusal(tile_key)}")
+        return 0
+    # An entry identical to one already handled (the twin check compares by
+    # value, so it passes both) must not queue a second `claude --cloud` under
+    # the same name: a duplicate is a second billed cloud session, and relying
+    # on the bring-up's has-session timing within one batch is not a guard.
+    # Every path that queues a window or tiles a pane appends a target.
+    if any(t.key == tile_key for t in targets):
+        click.echo(
+            f"SKIP: {title} — already queued under session {tile_key}"
+            " (duplicate project entry)"
+        )
+        return 0
+    running = is_running(tile_key, match_mode)
+    if not running and not opts.dry_run and not opts.tile_only:
+        resolved_dir = _resolve_path(proj.path, base_dir)
+        if not resolved_dir:
+            click.echo(f"SKIP: {proj.path} not found")
+            return 0
+        # THE liveness answer: a live session is re-attached, never gated and
+        # never re-created. A probe that drops answers "not live", which asks
+        # the gate: the safe direction, because a refusal only skips the
+        # window and the bring-up's own has-session probe still dedupes.
+        if not psmux_mod.live_sessions([tile_key]):
+            refusal = cloud_refusal(config, tile_key)
+            if refusal:
+                click.echo(f"SKIP: {title} — {refusal}")
+                return 0
+        psmux_windows.append(
+            PsmuxWindowOpts(
+                window_name=tile_key,
+                cwd=resolved_dir,
+                command=cmd,
+                resend=False,
+                nick="cloud",
+            )
+        )
+        psmux_colors[tile_key] = proj.color
+    targets.append(
+        _Target(name=tile_key, key=tile_key, mode=match_mode, is_new=not running)
+    )
+    _log_project(title, tool, running, None, psmux=True, node="cloud")
+    # A dry run says what the real run would do: for an open window, nothing.
+    if opts.dry_run and not running:
+        # The gate reads git and the push set, which a preview must not: say so,
+        # so the line cannot read as an approval.
+        click.echo(
+            style(f"      would run: {cmd} (create gate not consulted)", dim=True)
+        )
+    return 0 if running else 1
 
 
 def _node_map_snapshot(
@@ -2189,31 +2561,44 @@ def revive_psmux(
 
 
 def decorate_psmux_sessions(
-    names: list[str], code_hint: bool | None = None
+    names: list[str],
+    code_hint: bool | None = None,
+    *,
+    nicks: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Delegate to ``psmux.decorate_sessions``.
 
     ``code_hint`` stays optional here (unlike ``decoration_argv``'s required
     one) so existing callers keep working and get the default "probe on this
     machine" behaviour, which is what every one of them wants.
+
+    ``nicks`` (session name -> brand nick) is keyword-only, and a caller with
+    no nick must not pass it at all: other code fakes this wrapper with a
+    one-argument callable.
     """
     from magent import psmux
 
-    return psmux.decorate_sessions(names, code_hint=code_hint)
+    return psmux.decorate_sessions(names, code_hint=code_hint, nicks=nicks)
 
 
 def decorate_psmux_sessions_async(
-    names: list[str], code_hint: bool | None = None
+    names: list[str],
+    code_hint: bool | None = None,
+    *,
+    nicks: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Delegate to ``psmux.decorate_sessions_async``.
 
     The status-path variant: fires the same commands without waiting, and is
     throttled by a stamp file. `up --json` uses this one so a slow psmux can
     never delay (or fail) a status query -- see the psmux docstring.
+
+    ``nicks`` is keyword-only and passed only by a caller that has one, as in
+    ``decorate_psmux_sessions``.
     """
     from magent import psmux
 
-    return psmux.decorate_sessions_async(names, code_hint=code_hint)
+    return psmux.decorate_sessions_async(names, code_hint=code_hint, nicks=nicks)
 
 
 def stop_psmux(names: list[str]) -> tuple[list[str], list[str]]:
