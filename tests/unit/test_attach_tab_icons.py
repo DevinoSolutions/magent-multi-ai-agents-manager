@@ -20,7 +20,11 @@ def icons_on(monkeypatch):
 
 
 def _platform(monkeypatch, *, wt: bool, windows=None) -> FakePlatform:
-    fp = FakePlatform(windows=dict(windows or {}), supports_wt_profiles=wt)
+    fp = FakePlatform(
+        windows=dict(windows or {}),
+        supports_wt_profiles=wt,
+        supports_attach_windows=True,  # attach is gated on it up front
+    )
     monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
     return fp
 
