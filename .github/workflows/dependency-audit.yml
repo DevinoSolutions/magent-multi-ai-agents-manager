@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: dep-audit-${{ github.ref }}
+  group: dep-audit-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
