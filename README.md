@@ -373,21 +373,31 @@ A fleet grows, and most launches want four of its fourteen windows. So `magent -
 
 ```
   Launch which projects?
-  ----------------------------------------
-
+  filter: _
   work
-  >  1  [x] api-gateway
-     2  [x] web-app
-     3  [ ] admin-console
-
+  > [x] api-gateway
+    [x] web-app
+    [ ] admin-console
   other
-     4  [x] scratch
-
-  3 of 4 selected
-  space toggle   a all   n none   g section   up/down move   enter launch   q cancel
+    [x] scratch
+  v 51 more
+  3 of 59 selected - type to filter
+  space toggle  enter launch  ctrl+a all  tab next group  esc cancel
 ```
 
-Up/Down (or `j`/`k`) move, **Space** toggles the row, **`a`**/**`n`** check or clear everything, **`g`** toggles the whole section the cursor is in, digits **1-9** toggle that numbered row, **Enter** launches the checked set, and **`q`**/Esc walks away with `Nothing launched.` (as does Enter with nothing checked). Projects are grouped by their `group` field; ungrouped ones sit last under `other`.
+**Type to filter.** Every printable key (letters, digits, `-` `_` `.`) goes into the `filter:` line and narrows the list with the same ranking the menu uses (prefix, then word start, then substring, then in-order letters; ties keep config order). While a filter is active the section headings are dropped and each row shows its section instead. **Backspace** edits; **Esc** clears the filter (on an empty filter it walks away with `Nothing launched.`). Your checks survive every filter change — they belong to the project, not the row. The first character you type also clears the untouched "everything checked" default, so typing a name and pressing Enter launches just that project.
+
+| Key | Does |
+| --- | --- |
+| **Space** | Toggle the highlighted row |
+| **Enter** | Launch the checked set — or, if nothing is checked, just the highlighted project (the footer says which) |
+| **Ctrl+A** | Check every *visible* row; press again to clear them |
+| **Tab** / **Shift+Tab** | Jump to the next / previous section's first row |
+| **Up** / **Down**, **PgUp** / **PgDn**, **Home** / **End** | Move |
+| **Esc** | Clear the filter; on an empty one, cancel |
+| **Ctrl+C** | Cancel |
+
+The list always fits the terminal: the title, filter and footer stay pinned, the cursor row stays on screen, and `^ N more` / `v N more` say how many rows are scrolled out of view. Projects are grouped by their `group` field; ungrouped ones sit last under `other`.
 
 Off a terminal — a script, cron, CI, anything piped — there is **no prompt at all** and every enabled project launches, exactly as before. `--all` (`-a`) is the same escape hatch when you *are* on a terminal. `-g <group>` narrows the checklist to that group, and `--retile-all` never asks, since it launches nothing.
 
