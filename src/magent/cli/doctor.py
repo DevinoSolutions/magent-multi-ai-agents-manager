@@ -22,6 +22,7 @@ import click
 
 from magent import log, psmux, tailnet
 from magent.cli.app import main
+from magent.community import DISCORD_INVITE_URL
 from magent.paths import find_config
 from magent.style import style
 
@@ -706,5 +707,8 @@ def doctor_cmd(ctx: click.Context, as_json: bool) -> None:
     click.echo()
     if failures:
         click.echo(f"  {style(f'{failures} check(s) failed.', fg='red', bold=True)}")
+        click.echo(
+            f"  {style(f'Stuck? Ask in the mAgent Discord: {DISCORD_INVITE_URL}', dim=True)}"
+        )
         sys.exit(1)
     click.echo(f"  {style('No failures.', fg='green', bold=True)}")

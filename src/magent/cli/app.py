@@ -16,6 +16,7 @@ from magent.cli.checklist import ABORT_MESSAGE, choose_projects
 from magent.cli.config_io import _load_config_or_exit
 from magent.cli.pipeguard import run_guarded
 from magent.cli.ui import _open_in_editor
+from magent.community import DISCORD_INVITE_URL
 from magent.init_config import write_config
 from magent.paths import find_config
 
@@ -101,7 +102,11 @@ class _MagentGroup(click.Group):
         return run_guarded(lambda: super(_MagentGroup, self).__call__(*args, **kwargs))
 
 
-@click.group(cls=_MagentGroup, invoke_without_command=True)
+@click.group(
+    cls=_MagentGroup,
+    invoke_without_command=True,
+    epilog=f"Need help? Join the mAgent Discord: {DISCORD_INVITE_URL}",
+)
 @click.option("--go", is_flag=True, help="Skip interactive menu, launch + tile")
 @click.option("--retile-all", is_flag=True, help="Re-tile every matching window")
 @click.option("--dry-run", is_flag=True, hidden=True)

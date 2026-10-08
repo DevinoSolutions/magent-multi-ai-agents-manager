@@ -6,7 +6,8 @@
 </p>
 
 <p align="center">
-  <a href="https://magent.now"><strong>magent.now</strong></a>
+  <a href="https://magent.now"><strong>magent.now</strong></a> ·
+  <a href="https://discord.gg/P8g3pzBjDx"><strong>Discord</strong></a>
 </p>
 
 <!--
@@ -663,9 +664,16 @@ A bare `pytest` collects **all** tiers, including tests that enumerate real moni
 | Terminal | Windows Terminal | kitty/iTerm/Terminal.app | kitty/alacritty/gnome-terminal |
 | DPI awareness | Per-Monitor V2 | Native Retina | xrandr DPI |
 
+## Community
+
+Questions, bug reports, feature ideas, or a setup to show off? Join the
+[mAgent Discord](https://discord.gg/P8g3pzBjDx). `magent doctor` and
+`magent --help` point there too.
+
 ## Contributing
 
-Questions and feedback are welcome via [magent.now](https://magent.now).
+Questions and feedback are welcome in the [mAgent Discord](https://discord.gg/P8g3pzBjDx)
+or via [magent.now](https://magent.now).
 
 ## License
 

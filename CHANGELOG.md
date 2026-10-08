@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Where to get help is now one link away.** `magent --help` ends with the
+  mAgent Discord invite, a failing `magent doctor` points there under its
+  summary, the PyPI page lists it under Project links, and the README has a
+  Community section. The invite lives in one leaf, `magent/community.py`.
+
 ### Changed
 
 - **Every psmux argv is now built in `psmux.py`.** The attach, new-session and

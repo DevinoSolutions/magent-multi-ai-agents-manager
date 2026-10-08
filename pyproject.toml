@@ -82,6 +82,7 @@ magent-attach-client = "magent.attach_client:main"
 [project.urls]
 Homepage = "https://magent.now"
 Documentation = "https://faq.magent.now"
+Discord = "https://discord.gg/P8g3pzBjDx"
 
 [build-system]
 # hatchling 1.32.0 (2026-08-11) started emitting Metadata-Version 2.5. The
