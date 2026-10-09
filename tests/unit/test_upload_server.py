@@ -3188,7 +3188,7 @@ class TestDestFor:
     """Where one uploaded file lands, and what it is never allowed to clobber."""
 
     def test_a_file_from_an_earlier_request_is_never_overwritten(self, tmp_path):
-        from magent.upload_server import _dest_for
+        from magent.uploads import dest_for as _dest_for
 
         root = tmp_path.resolve()
         earlier = root / "1790000000_shot.png"
@@ -3200,7 +3200,7 @@ class TestDestFor:
         assert earlier.read_bytes() == b"earlier upload"
 
     def test_a_clash_keeps_the_original_extension(self, tmp_path):
-        from magent.upload_server import _dest_for
+        from magent.uploads import dest_for as _dest_for
 
         root = tmp_path.resolve()
         first = _dest_for(root, 1790000000, "notes.txt")
@@ -3212,7 +3212,7 @@ class TestDestFor:
 
     @pytest.mark.parametrize("name", ["..", "...", "."])
     def test_a_dots_only_name_becomes_upload(self, tmp_path, name):
-        from magent.upload_server import _dest_for
+        from magent.uploads import dest_for as _dest_for
 
         dest = _dest_for(tmp_path.resolve(), 1790000000, name)
         assert dest is not None
@@ -3221,7 +3221,7 @@ class TestDestFor:
     def test_a_long_original_name_still_lands(self, tmp_path):
         # 250 chars is a legal name on every OS; the `<stamp>_` prefix used to
         # push it past one path component's 255 limit and the upload was a 500.
-        from magent.upload_server import _dest_for
+        from magent.uploads import dest_for as _dest_for
 
         dest = _dest_for(tmp_path.resolve(), 1790000000, "a" * 250 + ".txt")
         assert dest is not None
@@ -3233,7 +3233,7 @@ class TestDestFor:
     def test_a_long_non_ascii_name_is_cut_on_a_character(self, tmp_path):
         # Linux counts BYTES, so a non-ASCII name hits the limit sooner -- and
         # a cut through the middle of a character would be a mangled name.
-        from magent.upload_server import _dest_for
+        from magent.uploads import dest_for as _dest_for
 
         dest = _dest_for(
             tmp_path.resolve(),
@@ -3248,7 +3248,7 @@ class TestDestFor:
         }
 
     def test_a_long_suffix_is_trimmed_like_a_stem(self, tmp_path):
-        from magent.upload_server import _dest_for
+        from magent.uploads import dest_for as _dest_for
 
         dest = _dest_for(tmp_path.resolve(), 1790000000, "notes." + "x" * 300)
         assert dest is not None
@@ -3259,7 +3259,7 @@ class TestDestFor:
     ):
         # Two requests in one second, each choosing its dest before the other
         # has written: `exists()` could not see a name chosen but unwritten.
-        from magent.upload_server import _dest_for
+        from magent.uploads import dest_for as _dest_for
 
         root = tmp_path.resolve()
         first = _dest_for(root, 1790000000, "shot.png")
@@ -3269,7 +3269,7 @@ class TestDestFor:
         assert first.exists() and second.exists()  # both are reserved on disk
 
     def test_concurrent_reservations_never_collide(self, tmp_path):
-        from magent.upload_server import _dest_for
+        from magent.uploads import dest_for as _dest_for
 
         root = tmp_path.resolve()
         got: list[Path | None] = []
@@ -3294,7 +3294,7 @@ class TestDestFor:
     def test_a_dotfile_keeps_its_name(self, tmp_path, name):
         # With any-file uploads a dotfile is a real case; the `<stamp>_`
         # prefix already stops it being hidden, so it keeps what it is called.
-        from magent.upload_server import _dest_for
+        from magent.uploads import dest_for as _dest_for
 
         dest = _dest_for(tmp_path.resolve(), 1790000000, name)
         assert dest is not None
@@ -3303,7 +3303,7 @@ class TestDestFor:
     def test_a_trailing_dot_is_dropped_so_the_path_names_the_file(self, tmp_path):
         # Windows silently drops a trailing dot on create; the returned (and
         # pasted) path has to be the file that actually exists.
-        from magent.upload_server import _dest_for
+        from magent.uploads import dest_for as _dest_for
 
         dest = _dest_for(tmp_path.resolve(), 1790000000, "notes.")
         assert dest is not None
