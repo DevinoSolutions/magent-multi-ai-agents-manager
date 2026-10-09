@@ -253,6 +253,13 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # the developer's own fleet. Off for every tier; tests that are ABOUT the
     # poller drive EventPoller.tick directly with fake seams.
     monkeypatch.setenv("MAGENT_EVENTS", "0")
+    # ...and a seventh, whose reach is the internet: `magent serve` runs the
+    # magent link thread, and on a developer box that is LINKED it would dial
+    # the real relay with the developer's own host token from the moment a test
+    # starts a real serve -- and run whatever the relay queued. Off for every
+    # tier; the link tests drive the link runner in process against a fake
+    # relay and never need the thread.
+    monkeypatch.setenv("MAGENT_LINK", "0")
     log.reset_logging()
     yield
     log.reset_logging()
