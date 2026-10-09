@@ -321,10 +321,23 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
     is_flag=True,
     help="Print live sessions as JSON (name, cwd, model, effort, state) and exit.",
 )
+@click.option(
+    "--v1",
+    "v1",
+    is_flag=True,
+    help=(
+        "Print the /api/v1/sessions?fresh=1 envelope (every SessionRow field) and "
+        "exit. A missing config is an empty list; an unreadable (broken) one is "
+        "an unavailable envelope, exit 1."
+    ),
+)
 @click.pass_context
-def sessions_cmd(ctx: click.Context, name: str | None, as_json: bool) -> None:
+def sessions_cmd(ctx: click.Context, name: str | None, as_json: bool, v1: bool) -> None:
     """List psmux sessions or attach to one. Usage: magent sessions [name]"""
     config_file = find_config(ctx.obj.get("config_path"))
+    if v1:
+        _emit_sessions_v1(ctx.obj.get("config_path"))
+        return
     if as_json:
         _emit_sessions_json(ctx.obj.get("config_path"))
         return
@@ -351,6 +364,21 @@ def _emit_sessions_json(config_path: str | None) -> None:
         click.echo(json.dumps({"ok": False, "error": str(e)}))
         sys.exit(1)
     click.echo(json.dumps([r.to_legacy() for r in rows], indent=2))
+
+
+def _emit_sessions_v1(config_path: str | None) -> None:
+    """``sessions --v1``: exactly ``GET /api/v1/sessions?fresh=1``, both
+    halves of every row (hook state and pane state), one envelope."""
+    import json
+
+    from magent import api, wire  # heavy subsystem: in-body per policy
+
+    try:
+        listing = api.session_list(config_path, fresh=True)
+    except wire.WireError as e:
+        click.echo(json.dumps(wire.from_exc(e)))
+        sys.exit(1)
+    click.echo(json.dumps(wire.ok(listing)))
 
 
 def _node_session_targets(

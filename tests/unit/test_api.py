@@ -428,6 +428,31 @@ class TestMetaHealthStatus:
         data = assert_wire(api.handle(make_req(path="/api/v1/status"), wired), "Status")
         assert data == {"upload": "up"}
 
+    def test_status_provider_failure_is_unavailable(self, ctx):
+        """The provider refuses an unreadable config itself, with the same
+        ``config:`` text ``/api/v1/sessions`` uses; the route passes it on."""
+
+        def _unreadable() -> dict[str, object]:
+            raise api.WireError("unavailable", "config: Config file not found: x")
+
+        wired = api.ApiContext(**{**ctx.__dict__, "status_provider": _unreadable})
+        resp = api.handle(make_req(path="/api/v1/status"), wired)
+        error = assert_refused(resp, 503, "unavailable")
+        assert error["message"] == "config: Config file not found: x"
+
+    def test_a_crashing_status_provider_is_the_logged_500(self, ctx, caplog):
+        """Nothing past the config load is a config problem: a probe that
+        raises is a crash, logged, never mislabelled ``config:``."""
+
+        def _crash() -> dict[str, object]:
+            raise OSError("ssh: node did not answer")
+
+        wired = api.ApiContext(**{**ctx.__dict__, "status_provider": _crash})
+        resp = api.handle(make_req(path="/api/v1/status"), wired)
+        error = assert_refused(resp, 500, "internal")
+        assert "node did not answer" in caplog.text
+        assert "node did not answer" not in json.dumps(error)
+
 
 class TestSessions:
     def test_lists_every_row(self, ctx, fixed_rows):

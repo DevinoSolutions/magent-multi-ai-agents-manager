@@ -23,7 +23,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, NoReturn
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -778,12 +778,87 @@ def _render_status(config_file: Path) -> StatusReport:
     return StatusReport(_is_degraded(status, sync_paused=paused is not None), listed)
 
 
+def _status_payload(cfg: MagentConfig) -> tuple[dict[str, object], bool]:
+    """The ``status --json`` payload without its ``ok`` key, and whether it
+    is degraded (exit 3). Shared by ``status --json``, ``status --v1`` and
+    serve's ``GET /api/v1/status`` (handed down as ``status_provider``)."""
+    from magent import fleetview  # heavy subsystem: in-body per policy
+    from magent.launch import psmux_status  # heavy subsystem: in-body per policy
+
+    status = _gather_status(cfg)
+    payload: dict[str, object] = dict(status)
+    payload["agents"] = _agents_snapshot(cfg)
+    # Additive (P3-04): a new key alongside the existing envelope, never a
+    # change to its shape or to the 0/1/3 exit contract -- a dead psmux
+    # session is a "not running" row, not a degraded daemon.
+    up, _down, projects = psmux_status(cfg)
+    payload["psmux_sessions"] = _psmux_sessions(
+        up, projects, fleetview.staleness_from_config(cfg)
+    )
+    # Additive too, and for the same reason the human line is on stderr and
+    # not in the verdict: a count of psmux servers stranded in logon
+    # Session 0 is a fact about the machine, not about magent's daemons, so
+    # it changes neither the envelope's shape nor the exit contract.
+    payload["psmux_session0"] = len(session0_server_pids())
+    # Additive, like psmux_sessions: a dead or stale node session is a row
+    # state, never a degraded daemon; only the sync daemon can degrade
+    # (exit 3): its own `node_sync` field, or `node_sync_paused` below.
+    from magent import nodes  # heavy subsystem: in-body per policy
+
+    map_errors: list[OSError | ValueError] = []
+    payload["node_sessions"] = nodes.session_rows(
+        cfg, now=time.time(), on_unreadable=map_errors.append
+    )
+    # Additive too: a paused sync says why (round-2 ruling 3), and is
+    # degraded like a stale daemon (Q1): every row is frozen until the
+    # map is repaired.
+    paused = _node_sync_pause(status["node_sync"], map_errors)
+    payload["node_sync_paused"] = _node_sync_pause_json(paused)
+    # Additive, as psmux_session0 is: never the verdict, never the exit code.
+    payload["daemons_session0"] = len(session0_daemons())
+    # Additive: the token nodes sign in with, null when no node is
+    # configured (nobody's business then). Never part of the verdict.
+    token = _node_token(cfg)
+    payload["claude_token"] = None if token is None else token.state
+    return payload, _is_degraded(status, sync_paused=paused is not None)
+
+
+def _status_v1(config_file: Path) -> NoReturn:
+    """``status --v1``: the ``/api/v1/status`` envelope, same exit codes.
+
+    A missing or broken config is the same ``unavailable`` envelope (same
+    ``config:`` text) ``GET /api/v1/status`` answers, with ``status``'s
+    legacy exit 1 rather than the fleet shells' 3."""
+    from magent import wire
+    from magent.config import load_config
+
+    try:
+        cfg = load_config(str(config_file))
+    except (ValueError, OSError) as e:
+        click.echo(json.dumps(wire.error("unavailable", f"config: {e}")))
+        sys.exit(1)
+    payload, degraded = _status_payload(cfg)
+    click.echo(json.dumps(wire.ok(payload)))
+    sys.exit(3 if degraded else 0)
+
+
 @main.command("status")
 @click.option("--json", "as_json", is_flag=True, help="Print daemon status as JSON")
+@click.option(
+    "--v1",
+    "v1",
+    is_flag=True,
+    help=(
+        "Print the /api/v1/status envelope ({ok, data}); --json keeps its shape "
+        "until 4.0. An unreadable config is an unavailable envelope, exit 1."
+    ),
+)
 @click.pass_context
-def status_cmd(ctx: click.Context, as_json: bool) -> None:
+def status_cmd(ctx: click.Context, as_json: bool, v1: bool) -> None:
     """Show which psmux sessions and services are currently running."""
     config_file = find_config(ctx.obj.get("config_path"))
+    if v1:
+        _status_v1(config_file)
     if not config_file.exists():
         if as_json:
             # P3-04: one error envelope shape across every CLI JSON surface.
@@ -793,51 +868,12 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         sys.exit(1)
 
     if as_json:
-        from magent import fleetview  # heavy subsystem: in-body per policy
-        from magent.launch import (
-            psmux_status,  # heavy subsystem: in-body per policy
-        )
-
         cfg = _load_config_or_exit(config_file, as_json=True)
-        status = _gather_status(cfg)
+        payload, degraded = _status_payload(cfg)
         # P3-04: `ok: true` is the success discriminator (only errors carry
         # ok: false); degraded is still signalled by the state fields + exit 3.
-        payload: dict[str, object] = {"ok": True, **status}
-        payload["agents"] = _agents_snapshot(cfg)
-        # Additive (P3-04): a new key alongside the existing envelope, never a
-        # change to its shape or to the 0/1/3 exit contract -- a dead psmux
-        # session is a "not running" row, not a degraded daemon.
-        up, _down, projects = psmux_status(cfg)
-        payload["psmux_sessions"] = _psmux_sessions(
-            up, projects, fleetview.staleness_from_config(cfg)
-        )
-        # Additive too, and for the same reason the human line is on stderr and
-        # not in the verdict: a count of psmux servers stranded in logon
-        # Session 0 is a fact about the machine, not about magent's daemons, so
-        # it changes neither the envelope's shape nor the exit contract.
-        payload["psmux_session0"] = len(session0_server_pids())
-        # Additive, like psmux_sessions: a dead or stale node session is a row
-        # state, never a degraded daemon; only the sync daemon can degrade
-        # (exit 3): its own `node_sync` field, or `node_sync_paused` below.
-        from magent import nodes  # heavy subsystem: in-body per policy
-
-        map_errors: list[OSError | ValueError] = []
-        payload["node_sessions"] = nodes.session_rows(
-            cfg, now=time.time(), on_unreadable=map_errors.append
-        )
-        # Additive too: a paused sync says why (round-2 ruling 3), and is
-        # degraded like a stale daemon (Q1): every row is frozen until the
-        # map is repaired.
-        paused = _node_sync_pause(status["node_sync"], map_errors)
-        payload["node_sync_paused"] = _node_sync_pause_json(paused)
-        # Additive, as psmux_session0 is: never the verdict, never the exit code.
-        payload["daemons_session0"] = len(session0_daemons())
-        # Additive: the token nodes sign in with, null when no node is
-        # configured (nobody's business then). Never part of the verdict.
-        token = _node_token(cfg)
-        payload["claude_token"] = None if token is None else token.state
-        click.echo(json.dumps(payload))
-        sys.exit(3 if _is_degraded(status, sync_paused=paused is not None) else 0)
+        click.echo(json.dumps({"ok": True, **payload}))
+        sys.exit(3 if degraded else 0)
 
     if _render_status(config_file).degraded:
         sys.exit(3)

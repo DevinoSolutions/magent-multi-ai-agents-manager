@@ -733,6 +733,8 @@ def _status(call: Call) -> ApiResponse:
     provider = call.ctx.status_provider
     if provider is None:
         raise WireError("unavailable", "status is served only by `magent serve`")
+    # The provider refuses an unreadable config itself (``unavailable``);
+    # anything else it raises is a crash, logged as a 500 by ``handle``.
     payload = dict(provider())
     payload.pop("ok", None)
     return ApiResponse.ok(payload)
@@ -786,13 +788,20 @@ def _row(
     return row
 
 
+def session_list(
+    config_path: str | None, *, fresh: bool, fleet: FleetSource | None = None
+) -> SessionList:
+    """``GET /api/v1/sessions`` (and ``magent sessions --v1``, with
+    ``fresh``): every row, panes read only when ``fresh``."""
+    rows = _rows(config_path, include_pane=fresh, fleet=fleet)
+    return SessionList(sessions=rows, snapshot_ts=time.time())
+
+
 def _sessions(call: Call) -> ApiResponse:
-    rows = _rows(
-        call.ctx.config_path,
-        include_pane=_flag(call.req, "fresh"),
-        fleet=call.ctx.fleet,
+    fresh = _flag(call.req, "fresh")
+    return ApiResponse.ok(
+        session_list(call.ctx.config_path, fresh=fresh, fleet=call.ctx.fleet)
     )
-    return ApiResponse.ok(SessionList(sessions=rows, snapshot_ts=time.time()))
 
 
 def _session(call: Call) -> ApiResponse:
