@@ -17,7 +17,6 @@ import contextlib
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -45,26 +44,11 @@ _PICKER_COMMANDS = frozenset({"q"})
 def _session_cwds(
     psmux: str, names: list[str], resolved: dict[str, str]
 ) -> dict[str, str]:
-    """Each session's working directory -- the key we match against the
-    agent-state store.
+    """Delegate to ``fleetview.session_cwds`` (config's resolved folder, a
+    ``pane_cwd`` probe only for a folder that did not resolve)."""
+    from magent import fleetview  # heavy subsystem: in-body per policy
 
-    Config is the source of truth here: magent creates every session with
-    ``-c <resolved>``, so the pane cwd is already known without asking psmux.
-    Probing ``pane_cwd`` per session per paint cost ~3.4s of a ~4.8s first
-    paint at 40 live sessions, and matched what config already said. Only a
-    session whose configured path failed to resolve falls back to a live
-    probe -- normally an empty set, so the concurrency here rarely runs."""
-    from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
-
-    cwds = {n: resolved.get(n, "") for n in names}
-    missing = [n for n in names if not cwds[n]]
-    if missing:
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            probed = list(
-                pool.map(lambda n: psmux_mod.pane_cwd(n, psmux=psmux), missing)
-            )
-        cwds.update(zip(missing, probed, strict=True))
-    return cwds
+    return fleetview.session_cwds(psmux, names, resolved)
 
 
 def _status_label(state: str | None, age_s: float | None = None) -> str:
@@ -87,45 +71,11 @@ def _status_label(state: str | None, age_s: float | None = None) -> str:
 def _session_states(
     cwds: dict[str, str], staleness: dict[str, float] | None = None
 ) -> dict[str, tuple[str | None, float | None]]:
-    """Map each session to its ``(state, age_s)`` from the agent-state store,
-    which agents populate via their own lifecycle events (Claude Code hooks,
-    Codex notify, ...) -- ground truth, not terminal scraping. A staleness guard
-    keeps a session killed mid-turn from showing 'working...' forever.
+    """Delegate to ``fleetview.session_states``: each session's ``(state,
+    age_s)`` from the agent-state store, a stale record reported as None."""
+    from magent import fleetview  # heavy subsystem: in-body per policy
 
-    ``staleness`` is the ``{state: seconds}`` window map, built once by the
-    caller from config (``attention_cmd.staleness_from_config``) -- passed in
-    rather than read here because this function had the module default
-    hardcoded, which made `magent sessions` and `status`'s psmux-session table
-    the only surfaces that ignored ``settings.attention.stalenessWorkingS``.
-    ``None`` keeps ``attention.STALENESS_S`` reachable as the documented
-    no-config fallback: a caller without a config degrades to the shipped
-    windows, never to a crash or a blank state column.
-
-    Split out of ``_session_statuses`` so ``magent status`` can report the same
-    ground truth as *data* (its ``--json`` session rows) instead of re-deriving
-    it from a styled label."""
-    from magent import agent_state  # heavy subsystem: in-body per policy
-    from magent.attention import (
-        STALENESS_S,  # heavy subsystem: in-body per policy
-    )
-
-    stale = STALENESS_S if staleness is None else staleness
-    out: dict[str, tuple[str | None, float | None]] = {}
-    for sock, cwd in cwds.items():
-        rec = agent_state.state_for(cwd) if cwd else None
-        raw_state = rec.get("state") if rec else None
-        state = raw_state if isinstance(raw_state, str) else None
-        age_s: float | None = None
-        if rec is not None and state is not None:
-            ts = rec.get("ts", 0)
-            ts_num = (
-                ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0
-            )
-            age_s = time.time() - ts_num
-            if state in stale and age_s > stale[state]:
-                state = None
-        out[sock] = (state, age_s)
-    return out
+    return fleetview.session_states(cwds, staleness)
 
 
 def _session_statuses(
@@ -383,87 +333,25 @@ def sessions_cmd(ctx: click.Context, name: str | None, as_json: bool) -> None:
 
 
 def _emit_sessions_json(config_path: str | None) -> None:
-    """Print each configured session with its live state, one JSON array.
+    """Print each configured session with its live state, one JSON array:
+    ``fleetview.rows`` in their legacy form (``SessionRow.to_legacy``).
 
-    Only stdout carries the JSON: the local rows come from the raw
-    ``config_sessions`` loader (no `load_config` version warning), and the
-    per-session pane reads fan out on a small pool so a big fleet stays quick.
-    A config that names a pool node also gets a typed load for the node rows
-    (see ``_node_session_rows``): its version warning goes to stderr, and a
-    config that fails validation answers the ``{"ok": false, "error": ...}``
+    Only stdout carries the JSON. ``hooks=False`` keeps the local rows on the
+    raw ``config_sessions`` loader (no `load_config` version warning); a
+    config that names a pool node also gets a typed load for the node rows,
+    and one that fails validation answers the ``{"ok": false, "error": ...}``
     envelope with exit 1 instead of an array.
     """
     import json
-    from concurrent.futures import ThreadPoolExecutor
 
-    from magent import fleet, psmux  # heavy subsystem: in-body per policy
+    from magent import fleetview  # heavy subsystem: in-body per policy
 
-    dicts = psmux.config_sessions(config_path)
-    names = [psmux.socket_id(d) for d in dicts]
-    resolved = {psmux.socket_id(d): str(d.get("resolved") or "") for d in dicts}
-    binary = psmux.find_psmux()
-    live = set(psmux.live_sessions(names, psmux=binary)) if binary and names else set()
-
-    def _row(name: str) -> dict[str, object]:
-        if name not in live:
-            return {
-                "name": name,
-                "cwd": resolved.get(name, ""),
-                "live": False,
-                "state": "dead",
-                "model": None,
-                "effort": None,
-            }
-        st = fleet.read_state(name, psmux_bin=binary)
-        return {
-            "name": name,
-            "cwd": resolved.get(name, ""),
-            "live": True,
-            "state": st["state"],
-            "model": st["model"],
-            "effort": st["effort"],
-        }
-
-    live_names = [n for n in names if n in live]
-    read: dict[str, dict[str, object]] = {}
-    if live_names:
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for name, row in zip(live_names, pool.map(_row, live_names), strict=True):
-                read[name] = row
-    rows = [read[n] if n in read else _row(n) for n in names]
-    for row in rows:
-        row["node"] = None
-    rows += _node_session_rows(config_path)
-    click.echo(json.dumps(rows, indent=2))
-
-
-def _node_session_rows(config_path: str | None) -> list[dict[str, object]]:
-    """``sessions --json`` rows for the node projects (PR-D), shaped like the
-    local ones plus ``node``. ``live`` is True / False from the sync daemon's
-    last pull, and None when that pull is stale -- an unreachable node is not
-    a dead session. ``state`` stays that vocabulary. ``model``/``effort`` of
-    a live row are read off its pane on the node, one bounded ssh capture
-    each (``remote_mux.capture_pane``), fanned out like the local reads; a
-    capture that fails leaves them None, as does every row not live -- a
-    stale node is not dialled at all."""
-    from magent import fleet, remote_mux  # heavy subsystem: in-body per policy
-
-    targets = _node_session_targets(config_path, as_json=True)
-    live = [
-        (row, node)
-        for row, node in targets
-        if row["state"] == "live" and node is not None
-    ]
-    if live:
-
-        def _pane(target: tuple[dict[str, object], Node]) -> str | None:
-            return remote_mux.capture_pane(target[1], str(target[0]["name"]))
-
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for (row, _), pane in zip(live, pool.map(_pane, live), strict=True):
-                if pane is not None:
-                    row["model"], row["effort"] = fleet.parse_footer(pane)
-    return [row for row, _ in targets]
+    try:
+        rows = fleetview.rows(config_path, hooks=False, dial_nodes=True)
+    except (ValueError, FileNotFoundError) as e:
+        click.echo(json.dumps({"ok": False, "error": str(e)}))
+        sys.exit(1)
+    click.echo(json.dumps([r.to_legacy() for r in rows], indent=2))
 
 
 def _node_session_targets(

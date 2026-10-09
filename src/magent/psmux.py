@@ -2251,9 +2251,15 @@ def revive_sessions(
     return revived
 
 
-def config_sessions(config_path: str | None) -> list[dict[str, object]]:
+def config_sessions(
+    config_path: str | None, *, detail: bool = False
+) -> list[dict[str, object]]:
     """Eligible psmux sessions from config — no psmux binary calls, fast path
-    for the upload server's session list."""
+    for the upload server's session list.
+
+    ``detail=True`` adds ``group``, ``tool``, ``enabled`` and ``node`` to each row for
+    ``fleetview``; the default rows keep the exact shape ``/api/sessions``
+    has always served."""
     import json
     from pathlib import Path
 
@@ -2286,16 +2292,23 @@ def config_sessions(config_path: str | None) -> list[dict[str, object]]:
         if p.get("node") not in (None, "cloud"):
             continue
         proj_name = p.get("title") or Path(p["path"]).name
-        out.append(
-            {
-                "name": proj_name,
-                "session": session_name(proj_name),
-                "path": p["path"],
-                # "" (never None) when the folder can't be resolved, so a JSON
-                # consumer can treat it as a plain string field.
-                "resolved": _resolve_path(p["path"], base_dir) or "",
-            }
-        )
+        row: dict[str, object] = {
+            "name": proj_name,
+            "session": session_name(proj_name),
+            "path": p["path"],
+            # "" (never None) when the folder can't be resolved, so a JSON
+            # consumer can treat it as a plain string field.
+            "resolved": _resolve_path(p["path"], base_dir) or "",
+        }
+        if detail:
+            group = p.get("group")
+            row["group"] = group if isinstance(group, str) else None
+            row["tool"] = tool if isinstance(tool, str) else None
+            row["enabled"] = True
+            # None for a local project, "cloud" for a cloud pane: the pool
+            # node rows were skipped above.
+            row["node"] = "cloud" if p.get("node") == "cloud" else None
+        out.append(row)
     return out
 
 
