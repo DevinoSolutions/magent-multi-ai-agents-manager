@@ -1,4 +1,4 @@
-"""Unit tests for scripts/lint_rules.py — the MD001-MD007 custom lint layer.
+"""Unit tests for scripts/lint_rules.py — the MD001-MD008 + MD011 custom lint layer.
 
 Each rule is proven with a violating snippet (fires) and a conforming snippet
 (silent), plus scope checks (which path prefixes each rule applies to). The
@@ -319,3 +319,42 @@ def test_md002_no_longer_whitelists_the_kill_recipes():
     allow = lint_rules.MD002_ALLOW
     assert "src/magent/cli/attention_cmd.py" not in allow
     assert "src/magent/node_sync.py" not in allow
+
+
+# ---- MD011: config writes only through the config_io seam -------------------
+
+
+def test_md011_flags_config_io_save_outside_the_allow_list():
+    src = "from magent import config_io\nconfig_io.save(p, d)\n"
+    assert _codes("src/magent/launch.py", src) == ["MD011"]
+
+
+def test_md011_flags_write_atomic_too():
+    src = "from magent import config_io\nconfig_io.write_atomic(p, d)\n"
+    assert _codes("src/magent/nodes.py", src) == ["MD011"]
+
+
+def test_md011_flags_importing_save_by_name():
+    assert _codes("src/magent/reap.py", "from magent.config_io import save\n") == [
+        "MD011"
+    ]
+
+
+def test_md011_flags_the_cli_wrappers_outside_the_editor():
+    src = "_save_raw_config(p, d)\n"
+    assert _codes("src/magent/cli/status.py", src) == ["MD011"]
+
+
+def test_md011_allows_projects_and_the_editor():
+    src = "from magent import config_io\nconfig_io.save(p, d)\n"
+    assert _codes("src/magent/projects.py", src) == []
+    assert _codes("src/magent/cli/config_editor.py", "_save_raw_config(p, d)\n") == []
+
+
+def test_md011_ignores_other_saves():
+    assert _codes("src/magent/launch.py", "image.save(p)\nstore.save(p)\n") == []
+
+
+def test_md011_allow_list_names_real_files():
+    root = Path(__file__).resolve().parents[2]
+    assert all((root / rel).is_file() for rel in lint_rules.MD011_ALLOW)

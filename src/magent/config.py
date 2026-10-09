@@ -5,9 +5,11 @@ This module owns the *typed* view of a config file: the dataclasses
 ``SCHEMA_VERSION``, ``DEFAULT_TOOLS``, and the pure ``load_config`` that parses,
 validates, and warns but never writes to disk. ``default_config`` /
 ``settings_to_dict`` are the one envelope factory every config generator shares,
-and ``migrate_config_file`` is this module's only writer. The other half of the
+and ``migrate_raw`` / ``migrate_config_text`` are the pure migration half of
+``magent config migrate``. Nothing in this module writes to disk (R10): every
+config write goes through ``magent.config_io.save``. The other half of the
 contract — raw-dict round-tripping that preserves unknown/unmodeled keys for the
-interactive editor — lives in ``cli/config_io.py``; the two paths never overlap.
+interactive editor — lives in ``config_io.py``; the two paths never overlap.
 """
 
 from __future__ import annotations
@@ -206,7 +208,7 @@ class MagentConfig:
 def _load_json_object(text: str) -> dict[str, object]:
     """Parse ``text`` as a JSON object whose every string has a UTF-8 form, or
     raise ConfigError. The single JSON entry point shared by load_config and
-    migrate_config_file, so both refuse the same text in the same words."""
+    migrate_config_text, so both refuse the same text in the same words."""
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
@@ -1045,7 +1047,7 @@ _MIGRATIONS: dict[int, Callable[[dict[str, object]], dict[str, object]]] = {
 
 def migrate_raw(raw: dict[str, object]) -> dict[str, object]:
     """Apply pending schema migrations to a raw config dict, returning the
-    migrated dict. Pure -- does not touch disk; migrate_config_file does."""
+    migrated dict. Pure -- does not touch disk."""
     version = _int(raw, "version", 0)
     while version < SCHEMA_VERSION:
         raw = _MIGRATIONS[version](raw)
@@ -1053,16 +1055,14 @@ def migrate_raw(raw: dict[str, object]) -> dict[str, object]:
     return raw
 
 
-def migrate_config_file(path: str) -> bool:
-    """Read, migrate to SCHEMA_VERSION, and persist backfilled project
-    colors, writing the canonical JSON shape back to `path`. Returns True if
-    the file changed, False if it was already current. This is the one place
-    in config.py that writes to disk -- load_config stays pure (R10)."""
-    config_path = Path(path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
-
-    raw = _load_json_object(config_path.read_text(encoding="utf-8"))
+def migrate_config_text(text: str) -> tuple[dict[str, object], bool]:
+    """The disk-free half of ``magent config migrate``: parse TEXT (refusing
+    what ``load_config`` refuses, in the same words, before anything is
+    reshaped), migrate it to SCHEMA_VERSION and backfill a tab color onto
+    every project without one. Returns the migrated raw dict (unknown keys
+    kept) and whether anything changed. Pure: the caller writes the result
+    through ``config_io.save`` -- config.py never writes (R10)."""
+    raw = _load_json_object(text)
 
     original_version = _int(raw, "version", 0)
     raw = migrate_raw(raw)
@@ -1077,8 +1077,4 @@ def migrate_config_file(path: str) -> bool:
         if isinstance(entry, dict):
             entry["color"] = p.color
 
-    if not version_changed and not colors_changed:
-        return False
-
-    config_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-    return True
+    return raw, version_changed or colors_changed

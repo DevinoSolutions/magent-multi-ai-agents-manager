@@ -127,8 +127,8 @@ None of these imports any other `magent` module (`style.py` imports
   `ProjectConfig`/`LayoutConfig`/`SSHConfig`), one envelope factory
   (`default_config`), one pair of serializers (`layout_to_dict`/
   `settings_to_dict`) that every config generator delegates through, a pure
-  `load_config` reader, and `migrate_config_file` as the single disk-writing
-  function in the module. `DEFAULT_TOOLS` is the one dict of built-in
+  `load_config` reader, and the pure `migrate_config_text` (no function in
+  the module writes to disk). `DEFAULT_TOOLS` is the one dict of built-in
   tool commands (`claude`, `codex`, `cursor-agent`, `agy`); `Settings.tools`'
   default factory and `_parse_settings`'s fallback both copy it
   (`dict(DEFAULT_TOOLS)`) rather than sharing one mutable dict (LS-B-002).
@@ -335,12 +335,13 @@ The two paths are the fix, not the disease. Anyone who "deduplicates" the
 editor onto `load_config`/a typed writer will cause silent data loss for any
 hand-added or forward-compatible config key.
 
-**`load_config` never writes; `migrate_config_file` is the only writer
-(R10).** `load_config` is a pure read: on a schema version below current, it
+**`load_config` never writes; nothing in `config.py` does (R10).**
+`load_config` is a pure read: on a schema version below current, it
 prints `Warning: config schema v<N> < v<CURRENT>; run: magent config
 migrate` to stderr and returns in-memory data — it never touches the file.
 Persisting a migration (or backfilled colors) requires `magent config
-migrate` (or a save through the config editor's raw path). A load that
+migrate`, which migrates in memory (`migrate_config_text`) and writes through
+`config_io.save` under the config lock. A load that
 rewrites the file as a side effect was one of the audited defects; do not
 reintroduce it.
 

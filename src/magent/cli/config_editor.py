@@ -20,9 +20,11 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING, NoReturn
 
 import click
 
+from magent import config_io
 from magent.cli.app import main
 from magent.cli.config_io import (
     _as_dict,
@@ -46,9 +48,13 @@ from magent.cli.ui import (
     _open_in_editor,
     _prompt_or_back,
 )
-from magent.config import _derive_tab_color, migrate_config_file
+from magent.config import _derive_tab_color, migrate_config_text
+from magent.lockfile import LockHeld
 from magent.paths import find_config
 from magent.style import style
+
+if TYPE_CHECKING:
+    from magent.wire import WireError
 
 
 def _config_menu(config_file: Path) -> None:
@@ -553,10 +559,25 @@ def config_show(ctx: click.Context) -> None:
 @click.pass_context
 def config_migrate(ctx: click.Context) -> None:
     """Migrate the config file to the current schema version, persisting any backfilled colors."""
+    # The disk half of the migration: read under the config lock, migrate in
+    # memory (config.migrate_config_text), then write through config_io.save
+    # -- validated (a migration's whole point is a config that loads; one
+    # that still would not is refused with the loader's words and the file
+    # left alone), backed up, atomic.
     config_file = find_config(ctx.obj.get("config_path"))
+    if not config_file.exists():
+        click.echo(f"Error: Config file not found: {config_file}", err=True)
+        sys.exit(1)
     try:
-        changed = migrate_config_file(str(config_file))
-    except (ValueError, FileNotFoundError) as e:
+        with config_io.locked():
+            raw, changed = migrate_config_text(config_file.read_text(encoding="utf-8"))
+            if changed:
+                config_io.save(config_file, raw)
+    except LockHeld:
+        click.echo("Error: the config is being changed by another magent.", err=True)
+        sys.exit(1)
+    except (ValueError, OSError) as e:
+        # ConfigError and ConfigWriteError are both ValueError.
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -661,28 +682,22 @@ def config_add(
     node: str | None,
 ) -> None:
     """Add a project. Usage: magent config add ./myapp -g INTERNAL -t claude"""
-    config_file = find_config(ctx.obj.get("config_path"))
-    data = _load_raw_config(config_file)
-    entry: dict[str, object] = {"path": path.replace("\\", "/")}
-    if group:
-        entry["group"] = group
-    if tool:
-        entry["tool"] = tool
-    if color:
-        entry["color"] = color
-    if title:
-        entry["title"] = title
-    if host:
-        entry["host"] = host
-    if windows:
-        entry["windows"] = windows
-    if node:
-        entry["node"] = node
+    from magent import projects  # heavy subsystem: in-body per policy
 
-    _sublist(data, "projects").append(entry)
-    if node:
-        _refuse_invalid(data)
-    _save_raw_config(config_file, data)
+    try:
+        projects.add(
+            ctx.obj.get("config_path"),
+            path,
+            title=title,
+            group=group,
+            tool=tool,
+            color=color,
+            host=host,
+            windows=windows,
+            node=node,
+        )
+    except projects.ProjectError as e:
+        _project_error_exit(e, path)
     click.echo(f"  Added {style(path, fg='cyan')}")
 
 
@@ -691,27 +706,15 @@ def config_add(
 @click.pass_context
 def config_remove(ctx: click.Context, path: str) -> None:
     """Remove a project by path (or leaf name)."""
-    config_file = find_config(ctx.obj.get("config_path"))
-    data = _load_raw_config(config_file)
-    projects = _project_dicts(data)
-    normalized = path.replace("\\", "/")
+    from magent import projects  # heavy subsystem: in-body per policy
 
-    before = len(projects)
-    kept = [
-        p
-        for p in projects
-        if _as_str(p.get("path")) != normalized
-        and Path(_as_str(p.get("path"))).name != path
-    ]
-    data["projects"] = kept
-
-    removed = before - len(kept)
-    if removed == 0:
-        click.echo(f"  No project matching '{path}' found.", err=True)
-        sys.exit(1)
-
-    _save_raw_config(config_file, data)
-    click.echo(f"  Removed {removed} project(s) matching {style(path, fg='cyan')}")
+    try:
+        result = projects.remove(ctx.obj.get("config_path"), path)
+    except projects.ProjectError as e:
+        _project_error_exit(e, path)
+    click.echo(
+        f"  Removed {len(result.removed)} project(s) matching {style(path, fg='cyan')}"
+    )
 
 
 @config.command("enable")
@@ -719,7 +722,7 @@ def config_remove(ctx: click.Context, path: str) -> None:
 @click.pass_context
 def config_enable(ctx: click.Context, path: str) -> None:
     """Enable a disabled project."""
-    _set_project_field(ctx, path, "enabled", True)
+    _set_enabled(ctx, path, True)
     click.echo(f"  Enabled {style(path, fg='cyan')}")
 
 
@@ -728,8 +731,27 @@ def config_enable(ctx: click.Context, path: str) -> None:
 @click.pass_context
 def config_disable(ctx: click.Context, path: str) -> None:
     """Disable a project without removing it."""
-    _set_project_field(ctx, path, "enabled", False)
+    _set_enabled(ctx, path, False)
     click.echo(f"  Disabled {style(path, fg='cyan')}")
+
+
+def _set_enabled(ctx: click.Context, path: str, enabled: bool) -> None:
+    from magent import projects  # heavy subsystem: in-body per policy
+
+    try:
+        projects.set_enabled(ctx.obj.get("config_path"), path, enabled)
+    except projects.ProjectError as e:
+        _project_error_exit(e, path)
+
+
+def _project_error_exit(e: WireError, query: str) -> NoReturn:
+    """A refused project change, said in one line on stderr, exit 1 --
+    nothing was written."""
+    if e.code == "not_found":
+        click.echo(f"  No project matching '{query}' found.", err=True)
+    else:
+        click.echo(f"  Not saved: {e.message}", err=True)
+    sys.exit(1)
 
 
 @config.command("set")

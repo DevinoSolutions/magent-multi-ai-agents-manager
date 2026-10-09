@@ -51,7 +51,17 @@ MD008  No bare process termination outside ``src/magent/procs.py``: no
        recorded process. Killing a ``Popen`` you hold (``proc.kill()``) is not
        the hazard and is not flagged.
 
-Scopes: MD001/002/003/006/007 apply to ``src/magent/`` only; MD005 to
+MD011  The config write seam: ``config_io.save`` / ``config_io.write_atomic``
+       (lock + validate + backup + atomic replace) and the cli wrappers over
+       them (``_save_raw_config`` / ``_save_raw_config_atomic``) are called
+       only from the files on the reasoned MD011_ALLOW list. A config written
+       anywhere else skips the validation, the backup or the atomic swap.
+       The match is syntactic and names the bare module: ``config_io.save``
+       as written after ``from magent import config_io``. An alias
+       (``import magent.config_io as cio``), a dotted ``magent.config_io.save``
+       or a bare ``path.write_text`` is not seen; review covers those.
+
+Scopes: MD001/002/003/006/007/011 apply to ``src/magent/`` only; MD005 to
 ``src/magent/cli/`` only; MD004 applies to ``src`` + ``scripts`` + ``tests``.
 """
 
@@ -147,6 +157,18 @@ WT_EXEC_NAMES = ("wt", "wt.exe")
 PSMUX_OWNER = "src/magent/psmux.py"
 PSMUX_EXEC_STRINGS = ("psmux", "psmux.exe", "pmux", "pmux.exe")
 PSMUX_EXEC_NAMES = ("psmux", "psmux_bin", "psmux_exe", "psmux_path")
+
+
+# MD011: the files allowed to write the config, each with why.
+MD011_ALLOW = {
+    "src/magent/config_io.py": "defines the one safe write",
+    "src/magent/projects.py": "project add / remove / enable (the API and the cli shells)",
+    "src/magent/cli/config_io.py": "the editor's exit-on-error wrappers over config_io.save",
+    "src/magent/cli/config_editor.py": "the interactive editor and config set/put/migrate, for keys projects.py does not own",
+    "src/magent/cli/node_onboard.py": "node onboarding writes settings.nodes",
+}
+_MD011_ATTRS = frozenset({"save", "write_atomic"})
+_MD011_NAMES = frozenset({"_save_raw_config", "_save_raw_config_atomic"})
 
 
 class Finding(NamedTuple):
@@ -398,8 +420,27 @@ def _is_bare_kill(node: ast.AST) -> bool:
     return isinstance(node, ast.Name) and node.id == "TerminateProcess"
 
 
+def _is_config_write(node: ast.AST) -> bool:
+    """MD011 -- ``config_io.save(...)`` / ``config_io.write_atomic(...)``, a
+    call to a cli save wrapper, or a ``from magent.config_io import save``."""
+    if isinstance(node, ast.ImportFrom):
+        return node.module == "magent.config_io" and any(
+            alias.name in _MD011_ATTRS for alias in node.names
+        )
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    if isinstance(f, ast.Attribute):
+        return (
+            f.attr in _MD011_ATTRS
+            and isinstance(f.value, ast.Name)
+            and f.value.id == "config_io"
+        )
+    return isinstance(f, ast.Name) and f.id in _MD011_NAMES
+
+
 def _ast_rules(rel: str, source: str) -> list[Finding]:
-    """MD001/002/003/006/007 (src/magent/) + MD005 (src/magent/cli/)."""
+    """MD001/002/003/006/007/008/011 (src/magent/) + MD005 (src/magent/cli/)."""
     out: list[Finding] = []
     try:
         tree = ast.parse(source, filename=rel)
@@ -419,6 +460,7 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
     md002_allowed = in_platform or rel in MD002_ALLOW
     md003_allowed = rel in MD003_ALLOW
     md008_allowed = rel in MD008_ALLOW
+    md011_allowed = rel in MD011_ALLOW
 
     # Constants that are pieces of an f-string are counted via their JoinedStr
     # parent (below), never again as standalone literals — so f"magent:{x}" flags once.
@@ -461,6 +503,16 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
                     col,
                     "MD008",
                     "bare process termination (os.kill / taskkill / TerminateProcess) outside procs.py — a pid from a file can name a stranger; use pidfile.terminate / procs.terminate_pid",
+                )
+            )
+        if not md011_allowed and _is_config_write(node):
+            out.append(
+                Finding(
+                    rel,
+                    line,
+                    col,
+                    "MD011",
+                    "config write outside the config_io seam -- call projects.* (or add a reasoned MD011_ALLOW entry); a config written anywhere else skips validation, the backup and the atomic swap",
                 )
             )
         if (
