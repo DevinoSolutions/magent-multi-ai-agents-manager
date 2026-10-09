@@ -226,11 +226,8 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
     /focus detaches this picker's client, the attach returns, and the loop jumps
     straight to the requested project."""
 
+    from magent import fleetview  # heavy subsystem: in-body per policy
     from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
-
-    # sibling module: the one config -> staleness-window translation, shared with
-    # the attention daemon / watch / status so no surface ages states differently.
-    from magent.cli.attention_cmd import staleness_from_config
 
     psmux_bin = psmux_mod.find_psmux()
     if not psmux_bin:
@@ -245,8 +242,10 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
     # which is what the agent-state lookup keys on.
     cfg = _load_config_or_exit(config_file)
     # Read once here rather than per paint: the windows cannot change under a
-    # running picker, and every redraw must age states the same way.
-    staleness = staleness_from_config(cfg)
+    # running picker, and every redraw must age states the same way. The one
+    # config -> staleness-window translation, shared with the attention
+    # daemon / watch / status so no surface ages states differently.
+    staleness = fleetview.staleness_from_config(cfg)
     candidates: list[str] = []
     resolved: dict[str, str] = {}
     for proj in psmux_mod.eligible_projects(cfg):
@@ -355,17 +354,17 @@ def _emit_sessions_json(config_path: str | None) -> None:
 
 
 def _node_session_targets(
-    config_path: str | None, *, as_json: bool = False
+    config_path: str | None,
 ) -> list[tuple[dict[str, object], Node | None]]:
     """Each node project's ``sessions --json`` row (``model``/``effort`` None)
     with the Node its session runs on -- None when it is placed nowhere or
     its node has left ``settings.nodes``. Reads files only: the state is the
-    sync daemon's last pull, never a dial. ``sessions --json`` and the fleet
-    commands (``peek``, and the refusals of ``send``/``model``) share it.
+    sync daemon's last pull, never a dial. The fleet commands (``peek``, and
+    the refusals of ``send``/``model``) share it.
 
     The typed config is loaded only when the raw file names a pool node, so
     every config without one keeps the raw loader's no-version-warning path;
-    ``as_json`` is ``_load_config_or_exit``'s, for a failed validation."""
+    a failed validation exits through ``_load_config_or_exit``."""
     import json
 
     from magent import env, nodes  # heavy subsystem: in-body per policy
@@ -384,7 +383,7 @@ def _node_session_targets(
         for p in raw.get("projects", [])
     ):
         return []
-    cfg = _load_config_or_exit(config_file, as_json=as_json)
+    cfg = _load_config_or_exit(config_file)
     # The state is nodes.session_rows' (the one answer `status` gives too);
     # the map is read again only for the folder, which status does not show.
     entries = nodes.read_node_map()

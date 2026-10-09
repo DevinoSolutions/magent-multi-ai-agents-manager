@@ -117,13 +117,93 @@ class TestTargets:
     def test_a_pool_node_session_is_a_conflict(self, fleet, monkeypatch):
         fake, cfg = fleet
         monkeypatch.setattr(
-            fleetview, "rows", lambda *_a, **_k: [_node_row("remote1", "box", "live")]
+            fleetview, "row_for", lambda *_a, **_k: _node_row("remote1", "box", "live")
         )
         with pytest.raises(control.ControlError) as err:
             control.send(cfg, "remote1", "hello there friend")
         assert (err.value.code, err.value.details) == ("conflict", {"reason": "node"})
         assert "node box" in err.value.message
         assert fake.send_key_calls() == []
+
+    def test_the_target_alone_is_probed_with_a_bounded_wait(self, fleet, monkeypatch):
+        # Every verb starts with one row: one `has-session` for the target
+        # (not the fleet's fan-out), bounded by the capture budget so a
+        # wedged psmux cannot park the request, and no pane read before the
+        # verb's own.
+        fake, cfg = fleet
+        seen: list[tuple[list[str], float | None, int]] = []
+        real = psmux.live_sessions
+
+        def _live(names, psmux=None, *, timeout=None, retries=1):
+            seen.append((list(names), timeout, retries))
+            return real(names, psmux, timeout=timeout, retries=retries)
+
+        monkeypatch.setattr(psmux, "live_sessions", _live)
+        monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 7.5)
+
+        row = control._row(cfg, "caramel")
+
+        assert (row.session, row.live, row.pane_state) == ("caramel", True, None)
+        # No retry: the three-state re-probe below is the verb's retry.
+        assert seen == [(["caramel"], 7.5, 0)]
+        assert [c for c in fake.calls() if "capture-pane" in c] == []
+
+    def test_a_probe_that_runs_out_never_makes_the_session_not_found(
+        self, fleet, monkeypatch
+    ):
+        # The bounded sweep folds a late `has-session` into "not live"; a
+        # verb may not (not_found points a client at `start`). The verb goes
+        # ahead: the prompt and its Enter reach the pane. (The read-back after
+        # the send shares the 0.3s budget, which the Python shim cannot
+        # promise on a loaded box, so its outcome is not pinned here.)
+        fake, cfg = fleet
+        fake.set_has_session_delay(1.0)
+        monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 0.3)
+
+        result = control.send(cfg, "caramel", "hello there friend")
+
+        assert result.session == "caramel"
+        assert [s[-1] for s in fake.send_key_calls()] == ["hello there friend", "Enter"]
+
+    def test_an_unknown_liveness_reads_live_with_the_pane_unread(
+        self, fleet, monkeypatch
+    ):
+        fake, cfg = fleet
+        fake.set_has_session_delay(1.0)
+        monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 0.3)
+
+        row = control._row(cfg, "caramel")
+
+        # Not the sweep's `dead`: no pane was read, and the verb reads its own.
+        assert (row.live, row.pane_state, row.pane_state_ts) == (True, None, None)
+
+    def test_a_session_psmux_calls_absent_is_not_found_at_once(self, fleet):
+        fake, cfg = fleet
+        with pytest.raises(control.ControlError) as err:
+            control.interrupt(cfg, "upup")
+        assert (err.value.code, err.value.details) == (
+            "not_found",
+            {"reason": "not_live"},
+        )
+        # The sweep (no retry) and the one three-state re-probe: every probe
+        # named the target alone, and nothing was sent.
+        assert [c[c.index("-t") + 1] for c in fake.calls() if "has-session" in c] == [
+            "upup",
+            "upup",
+        ]
+        assert fake.send_key_calls() == []
+
+    def test_a_row_lookup_never_loads_the_typed_config(self, fleet, monkeypatch):
+        from magent import config as config_mod
+
+        _fake, cfg = fleet
+
+        def _boom(_path):
+            raise AssertionError("load_config called")
+
+        monkeypatch.setattr(config_mod, "load_config", _boom)
+
+        assert control._row(cfg, "caramel").live is True
 
 
 class TestSend:
@@ -504,7 +584,7 @@ class TestReadPane:
     ):
         _fake, cfg = fleet
         monkeypatch.setattr(
-            fleetview, "rows", lambda *_a, **_k: [_node_row("remote1", "box", state)]
+            fleetview, "row_for", lambda *_a, **_k: _node_row("remote1", "box", state)
         )
 
         def _no_ssh(*_a, **_k):
@@ -522,7 +602,7 @@ class TestReadPane:
     def test_a_live_node_session_is_read_on_its_node(self, fleet, monkeypatch):
         _fake, cfg = fleet
         monkeypatch.setattr(
-            fleetview, "rows", lambda *_a, **_k: [_node_row("remote1", "box", "live")]
+            fleetview, "row_for", lambda *_a, **_k: _node_row("remote1", "box", "live")
         )
         monkeypatch.setattr(control, "_node_pane", lambda *_a, **_k: "one\ntwo\n")
         result = control.read_pane(cfg, "remote1", lines=1)

@@ -86,30 +86,27 @@ def stop_daemon() -> bool:
     return False
 
 
-def name_pairs_from_config(cfg: MagentConfig) -> list[tuple[str, str]]:
-    """Delegate to ``fleetview.name_pairs_from_config`` (lifted there so a src
-    module can build the engine without importing the cli package)."""
-    from magent import fleetview  # heavy subsystem: in-body per policy
-
-    return fleetview.name_pairs_from_config(cfg)
+# The config -> engine translation lives in ``fleetview`` (lifted there so a
+# src module can build the engine without importing the cli package). These
+# two are plain re-exports kept lazy -- fleetview pulls in attention and
+# agent_state, which this module must not import at the top (MD005) -- for
+# the callers that still spell them here. New code reaches for fleetview.
 
 
 def staleness_from_config(cfg: MagentConfig) -> dict[str, float]:
-    """Delegate to ``fleetview.staleness_from_config`` -- the ONE translation
-    of ``settings.attention``'s staleness keys."""
+    """``fleetview.staleness_from_config``, the ONE translation of
+    ``settings.attention``'s staleness keys."""
     from magent import fleetview  # heavy subsystem: in-body per policy
 
     return fleetview.staleness_from_config(cfg)
 
 
 def engine_from_config(cfg: MagentConfig) -> attention.AttentionEngine:
-    """Delegate to ``fleetview.engine_from_config``, the one place an
-    AttentionEngine is built (MD012). The staleness map goes through this
-    module's own ``staleness_from_config`` so a caller patching it here is
-    still honoured."""
+    """``fleetview.engine_from_config``, the one place an AttentionEngine is
+    built (MD012)."""
     from magent import fleetview  # heavy subsystem: in-body per policy
 
-    return fleetview.engine_from_config(cfg, staleness=staleness_from_config(cfg))
+    return fleetview.engine_from_config(cfg)
 
 
 def _plan_renderers(

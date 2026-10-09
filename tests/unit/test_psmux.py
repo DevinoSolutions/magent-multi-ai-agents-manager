@@ -3266,3 +3266,43 @@ class TestANodeProjectIsNotALocalSession:
         )
         [entry] = psmux.config_sessions(str(cfg))
         assert entry["path"] == str(tmp_path / "b" / "api")
+
+    def test_a_parsed_config_is_used_instead_of_the_file(self, tmp_path):
+        raw: dict[str, object] = {
+            "projects": [{"path": str(tmp_path / "api"), "group": "G"}]
+        }
+
+        [entry] = psmux.config_sessions(
+            str(tmp_path / "does-not-exist.json"), detail=True, raw=raw
+        )
+
+        assert (entry["session"], entry["group"]) == ("api", "G")
+
+
+class TestBoundedLivenessSweepDeadline:
+    """A bounded ``live_sessions`` pass waits its fan-out out under ONE
+    deadline: W wedged sockets cost one ``timeout``, not W. Driven against
+    the real on-disk fake psmux, whose ``has-session`` is made to answer late,
+    and measured on the wall clock -- a sequential wait would take 2x."""
+
+    def test_two_wedged_sockets_cost_one_timeout(self, tmp_path):
+        from tests.unit._fake_psmux import make_fake_psmux
+
+        fake = make_fake_psmux(tmp_path, live=["a", "b"])
+        fake.set_has_session_delay(6.0)
+        started = time.monotonic()
+
+        live = psmux.live_sessions(["a", "b"], psmux=fake.path, timeout=2.0, retries=0)
+
+        took = time.monotonic() - started
+        assert live == []
+        assert took < 3.0, f"two timed-out probes took {took:.1f}s (one budget: 2s)"
+
+    def test_the_default_pass_is_unbounded_and_sequential(self, tmp_path):
+        # The status/down/picker surfaces keep waiting a slow server out.
+        from tests.unit._fake_psmux import make_fake_psmux
+
+        fake = make_fake_psmux(tmp_path, live=["a"])
+        fake.set_has_session_delay(0.5)
+
+        assert psmux.live_sessions(["a"], psmux=fake.path) == ["a"]

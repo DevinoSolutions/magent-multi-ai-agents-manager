@@ -12,6 +12,7 @@ the cli package (LS-A-001).
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 import threading
@@ -115,14 +116,47 @@ class StopResult:
 
 
 def _row(config_path: str | None, session: str) -> fleetview.SessionRow:
+    """``session``'s row alone: one bounded liveness probe (no retry), no
+    pane, no hook join, and no typed load for a local session (a verb needs
+    ``live``/``node``/``node_state``, nothing an engine poll would add; a
+    node session's row is built from the typed config, so that one loads
+    it), so a wedged psmux cannot park the request.
+
+    The sweep folds a probe that ran out into "not live", which is right for
+    a status table and wrong for a verb: ``not_found`` sends a client to
+    ``start``, which kill-servers a frozen-but-live session (the 2026-08-18
+    wedge). So a local row the sweep called not live gets ONE three-state
+    re-probe (``psmux.probe_sessions``) -- that re-probe IS the sweep's
+    retry, hence ``probe_retries=0`` -- and only psmux positively answering
+    ``absent`` keeps it not live; ``unknown`` proceeds as live (its pane
+    state, ``dead`` from the fold, cleared to unread), because the verb's own
+    send is the next probe and ``_send_failed`` classifies its refusal
+    three-state too. A dead session answers both probes at once; a wedged
+    one costs two capture budgets before the verb sends."""
     try:
-        rows = fleetview.rows(config_path, include_pane=False, hooks=False)
+        row = fleetview.row_for(
+            config_path,
+            session,
+            include_pane=False,
+            hooks=False,
+            probe_timeout_s=psmux.CAPTURE_PANE_TIMEOUT_S,
+            probe_retries=0,
+        )
     except (ValueError, FileNotFoundError) as exc:
         raise ControlError("unavailable", f"config: {exc}") from exc
-    for row in rows:
-        if row.session == session:
-            return row
-    raise ControlError("not_found", f"no configured session named {session!r}")
+    if row is None:
+        raise ControlError("not_found", f"no configured session named {session!r}")
+    if row.live or row.node is not None:
+        return row
+    binary = psmux.find_psmux()
+    if not binary:
+        return row
+    state = psmux.probe_sessions(
+        [session], binary, timeout=psmux.CAPTURE_PANE_TIMEOUT_S
+    )[session]
+    if state == "absent":
+        return row
+    return dataclasses.replace(row, live=True, pane_state=None)
 
 
 def _writable(config_path: str | None, session: str) -> str:

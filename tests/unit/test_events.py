@@ -362,7 +362,9 @@ class TestRunPoller:
         log.get_logger("events")  # configure first: get_logger sets the level
         caplog.set_level(logging.INFO, logger="magent.events")
         with bus.subscription():
-            events.run_poller(poller, stop, 0.001)
+            # A wide enough interval that a trivial tick on a loaded box can
+            # never count as slow (the slow-tick warning has its own test).
+            events.run_poller(poller, stop, 0.05)
         assert len(calls) == 3
         records = [r for r in caplog.records if r.name == "magent.events"]
         assert [(r.levelname, r.getMessage()) for r in records] == [
@@ -390,13 +392,146 @@ class TestRunPoller:
         log.get_logger("events")
         caplog.set_level(logging.INFO, logger="magent.events")
         with bus.subscription():
-            events.run_poller(poller, stop, 0.001)
+            events.run_poller(poller, stop, 0.05)
         assert len(calls) == 4
         records = [r for r in caplog.records if r.name == "magent.events"]
         assert [(r.levelname, r.getMessage()) for r in records] == [
             ("ERROR", "events: poll failed"),
             ("INFO", "events: poller recovered after 2 failed ticks"),
         ]
+
+    def _slow_ticks(self, caplog, script: str) -> list[logging.LogRecord]:
+        """Run one tick per letter of ``script`` ('s' slow: 150ms against a
+        50ms interval, 100ms budget; 'f' fast) and return the events log."""
+        bus = events.EventBus("e")
+        stop = threading.Event()
+        calls: list[int] = []
+
+        def _rows(_include_pane: bool) -> list[SessionRow]:
+            calls.append(1)
+            if script[len(calls) - 1] == "s":
+                time.sleep(0.15)
+            if len(calls) == len(script):
+                stop.set()
+            return []
+
+        poller = events.EventPoller(
+            bus=bus, rows_fn=_rows, fire_fn=lambda *_: False, pane_fn=lambda _s: None
+        )
+        log.get_logger("events")
+        caplog.set_level(logging.INFO, logger="magent.events")
+        with bus.subscription():
+            events.run_poller(poller, stop, 0.05)
+        assert len(calls) == len(script)
+        return [r for r in caplog.records if r.name == "magent.events"]
+
+    def test_a_slow_streak_is_one_warning_and_one_all_clear(self, caplog):
+        # Two slow ticks are one streak (one WARNING, not one a tick); the
+        # all-clear comes after SLOW_TICK_CLEAR_TICKS fitting ticks in a row.
+        records = self._slow_ticks(caplog, "ssfff")
+        assert [r.levelname for r in records] == ["WARNING", "INFO"]
+        assert records[0].getMessage().startswith("events: tick took ")
+        assert "over 2x the 0.05s interval" in records[0].getMessage()
+        assert records[1].getMessage() == (
+            "events: ticks fit the interval again after 2 slow"
+        )
+
+    def test_fewer_fitting_ticks_than_the_hysteresis_is_no_all_clear(self, caplog):
+        records = self._slow_ticks(caplog, "ssff")
+        assert [r.levelname for r in records] == ["WARNING"]
+
+    def test_a_slow_tick_inside_the_hysteresis_window_extends_the_streak(self, caplog):
+        # s s f s f f f: the lone fitting tick ends nothing, the later slow
+        # tick joins the same streak (no second WARNING), and the count the
+        # all-clear reports is every slow tick of the streak.
+        records = self._slow_ticks(caplog, "ssfsfff")
+        assert [r.levelname for r in records] == ["WARNING", "INFO"]
+        assert records[1].getMessage() == (
+            "events: ticks fit the interval again after 3 slow"
+        )
+
+    def test_the_hysteresis_is_three_ticks(self):
+        assert events.SLOW_TICK_CLEAR_TICKS == 3
+
+
+class TestForConfig:
+    """The real seams: one typed load and one engine for the life of the
+    poller, handed to every ``fleetview.rows`` call with the bounded probe."""
+
+    @pytest.fixture
+    def seams(self, monkeypatch):
+        from magent import fleetview
+
+        loads: list[str | None] = []
+        rows_calls: list[dict[str, object]] = []
+        cfg = object()
+        engine = _Engine()
+
+        def _load(path):
+            loads.append(path)
+            return cfg
+
+        monkeypatch.setattr(fleetview, "load_typed", _load)
+        monkeypatch.setattr(fleetview, "engine_from_config", lambda _cfg: engine)
+        monkeypatch.setattr(
+            fleetview, "rows", lambda path, **kw: rows_calls.append(kw) or []
+        )
+        return loads, rows_calls, cfg, engine
+
+    def test_loads_the_config_once_and_reuses_the_engine(self, seams):
+        loads, rows_calls, cfg, engine = seams
+        poller = events.EventPoller.for_config(events.EventBus("e"), "/c.json")
+
+        poller.rows_fn(False)
+        poller.rows_fn(True)
+        poller.fire_fn("a", "done")
+
+        assert loads == ["/c.json"]
+        assert rows_calls == [
+            {
+                "include_pane": False,
+                "engine": engine,
+                "cfg": cfg,
+                "probe_timeout_s": events.PROBE_TIMEOUT_S,
+            },
+            {
+                "include_pane": True,
+                "engine": engine,
+                "cfg": cfg,
+                "probe_timeout_s": events.PROBE_TIMEOUT_S,
+            },
+        ]
+        assert engine.fired == [("a", "done")]
+
+    def test_no_config_yet_polls_without_an_engine_and_never_fires(
+        self, seams, monkeypatch
+    ):
+        from magent import fleetview
+
+        loads, rows_calls, _cfg, _engine = seams
+        monkeypatch.setattr(fleetview, "load_typed", loads.append)  # -> None
+        poller = events.EventPoller.for_config(events.EventBus("e"), None)
+
+        poller.rows_fn(False)
+        fired = poller.fire_fn("a", "done")
+
+        assert fired is False
+        assert loads == [None, None]  # retried each time: a config may appear
+        assert rows_calls[0]["engine"] is None
+        assert rows_calls[0]["cfg"] is None
+        assert rows_calls[0]["probe_timeout_s"] == events.PROBE_TIMEOUT_S
+
+    def test_the_probe_bound_is_a_few_seconds(self):
+        assert 1.0 <= events.PROBE_TIMEOUT_S <= 10.0
+
+
+class _Engine:
+    def __init__(self) -> None:
+        self.fired: list[tuple[str, str]] = []
+
+    def should_fire(self, session: str, state: str) -> bool:
+        self.fired.append((session, state))
+        return True
 
 
 class TestOptOut:

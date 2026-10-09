@@ -387,9 +387,9 @@ def _agents_snapshot(cfg: MagentConfig) -> list[dict[str, object]]:
     """One-shot engine poll — the scripting face of `magent watch`. Builds
     the engine via the shared config-driven builder so `status` ages states
     with settings.attention staleness/debounce, not the module defaults."""
-    from magent.cli.attention_cmd import engine_from_config
+    from magent import fleetview  # heavy subsystem: in-body per policy
 
-    engine = engine_from_config(cfg)
+    engine = fleetview.engine_from_config(cfg)
     return [
         {"name": v.name, "state": v.state, "age_s": round(v.age_s, 1)}
         for v in engine.poll()
@@ -542,14 +542,14 @@ def _render_status(config_file: Path) -> StatusReport:
     """Prints the status report; reports whether any daemon is degraded
     (dead/stale) plus the live psmux sessions it listed, in display order.
     Never exits -- shared with the menu's _menu_status."""
-    from magent.cli.attention_cmd import staleness_from_config
+    from magent import fleetview  # heavy subsystem: in-body per policy
     from magent.launch import psmux_status  # heavy subsystem: in-body per policy
 
     cfg = _load_config_or_exit(config_file)
     up, down, projects = psmux_status(cfg)
     rows = {
         _as_str(r.get("name")): r
-        for r in _psmux_sessions(up, projects, staleness_from_config(cfg))
+        for r in _psmux_sessions(up, projects, fleetview.staleness_from_config(cfg))
     }
     listed: list[dict[str, object]] = []
     # Node sessions (PR-D): read from the sync daemon's last pull, never over
@@ -793,7 +793,7 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         sys.exit(1)
 
     if as_json:
-        from magent.cli.attention_cmd import staleness_from_config
+        from magent import fleetview  # heavy subsystem: in-body per policy
         from magent.launch import (
             psmux_status,  # heavy subsystem: in-body per policy
         )
@@ -809,7 +809,7 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         # session is a "not running" row, not a degraded daemon.
         up, _down, projects = psmux_status(cfg)
         payload["psmux_sessions"] = _psmux_sessions(
-            up, projects, staleness_from_config(cfg)
+            up, projects, fleetview.staleness_from_config(cfg)
         )
         # Additive too, and for the same reason the human line is on stderr and
         # not in the verdict: a count of psmux servers stranded in logon

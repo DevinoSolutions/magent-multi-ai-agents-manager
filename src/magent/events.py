@@ -7,12 +7,17 @@ client resuming against a restarted server is told to refetch (``reset``
 that fell more than ``ring`` events behind gets ``reset`` ``evicted``.
 
 ``EventPoller`` turns the fleet into events: every second it diffs the hook
-half of ``fleetview.rows`` (cheap: files only), every fifth second the pane
-half (one ``capture-pane`` per live session), and every second it tails the
-panes a client asked for by name. It runs only while somebody listens
-(``EventBus.subscribers``) and only when ``MAGENT_EVENTS`` allows it --
-the opt-out is a test-isolation law like the other serve threads, pinned to
-0 in ``tests/conftest.py``.
+half of ``fleetview.rows`` (the agent-state files plus one ``has-session``
+probe per configured session: a fan-out under one ``PROBE_TIMEOUT_S``
+deadline, its misses re-probed once under another, so the liveness part of
+a tick is bounded at 2 x ``PROBE_TIMEOUT_S`` however many sockets are
+wedged), every fifth second the pane half (one ``capture-pane`` per live
+session), and every second it tails the panes a client asked for by name. It
+runs only while somebody listens (``EventBus.subscribers``) and only when
+``MAGENT_EVENTS`` allows it -- the opt-out is a test-isolation law like the
+other serve threads, pinned to 0 in ``tests/conftest.py``. A tick that
+outruns ``SLOW_TICK_FACTOR`` intervals is warned about once per slow streak
+(``run_poller``).
 
 A leaf over ``fleetview``, ``psmux`` and ``log``; never imports the cli
 package (LS-A-001).
@@ -37,6 +42,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     from magent.attention import AttentionEngine
+    from magent.config import MagentConfig
     from magent.fleetview import SessionRow
     from magent.psmux import PaneCapture
 
@@ -57,6 +63,15 @@ RING_SIZE = 1024
 HOOK_INTERVAL_S = 1.0
 PANE_EVERY_N_TICKS = 5
 HEARTBEAT_S = 15.0
+# The bound on each liveness probe the poller's tick makes: a wedged psmux
+# server answers "not live" after this long instead of parking the poller
+# (the status/down surfaces wait unbounded on purpose; a poller must not).
+PROBE_TIMEOUT_S = 5.0
+# A tick slower than this many intervals is reported (once per slow streak),
+# and the streak is over only after this many consecutive ticks fit again --
+# hysteresis, so a fleet hovering at the budget is not a log line a tick.
+SLOW_TICK_FACTOR = 2.0
+SLOW_TICK_CLEAR_TICKS = 3
 
 # The row fields each half of the poller owns. A hook tick reads no pane, so
 # it must never report the pane fields as changed (to None), and vice versa.
@@ -248,38 +263,57 @@ class EventPoller:
     @classmethod
     def for_config(cls, bus: EventBus, config_path: str | None) -> EventPoller:
         """The real seams: ``fleetview.rows`` through ONE long-lived engine
-        (so the attention debounce survives between ticks), and
-        ``psmux.read_pane``.
+        (so the attention debounce survives between ticks) and the ONE typed
+        config it was built from, with each liveness probe bounded by
+        ``PROBE_TIMEOUT_S``; and ``psmux.read_pane``.
 
-        The engine is built once per serve, from the config as it reads on
-        the first tick that has one, and kept until the server restarts: its
-        staleness windows, debounce and node extra-stores are frozen at that
-        point, so a ``settings.attention`` edit reaches the stream only after
-        a restart. ``fire_fn`` keys the engine's debounce map
-        (``_last_fired``) by SESSION NAME, and nothing on this path ever
-        prunes it (only ``AttentionEngine.transitions`` does, which
-        ``fleetview.rows`` never calls): one entry per (session, state) ever
-        paged, for the life of the serve."""
+        The config is loaded once per serve, on the first tick that has one,
+        and the engine built from it; both are kept until the server
+        restarts. So the staleness windows, debounce and node extra-stores
+        are frozen at that point (a ``settings.attention`` edit reaches the
+        stream only after a restart), and so is the node-project list the
+        node rows are built from -- the LOCAL rows read the raw file every
+        tick, so a project added later is announced as usual. Loading per
+        tick instead would echo ``load_config``'s stderr warning once a
+        second. ``fire_fn`` keys the engine's debounce map (``_last_fired``)
+        by SESSION NAME, and nothing on this path ever prunes it (only
+        ``AttentionEngine.transitions`` does, which ``fleetview.rows`` never
+        calls): one entry per (session, state) ever paged, for the life of
+        the serve.
+
+        The engine is the POLLER THREAD's alone: ``should_fire`` mutates
+        ``_last_fired`` with no lock, and ``poll`` holds per-node state. A
+        request thread (Task 6's routes) must not be handed it; a route that
+        needs rows builds its own engine or passes ``cfg=`` to
+        ``fleetview.rows``."""
         from magent import fleetview, psmux
 
-        engines: list[AttentionEngine] = []
+        loaded: list[tuple[MagentConfig, AttentionEngine]] = []
 
-        def _engine() -> AttentionEngine | None:
-            if not engines:
+        def _config() -> tuple[MagentConfig, AttentionEngine] | None:
+            if not loaded:
                 cfg = fleetview.load_typed(config_path)
                 if cfg is None:
                     return None
-                engines.append(fleetview.engine_from_config(cfg))
-            return engines[0]
+                loaded.append((cfg, fleetview.engine_from_config(cfg)))
+            return loaded[0]
 
         def _rows(include_pane: bool) -> list[SessionRow]:
+            cfg, engine = _config() or (None, None)
             return fleetview.rows(
-                config_path, include_pane=include_pane, engine=_engine()
+                config_path,
+                include_pane=include_pane,
+                engine=engine,
+                cfg=cfg,
+                probe_timeout_s=PROBE_TIMEOUT_S,
             )
 
         def _fire(session: str, state: str) -> bool:
-            engine = _engine()
-            return engine.should_fire(session, state) if engine else False
+            got = _config()
+            if got is None:
+                return False
+            _cfg, engine = got
+            return engine.should_fire(session, state)
 
         return cls(bus=bus, rows_fn=_rows, fire_fn=_fire, pane_fn=psmux.read_pane)
 
@@ -376,11 +410,20 @@ def run_poller(
     must never take down the server it rides on. Only the FIRST failure of a
     run is logged with its traceback; the repeats are counted silently until
     a tick succeeds, which logs one recovery line with the count (a dead
-    multiplexer would otherwise write a traceback a second)."""
+    multiplexer would otherwise write a traceback a second). A tick that
+    takes longer than ``SLOW_TICK_FACTOR`` intervals (a slow multiplexer, a
+    fleet too big for the budget) is reported the same way: one WARNING when
+    the streak starts, one INFO once ``SLOW_TICK_CLEAR_TICKS`` consecutive
+    ticks fit again (a single fitting tick between two slow ones ends
+    nothing)."""
     log = get_logger("events")
     failed = 0
+    slow = 0
+    fitting = 0
+    budget = SLOW_TICK_FACTOR * interval
     while not stop_event.is_set():
         if poller.bus.subscribers > 0:
+            started = time.monotonic()
             try:
                 poller.tick()
             except Exception:
@@ -391,5 +434,24 @@ def run_poller(
                 if failed:
                     log.info("events: poller recovered after %d failed ticks", failed)
                     failed = 0
+                took = time.monotonic() - started
+                if took > budget:
+                    slow += 1
+                    fitting = 0
+                    if slow == 1:
+                        log.warning(
+                            "events: tick took %.2fs, over %gx the %.2fs interval",
+                            took,
+                            SLOW_TICK_FACTOR,
+                            interval,
+                        )
+                elif slow:
+                    fitting += 1
+                    if fitting >= SLOW_TICK_CLEAR_TICKS:
+                        log.info(
+                            "events: ticks fit the interval again after %d slow", slow
+                        )
+                        slow = 0
+                        fitting = 0
         if stop_event.wait(interval):
             return

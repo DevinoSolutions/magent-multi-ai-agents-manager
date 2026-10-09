@@ -411,7 +411,15 @@ class TestDebounceMapPruning:
 
 
 def _view(name: str, cwd: str, state: str) -> attention.SessionView:
-    return attention.SessionView(name=name, cwd=cwd, state=state, ts=999.0, age_s=1.0)
+    return attention.SessionView(
+        name=name,
+        cwd=cwd,
+        state=state,
+        ts=999.0,
+        age_s=1.0,
+        raw_state=state,
+        session_id=None,
+    )
 
 
 def _trans(view: attention.SessionView, prev: str | None) -> attention.Transition:
