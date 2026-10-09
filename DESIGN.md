@@ -24,7 +24,11 @@ convention-following.
 ```
 pure leaves:  grid · paths · style · titles · log · terminals · agent_state · config
                           ^
-subsystems:   tiling · platform/ · sessions/ · discover · init_config · launch · upload_server · hotkey
+subsystems:   tiling · platform/ · sessions/ · discover · init_config · launch · hotkey
+                          ^
+/api/v1:      wire · fleetview · events · control · config_io · projects · uploads · api
+                          ^
+server:       upload_server  (delegates /api/v1/* to api.handle)
                           ^
 cli/ command modules:  app · config_io · ui · background · config_editor · menu · attach · docs · mobile · session_picker · status
                           ^
@@ -248,6 +252,38 @@ None of these imports any other `magent` module (`style.py` imports
   (`SSH_CONNECTION_OPTS`) and the remote attach command — so the marker
   `_attach_markers` scans for and the command a pane actually runs cannot
   drift apart.
+
+### The `/api/v1` layer (2026-10-08)
+
+Lifted out of the cli shells and the upload handler so the HTTP API and the CLI
+`--json` shells call the same functions. None of these
+imports the cli package (LS-A-001); none prints, prompts or exits (MD001).
+
+- **`wire.py`** — the envelope (`ok`/`error`/`from_exc`), `ErrorCode`, the
+  code->HTTP status map, and `WireError`, which every leaf's own error
+  (`ControlError`, `ProjectError`, `UploadError`) subclasses.
+- **`fleetview.py`** — the one `SessionRow`: `hook_state` (the agent-state
+  vocabulary, through `AttentionEngine`) and `pane_state` (the pane
+  classifier's) side by side and never merged. `rows()`/`row_for()`; the
+  only `AttentionEngine(` call (MD012); `to_legacy()` keeps `sessions --json`.
+- **`events.py`** — `EventBus` (ring of 1024, ids `<epoch>:<n>`, `since`
+  answers `reset` on a foreign epoch or an evicted id, `wait` for long-poll)
+  and `EventPoller`, which diffs `fleetview.rows` into `session.*` and
+  `attention` events: hooks every second, panes every fifth, subscribed pane
+  tails on hash change. It only ticks while somebody listens.
+- **`control.py`** — the verbs as frozen results, exact socket ids only.
+  `send`, `choose`, `interrupt` and `set_model` refuse node and cloud rows with
+  `conflict`; `read_pane` reads a live node pane over one bounded ssh capture,
+  and `start`/`stop` drive node sessions too. `choose` refuses unless the pane
+  reads `dialog` and presses the digit alone.
+- **`config_io.py` / `projects.py`** — the one config write (validate, back
+  up, atomic replace) under `config_io.locked()`: a thread lock, then the
+  persistent `config.lock` sidecar with a 2 s wait; MD011.
+- **`uploads.py`** — the upload save + one-shot paste with its three states,
+  lifted out of `upload_server._handle_post` with the contract unchanged.
+- **`api.py`** — `handle(ApiRequest, ApiContext) -> ApiResponse | ApiStream`,
+  the route table, `PREFIX` (MD009), and `guard()`; the SSE generator holds a
+  bus subscription for exactly as long as its connection.
 
 ### `cli/` command modules
 
@@ -3109,6 +3145,30 @@ member), `tests/unit/test_node_onboard.py`, `tests/unit/test_node_ready_gate.py`
 `tests/unit/test_node_token_renewal.py`, `tests/unit/test_config_node_pin.py`,
 `tests/unit/test_node_sync_lifetime.py`, and `tests/e2e/test_nodes_real.py`
 D7 (the session starts on the node, the folder trusted).
+
+### The API is a pure function, and only a browser is judged by its Host (2026-10-08)
+
+`upload_server` grew one route at a time on a handler class whose state lived
+in class attributes, so nothing but a socket could test a route. `/api/v1` is
+the opposite: `api.handle` takes an `ApiRequest` and an `ApiContext` and
+returns data, and the handler's whole job for it is one method (`_serve_api`)
+that builds the request and writes the answer. The CLI `--json` shells call the same leaves,
+and a parity test holds the two to one JSON.
+
+The origin guard closes two holes the loopback + Tailscale bind never closed:
+DNS rebinding (a page whose name resolves to 127.0.0.1 reads the fleet) and
+CSRF on the GET side effects (`<img src=/api/flash>`, `/focus`). Host,
+Origin and `Sec-Fetch-Site` are checked on every route, legacy included.
+The Host allowlist applies only to a request that looks like a browser (an
+Origin, any `Sec-Fetch-*` header, or a `Mozilla/` User-Agent). Origin and
+`Sec-Fetch-*` are set by the browser, and page script cannot drop them. The
+User-Agent is a weaker tell, since page script can set it, so it can add a
+check but never remove one. Rebinding needs a browser, a non-browser client can
+send any Host it likes, and the remote Alt+V listener posts to whatever ssh
+name `magent attach` was given -- an alias the server cannot know. Writes
+(`POST/PATCH/DELETE`) also need `X-Magent-Client`, which a form or an `<img>`
+cannot send, and the write verbs answer only a caller whose peer AND Host are
+loopback: the tailnet bind stays read-only plus upload, as it always was.
 
 ## 3. Known debt
 
