@@ -165,14 +165,24 @@ class ProjectConfig:
 
 def is_cloud(proj: ProjectConfig) -> bool:
     """A cloud project: a LOCAL pane driving a cloud session (PR-J)."""
-    return proj.node == NODE_CLOUD
+    return node_is_cloud(proj.node)
 
 
 def runs_on_node(proj: ProjectConfig) -> bool:
     """THE node-skip predicate (DECISION-15): pinned to a pool node or
     ``auto``. Never ``if proj.node:`` -- that would drop cloud projects,
     which run here. Raw dicts spell it ``p.get("node") not in (None, "cloud")``."""
-    return proj.node is not None and not is_cloud(proj)
+    return node_is_pool(proj.node)
+
+
+def node_is_cloud(node: str | None) -> bool:
+    """``is_cloud`` for a bare ``node`` value (an API row, a raw entry)."""
+    return node == NODE_CLOUD
+
+
+def node_is_pool(node: str | None) -> bool:
+    """``runs_on_node`` for a bare ``node`` value: a pool nick or ``auto``."""
+    return node is not None and not node_is_cloud(node)
 
 
 @dataclass

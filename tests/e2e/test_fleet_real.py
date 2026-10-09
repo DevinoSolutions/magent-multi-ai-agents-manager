@@ -696,3 +696,82 @@ class TestAnUnsubmittedPromptIsReportedAsNotConfirmed:
         assert _wait_until(
             lambda: prompt in fleet.received(fleet.beta), _HOLD_S + 10.0, 0.4
         ), fleet.received(fleet.beta)
+
+
+# A busy window long enough that the stand-in finishing on its own can never be
+# mistaken for the interrupt landing.
+_INTERRUPT_BUSY_S = 60.0
+
+
+def _in_process(fleet: _Fleet, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Point THIS process's psmux seam (and its child env) at the fleet's
+    multiplexer, so ``magent.control`` drives it in-process. Returns the
+    config path."""
+    monkeypatch.setattr("magent.psmux.find_psmux", lambda: fleet.binary)
+    for key in ("TMUX_TMPDIR", "PATH"):
+        if key in fleet.env:
+            monkeypatch.setenv(key, fleet.env[key])
+    return str(fleet.cfg)
+
+
+@pytest.mark.psmux
+class TestEscapeInterruptsARealTurn:
+    """Spec 12's probe, "Esc as interrupt through psmux": ``control.interrupt``
+    presses Escape through the REAL multiplexer and the turn running in the
+    pane stops within 3 s."""
+
+    def test_escape_stops_a_running_turn(self, fleet, monkeypatch):
+        from magent import control
+
+        cfg = _in_process(fleet, monkeypatch)
+        assert (
+            fleet.cli("send", fleet.alpha, f"/busy {_INTERRUPT_BUSY_S:g}").returncode
+            == 0
+        )
+        assert _wait_until(
+            lambda: "esc to interrupt" in fleet.capture(fleet.alpha), 6.0, 0.2
+        ), fleet.capture(fleet.alpha)
+
+        # The 3 s window is measured from BEFORE the call: the verb's own
+        # settle and re-read are part of what the probe times.
+        started = time.monotonic()
+        result = control.interrupt(cfg, fleet.alpha)
+
+        assert result.key == "Escape"
+        assert result.pane_state_after == "idle", result
+        assert _wait_until(
+            lambda: "INTERRUPTED" in fleet.capture(fleet.alpha),
+            3.0 - (time.monotonic() - started),
+            0.1,
+        ), fleet.capture(fleet.alpha)
+        assert "<Escape>" in fleet.received(fleet.alpha)
+
+
+@pytest.mark.psmux
+class TestADigitAnswersARealDialog:
+    def test_choose_presses_the_digit_and_the_menu_closes(self, fleet, monkeypatch):
+        from magent import control
+
+        cfg = _in_process(fleet, monkeypatch)
+        assert fleet.cli("send", fleet.beta, "/menu").returncode == 0
+        assert _wait_until(
+            lambda: "Do you want to proceed?" in fleet.capture(fleet.beta), 6.0, 0.2
+        ), fleet.capture(fleet.beta)
+
+        result = control.choose(cfg, fleet.beta, 2)
+
+        assert result.confirmed is True, result
+        assert "<choice 2>" in fleet.received(fleet.beta)
+
+    def test_choose_outside_a_dialog_types_nothing(self, fleet, monkeypatch):
+        from magent import control
+
+        cfg = _in_process(fleet, monkeypatch)
+        before = fleet.received(fleet.alpha)
+
+        with pytest.raises(control.ControlError) as err:
+            control.choose(cfg, fleet.alpha, 1)
+
+        assert err.value.details["reason"] == "not_in_dialog"
+        time.sleep(1.0)
+        assert fleet.received(fleet.alpha) == before

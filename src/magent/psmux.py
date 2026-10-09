@@ -803,6 +803,29 @@ def send_keys(
         return result.returncode == 0
 
 
+# The key NAMES magent presses as keys (not pasted as text). A closed set:
+# ``send_key`` refuses anything else, so a caller can never smuggle text in
+# through a key name.
+NAMED_KEYS = frozenset({"Escape", "Enter"})
+
+
+def send_key(
+    name: str,
+    key: str,
+    *,
+    psmux: str | None = None,
+    timeout: float = SEND_KEYS_TIMEOUT_S,
+) -> bool:
+    """Press ONE named key in session ``name``'s pane (``send-keys -t name
+    <key>``, no ``-l``). ``Escape`` is the interrupt Claude Code honours
+    mid-turn. Same bound and non-raising contract as ``send_keys``; an
+    unknown key name raises ``ValueError`` (a programming error, not a
+    runtime condition)."""
+    if key not in NAMED_KEYS:
+        raise ValueError(f"not a key magent presses: {key!r}")
+    return send_keys(name, key, target=name, psmux=psmux, timeout=timeout)
+
+
 def pane_cwd(name: str, psmux: str | None = None) -> str:
     """Return the current working directory of the active pane, or ``""``.
 
