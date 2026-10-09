@@ -70,7 +70,8 @@ def make_req(
     body: bytes = b"",
     query: dict[str, list[str]] | None = None,
 ) -> api.ApiRequest:
-    merged: dict[str, str | None] = {"host": host}
+    # Browser-shaped by default: the Host allowlist judges browsers only.
+    merged: dict[str, str | None] = {"host": host, "user-agent": "Mozilla/5.0 (pytest)"}
     if method in {"POST", "PATCH", "DELETE"}:
         merged["x-magent-client"] = "pytest"
         merged["content-type"] = "application/json"
@@ -216,6 +217,19 @@ class TestOriginGuard:
             "bad_host",
         )
 
+    @pytest.mark.parametrize("host", ["desk:8080", "evil.example:9999", None])
+    def test_a_non_browser_client_is_not_judged_by_host(self, ctx, host):
+        # The remote Alt+V listener posts to whatever ssh name `attach` used.
+        resp = api.handle(
+            make_req(host=host, headers={"User-Agent": "Python-urllib/3.13"}), ctx
+        )
+        assert_wire(resp, "Meta")
+
+    def test_fetch_metadata_alone_marks_a_browser(self, ctx):
+        headers: dict[str, str | None] = {"User-Agent": None, "Sec-Fetch-Mode": "cors"}
+        resp = api.handle(make_req(host="evil.example:8080", headers=headers), ctx)
+        assert_refused(resp, 403, "forbidden", "bad_host")
+
     @pytest.mark.parametrize(
         "origin",
         [
@@ -284,21 +298,27 @@ class TestOriginGuard:
 
 
 class TestAllowedHosts:
-    def test_loopback_tailnet_and_an_explicit_host(self, monkeypatch):
+    def test_loopback_hostname_tailnet_and_an_explicit_host(self, monkeypatch):
         monkeypatch.setattr(tailnet, "ip4", lambda: "100.64.0.7")
         monkeypatch.setattr(tailnet, "magicdns_host", lambda: "Box.tailDECOY.ts.net")
+        # The hostname differs from the MagicDNS label on purpose: both must
+        # be in the set, each on its own account.
+        monkeypatch.setattr(api.socket, "gethostname", lambda: "DESK")
         assert api.allowed_hosts("MyHost") == {
             "localhost",
             "127.0.0.1",
             "::1",
+            "desk",
             "100.64.0.7",
             MAGICDNS.lower(),
+            "box",  # the MagicDNS name's short label
             "myhost",
         }
 
     def test_a_wildcard_bind_adds_no_name(self, monkeypatch):
         monkeypatch.setattr(tailnet, "ip4", lambda: None)
         monkeypatch.setattr(tailnet, "magicdns_host", lambda: None)
+        monkeypatch.setattr(api.socket, "gethostname", lambda: "localhost")
         assert api.allowed_hosts("0.0.0.0") == api.LOOPBACK_NAMES
 
 

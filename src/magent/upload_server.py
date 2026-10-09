@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import errno
 import html
 import json
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
     import logging
     from collections.abc import Callable, Sequence
 
-from magent import pidfile, psmux, tailnet, uploads
+from magent import api, events, pidfile, psmux, tailnet, uploads
 from magent.icons import render_icon
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger, log_safe
@@ -1101,6 +1102,38 @@ def _request_focus(project: str) -> None:
         psmux.detach_client(current)
 
 
+def _is_api(path: str) -> bool:
+    return path == api.PREFIX or path.startswith(api.PREFIX + "/")
+
+
+def _bound_port(address: object) -> int:
+    """The port of a bound socket address (``(host, port[, ...])``)."""
+    if isinstance(address, tuple) and len(address) > 1 and isinstance(address[1], int):
+        return address[1]
+    return 0
+
+
+def _health() -> api.Health:
+    """``/health`` and ``/api/v1/health``.
+
+    Lock-free and sweep-free on purpose: this is a liveness probe, and the
+    sessions lock is held for as long as psmux takes to answer.
+    ``sessions_ts`` is written AFTER the list, so a nonzero stamp means the
+    list read below is a real sweep's result. P3-18: ``session_count`` is a
+    COUNT, named distinctly from the /api/sessions LIST; ``None`` = unknown
+    (no sweep has landed yet), never a false 0."""
+    swept_at = UploadHandler.sessions_ts
+    started = UploadHandler.started_at
+    return api.Health(
+        service="magent-upload",
+        port=UploadHandler.port,
+        pid=UploadHandler.pid,
+        uptime_s=time.time() - started if started else 0.0,
+        session_count=len(UploadHandler.cached_sessions) if swept_at else None,
+        sessions_age_s=max(0.0, time.time() - swept_at) if swept_at else None,
+    )
+
+
 class UploadHandler(BaseHTTPRequestHandler):
     # Per socket OPERATION, not per request (StreamRequestHandler applies it
     # with settimeout): a slow 100 MB upload that keeps moving is never cut
@@ -1114,6 +1147,15 @@ class UploadHandler(BaseHTTPRequestHandler):
     port: int | None = None
     pid: int | None = None
     started_at: float = 0.0
+    # The /api/v1 state. run_server replaces all four at start: a fresh bus
+    # (new epoch), the Host names read once from tailscale, the status
+    # callback the command shell handed down, and the one FleetSource every
+    # request thread builds rows through. These defaults are what an
+    # in-process test server answers with.
+    bus: ClassVar[events.EventBus] = events.EventBus()
+    allowed_hosts: ClassVar[frozenset[str]] = api.LOOPBACK_NAMES
+    status_provider: ClassVar[Callable[[], dict[str, object]] | None] = None
+    fleet: ClassVar[api.FleetSource | None] = None
 
     @staticmethod
     def _sessions_snapshot() -> list[dict[str, object]]:
@@ -1128,6 +1170,160 @@ class UploadHandler(BaseHTTPRequestHandler):
 
     def _sessions(self) -> list[dict[str, object]]:
         return self._sessions_snapshot()
+
+    @classmethod
+    def _api_context(cls) -> api.ApiContext:
+        """This server, as the routes in ``api`` see it. Built per request
+        from the class state, so a test that sets an attribute (or
+        ``_UPLOAD_DIR``) is what the next request reads."""
+        return api.ApiContext(
+            config_path=cls.config_path,
+            bus=cls.bus,
+            allowed_hosts=cls.allowed_hosts,
+            upload_dir=_UPLOAD_DIR,
+            upload_max_bytes=MAX_UPLOAD_BYTES,
+            request_limit=_request_limit(),
+            health=_health,
+            upload_sessions=lambda: {_sid(s) for s in cls._sessions_snapshot()},
+            status_provider=cls.status_provider,
+            inject_fn=_inject_paste,
+            fleet=cls.fleet,
+        )
+
+    def _api_request(self, method: str) -> api.ApiRequest:
+        parsed = urlparse(self.path)
+        try:
+            length: int | None = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            length = None
+        return api.ApiRequest(
+            method=method,
+            path=parsed.path,
+            query=parse_qs(parsed.query),
+            headers={k.lower(): v for k, v in self.headers.items()},
+            body=api.Body(self.rfile.read1, length),
+            peer=str(self.client_address[0]),
+            bind=str(self.connection.getsockname()[0]),
+            port=_bound_port(self.server.server_address),
+        )
+
+    def _serve_api(self, method: str) -> None:
+        """Every ``/api/v1`` request: ``api.handle``, then its answer on the
+        wire. A refused body is drained (no RST); SSE frames are flushed one
+        by one until the client goes."""
+        req = self._api_request(method)
+        answer = api.handle(req, self._api_context())
+        if isinstance(answer, api.ApiStream):
+            self._stream(answer)
+            return
+        if req.body.unread:
+            if req.body.consumed:
+                # A body read PART way (an UploadError other than a short
+                # body: a bad part, an oversized file): close instead of
+                # draining what may be 100 MB. The handler speaks HTTP/1.0
+                # today, so the connection closes after every reply anyway;
+                # this close is defence for a future HTTP/1.1 switch, where
+                # the unread rest of the body, left on a kept-alive socket,
+                # would be parsed as the next request.
+                self.close_connection = True
+            else:
+                self._drain_request_body()
+        if answer.close:
+            # ``answer.close`` is the contract: the route says the connection
+            # is out of step with HTTP (a short upload body, the client may
+            # already be gone). Close, and answer only if it can still hear,
+            # as the legacy /upload branch does. The handler speaks HTTP/1.0
+            # today, so the connection closes after every reply anyway; the
+            # explicit close is defence for a future HTTP/1.1 switch, where a
+            # short body would otherwise leave unread bytes on a kept-alive
+            # socket: after a read timeout the next readline raises inside
+            # the server (a traceback, pinned by TestAnIncompleteUpload), and
+            # without one the rest of the body is parsed as a request.
+            self.close_connection = True
+            with contextlib.suppress(OSError):
+                self._write_answer(answer)
+            return
+        self._write_answer(answer)
+
+    def _write_answer(self, answer: api.ApiResponse) -> None:
+        body = answer.encode()
+        self.send_response(answer.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _stream(self, stream: api.ApiStream) -> None:
+        # One response per connection; the socket's per-operation timeout
+        # stays on, so a client that stops READING is dropped after
+        # CONNECTION_TIMEOUT_S while a quiet stream is kept alive by its pings.
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", stream.content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        # Said on the wire too: no Content-Length, no chunking, so the client
+        # (and any proxy) knows the stream ends with the connection.
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            for frame in stream.frames:
+                self.wfile.write(frame)
+                self.wfile.flush()
+        except OSError as exc:
+            get_logger("upload").debug("events: client left: %s", log_safe(repr(exc)))
+        finally:
+            stream.frames.close()
+
+    def _legacy_allowed(self, method: str) -> bool:
+        """The origin guard for a legacy route: False (and a 403 already
+        sent, in the legacy error shape) when ``api.guard`` refuses."""
+        refusal = api.guard(self._api_request(method), self._api_context())
+        if refusal is None:
+            return True
+        reason = refusal.details.get("reason")
+        get_logger("upload").warning(
+            "refused %s %s: %s", method, log_safe(self.path), reason
+        )
+        if method == "POST":
+            self._drain_request_body()
+        self._json_response(
+            {"ok": False, "error": refusal.message, "reason": reason}, 403
+        )
+        return False
+
+    def _api_only(self, method: str) -> None:
+        """PATCH, DELETE and OPTIONS exist only under /api/v1 (where OPTIONS
+        is answered 405: no CORS); anywhere else they are 405 or 404."""
+        try:
+            path = urlparse(self.path).path
+            if _is_api(path):
+                self._serve_api(method)
+                return
+            self._drain_request_body()
+            if path in _GET_PATHS or path in _POST_PATHS:
+                self._json_response({"ok": False, "error": "Method not allowed"}, 405)
+            else:
+                self._json_response({"ok": False, "error": "Not found"}, 404)
+        except Exception as exc:
+            log = get_logger("upload")
+            if _client_went_away(exc):
+                self.close_connection = True
+                log.warning("upload client went away during %s", method)
+                return
+            log.exception("%s handler crashed for %s", method, log_safe(self.path))
+            with contextlib.suppress(OSError):
+                self._json_response({"ok": False, "error": "internal"}, 500)
+
+    def do_PATCH(self) -> None:
+        self._api_only("PATCH")
+
+    def do_DELETE(self) -> None:
+        self._api_only("DELETE")
+
+    def do_OPTIONS(self) -> None:
+        self._api_only("OPTIONS")
 
     def _send_bytes(self, data: bytes, content_type: str, cache: bool = False) -> None:
         self.send_response(200)
@@ -1176,6 +1372,11 @@ class UploadHandler(BaseHTTPRequestHandler):
 
     def _handle_get(self) -> None:
         path = urlparse(self.path).path
+        if _is_api(path):
+            self._serve_api("GET")
+            return
+        if not self._legacy_allowed("GET"):
+            return
         if path == "/" or path == "":
             self._send_bytes(
                 _build_html(self._sessions()).encode("utf-8"),
@@ -1255,34 +1456,8 @@ class UploadHandler(BaseHTTPRequestHandler):
             else:
                 self._json_response({"ok": False, "error": "Unknown project"}, 404)
         elif path == "/health":
-            uptime = (
-                time.time() - UploadHandler.started_at
-                if UploadHandler.started_at
-                else 0.0
-            )
-            # Lock-free and sweep-free on purpose: this is a liveness probe, and
-            # the sessions lock is held for as long as psmux takes to answer.
-            # `sessions_ts` is written AFTER the list, so a nonzero stamp means
-            # the list read below is a real sweep's result.
-            swept_at = UploadHandler.sessions_ts
-            body = json.dumps(
-                {
-                    "ok": True,
-                    "service": "magent-upload",
-                    "port": UploadHandler.port,
-                    "pid": UploadHandler.pid,
-                    "uptime_s": uptime,
-                    # P3-18: a COUNT, named distinctly from the /api/sessions
-                    # LIST. `null` = unknown (no sweep has landed yet), never a
-                    # false 0; `sessions_age_s` says how old a known count is.
-                    "session_count": (
-                        len(UploadHandler.cached_sessions) if swept_at else None
-                    ),
-                    "sessions_age_s": (
-                        max(0.0, time.time() - swept_at) if swept_at else None
-                    ),
-                }
-            ).encode()
+            # Lock-free and sweep-free: see _health.
+            body = json.dumps({"ok": True, **dataclasses.asdict(_health())}).encode()
             self._send_bytes(body, "application/json")
         elif path in _PWA_ROUTES:
             content_type, factory = _PWA_ROUTES[path]
@@ -1320,6 +1495,11 @@ class UploadHandler(BaseHTTPRequestHandler):
     def _handle_post(self) -> None:
         log = get_logger("upload")
         parsed = urlparse(self.path)
+        if _is_api(parsed.path):
+            self._serve_api("POST")
+            return
+        if not self._legacy_allowed("POST"):
+            return
         if parsed.path != "/upload":
             self._drain_request_body()  # reject-before-read: avoid a Windows RST
             self._reject("POST", parsed.path)
@@ -2017,14 +2197,29 @@ def _warm_sessions() -> None:
         )
 
 
+def _learn_hosts(host: str | None) -> None:
+    """Add the tailnet IPv4 and MagicDNS name to the Host allowlist, once,
+    off-thread: ``tailscale`` is a subprocess and serve must not wait on it.
+    Meanwhile a request is judged against loopback, ``--host`` and the
+    address it arrived on, which already covers the tailnet IP."""
+    try:
+        UploadHandler.allowed_hosts = api.allowed_hosts(host)
+    except Exception:  # noqa: BLE001  # reason: a daemon-thread probe must never kill serve; the allowlist just stays loopback + bound addresses
+        get_logger("upload").warning(
+            "upload server: could not read the tailnet names", exc_info=True
+        )
+
+
 def run_server(
     port: int = 8080,
     config_path: str | None = None,
     host: str | None = None,
     watchdogs: Sequence[Callable[[], None]] = (),
+    status_provider: Callable[[], dict[str, object]] | None = None,
 ) -> None:
     log = get_logger("upload")
     UploadHandler.config_path = config_path
+    UploadHandler.status_provider = status_provider
 
     servers: list[ThreadingHTTPServer] = []
     bound_addrs: list[str] = []
@@ -2078,6 +2273,14 @@ def run_server(
     UploadHandler.port = port
     UploadHandler.pid = os.getpid()
     UploadHandler.started_at = time.time()
+    # /api/v1: a fresh epoch per serve, so a client resuming against a
+    # restarted server is told to refetch. Loopback and --host answer at
+    # once; the tailnet names are learned off-thread (see _learn_hosts).
+    UploadHandler.bus = events.EventBus()
+    UploadHandler.allowed_hosts = api.allowed_hosts(host, tailnet_names=False)
+    # One typed config + engine for every request thread, kept for this
+    # serve; never the poller's, which belongs to the poller thread.
+    UploadHandler.fleet = api.FleetSource(config_path)
     log.info(
         "listening on %s:%d pid %d", ", ".join(bound_addrs), port, UploadHandler.pid
     )
@@ -2086,6 +2289,10 @@ def run_server(
 
     for s in servers[1:]:
         threading.Thread(target=_serve_bind, args=(s, log), daemon=True).start()
+
+    threading.Thread(
+        target=_learn_hosts, args=(host,), daemon=True, name="magent-hosts"
+    ).start()
 
     # /health's session count comes from this cache; fill it now rather than
     # when the first phone happens to load the page. Daemon: it must not hold
@@ -2126,6 +2333,21 @@ def run_server(
         name="magent-reaper",
     ).start()
 
+    # ...and the /api/v1 event stream, which only polls while a client
+    # listens. MAGENT_EVENTS=0 opts out (a test-isolation law, like the
+    # supervisors above: pinned in tests/conftest.py).
+    events_stop = threading.Event()
+    if events.events_enabled():
+        threading.Thread(
+            target=events.run_poller,
+            args=(
+                events.EventPoller.for_config(UploadHandler.bus, config_path),
+                events_stop,
+            ),
+            daemon=True,
+            name="magent-events",
+        ).start()
+
     # ...and whatever the command shell asked this server to keep an eye on.
     # After the bind, like the ones above: a serve that lost the port to another
     # one exits with PortInUse and must not have started anything on the way.
@@ -2158,6 +2380,7 @@ def run_server(
         boost_stop.set()
         node_sync_stop.set()
         reap_stop.set()
+        events_stop.set()
         watchdog_stop.set()
         for s in servers[1:]:
             s.shutdown()  # called from a different thread than its serve_forever -> safe

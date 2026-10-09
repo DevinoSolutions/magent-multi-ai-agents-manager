@@ -954,8 +954,8 @@ class TestUploadServerIntegration:
         body = self._CUT
         with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
             s.sendall(
-                b"POST /upload HTTP/1.1\r\nHost: x\r\n"
-                b"Content-Type: multipart/form-data; boundary=----B\r\n"
+                f"POST /upload HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n".encode()
+                + b"Content-Type: multipart/form-data; boundary=----B\r\n"
                 + f"Content-Length: {len(body)}\r\n\r\n".encode()
                 + body[: len(body) - 2000]
             )
@@ -982,8 +982,8 @@ class TestUploadServerIntegration:
         started = time.monotonic()
         with socket.create_connection(("127.0.0.1", self.port), timeout=10) as s:
             s.sendall(
-                b"POST /upload HTTP/1.1\r\nHost: x\r\n"
-                b"Content-Type: multipart/form-data; boundary=----B\r\n"
+                f"POST /upload HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n".encode()
+                + b"Content-Type: multipart/form-data; boundary=----B\r\n"
                 + f"Content-Length: {len(body)}\r\n\r\n".encode()
                 + body[: len(body) // 2]
             )
@@ -1020,8 +1020,8 @@ class TestUploadServerIntegration:
         started = time.monotonic()
         with socket.create_connection(("127.0.0.1", self.port), timeout=10) as s:
             s.sendall(
-                b"POST /upload HTTP/1.1\r\nHost: x\r\n"
-                b"Content-Type: multipart/form-data; boundary=----B\r\n"
+                f"POST /upload HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n".encode()
+                + b"Content-Type: multipart/form-data; boundary=----B\r\n"
                 + f"Content-Length: {len(body)}\r\n\r\n".encode()
             )
             for i in range(0, len(body), 4096):
@@ -3371,8 +3371,8 @@ class TestAClientThatGoesAwayIsNotACrash:
 
     def _headers(self) -> bytes:
         return (
-            b"POST /upload?project=marka HTTP/1.1\r\nHost: x\r\n"
-            b"Content-Type: multipart/form-data; boundary=----B\r\n"
+            f"POST /upload?project=marka HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n".encode()
+            + b"Content-Type: multipart/form-data; boundary=----B\r\n"
             + f"Content-Length: {len(self._BODY)}\r\n\r\n".encode()
         )
 

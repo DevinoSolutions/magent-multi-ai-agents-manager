@@ -309,6 +309,24 @@ def _no_real_gh(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_tailnet_names(request, monkeypatch):
+    """No in-process ``run_server`` learns the developer's REAL tailnet
+    names. ``upload_server._learn_hosts`` runs on a daemon thread that
+    ``run_server`` starts: it shells out to ``tailscale`` and writes
+    ``UploadHandler.allowed_hosts``, a class attribute, so a thread that
+    outlives its test's monkeypatch teardown would land the real MagicDNS
+    name and tailnet IP in the class state every later test reads. Stubbed
+    on the module attribute (the thread target is looked up at start time),
+    so the one test that drives ``_learn_hosts`` directly opts out with
+    ``@pytest.mark.learn_hosts`` and patches ``tailnet`` itself. A real
+    serve in a child process keeps the real function: its class state dies
+    with the process."""
+    if request.node.get_closest_marker("learn_hosts") is not None:
+        return
+    monkeypatch.setattr("magent.upload_server._learn_hosts", lambda _host: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_claude(monkeypatch):
     """No test resolves the REAL ``claude`` for ``node_auth``: ``claude
     setup-token`` mints a year-long credential on the developer's Claude

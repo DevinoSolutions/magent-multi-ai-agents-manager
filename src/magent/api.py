@@ -28,6 +28,7 @@ import functools
 import io
 import ipaddress
 import json
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -230,14 +231,21 @@ class ApiContext:
     fleet: FleetSource | None = None
 
 
-def allowed_hosts(explicit: str | None) -> frozenset[str]:
-    """The Host names this server answers to besides the address a request
-    arrived on: loopback, the tailnet IPv4 and MagicDNS name, and an explicit
-    ``--host``. Read ONCE at serve start (``tailscale`` is a subprocess)."""
+def allowed_hosts(
+    explicit: str | None, *, tailnet_names: bool = True
+) -> frozenset[str]:
+    """The Host names a BROWSER may use for this server besides the address
+    a request arrived on: loopback, this machine's hostname, an explicit
+    ``--host`` and, with ``tailnet_names``, the tailnet IPv4 and the
+    MagicDNS name, full and short (``tailscale`` is a subprocess: serve
+    reads them once, off its startup path)."""
     from magent import tailnet
 
     names = set(LOOPBACK_NAMES)
-    names.update(n for n in (tailnet.ip4(), tailnet.magicdns_host()) if n)
+    names.add(socket.gethostname())
+    if tailnet_names:
+        dns = tailnet.magicdns_host()
+        names.update(n for n in (tailnet.ip4(), dns, dns and dns.split(".")[0]) if n)
     if explicit and explicit not in _WILDCARDS:
         names.add(explicit.strip("[]"))
     return frozenset(n.lower() for n in names)
@@ -377,12 +385,27 @@ def _host_allowed(value: str, req: ApiRequest, ctx: ApiContext) -> bool:
     return host in names and (port or 80) == req.port
 
 
+def _from_browser(req: ApiRequest) -> bool:
+    """An Origin, any fetch-metadata header, or a browser User-Agent (which
+    page script cannot change)."""
+    if req.header("origin") is not None:
+        return True
+    if any(name.startswith("sec-fetch-") for name in req.headers):
+        return True
+    return (req.header("user-agent") or "").startswith("Mozilla/")
+
+
 def guard(req: ApiRequest, ctx: ApiContext) -> WireError | None:
     """The refusal for a request this server must not answer, or None.
     Host allowlist (DNS rebinding), Origin, then fetch metadata (the
-    ``<img src=/api/flash>`` CSRF hole). Applies to every route."""
+    ``<img src=/api/flash>`` CSRF hole). Applies to every route.
+
+    The Host allowlist judges browsers only: DNS rebinding needs a browser,
+    and a non-browser client can send any Host it likes anyway. That keeps
+    the remote Alt+V listener working, which posts to the ssh host name the
+    user typed for ``magent attach`` (an alias, a short name)."""
     host = req.header("host")
-    if host is None or not _host_allowed(host, req, ctx):
+    if _from_browser(req) and (host is None or not _host_allowed(host, req, ctx)):
         return WireError(
             "forbidden",
             "Host is not one this server answers to",
@@ -885,7 +908,15 @@ def _upload(call: Call) -> ApiResponse:
     except uploads.UploadIncomplete as exc:
         # The one UploadError that also closes the connection: the body
         # stopped short, so there is nothing left to drain. Its byte counts
-        # ride along for the client.
+        # ride along for the client, and the one log line says how far it
+        # got (a warning, no traceback: a client leaving is not a crash).
+        get_logger("upload").warning(
+            "upload client went away mid-body on %s after %d of %d bytes: %s",
+            log_safe(req.path),
+            exc.received,
+            exc.declared,
+            log_safe(str(exc)),
+        )
         return ApiResponse.refuse(
             WireError(
                 "invalid_request",

@@ -127,6 +127,7 @@ markers = [
     "live_process_table: opt OUT of the autouse guard that makes reap._stop's default snapshot fail the test -- only for a tier that must walk the REAL process table. Its kills still go through the own-pids guard.",
     "psmux: drives a REAL multiplexer (psmux on Windows, tmux-as-psmux on POSIX); rides the end-to-end job, fails on CI without one, skips locally",
     "real_home: opt OUT of the autouse HOME redirect -- the test legitimately needs the machine's own home (CI-only tiers that seed the real ~/, e.g. the ssh flagship). Never use on a test that can run on a dev box.",
+    "learn_hosts: opt OUT of the autouse stub of upload_server._learn_hosts -- only for the test that exercises it, with tailnet patched so no real tailscale is read.",
 ]
 
 [tool.ruff]
