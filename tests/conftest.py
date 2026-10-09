@@ -247,6 +247,12 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # box's live fleet. Off for every tier; reaper tests turn it on IN PROCESS
     # only (monkeypatch.setenv + resetting env._cached_env).
     monkeypatch.setenv("MAGENT_IDLE_REAP", "0")
+    # ...and a sixth: `magent serve`'s event poller (events.run_poller)
+    # captures every live pane on this machine while a client listens. A test
+    # that starts a real serve and opens /api/v1/events would otherwise read
+    # the developer's own fleet. Off for every tier; tests that are ABOUT the
+    # poller drive EventPoller.tick directly with fake seams.
+    monkeypatch.setenv("MAGENT_EVENTS", "0")
     log.reset_logging()
     yield
     log.reset_logging()
