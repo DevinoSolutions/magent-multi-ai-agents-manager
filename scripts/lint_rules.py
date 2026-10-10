@@ -83,7 +83,21 @@ MD012  ``AttentionEngine(`` is constructed only in ``src/magent/fleetview.py``
        (``engine_from_config``): one place decides the staleness and the name
        pairs every reader of the agent-state store uses.
 
-Scopes: MD001/002/003/006/007/009/010/011/012 apply to ``src/magent/`` only; MD005 to
+MD013  No outbound HTTP client outside the files on ``MD013_ALLOW``: no import
+       of an HTTP client module (``urllib.request``, ``http.client``,
+       ``xmlrpc.client``, ``requests``, ``httpx``, ``aiohttp``, ``urllib3``,
+       a submodule of one, or ``from urllib import request`` and the like) and
+       no ``HTTPSConnection`` / ``HTTPConnection`` / ``urlopen`` /
+       ``urlretrieve`` / ``build_opener`` / ``OpenerDirector`` name or
+       attribute. The import is what catches an alias
+       (``from urllib.request import urlopen as fetch``). ``link.py`` is the
+       one module that dials a non-local service on its own (the relay);
+       every other entry is a loopback, tailnet or user-configured target with
+       its reason recorded. Out of scope: raw ``socket`` use and subprocesses
+       (``tailscale``, ``ssh``), which the product uses for local probes and
+       its own transports; review covers those.
+
+Scopes: MD001/002/003/006/007/008/009/010/011/012/013 apply to ``src/magent/`` only; MD005 to
 ``src/magent/cli/`` only; MD004 applies to ``src`` + ``scripts`` + ``tests``.
 """
 
@@ -134,6 +148,36 @@ MD002_ALLOW = {
 MD008_ALLOW = {"src/magent/procs.py"}
 _MD008_ARGV0 = frozenset({"taskkill", "taskkill.exe"})
 _MD008_OS_KILLS = frozenset({"kill", "killpg"})
+
+# MD013: the files that may open an outbound HTTP connection, and why.
+MD013_ALLOW = {
+    "src/magent/link.py": "the relay link (P2): the one module that dials a non-local service on its own",
+    "src/magent/altv.py": "Alt+V uploads to a serve URL: loopback, or a tailnet peer for a remote-wired listener",
+    "src/magent/attention.py": "ntfy push to the user's own MAGENT_NTFY_TOPIC",
+    "src/magent/hotkey.py": "the Alt+V listener reads /api/sessions from the loopback serve",
+    "src/magent/cli/status.py": "the loopback /health probe behind `magent status`",
+}
+_MD013_NAMES = frozenset(
+    {
+        "HTTPSConnection",
+        "HTTPConnection",
+        "urlopen",
+        "urlretrieve",
+        "build_opener",
+        "OpenerDirector",
+    }
+)
+_MD013_MODULES = frozenset(
+    {
+        "urllib.request",
+        "http.client",
+        "xmlrpc.client",
+        "requests",
+        "httpx",
+        "aiohttp",
+        "urllib3",
+    }
+)
 
 # MD003: the only two src files allowed to hold a literal "magent:".
 MD003_ALLOW = {"src/magent/titles.py", "src/magent/cli/attach.py"}
@@ -461,6 +505,30 @@ def _is_bare_kill(node: ast.AST) -> bool:
     return isinstance(node, ast.Name) and node.id == "TerminateProcess"
 
 
+def _is_http_module(name: str) -> bool:
+    """MD013 -- ``name`` is an HTTP client module or one of its submodules."""
+    return any(name == m or name.startswith(f"{m}.") for m in _MD013_MODULES)
+
+
+def _is_outbound_http(node: ast.AST) -> bool:
+    """MD013 -- an import of an HTTP client module, or one of its connection /
+    opener names as a bare name or an attribute (so
+    ``http.client.HTTPSConnection`` counts)."""
+    if isinstance(node, ast.Import):
+        return any(_is_http_module(alias.name) for alias in node.names)
+    if isinstance(node, ast.ImportFrom):
+        if node.level or not node.module:
+            return False
+        return _is_http_module(node.module) or any(
+            _is_http_module(f"{node.module}.{alias.name}") for alias in node.names
+        )
+    if isinstance(node, ast.Name):
+        return node.id in _MD013_NAMES
+    if isinstance(node, ast.Attribute):
+        return node.attr in _MD013_NAMES
+    return False
+
+
 def _is_config_write(node: ast.AST) -> bool:
     """MD011 -- ``config_io.save(...)`` / ``config_io.write_atomic(...)``, a
     call to a cli save wrapper, or a ``from magent.config_io import save``."""
@@ -520,7 +588,7 @@ def _is_engine_build(node: ast.AST) -> bool:
 
 
 def _ast_rules(rel: str, source: str) -> list[Finding]:
-    """MD001/002/003/006/007/008/009/010/011/012 (src/magent/) + MD005 (src/magent/cli/)."""
+    """MD001/002/003/006/007/008/009/010/011/012/013 (src/magent/) + MD005 (src/magent/cli/)."""
     out: list[Finding] = []
     try:
         tree = ast.parse(source, filename=rel)
@@ -540,6 +608,7 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
     md002_allowed = in_platform or rel in MD002_ALLOW
     md003_allowed = rel in MD003_ALLOW
     md008_allowed = rel in MD008_ALLOW
+    md013_allowed = rel in MD013_ALLOW
     md011_allowed = rel in MD011_ALLOW
     md009_applies = rel != MD009_OWNER
     md010_applies = rel not in MD010_ALLOW
@@ -586,6 +655,16 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
                     col,
                     "MD008",
                     "bare process termination (os.kill / taskkill / TerminateProcess) outside procs.py — a pid from a file can name a stranger; use pidfile.terminate / procs.terminate_pid",
+                )
+            )
+        if not md013_allowed and _is_outbound_http(node):
+            out.append(
+                Finding(
+                    rel,
+                    line,
+                    col,
+                    "MD013",
+                    "outbound HTTP client outside the MD013 allowlist -- the relay link is link.py's job; a new loopback/tailnet caller needs a reasoned MD013_ALLOW entry",
                 )
             )
         if md009_applies and _is_api_prefix(node):

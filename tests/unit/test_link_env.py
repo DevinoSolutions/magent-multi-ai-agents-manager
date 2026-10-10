@@ -56,3 +56,47 @@ class TestOverrides:
 def test_conftest_pins_the_link_thread_off():
     # The autouse _isolate_magent_home fixture ran before this test.
     assert os.environ.get("MAGENT_LINK") == "0"
+
+
+class TestTheProductionRelayIsUnreachable:
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "api.magent.now",
+            "API.Magent.Now.",
+            b"relay.magent.now",
+            b"api.magent.now..",
+            "magent.now",
+            "api.magent\u3002now",
+            "api\uff0emagent\uff0enow",
+            "api.magent\uff61now",
+        ],
+    )
+    def test_resolving_it_fails_the_test(self, host):
+        import socket
+
+        with pytest.raises(pytest.fail.Exception, match="production relay"):
+            socket.getaddrinfo(host, 443)
+
+    def test_other_names_still_resolve(self):
+        import socket
+
+        assert socket.getaddrinfo("127.0.0.1", 9)
+
+    def test_the_fail_open_fallback_cannot_dial_it(self, monkeypatch):
+        from magent import env, link
+
+        monkeypatch.setenv("MAGENT_NOT_A_THING", "1")
+        monkeypatch.setattr(env, "_cached_env", None)
+        assert link.relay_url() == link.DEFAULT_RELAY_URL
+        client = link.RelayClient(link.relay_url(), timeout=2)
+        with pytest.raises(pytest.fail.Exception, match="production relay"):
+            client.call("GET", "/v1/host/devices")
+
+
+def test_conftest_pins_the_relay_to_a_dead_loopback(monkeypatch):
+    from magent import env, link
+
+    assert os.environ.get("MAGENT_LINK_URL") == "http://127.0.0.1:9"
+    monkeypatch.setattr(env, "_cached_env", None)
+    assert link.relay_url() == "http://127.0.0.1:9"

@@ -205,6 +205,8 @@ class MagentEnv(BaseSettings):
     # Where `magent link` pairs (default: https://api.magent.now). The relay URL
     # is saved into ~/.magent/link.json at pairing time, so changing this later
     # does not move an already-linked machine; unlink and link again for that.
+    # tests/conftest.py pins it to a dead loopback (http://127.0.0.1:9) so no
+    # test can reach the real relay by omission.
     link_url: HttpUrl = HttpUrl("https://api.magent.now")
 
     @model_validator(mode="after")
