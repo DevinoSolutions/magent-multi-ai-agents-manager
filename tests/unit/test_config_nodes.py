@@ -164,7 +164,7 @@ class TestNodeProjectsParse:
         assert "unknown config key" not in capsys.readouterr().err
 
     def test_the_typed_view_skips_what_validation_will_refuse(self):
-        # migrate_config_file parses UNVALIDATED raw dicts through _parse_project,
+        # migrate_config_text parses UNVALIDATED raw dicts through _parse_project,
         # so the helper must never raise on a shape load_config will refuse.
         proj = _parse_project({"path": "api", "node": 2, "push": ["a", 3]})
         assert proj.node is None
