@@ -331,6 +331,24 @@ def _no_production_relay(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", guarded)
 
 
+@pytest.fixture
+def fake_relay(monkeypatch):
+    """A running FakeRelay (tests/_fake_relay.py) that MAGENT_LINK_URL names.
+
+    The pin above aims every test at a dead port; a link test points the env at
+    its own loopback relay and drops the env cache so ``link.relay_url()``
+    reads it. Tests that need constructor options (devices, host_keys,
+    long_poll_s, heartbeat_s) build their own ``with FakeRelay(...)`` and set
+    MAGENT_LINK_URL the same way.
+    """
+    from tests._fake_relay import FakeRelay
+
+    with FakeRelay() as relay:
+        monkeypatch.setenv("MAGENT_LINK_URL", relay.url)
+        monkeypatch.setattr(env, "_cached_env", None)
+        yield relay
+
+
 @pytest.fixture(autouse=True)
 def _no_real_ssh(monkeypatch):
     """No test resolves the REAL ``ssh`` client. A test that installed no fake
