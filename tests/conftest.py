@@ -84,6 +84,9 @@ _IMPORT_BOUND_PATHS = (
     ("magent.psmux", "DECOR_STAMP", "decor.stamp"),
     ("magent.nodes", "NODES_DIR", "nodes"),
     ("magent.nodes", "NODE_MAP_PATH", "nodes/node-map.json"),
+    ("magent.linkfiles", "LINK_PATH", "link.json"),
+    ("magent.linkfiles", "LINK_STATE_PATH", "link-state.json"),
+    ("magent.linkfiles", "INCOMING_DIR", "uploads/.incoming"),
     # win32-only module (it raises ImportError elsewhere by design), so this
     # entry is skipped rather than imported off-Windows.
     ("magent.hotkey", "_PID_PATH", "hotkey.pid"),
