@@ -118,7 +118,7 @@ MD002_ALLOW = {
     "src/magent/sessions/codex.py": "FS case-insensitivity for session-path matching",
     "src/magent/cli/ui.py": "OS-specific editor command + Windows console UTF-8 fix",
     "src/magent/procs.py": "OpenProcess vs os.kill pid-liveness primitive",
-    "src/magent/node_auth.py": "an owner-only token file is a protected DACL at CreateFileW (ctypes, Windows) vs O_EXCL 0600 + owner check (POSIX)",
+    "src/magent/fsutil.py": "an owner-only file is a protected DACL at CreateFileW (ctypes, Windows) vs O_EXCL 0600 + owner check (POSIX)",
     "src/magent/cli/session_picker.py": "terminal reset (cls vs stty/tput) is per-OS",
     "src/magent/console.py": "whether stdin is a person's console: GetConsoleMode (ctypes, Windows; NUL is a 'tty' there) vs isatty (POSIX)",
     "src/magent/cli/picker.py": "raw single-key console reads are per-OS (msvcrt vs termios/tty), same split as cli/watch.py",
