@@ -333,7 +333,9 @@ def _no_production_relay(monkeypatch):
 
 @pytest.fixture
 def fake_relay(monkeypatch):
-    """A running FakeRelay (tests/_fake_relay.py) that MAGENT_LINK_URL names.
+    """A running FakeRelay (tests/_fake_relay.py) that MAGENT_LINK_URL names,
+    with MAGENT_LINK_APP_URL on the same address (the fake answers pair/start
+    with its own URL as the appUrl, and a pairing refuses any other).
 
     The pin above aims every test at a dead port; a link test points the env at
     its own loopback relay and drops the env cache so ``link.relay_url()``
@@ -345,6 +347,7 @@ def fake_relay(monkeypatch):
 
     with FakeRelay() as relay:
         monkeypatch.setenv("MAGENT_LINK_URL", relay.url)
+        monkeypatch.setenv("MAGENT_LINK_APP_URL", relay.url)
         monkeypatch.setattr(env, "_cached_env", None)
         yield relay
 

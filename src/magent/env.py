@@ -208,6 +208,11 @@ class MagentEnv(BaseSettings):
     # tests/conftest.py pins it to a dead loopback (http://127.0.0.1:9) so no
     # test can reach the real relay by omission.
     link_url: HttpUrl = HttpUrl("https://api.magent.now")
+    # The app the pairing QR opens (default: https://app.magent.now). The QR's
+    # fragment carries the pairing secret, so `magent link` refuses a relay
+    # reply whose appUrl is not this origin: a relay cannot aim the QR at a
+    # page of its own choosing.
+    link_app_url: HttpUrl = HttpUrl("https://app.magent.now")
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:

@@ -1,4 +1,5 @@
-"""MAGENT_LINK / MAGENT_LINK_URL: the link thread's switch and relay address.
+"""MAGENT_LINK / MAGENT_LINK_URL / MAGENT_LINK_APP_URL: the link thread's
+switch, the relay address, and the app a pairing QR may open.
 
 MAGENT_LINK joins the test-isolation law: conftest pins it to 0 for every
 tier, because a test that starts a real serve on a linked developer box would
@@ -31,6 +32,12 @@ class TestDefaults:
             str(_bare_env(monkeypatch).link_url).rstrip("/") == "https://api.magent.now"
         )
 
+    def test_the_app_defaults_to_app_magent_now(self, monkeypatch):
+        assert (
+            str(_bare_env(monkeypatch).link_app_url).rstrip("/")
+            == "https://app.magent.now"
+        )
+
 
 class TestOverrides:
     def test_zero_turns_the_thread_off(self, monkeypatch):
@@ -51,6 +58,28 @@ class TestOverrides:
         monkeypatch.setenv("MAGENT_LINK_URL", "not a url")
         with pytest.raises(ValidationError):
             MagentEnv(_env_file=None)
+
+    def test_another_app_is_accepted(self, monkeypatch):
+        _bare_env(monkeypatch)
+        monkeypatch.setenv("MAGENT_LINK_APP_URL", "https://app.example.com")
+        env = MagentEnv(_env_file=None)
+        assert str(env.link_app_url).rstrip("/") == "https://app.example.com"
+
+    def test_a_non_url_app_is_refused(self, monkeypatch):
+        from pydantic import ValidationError
+
+        _bare_env(monkeypatch)
+        monkeypatch.setenv("MAGENT_LINK_APP_URL", "not a url")
+        with pytest.raises(ValidationError):
+            MagentEnv(_env_file=None)
+
+    def test_app_url_reads_the_setting(self, monkeypatch):
+        from magent import env, link
+
+        _bare_env(monkeypatch)
+        monkeypatch.setenv("MAGENT_LINK_APP_URL", "https://app.example.com")
+        monkeypatch.setattr(env, "_cached_env", None)
+        assert link.app_url() == "https://app.example.com"
 
 
 def test_conftest_pins_the_link_thread_off():

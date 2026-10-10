@@ -282,6 +282,14 @@ class TestRateLimit:
         assert slept == [1.0, 1.0]
         assert self._hits("/busy/9/1") == 3
 
+    def test_a_per_call_retries_override_wins(self, server):
+        slept: list[float] = []
+        client = RelayClient(server, sleep=slept.append, retries=3)
+        with pytest.raises(RelayError) as exc:
+            client.call("GET", "/busy/9/1", retries=0)
+        assert (exc.value.status, exc.value.retry_after) == (429, 1.0)
+        assert slept == [] and self._hits("/busy/9/1") == 1
+
     def test_a_rate_limited_stream_raises_with_retry_after_and_no_sleep(self, server):
         slept: list[float] = []
         with pytest.raises(RelayError) as exc:

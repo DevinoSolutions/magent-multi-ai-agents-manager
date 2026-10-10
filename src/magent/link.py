@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 PROTOCOL_HEADER = ("X-Magent-Link", "1")
 DEFAULT_RELAY_URL = "https://api.magent.now"
+DEFAULT_APP_URL = "https://app.magent.now"
 MAX_JSON_BYTES = 8 * 1024 * 1024
 # One SSE line, newline included. A relay frame is one JSON ``data:`` line well
 # under this (a device command body is at most 64 KiB before sealing); the cap
@@ -285,6 +286,7 @@ class RelayClient:
         *,
         token: str | None = None,
         timeout: float | None = None,
+        retries: int | None = None,
     ) -> dict[str, object]:
         """One JSON request; the envelope's ``data`` on success.
 
@@ -293,7 +295,9 @@ class RelayClient:
         RATE_LIMIT_CAP_S raises at once with ``retry_after`` set, for the
         caller to wait out. The relay rate-limits before it acts on a request,
         so a retried POST is never applied twice. ``timeout`` overrides the
-        client's for this call (the long-poll path passes its own).
+        client's for this call (the long-poll path passes its own), and
+        ``retries`` its 429 retries (0: raise the first 429 at once, for a
+        caller that keeps its own clock).
         """
         payload = (
             None
@@ -304,6 +308,7 @@ class RelayClient:
             token, accept="application/json", json_body=payload is not None
         )
         wait = self._timeout if timeout is None else timeout
+        limit = self._retries if retries is None else retries
         backoff = Backoff(cap=RATE_LIMIT_CAP_S)
         attempt = 0
         while True:
@@ -311,7 +316,7 @@ class RelayClient:
                 method, path, payload, headers, wait
             )
             too_long = retry_after is not None and retry_after > RATE_LIMIT_CAP_S
-            if status != 429 or attempt >= self._retries or too_long:
+            if status != 429 or attempt >= limit or too_long:
                 return _decode(status, raw, retry_after=retry_after)
             attempt += 1
             self._sleep(backoff.next_delay() if retry_after is None else retry_after)
@@ -466,3 +471,10 @@ def relay_url() -> str:
     """MAGENT_LINK_URL without a trailing slash (pydantic adds one)."""
     env = _env()
     return DEFAULT_RELAY_URL if env is None else str(env.link_url).rstrip("/")
+
+
+def app_url() -> str:
+    """MAGENT_LINK_APP_URL without a trailing slash: the only origin a pairing
+    QR may point at."""
+    env = _env()
+    return DEFAULT_APP_URL if env is None else str(env.link_app_url).rstrip("/")
