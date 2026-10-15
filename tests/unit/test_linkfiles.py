@@ -219,6 +219,44 @@ class TestState:
             f"link: {path} is unreadable; starting from a fresh state"
         ]
 
+    def test_a_read_that_fails_for_a_moment_is_retried(self, tmp_path, monkeypatch):
+        # On Windows a read racing the writer's atomic replace is refused for
+        # a moment; that must not look like a fresh state (a lost seen ring).
+        path = tmp_path / "s.json"
+        state = LinkState(cursor=7, seen_ids=("a",), state="online")
+        linkfiles.save_state(state, path)
+        real = linkfiles._read_json
+        fails = [2]
+
+        def flaky(p):
+            if fails[0] > 0:
+                fails[0] -= 1
+                raise PermissionError("DECOY sharing violation")
+            return real(p)
+
+        monkeypatch.setattr(linkfiles, "_read_json", flaky)
+        monkeypatch.setattr(linkfiles, "READ_RETRY_S", 0.0)
+        assert linkfiles.load_state(path) == state
+        assert fails == [0]
+
+    def test_a_read_that_keeps_failing_is_the_fresh_state(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        path = tmp_path / "s.json"
+        linkfiles.save_state(LinkState(cursor=7), path)
+        calls = []
+
+        def broken(p):
+            calls.append(p)
+            raise PermissionError("DECOY sharing violation")
+
+        monkeypatch.setattr(linkfiles, "_read_json", broken)
+        monkeypatch.setattr(linkfiles, "READ_RETRY_S", 0.0)
+        with caplog.at_level(logging.WARNING, logger="magent.link"):
+            assert linkfiles.load_state(path) == LinkState()
+        assert len(calls) == linkfiles.READ_ATTEMPTS
+        assert len(caplog.records) == 1
+
     def test_wrong_field_types_fall_back_one_by_one(self, tmp_path):
         path = tmp_path / "s.json"
         body = {

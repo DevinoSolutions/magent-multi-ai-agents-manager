@@ -241,9 +241,20 @@ class TestCall:
             RelayClient("http://127.0.0.1:9", timeout=2).call("GET", "/ok")
         assert (exc.value.status, exc.value.code) == (0, "network")
 
-    def test_a_bad_url_is_refused_without_echoing_it(self):
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ftp://user:DECOY_secret@relay",
+            "http://user:DECOY_secret@relay:99999",
+            "http://user:DECOY_secret@relay:DECOY",
+        ],
+        ids=["scheme", "port-range", "port-text"],
+    )
+    def test_a_bad_url_is_refused_without_echoing_it(self, url):
+        # A bad port is refused here, not at the first call, so a hand-edited
+        # link.json is a bad file (reported once), not a crash per retry.
         with pytest.raises(ValueError) as exc:
-            RelayClient("ftp://user:DECOY_secret@relay")
+            RelayClient(url)
         assert "DECOY" not in str(exc.value)
 
 

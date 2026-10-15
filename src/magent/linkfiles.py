@@ -15,6 +15,7 @@ tests/conftest.py's tripwire redirects them.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -27,6 +28,11 @@ INCOMING_DIR = Path.home() / ".magent" / "uploads" / ".incoming"
 
 FILE_VERSION = 1
 SEEN_MAX = 1024
+# On Windows a read racing a writer's atomic replace is refused for a moment
+# (the runner rewrites link-state.json on every change): retried this many
+# times, this far apart, as LinkRunner retries its own reads and writes.
+READ_ATTEMPTS = 5
+READ_RETRY_S = 0.02
 
 _LINK_KEYS = ("relay_url", "host_id", "host_token", "host_kex_priv", "host_sign_priv")
 _DEVICE_KEYS = ("device_id", "name", "kex_pub", "sign_pub", "paired_at")
@@ -154,12 +160,18 @@ def delete_link(path: Path | None = None, state_path: Path | None = None) -> Non
 def load_state(path: Path | None = None) -> LinkState:
     """The saved state; a fresh LinkState when it is missing or unreadable."""
     p = _state_path(path)
-    try:
-        raw = _read_json(p)
-    except FileNotFoundError:
-        return LinkState()
-    except OSError:
-        raw = _NOT_JSON
+    raw: object = _NOT_JSON
+    for attempt in range(READ_ATTEMPTS):
+        try:
+            raw = _read_json(p)
+        except FileNotFoundError:
+            return LinkState()
+        except OSError:
+            # A read racing the writer: never a phantom fresh state at once.
+            if attempt < READ_ATTEMPTS - 1:
+                time.sleep(READ_RETRY_S)
+        else:
+            break
     if not isinstance(raw, dict) or not _is_current(raw):
         get_logger("link").warning(
             "link: %s is unreadable; starting from a fresh state", p

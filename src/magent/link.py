@@ -274,9 +274,14 @@ class RelayClient:
         sleep: Callable[[float], object] = time.sleep,
     ) -> None:
         parts = urlsplit(base_url)
-        if parts.scheme not in ("https", "http") or not parts.hostname:
+        try:
+            # Read now, not at the first call: a bad port is a bad URL.
+            port = parts.port
+        except ValueError:
+            port = -1
+        if parts.scheme not in ("https", "http") or not parts.hostname or port == -1:
             # The URL itself stays out of the message: it may carry userinfo.
-            raise ValueError("not a relay URL: need http(s)://host")
+            raise ValueError("not a relay URL: need http(s)://host[:port]")
         self.base_url = base_url.rstrip("/")
         self._token = token
         self._timeout = timeout
@@ -738,6 +743,14 @@ def _daemon_field(value: object) -> str:
     return "unknown"
 
 
+def _check_host_token(link: LinkFile) -> None:
+    """A LinkFileError for a host token no request could carry. Pairing never
+    writes one; a hand edit can, and the client would refuse it on every call,
+    so it is a bad file (reported once), not a failure retried forever."""
+    if not all("!" <= ch <= "~" for ch in link.host_token):
+        raise linkfiles.LinkFileError("link.json holds an unusable host token")
+
+
 class LinkRunner:
     """The link thread's body: idle while unlinked, else one relay connection
     at a time, run until stopped, revoked or refused as too old.
@@ -824,6 +837,7 @@ class LinkRunner:
             link = self._read_link()
             if link is None:
                 return None
+            _check_host_token(link)
             self._load(link)
             return self._client_factory(link.relay_url, link.host_token, sleep=sleep)
         except (linkfiles.LinkFileError, ValueError) as exc:
@@ -976,10 +990,7 @@ class LinkRunner:
             cached = self._results.get(cid)
             peer = self._peers.get(str(command.get("deviceId")))
         if seen:
-            if cached is not None:
-                self._answer(client, cid, seq, cached)
-            else:
-                self._ack(client, seq)
+            self._replay(client, cid, seq, cached)
             return
         if peer is None:
             self._log.warning("link: refused command %s from an untrusted device", cid)
@@ -1000,8 +1011,14 @@ class LinkRunner:
         else:
             remembered = True
             with self._lock:
-                self._seen.add(cid)
-                saved = self._save()
+                # The add is the seen check: of two deliveries of one id,
+                # only the first to get here runs it, on any thread.
+                fresh = self._seen.add(cid)
+                saved = fresh and self._save()
+                cached = None if fresh else self._results.get(cid)
+            if not fresh:
+                self._replay(client, cid, seq, cached)
+                return
             if saved:
                 status, body = self._run_command(cid, peer, *request)
             else:
@@ -1027,6 +1044,19 @@ class LinkRunner:
                 while len(self._results) > RESULT_CACHE_MAX:
                     self._results.popitem(last=False)
         self._answer(client, cid, seq, result)
+
+    def _replay(
+        self,
+        client: RelayClient,
+        cid: str,
+        seq: int,
+        cached: dict[str, object] | None,
+    ) -> None:
+        """A command id already handled: its cached result again, or an ack."""
+        if cached is not None:
+            self._answer(client, cid, seq, cached)
+        else:
+            self._ack(client, seq)
 
     def _run_command(
         self, cid: str, peer: _Peer, method: str, path: str, body: bytes | None

@@ -143,6 +143,23 @@ class TestIdle:
         assert relay.requests == []
         assert sum("magent unlink" in r.getMessage() for r in caplog.records) == 1
 
+    @pytest.mark.parametrize("bad", ["token", "port"])
+    def test_a_hand_edited_link_json_is_reported_once_without_a_traceback(
+        self, tmp_path, relay, phone, caplog, bad
+    ):
+        # Pairing never writes either; a hand edit can. The client would
+        # refuse them on every call, so they are a bad file, not a host fault.
+        url = "http://127.0.0.1:99999" if bad == "port" else relay.url
+        token = "bad token DECOY" if bad == "token" else relay.host_token
+        linked = write_link(tmp_path, url, (phone,), host_token=token)
+        with caplog.at_level("INFO", logger="magent.link"):
+            run = Running(FakeHost(), linked)
+            relay.wait_for(lambda: len(run.sleeps) >= 3)
+            assert run.finish(relay) == "stopped"
+        assert relay.requests == []
+        assert sum("repair with" in r.getMessage() for r in caplog.records) == 1
+        assert [r for r in caplog.records if r.exc_info] == []
+
 
 class TestSnapshot:
     def test_every_connect_puts_a_sealed_snapshot(self, tmp_path, relay, phone):
@@ -911,6 +928,40 @@ class TestBackoff:
             run.finish(relay)
         floors = [s for s in run.sleeps if 1233.0 < s <= 1234.0]
         assert len(floors) >= 1
+
+    def test_a_poll_that_moved_the_cursor_is_not_floored(
+        self, monkeypatch, tmp_path, phone
+    ):
+        # The other half of the floor: a round that answered a command moved
+        # the cursor, so the next poll goes out at once. The round after it
+        # comes back empty and is floored, which proves the patch took.
+        monkeypatch.setattr(link, "POLL_MIN_INTERVAL_S", 1234.0)
+        polls: list[int] = []  # len(run.sleeps) as each poll went out
+
+        class Marking(RelayClient):
+            def call(self, method, path, body=None, **kwargs):
+                if path.startswith("/v1/host/commands"):
+                    polls.append(len(self._sleep.__self__.sleeps))
+                return super().call(method, path, body, **kwargs)
+
+        def factory(url, token, *, sleep):
+            return Marking(url, token=token, sleep=sleep)
+
+        with FakeRelay() as relay:
+            relay.fail_next_connects(3)
+            linked = write_link(
+                tmp_path, relay.url, (phone,), host_token=relay.host_token
+            )
+            relay.queue_command(make_command(linked, phone, cid=cmd_id(42), seq=1))
+            run = Running(FakeHost(), linked, client_factory=factory)
+            relay.wait_for(lambda: relay.results and len(polls) >= 3)
+            run.finish(relay)
+
+        def floored(first: int, last: int) -> bool:
+            return any(1233.0 < s <= 1234.0 for s in run.sleeps[first:last])
+
+        assert not floored(polls[0], polls[1])  # the productive round
+        assert floored(polls[1], polls[2])  # the empty one after it
 
     def test_a_huge_retry_after_is_capped(self, tmp_path, relay, phone):
         relay.fail_next_connects(1, 429, retry_after=99999)
