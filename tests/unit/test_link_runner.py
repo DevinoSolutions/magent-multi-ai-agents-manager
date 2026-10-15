@@ -576,6 +576,80 @@ class TestCommands:
         assert linked.state().seen_ids == (cmd_id(20),)
         run.finish(relay)
 
+    def test_a_duplicate_of_a_command_still_running_is_left_unacknowledged(
+        self, tmp_path, relay, phone
+    ):
+        # Once a second thread can deliver an id (uploads run on their own),
+        # "seen but no cached result" no longer means "ran before a restart":
+        # it can mean "still running". Acking that duplicate would move the
+        # cursor past an answer that is not posted yet, and lose it if the
+        # post then fails. So it stays unacknowledged; the relay redelivers.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        entered, release = threading.Event(), threading.Event()
+
+        def hold(method: str, path: str) -> None:
+            entered.set()
+            assert release.wait(5)
+
+        host = FakeHost(on_handle=hold)
+        run = Running(host, linked)
+        command = make_command(linked, phone, cid=cmd_id(40), seq=1)
+        relay.queue_command(command)
+        assert entered.wait(5)
+
+        client = RelayClient(relay.url, token=relay.host_token)
+        try:
+            run.runner._on_command(client, command)  # a second delivery, elsewhere
+            assert (relay.acks, relay.results) == ([], [])
+            assert linked.state().cursor == 0
+        finally:
+            release.set()
+        relay.wait_for(lambda: relay.results)
+        assert relay.acks == [1]
+        assert len(host.calls) == 1
+        run.finish(relay)
+
+        run.runner._on_command(client, command)  # done now: the cached answer
+        assert [r["commandId"] for r in relay.results] == [cmd_id(40)] * 2
+
+    def test_a_duplicate_that_lost_the_race_to_the_ring_is_left_unacknowledged(
+        self, tmp_path, relay, phone, monkeypatch
+    ):
+        # The same, one step later: this delivery passed the first seen check
+        # before the other one ran, and finds it running at the ring's add.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        entered, release = threading.Event(), threading.Event()
+
+        def hold(method: str, path: str) -> None:
+            entered.set()
+            assert release.wait(5)
+
+        host = FakeHost(on_handle=hold)
+        run = Running(host, linked)
+        relay.wait_for(run.runner.online)
+        command = make_command(linked, phone, cid=cmd_id(41), seq=1)
+        real_open = run.runner._open_command
+        here = threading.current_thread()
+
+        def open_late(cid, peer, cmd):
+            if threading.current_thread() is here:
+                # Past the first check: now the other delivery starts running.
+                relay.queue_command(command)
+                assert entered.wait(5)
+            return real_open(cid, peer, cmd)
+
+        monkeypatch.setattr(run.runner, "_open_command", open_late)
+        client = RelayClient(relay.url, token=relay.host_token)
+        try:
+            run.runner._on_command(client, command)
+            assert (relay.acks, relay.results) == ([], [])
+        finally:
+            release.set()
+        relay.wait_for(lambda: relay.results)
+        assert relay.acks == [1]
+        assert len(host.calls) == 1
+        run.finish(relay)
+
     def test_a_reconnect_resumes_from_the_cursor_with_a_fresh_snapshot(
         self, tmp_path, relay, phone
     ):

@@ -4,8 +4,10 @@ The transport first: a stdlib http.client client for the relay's
 ``/v1/host/*`` routes (every reply is the daemon envelope, contract C1), an SSE
 parser for ``/v1/stream/host`` (C5), the reconnect backoff and the seen-id
 ring. Then LinkRunner, the serve thread built on it: the relay connection,
-the snapshot, and the commands paired devices send. Last, EventForwarder,
-the runner's second thread: the daemon's events, sealed per device.
+the snapshot, and the commands paired devices send. Then EventForwarder,
+the runner's second thread: the daemon's events, sealed per device. Last,
+UploadPuller, its third: the files paired devices upload, pulled from
+storage, decrypted and handed to the daemon.
 
 Outbound only: the relay never connects to this machine. MD013 keeps this
 module the only new code that opens an outbound HTTP connection.
@@ -17,9 +19,12 @@ import collections
 import contextlib
 import http.client
 import importlib.metadata
+import ipaddress
 import json
+import queue
 import random
 import re
+import shutil
 import socket
 import ssl
 import threading
@@ -30,13 +35,22 @@ from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlsplit
 
 from magent import linkcrypto, linkfiles
-from magent.linkcrypto import AAD_CMD, AAD_EVT, AAD_RES, AAD_SNAP, SealError
+from magent.linkcrypto import (
+    AAD_CMD,
+    AAD_EVT,
+    AAD_RES,
+    AAD_SNAP,
+    AAD_UKEY,
+    AAD_UMETA,
+    SealError,
+)
 from magent.linkfiles import SEEN_MAX, LinkState
 from magent.log import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Iterator
     from pathlib import Path
+    from typing import BinaryIO
 
     from magent.env import MagentEnv
     from magent.linkcrypto import PairKeys
@@ -56,6 +70,9 @@ _READ_CHUNK = 64 * 1024
 # not waited out here: call() raises at once with it set.
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_CAP_S = 60.0
+# The longest one presigned download may take, start to finish: 100 MB at
+# about 1 Mbit/s. Each read is still bounded by the client's timeout.
+DOWNLOAD_DEADLINE_S = 900.0
 
 
 class RelayError(Exception):
@@ -238,27 +255,54 @@ class _Deadline:
     wakes a blocked read; ``expired`` tells that cut from a dropped
     connection. The socket is held here, not read off the connection later:
     http.client hands it to the response (and clears ``conn.sock``) when the
-    reply will close the connection.
+    reply will close the connection. A deadline started before the socket
+    exists is handed it with ``watch`` (cut at once if the time is up), and
+    ``left`` bounds what a cut cannot wake on every OS (a TLS handshake).
     """
 
     def __init__(self, sock: socket.socket | None, seconds: float) -> None:
         self.expired = False
         self._sock = sock
+        self._seconds = seconds
+        self._ends = time.monotonic() + seconds
         self._timer = threading.Timer(seconds, self._expire)
         self._timer.daemon = True
 
     def __enter__(self) -> _Deadline:
+        self._ends = time.monotonic() + self._seconds
         self._timer.start()
         return self
+
+    def left(self) -> float:
+        """Seconds until the cut (0 or less once it is due)."""
+        return self._ends - time.monotonic()
+
+    @property
+    def passed(self) -> bool:
+        """Due, whether or not the timer thread has run yet."""
+        return self.expired or self.left() <= 0
 
     def __exit__(self, *_: object) -> None:
         self._timer.cancel()
 
+    def watch(self, sock: socket.socket | None) -> None:
+        # Set before the check, as _expire sets expired before it reads the
+        # socket: whichever runs second does the cut.
+        self._sock = sock
+        if self.expired:
+            self._cut()
+
     def _expire(self) -> None:
         self.expired = True
-        if self._sock is not None:
+        self._cut()
+
+    def _cut(self) -> None:
+        sock = self._sock
+        if sock is not None:
             with contextlib.suppress(OSError):
-                self._sock.shutdown(socket.SHUT_RDWR)
+                # The plain socket's shutdown: a TLS socket's own would also
+                # drop its TLS state under the thread still reading it.
+                socket.socket.shutdown(sock, socket.SHUT_RDWR)
 
 
 class RelayClient:
@@ -437,35 +481,178 @@ class RelayClient:
             conn.close()
 
     def get_bytes(
-        self, url: str, sink: Callable[[bytes], None], *, max_bytes: int
+        self,
+        url: str,
+        sink: Callable[[bytes], None],
+        *,
+        max_bytes: int,
+        deadline: float = DOWNLOAD_DEADLINE_S,
     ) -> int:
         """Stream an absolute (presigned) URL into ``sink``; the byte count.
 
         No relay headers: a presigned GET carries its own authority, and an
         extra Authorization header would make the storage service refuse it.
-        Only http(s) is fetched; the URL never appears in an error.
+        A relay on https hands out https URLs on a public storage host, so
+        then only https on port 443 is fetched, and never from a loopback,
+        private or otherwise non-public address: the name is resolved once,
+        every address it has must be public, and the connection goes to the
+        one that was checked. A relay on plain http (a local one) may name
+        any http(s) URL. A URL refused here is a RelayError
+        ``invalid_response``. ``deadline`` bounds the whole download, the TLS
+        handshake included, however slowly it trickles in (the name lookup
+        and the TCP connect only by the client's timeout). The URL never
+        appears in an error.
         """
         parts = urlsplit(url)
-        if parts.scheme not in ("https", "http") or not parts.hostname:
-            raise RelayError(0, "invalid_response", "download URL is not http(s)")
-        conn, target = self._connection(url, self._timeout)
+        secure = urlsplit(self.base_url).scheme == "https"
         try:
-            resp = _send(conn, "GET", target, None, {"User-Agent": _user_agent()})
-            if resp.status != 200:
-                raise RelayError(resp.status, "download_failed")
-            total = 0
-            while True:
-                chunk = _read(resp, _READ_CHUNK)
-                if not chunk:
-                    return total
-                total += len(chunk)
-                if total > max_bytes:
-                    raise RelayError(
-                        413, "payload_too_large", f"more than {max_bytes} bytes"
-                    )
-                sink(chunk)
-        finally:
-            conn.close()
+            port = parts.port  # read now: a bad port is a bad URL
+        except ValueError:
+            port = -1
+        if secure:
+            allowed = parts.scheme == "https" and port in (None, 443)
+        else:
+            allowed = parts.scheme in ("https", "http") and port != -1
+        if not allowed or not parts.hostname:
+            raise RelayError(0, "invalid_response", "download URL is not allowed")
+        with _Deadline(None, deadline) as cut:
+            conn: http.client.HTTPConnection | None = None
+            try:
+                if secure:
+                    conn, target = self._public_connection(url, cut.left)
+                else:
+                    conn, target = self._connection(url, self._timeout)
+                _connect(conn)
+                cut.watch(conn.sock)
+                total = self._download(conn, target, sink, max_bytes)
+            except RelayError:
+                if cut.passed:
+                    raise _too_slow() from None
+                raise
+            finally:
+                if conn is not None:
+                    conn.close()
+            if cut.passed:
+                # A body without a Content-Length reads a cut as its end.
+                raise _too_slow()
+            return total
+
+    def _public_connection(
+        self, url: str, budget: Callable[[], float]
+    ) -> tuple[http.client.HTTPConnection, str]:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        address = _public_address(host, 443)
+        target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        conn = _PinnedHTTPSConnection(
+            host,
+            443,
+            address=address,
+            timeout=self._timeout,
+            context=ssl.create_default_context(),
+            budget=budget,
+        )
+        return conn, target
+
+    @staticmethod
+    def _download(
+        conn: http.client.HTTPConnection,
+        target: str,
+        sink: Callable[[bytes], None],
+        max_bytes: int,
+    ) -> int:
+        resp = _send(conn, "GET", target, None, {"User-Agent": _user_agent()})
+        if resp.status != 200:
+            raise RelayError(resp.status, "download_failed")
+        total = 0
+        while True:
+            chunk = _read(resp, _READ_CHUNK)
+            if not chunk:
+                return total
+            total += len(chunk)
+            if total > max_bytes:
+                raise RelayError(
+                    413, "payload_too_large", f"more than {max_bytes} bytes"
+                )
+            sink(chunk)
+
+
+# NAT64's well-known prefix: behind a NAT64 gateway, 64:ff9b::a00:1 reaches
+# the IPv4 address 10.0.0.1.
+_NAT64 = ipaddress.IPv6Network("64:ff9b::/96")
+
+
+def _is_public(address: str) -> bool:
+    """A globally routable unicast address that is not reserved. An IPv6
+    address that carries an IPv4 one (IPv4-mapped, 6to4, NAT64) is judged
+    as the IPv4 address it reaches."""
+    try:
+        ip: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(
+            address.split("%", 1)[0]
+        )
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        elif ip.sixtofour is not None:
+            ip = ip.sixtofour
+        elif ip in _NAT64:
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return ip.is_global and not ip.is_multicast and not ip.is_reserved
+
+
+def _public_address(host: str, port: int) -> str:
+    """The address to dial for ``host``: a RelayError when it resolves to
+    nothing, or to any address that is not public."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as exc:
+        raise RelayError(0, "network", type(exc).__name__) from exc
+    addresses = [str(info[4][0]) for info in infos]
+    if not addresses or not all(_is_public(a) for a in addresses):
+        raise RelayError(0, "invalid_response", "download host is not public")
+    return addresses[0]
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS to one address checked beforehand, so a second name lookup can
+    never swap in another; the certificate is still verified for the URL's
+    host name."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        address: str,
+        timeout: float,
+        context: ssl.SSLContext,
+        budget: Callable[[], float],
+    ) -> None:
+        super().__init__(host, port, timeout=timeout, context=context)
+        self._address = address
+        self._tls = context
+        self._budget = budget
+        self._read_timeout = timeout
+
+    def connect(self) -> None:
+        """Dial, then shake hands within what is left of the caller's
+        deadline (``budget``): the socket timeout bounds the whole handshake,
+        which a cut from another thread does not wake on every OS."""
+        sock = socket.create_connection((self._address, self.port), self.timeout)
+        tls: ssl.SSLSocket | None = None
+        try:
+            tls = self._tls.wrap_socket(
+                sock, server_hostname=self.host, do_handshake_on_connect=False
+            )
+            tls.settimeout(max(0.001, min(self._read_timeout, self._budget())))
+            tls.do_handshake()
+            tls.settimeout(self._read_timeout)
+        except BaseException:
+            (tls or sock).close()
+            raise
+        self.sock = tls
 
 
 def _readline(resp: http.client.HTTPResponse) -> bytes:
@@ -796,7 +983,10 @@ class LinkRunner:
     sealed. Each id is saved before it runs, so a command the relay replays
     never runs twice: its cached result is re-sent, or, after a restart, it
     is only acknowledged. The cursor moves only once the relay has the
-    answer, so a lost result post is replayed, not dropped.
+    answer, so a lost result post is replayed, not dropped, and a second
+    delivery of a command still running is not acknowledged at all.
+    ``upload.ready`` (a stream frame, or a poll's ``uploads``) goes to the
+    UploadPuller.
     """
 
     def __init__(
@@ -832,6 +1022,11 @@ class LinkRunner:
         # put_snapshot runs on the runner and on the event forwarder (a
         # reset): one at a time, so an older read never lands last.
         self._snapshot_lock = threading.Lock()
+        # Command ids being run now. Seen with no cached answer used to mean
+        # "ran before a restart"; with a second thread delivering, it can
+        # mean "still running", and that duplicate must not be acked.
+        self._inflight: set[str] = set()
+        self._uploads: UploadPuller | None = None
 
     # -- the loop ------------------------------------------------------------
 
@@ -880,14 +1075,22 @@ class LinkRunner:
     def _run_linked(
         self, client: RelayClient, stop: threading.Event, sleep: Callable[[float], bool]
     ) -> str:
-        """The connection loop, with the event forwarder beside it for as long
-        as it runs, however it ends."""
+        """The connection loop, with the event forwarder and the upload
+        puller beside it for as long as it runs, however it ends: the puller
+        is stopped even when stopping the forwarder fails."""
         forwarder = EventForwarder(self, client, self._host.subscribe)
+        puller = UploadPuller(self, client, self._host)
         forwarder.start()
+        puller.start()
+        self._uploads = puller
         try:
             return self._connect_loop(client, stop, sleep)
         finally:
-            forwarder.stop()
+            self._uploads = None
+            try:
+                forwarder.stop()
+            finally:
+                puller.stop()
 
     def _connect_loop(
         self, client: RelayClient, stop: threading.Event, sleep: Callable[[float], bool]
@@ -982,17 +1185,20 @@ class LinkRunner:
                     return
 
     def _poll_round(self, client: RelayClient, sleep: Callable[[float], bool]) -> None:
-        """One long-poll of ``/v1/host/commands`` (the stream's fallback), then
-        the device list, which the stream would have pushed. A round that
-        moved nothing forward (nothing came, or nothing that could be acked)
-        and came back sooner than POLL_MIN_INTERVAL_S waits out the rest, so
-        a relay that answers at once is never polled in a tight loop."""
+        """One long-poll of ``/v1/host/commands`` (the stream's fallback): its
+        commands and ready uploads, then the device list, which the stream
+        would have pushed. A round that moved nothing forward (nothing came,
+        or nothing that could be acked) and came back sooner than
+        POLL_MIN_INTERVAL_S waits out the rest, so a relay that answers at
+        once is never polled in a tight loop."""
         began = time.monotonic()
         since = self._cursor
         path = f"/v1/host/commands?since={since}&wait={LONG_POLL_WAIT_S}"
         data = client.call("GET", path, timeout=LONG_POLL_TIMEOUT_S)
         for command in _objects(data.get("commands")):
             self._on_command(client, command)
+        for ready in _objects(data.get("uploads")):
+            self._offer_upload(ready)
         self._on_devices(client, client.call("GET", "/v1/host/devices"))
         quick = time.monotonic() - began
         if self._cursor == since and quick < POLL_MIN_INTERVAL_S:
@@ -1007,6 +1213,8 @@ class LinkRunner:
             self._on_command(client, data)
         elif event.event == "devices":
             self._on_devices(client, data)
+        elif event.event == "upload.ready":
+            self._offer_upload(data)
         elif event.event == "revoked":
             raise Revoked(401, "unauthorized", "the relay revoked this host")
         else:
@@ -1027,8 +1235,12 @@ class LinkRunner:
             return
         with self._lock:
             seen = cid in self._seen
+            running = cid in self._inflight
             cached = self._results.get(cid)
             peer = self._peers.get(str(command.get("deviceId")))
+        if running:
+            self._still_running(cid)
+            return
         if seen:
             self._replay(client, cid, seq, cached)
             return
@@ -1036,54 +1248,74 @@ class LinkRunner:
             self._log.warning("link: refused command %s from an untrusted device", cid)
             self._ack(client, seq)
             return
-        remembered = False
+        remembered = claimed = False
         try:
-            request = self._open_command(cid, peer, command)
-        except _Refused as refused:
-            # Never remembered: only a verified id may take a place in the
-            # ring (or the result cache), so a relay cannot flush a real id
-            # out with junk. A replayed refusal is just refused again.
-            self._log.warning("link: refused command %s: %s", cid, refused.reason)
-            status, body = (
-                refused.status,
-                _error(refused.code, str(refused), refused.reason),
-            )
-        else:
-            remembered = True
-            with self._lock:
-                # The add is the seen check: of two deliveries of one id,
-                # only the first to get here runs it, on any thread.
-                fresh = self._seen.add(cid)
-                saved = fresh and self._save()
-                cached = None if fresh else self._results.get(cid)
-            if not fresh:
-                self._replay(client, cid, seq, cached)
-                return
-            if saved:
-                status, body = self._run_command(cid, peer, *request)
-            else:
-                # Unsaved, a restart would not know it ran: so it does not run.
+            try:
+                request = self._open_command(cid, peer, command)
+            except _Refused as refused:
+                # Never remembered: only a verified id may take a place in the
+                # ring (or the result cache), so a relay cannot flush a real id
+                # out with junk. A replayed refusal is just refused again.
+                self._log.warning("link: refused command %s: %s", cid, refused.reason)
                 status, body = (
-                    503,
-                    _error(
-                        "unavailable",
-                        "the link state could not be saved",
-                        "state_unsaved",
-                    ),
+                    refused.status,
+                    _error(refused.code, str(refused), refused.reason),
                 )
-        answer = json.dumps({"status": status, "body": body}, separators=(",", ":"))
-        result: dict[str, object] = {
-            "type": "command",
-            "commandId": cid,
-            "status": status,
-            "sealed": linkcrypto.seal(peer.keys.h2d, answer.encode(), AAD_RES + cid),
-        }
-        if remembered:
-            with self._lock:
-                self._results[cid] = result
-                while len(self._results) > RESULT_CACHE_MAX:
-                    self._results.popitem(last=False)
-        self._answer(client, cid, seq, result)
+            else:
+                remembered = True
+                with self._lock:
+                    # The add is the seen check: of two deliveries of one id,
+                    # only the first to get here runs it, on any thread.
+                    fresh = self._seen.add(cid)
+                    saved = fresh and self._save()
+                    running = not fresh and cid in self._inflight
+                    cached = None if fresh else self._results.get(cid)
+                    if fresh:
+                        self._inflight.add(cid)
+                        claimed = True
+                if running:
+                    self._still_running(cid)
+                    return
+                if not fresh:
+                    self._replay(client, cid, seq, cached)
+                    return
+                if saved:
+                    status, body = self._run_command(cid, peer, *request)
+                else:
+                    # Unsaved, a restart would not know it ran: so it does not run.
+                    status, body = (
+                        503,
+                        _error(
+                            "unavailable",
+                            "the link state could not be saved",
+                            "state_unsaved",
+                        ),
+                    )
+            answer = json.dumps({"status": status, "body": body}, separators=(",", ":"))
+            result: dict[str, object] = {
+                "type": "command",
+                "commandId": cid,
+                "status": status,
+                "sealed": linkcrypto.seal(
+                    peer.keys.h2d, answer.encode(), AAD_RES + cid
+                ),
+            }
+            if remembered:
+                with self._lock:
+                    self._results[cid] = result
+                    while len(self._results) > RESULT_CACHE_MAX:
+                        self._results.popitem(last=False)
+            self._answer(client, cid, seq, result)
+        finally:
+            if claimed:
+                with self._lock:
+                    self._inflight.discard(cid)
+
+    def _still_running(self, cid: str) -> None:
+        """A second delivery of a command still running elsewhere: left
+        unacknowledged, so the cursor never passes an answer not yet posted.
+        The relay delivers it again, and by then its answer is cached."""
+        self._log.info("link: command %s is still running; not acknowledged", cid)
 
     def _replay(
         self,
@@ -1293,6 +1525,32 @@ class LinkRunner:
             for p in peers
         }
 
+    # -- uploads (what the puller reads off the runner) ------------------------
+
+    def _offer_upload(self, ready: dict[str, object]) -> None:
+        puller = self._uploads
+        if puller is not None:
+            puller.offer(ready)
+
+    def peer(self, device_id: str) -> _Peer | None:
+        """The trusted device ``device_id`` and its keys, or None."""
+        with self._lock:
+            return self._peers.get(device_id)
+
+    def has_seen(self, item_id: str) -> bool:
+        with self._lock:
+            return item_id in self._seen
+
+    def remember(self, item_id: str) -> bool | None:
+        """Add a verified upload id to the seen ring, persisted. The add is
+        the seen check, one step under the lock: None when the id was
+        already there (another delivery got here first), else whether the
+        ring was saved."""
+        with self._lock:
+            if not self._seen.add(item_id):
+                return None
+            return self._save()
+
     # -- files -----------------------------------------------------------------
 
     def _peers_for(self, link: LinkFile) -> dict[str, _Peer]:
@@ -1399,6 +1657,7 @@ def _delay(backoff: Backoff, error: RelayError | None) -> float:
 # --- Event forwarding (spec 4.1) ----------------------------------------------
 
 EVENT_THREAD = "magent-relay-events"
+UPLOAD_THREAD = "magent-relay-uploads"
 EVENT_BATCH_S = 0.25  # events arriving this close together share one POST
 EVENT_IDLE_WAIT_S = 1.0  # how long one quiet read blocks (bounds the stop latency)
 EVENTS_MAX_BYTES = 256 * 1024  # the relay's cap on one POST /v1/host/events body
@@ -1640,3 +1899,379 @@ class EventForwarder:
         if current:
             chunks.append(current)
         return chunks
+
+
+# --- Upload pulls (spec 4.5) --------------------------------------------------
+
+UPLOAD_SLACK_BYTES = 65536  # ciphertext framing allowed over the daemon's upload cap
+UPLOAD_QUEUE_WAIT_S = 0.5  # how long the idle puller blocks (bounds the stop latency)
+UPLOAD_JOIN_S = 5.0  # how long stop() waits for a pull in flight
+# UTF-8 bytes kept of the device's file name, as the daemon's own saved names
+# (uploads.saved_name): the stem is cut, an extension of at most
+# _SUFFIX_MAX_BYTES kept, so the agent still knows what the file is and the
+# incoming path stays under Windows' 260-character MAX_PATH.
+UPLOAD_NAME_MAX = 150
+_SUFFIX_MAX_BYTES = 20
+# The relay issues upload ids as it does command ids (C3): UUIDs, in lower
+# case. One names a folder here, so nothing else gets near the file system,
+# and no two ids that differ in case share a folder on Windows.
+_UPLOAD_ID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.ASCII
+)
+# The relay's order of upload states: a result only ever moves to a later one.
+_UPLOAD_RANK = {"pulled": 1, "inject_pending": 2, "injected": 3, "inject_failed": 3}
+_PASTE_STATES = {"injected": "injected", "pending": "inject_pending"}
+_NAME_FORBIDDEN = frozenset('<>:"|?*')
+# Names Windows opens as a device in any folder, an extension or not.
+_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{n}" for n in (*range(1, 10), "\u00b9", "\u00b2", "\u00b3")),
+        *(f"LPT{n}" for n in (*range(1, 10), "\u00b9", "\u00b2", "\u00b3")),
+    }
+)
+
+
+def safe_name(name: object) -> str:
+    """The base name of the device's file name, safe to create here: no
+    folder part, no character a file system refuses, no leading or trailing
+    dot or space, at most UPLOAD_NAME_MAX UTF-8 bytes (the stem cut, a short
+    extension kept), never a device name."""
+    text = name if isinstance(name, str) else ""
+    base = text.replace("\\", "/").rsplit("/", 1)[-1]
+    base = "".join(c for c in base if c.isprintable() and c not in _NAME_FORBIDDEN)
+    base = base.strip(" .")
+    if not base:
+        return "upload.bin"
+    dot = base.rfind(".")
+    suffix = base[dot:] if dot > 0 else ""
+    if len(suffix.encode("utf-8")) > _SUFFIX_MAX_BYTES:
+        suffix = ""
+    stem = base[: len(base) - len(suffix)]
+    budget = UPLOAD_NAME_MAX - len(suffix.encode("utf-8"))
+    if len(stem.encode("utf-8")) > budget:
+        # A cut can land on a space or a dot: neither may end a name.
+        cut = stem.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+        stem = cut.rstrip(" .")
+    base = stem + suffix
+    if base.split(".", 1)[0].rstrip(" ").upper() in _DEVICE_NAMES:
+        return f"_{base}"
+    return base
+
+
+def upload_state(envelope: dict[str, object], inject: bool) -> str:
+    """The relay's word for what ``stage_upload`` made of a pulled file:
+    ``pulled`` when no paste was asked for and the file was saved."""
+    data = envelope.get("data") if envelope.get("ok") is True else None
+    paste = data.get("paste") if isinstance(data, dict) else None
+    if not isinstance(paste, str):
+        return "inject_failed"
+    if paste in _PASTE_STATES:
+        return _PASTE_STATES[paste]
+    return "inject_failed" if inject else "pulled"
+
+
+class _UploadRefused(Exception):
+    """An upload this host will not take: reported ``inject_failed``, and
+    never remembered (the ring and the result cache hold verified ids only)."""
+
+
+@dataclass(frozen=True)
+class _Verified:
+    """An ``upload.ready`` whose key and name opened under a trusted
+    device's d2h key."""
+
+    upload_id: str
+    device_id: str
+    session: str
+    inject: bool
+    url: str
+    cap: int
+    content_key: bytes
+    name: str
+
+
+class UploadPuller:
+    """``upload.ready`` -> verify, download, decrypt, stage, report; one at a
+    time, on its own thread, so a 100 MB pull never stalls the commands.
+
+    An offer is skipped while the same upload is queued or being pulled, and
+    an upload whose id is in the seen ring is only re-reported (its last
+    state; ``pulled`` when a restart lost it), never fetched or pasted
+    again. Otherwise the device must be trusted, ``sizeBytes`` at most the
+    daemon's upload cap plus 64 KiB of framing (or nothing is fetched), and
+    the content key (AAD ``ukey:<id>``) and meta (AAD ``umeta:<id>``) must
+    open under that device's d2h key. The object is streamed from its
+    presigned URL into ``~/.magent/uploads/.incoming/<uploadId>/`` under the
+    same cap and decrypted chunk by chunk (a tampered or cut-short object
+    fails whole). Only then does the id enter the seen ring, in one step
+    with the seen check; it is reported ``pulled``, handed to
+    ``LinkHost.stage_upload``, and its outcome reported: ``injected``,
+    ``inject_pending``, ``inject_failed`` (a paste was asked for and did not
+    happen) or nothing more (none was asked for). Reported states only move
+    forward.
+
+    A refusal is reported ``inject_failed`` and never remembered, so junk
+    under a real id can neither flush the ring nor block the real upload. A
+    download that fails on the way is reported nothing: the relay sends
+    ``upload.ready`` again, with a fresh URL, on the next connect; so is one
+    that a stop cut short. A URL the download refuses, or a file that cannot
+    be written here, is a refusal. The incoming folder is always removed.
+    The presigned URL is never logged.
+    """
+
+    def __init__(self, runner: LinkRunner, client: RelayClient, host: LinkHost) -> None:
+        self._runner = runner
+        self._client = client
+        self._host = host
+        self._lock = threading.Lock()
+        self._inflight: set[str] = set()  # queued or being pulled
+        self._states: collections.OrderedDict[str, str] = collections.OrderedDict()
+        self._queue: queue.Queue[dict[str, object] | None] = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=UPLOAD_THREAD
+        )
+        self._log = get_logger("link")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop and join: at once when idle, else once the pull in flight
+        ends, waiting up to UPLOAD_JOIN_S."""
+        self._stop.set()
+        self._queue.put(None)  # wakes an idle puller at once
+        if self._thread.is_alive():
+            self._thread.join(UPLOAD_JOIN_S)
+            if self._thread.is_alive():
+                self._log.warning("link: the upload puller is still finishing a pull")
+
+    def offer(self, ready: dict[str, object]) -> None:
+        """Take one ``upload.ready``; returns at once (a replay's report
+        aside)."""
+        upload_id = ready.get("uploadId")
+        if not isinstance(upload_id, str) or not _UPLOAD_ID.fullmatch(upload_id):
+            self._log.warning("link: ignoring an upload.ready without a valid id")
+            return
+        with self._lock:
+            if upload_id in self._inflight:
+                return
+            if not self._runner.has_seen(upload_id):
+                self._inflight.add(upload_id)
+                self._queue.put(ready)
+                return
+            state = self._states.get(upload_id, "pulled")
+        self._post(upload_id, state)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                ready = self._queue.get(timeout=UPLOAD_QUEUE_WAIT_S)
+            except queue.Empty:
+                continue
+            if ready is None or self._stop.is_set():
+                continue
+            upload_id = str(ready.get("uploadId"))
+            try:
+                self._pull(upload_id, ready)
+            except Exception:  # noqa: BLE001  # reason: a LinkHost or disk failure ends this pull unreported (the relay resends it on the next connect), never the puller
+                self._log.exception("link: upload %s crashed", upload_id)
+            finally:
+                with self._lock:
+                    self._inflight.discard(upload_id)
+
+    def _pull(self, upload_id: str, ready: dict[str, object]) -> None:
+        """One upload, start to finish. The incoming folder is gone before
+        the final state is reported."""
+        folder = linkfiles.INCOMING_DIR / upload_id
+        try:
+            outcome = self._take(upload_id, ready, folder)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+        if outcome is None:
+            return
+        state, verified = outcome
+        if verified:
+            self._advance(upload_id, state)
+        else:
+            self._post(upload_id, state)
+
+    def _take(
+        self, upload_id: str, ready: dict[str, object], folder: Path
+    ) -> tuple[str, bool] | None:
+        """The state to report, and whether it is a verified upload's (kept,
+        and moving forward only) or a refusal's (posted, never kept); None
+        when a failed download should wait for the relay's resend."""
+        try:
+            verified = self._verify(upload_id, ready)
+            target = self._fetch(verified, folder)
+        except _UploadRefused as refused:
+            self._log.warning("link: refused upload %s: %s", upload_id, refused)
+            return "inject_failed", False
+        if target is None:
+            return None
+        return self._stage(verified, target)
+
+    def _verify(self, upload_id: str, ready: dict[str, object]) -> _Verified:
+        device_id = str(ready.get("deviceId"))
+        peer = self._runner.peer(device_id)
+        if peer is None:
+            raise _UploadRefused("it came from a device this host does not trust")
+        size, url, session = (
+            ready.get("sizeBytes"),
+            ready.get("getUrl"),
+            ready.get("session"),
+        )
+        wrapped, sealed_meta = ready.get("wrappedKey"), ready.get("sealedMeta")
+        if not (
+            isinstance(size, int)
+            and not isinstance(size, bool)
+            and size >= 0
+            and isinstance(url, str)
+            and isinstance(wrapped, str)
+            and isinstance(sealed_meta, str)
+            and isinstance(session, str)
+            and session
+        ):
+            raise _UploadRefused("the upload.ready is malformed")
+        cap = self._host.upload_max_bytes() + UPLOAD_SLACK_BYTES
+        if size > cap:
+            raise _UploadRefused(f"{size} bytes is over this host's {cap}-byte cap")
+        try:
+            content_key = linkcrypto.open_sealed(
+                peer.keys.d2h, wrapped, AAD_UKEY + upload_id
+            )
+            meta = _object(
+                linkcrypto.open_sealed(
+                    peer.keys.d2h, sealed_meta, AAD_UMETA + upload_id
+                ).decode("utf-8")
+            )
+        except (SealError, UnicodeDecodeError) as exc:
+            raise _UploadRefused("its key or name did not decrypt") from exc
+        if len(content_key) != 32 or meta is None:
+            raise _UploadRefused("its key or name is malformed")
+        return _Verified(
+            upload_id=upload_id,
+            device_id=device_id,
+            session=session,
+            inject=ready.get("inject") is True,
+            url=url,
+            cap=cap,
+            content_key=content_key,
+            name=safe_name(meta.get("name")),
+        )
+
+    def _fetch(self, ready: _Verified, folder: Path) -> Path | None:
+        """The decrypted file, or None when the download failed on the way
+        (no result: the relay resends it)."""
+        # safe_name never starts with a dot, so the two never collide.
+        blob, target = folder / ".blob", folder / ready.name
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            with blob.open("wb") as fh:
+                self._client.get_bytes(ready.url, self._sink(fh), max_bytes=ready.cap)
+        except RelayError as exc:
+            if exc.status == 413:
+                raise _UploadRefused(
+                    f"the object is over this host's {ready.cap}-byte cap"
+                ) from exc
+            if exc.code == "invalid_response":
+                # Refused by policy, not lost on the way: a retry would only
+                # be refused again.
+                raise _UploadRefused(f"its download: {exc.message}") from exc
+            self._log.info(
+                "link: upload %s download failed (%s); waiting for a resend",
+                ready.upload_id,
+                exc,
+            )
+            return None
+        except OSError as exc:
+            raise _UploadRefused("it could not be written here") from exc
+        try:
+            with blob.open("rb") as src, target.open("wb") as dst:
+                pieces = iter(lambda: src.read(_READ_CHUNK), b"")
+                for chunk in linkcrypto.iter_decrypt_upload(
+                    ready.content_key, ready.upload_id, pieces
+                ):
+                    dst.write(chunk)
+            blob.unlink()
+        except SealError as exc:
+            raise _UploadRefused(
+                "the object did not decrypt (tampered or cut short)"
+            ) from exc
+        except OSError as exc:
+            # A full disk, or a path past MAX_PATH: never remembered, so a
+            # resend that can be written still goes through.
+            raise _UploadRefused("it could not be written here") from exc
+        return target
+
+    def _sink(self, fh: BinaryIO) -> Callable[[bytes], None]:
+        def sink(data: bytes) -> None:
+            if self._stop.is_set():
+                # Abandoned, never remembered: resent on the next run.
+                raise RelayError(0, "network", "stopping")
+            fh.write(data)
+
+        return sink
+
+    def _stage(self, ready: _Verified, target: Path) -> tuple[str, bool]:
+        """Remember, report ``pulled``, stage: the final state (see _take)."""
+        upload_id = ready.upload_id
+        fresh = self._runner.remember(upload_id)
+        if fresh is None:
+            # Another delivery got here first: reported, never pasted again.
+            with self._lock:
+                return self._states.get(upload_id, "pulled"), False
+        if not fresh:
+            # Unsaved, a restart would not know it was pasted: so it is not.
+            self._log.warning(
+                "link: upload %s not staged: the link state could not be saved",
+                upload_id,
+            )
+            return "inject_failed", True
+        self._advance(upload_id, "pulled")
+        try:
+            envelope = self._host.stage_upload(
+                ready.device_id, ready.session, target, ready.inject
+            )
+        except Exception:  # noqa: BLE001  # reason: a LinkHost failure fails this upload (reported inject_failed), never the puller
+            self._log.exception("link: staging upload %s failed", upload_id)
+            state = "inject_failed"
+        else:
+            state = upload_state(envelope, ready.inject)
+        return state, True
+
+    def _advance(self, upload_id: str, state: str) -> None:
+        if self._record(upload_id, state):
+            self._post(upload_id, state)
+
+    def _record(self, upload_id: str, state: str) -> bool:
+        """Keep ``state`` as the upload's latest; False, and no change, when
+        it would not move it forward."""
+        with self._lock:
+            known = self._states.get(upload_id)
+            if known is not None and _UPLOAD_RANK[state] <= _UPLOAD_RANK[known]:
+                return False
+            self._states[upload_id] = state
+            self._states.move_to_end(upload_id)
+            while len(self._states) > RESULT_CACHE_MAX:
+                self._states.popitem(last=False)
+            return True
+
+    def _post(self, upload_id: str, state: str) -> bool:
+        """POST one upload result; False when the relay did not take it."""
+        result = {"type": "upload", "uploadId": upload_id, "state": state}
+        try:
+            self._client.call("POST", "/v1/host/results", {"results": [result]})
+        except RelayError as exc:
+            self._log.info(
+                "link: upload %s result %s not delivered: %s", upload_id, state, exc
+            )
+            return False
+        return True

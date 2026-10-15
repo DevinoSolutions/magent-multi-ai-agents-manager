@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
 from magent import linkcrypto, linkfiles
-from magent.link import EVENT_THREAD, LinkRunner, _default_client
+from magent.link import EVENT_THREAD, UPLOAD_THREAD, LinkRunner, _default_client
 from magent.linkcrypto import AAD_CMD, AAD_RES, AAD_UKEY, AAD_UMETA, KeyPairs, PairKeys
 from magent.linkfiles import LinkFile, TrustedDevice
 
@@ -39,6 +39,11 @@ OTHER_ID = "0190f3a2-7b1c-7d4e-8a5b-3c2d1e0f9a04"
 def cmd_id(n: int) -> str:
     """The n-th test command id: a canonical v4 UUID, as the relay requires."""
     return f"00000000-0000-4000-8000-{n:012d}"
+
+
+def up_id(n: int) -> str:
+    """The n-th test upload id: a canonical v4 UUID, never a command's."""
+    return f"00000000-0000-4000-a000-{n:012d}"
 
 
 @dataclass(frozen=True)
@@ -416,16 +421,21 @@ def stop_all(timeout: float = 5.0) -> list[Running]:
     return stuck
 
 
-def stray_forwarders(timeout: float = 5.0) -> list[threading.Thread]:
-    """Join every event forwarder thread still running; the ones still alive.
+# The threads a runner starts beside itself, each stopped before run() returns.
+_RUNNER_THREADS = frozenset({EVENT_THREAD, UPLOAD_THREAD})
 
-    A runner stops its forwarder before run() returns, so once stop_all()
-    is done none should be left: one here outlived its runner.
+
+def stray_forwarders(timeout: float = 5.0) -> list[threading.Thread]:
+    """Join every event forwarder and upload puller thread still running;
+    the ones still alive.
+
+    A runner stops both before run() returns, so once stop_all() is done
+    none should be left: one here outlived its runner.
     """
     deadline = time.monotonic() + timeout
     stuck: list[threading.Thread] = []
     for thread in threading.enumerate():
-        if thread.name == EVENT_THREAD:
+        if thread.name in _RUNNER_THREADS:
             thread.join(max(0.0, deadline - time.monotonic()))
             if thread.is_alive():
                 stuck.append(thread)
