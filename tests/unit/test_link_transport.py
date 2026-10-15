@@ -104,6 +104,23 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             time.sleep(1.5)
             return None
+        if self.path in ("/drip", "/drip-open"):
+            # A byte every 0.1 s: never silent for a whole timeout, so only a
+            # deadline on the whole call can end it early. -open has no
+            # Content-Length, so the cut reads as an early end of the body.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            if self.path == "/drip":
+                self.send_header("Content-Length", "40")
+            self.end_headers()
+            try:
+                for _ in range(40):
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                    time.sleep(0.1)
+            except OSError:
+                pass
+            return None
         if self.path == "/created":
             return self._send(201, b'{"ok": true, "data": {}}')
         if self.path == "/sse-big":
@@ -500,6 +517,16 @@ class TestReadBounds:
             "invalid_response",
             "reply too large",
         )
+
+    @pytest.mark.parametrize("path", ["/drip", "/drip-open"])
+    def test_a_dripping_reply_is_cut_at_the_call_deadline(self, server, path):
+        # The timeout bounds the whole call, not each read: a relay that
+        # drips one byte at a time cannot hold the caller past it.
+        started = time.monotonic()
+        with pytest.raises(RelayError) as exc:
+            RelayClient(server, timeout=0.5).call("GET", path)
+        assert (exc.value.status, exc.value.code) == (0, "timeout")
+        assert time.monotonic() - started < 2.5
 
 
 class TestIterSse:

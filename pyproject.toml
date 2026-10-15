@@ -224,4 +224,5 @@ ignore_names = [
   "hdc",          # platform/windows.py: ctypes EnumDisplayMonitors callback positional (required by MONITORENUMPROC)
   "lprect",       # platform/windows.py: ctypes EnumDisplayMonitors callback positional (required by MONITORENUMPROC)
   "lparam",       # platform/windows.py: ctypes EnumDisplayMonitors callback positional (required by MONITORENUMPROC)
+  "file_path",    # link.py: LinkHost.stage_upload Protocol parameter; no src implementation reads it until link_host.py (P2 Task 37), then drop this entry
 ]
