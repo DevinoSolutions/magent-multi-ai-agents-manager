@@ -271,6 +271,21 @@ class TestRateLimit:
         assert slept == [2.0]
         assert self._hits("/busy/1/2") == 2
 
+    def test_a_stopped_sleep_raises_the_429_instead_of_retrying(self, server):
+        # The runner's stop-aware sleep returns True once it is stopping: the
+        # 429 stands, and nothing is retried back to back.
+        slept: list[float] = []
+
+        def stopped(seconds: float) -> bool:
+            slept.append(seconds)
+            return True
+
+        with pytest.raises(RelayError) as exc:
+            RelayClient(server, sleep=stopped).call("POST", "/busy/1/2", {"a": 1})
+        assert (exc.value.status, exc.value.retry_after) == (429, 2.0)
+        assert slept == [2.0]
+        assert self._hits("/busy/1/2") == 1
+
     def test_a_429_without_retry_after_backs_off_with_jitter(self, server):
         slept: list[float] = []
         RelayClient(server, sleep=slept.append).call("GET", "/busy/2/none")

@@ -4,7 +4,8 @@ The transport first: a stdlib http.client client for the relay's
 ``/v1/host/*`` routes (every reply is the daemon envelope, contract C1), an SSE
 parser for ``/v1/stream/host`` (C5), the reconnect backoff and the seen-id
 ring. Then LinkRunner, the serve thread built on it: the relay connection,
-the snapshot, and the commands paired devices send.
+the snapshot, and the commands paired devices send. Last, EventForwarder,
+the runner's second thread: the daemon's events, sealed per device.
 
 Outbound only: the relay never connects to this machine. MD013 keeps this
 module the only new code that opens an outbound HTTP connection.
@@ -29,7 +30,7 @@ from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlsplit
 
 from magent import linkcrypto, linkfiles
-from magent.linkcrypto import AAD_CMD, AAD_RES, AAD_SNAP, SealError
+from magent.linkcrypto import AAD_CMD, AAD_EVT, AAD_RES, AAD_SNAP, SealError
 from magent.linkfiles import SEEN_MAX, LinkState
 from magent.log import get_logger
 
@@ -373,7 +374,8 @@ class RelayClient:
         client's for this call (the long-poll path passes its own), and
         ``retries`` its 429 retries (0: raise the first 429 at once, for a
         caller that keeps its own clock). ``timeout`` is also each attempt's
-        total deadline (see _exchange).
+        total deadline (see _exchange). A ``sleep`` that returns True (a
+        stop-aware wait cut short) ends the retries: the 429 is raised.
         """
         payload = (
             None
@@ -395,7 +397,10 @@ class RelayClient:
             if status != 429 or attempt >= limit or too_long:
                 return _decode(status, raw, retry_after=retry_after)
             attempt += 1
-            self._sleep(backoff.next_delay() if retry_after is None else retry_after)
+            delay = backoff.next_delay() if retry_after is None else retry_after
+            if self._sleep(delay) is True:
+                # The caller is stopping: the 429 stands, no retry back to back.
+                return _decode(status, raw, retry_after=retry_after)
 
     def stream(
         self, path: str, *, read_timeout: float = 60.0
@@ -804,6 +809,9 @@ class LinkRunner:
         self._last_connected: float | None = None
         self._frames = 0
         self._warned_bad_file = False
+        # put_snapshot runs on the runner and on the event forwarder (a
+        # reset): one at a time, so an older read never lands last.
+        self._snapshot_lock = threading.Lock()
 
     # -- the loop ------------------------------------------------------------
 
@@ -819,7 +827,7 @@ class LinkRunner:
                     if sleep(IDLE_RECHECK_S):
                         break
                     continue
-                return self._connect_loop(client, stop, sleep)
+                return self._run_linked(client, stop, sleep)
             except linkcrypto.LinkCryptoUnavailable:
                 self._log.warning(
                     "link: the link needs the cryptography package: %s",
@@ -848,6 +856,18 @@ class LinkRunner:
                     exc,
                 )
             return None
+
+    def _run_linked(
+        self, client: RelayClient, stop: threading.Event, sleep: Callable[[float], bool]
+    ) -> str:
+        """The connection loop, with the event forwarder beside it for as long
+        as it runs, however it ends."""
+        forwarder = EventForwarder(self, client, self._host.subscribe)
+        forwarder.start()
+        try:
+            return self._connect_loop(client, stop, sleep)
+        finally:
+            forwarder.stop()
 
     def _connect_loop(
         self, client: RelayClient, stop: threading.Event, sleep: Callable[[float], bool]
@@ -1215,27 +1235,34 @@ class LinkRunner:
         return linkfiles.load_link(self._link_path)
 
     def put_snapshot(self, client: RelayClient) -> None:
-        """PUT /v1/host/snapshot: routing metadata, plus the rows sealed per device."""
-        rows, daemon = self._host.snapshot()
-        plain = json.dumps({"sessions": rows}, separators=(",", ":")).encode("utf-8")
-        with self._lock:
-            host_id = self._link.host_id if self._link is not None else ""
-        metas = [m for m in (session_meta(r) for r in rows) if m is not None]
-        body = {
-            "daemon": {
-                key: _daemon_field(daemon.get(key))
-                for key in ("version", "platform", "epoch")
-            },
-            "remoteControl": self._host.remote_control() is True,
-            "uploadMaxBytes": max(1, self._host.upload_max_bytes()),
-            "sessions": metas[:SNAPSHOT_SESSIONS_MAX],
-            "sealed": self.seal_for_devices(plain, AAD_SNAP + host_id),
-        }
-        client.call("PUT", "/v1/host/snapshot", body)
+        """PUT /v1/host/snapshot: routing metadata, plus the rows sealed per
+        device. Serialised, the read with its PUT: two threads put snapshots."""
+        with self._snapshot_lock:
+            rows, daemon = self._host.snapshot()
+            plain = json.dumps({"sessions": rows}, separators=(",", ":")).encode()
+            host_id = self.host_id
+            metas = [m for m in (session_meta(r) for r in rows) if m is not None]
+            body = {
+                "daemon": {
+                    key: _daemon_field(daemon.get(key))
+                    for key in ("version", "platform", "epoch")
+                },
+                "remoteControl": self._host.remote_control() is True,
+                "uploadMaxBytes": max(1, self._host.upload_max_bytes()),
+                "sessions": metas[:SNAPSHOT_SESSIONS_MAX],
+                "sealed": self.seal_for_devices(plain, AAD_SNAP + host_id),
+            }
+            client.call("PUT", "/v1/host/snapshot", body)
 
     def online(self) -> bool:
         with self._lock:
             return self._state == "online"
+
+    @property
+    def host_id(self) -> str:
+        """The linked host's id ("" before a link is loaded)."""
+        with self._lock:
+            return self._link.host_id if self._link is not None else ""
 
     def seal_for_devices(self, plaintext: bytes, aad: str) -> dict[str, str]:
         """``plaintext`` sealed once per trusted device, with its h2d key."""
@@ -1347,3 +1374,249 @@ def _delay(backoff: Backoff, error: RelayError | None) -> float:
     if error.retry_after is not None:
         return max(delay, min(error.retry_after, RETRY_AFTER_MAX_S))
     return delay
+
+
+# --- Event forwarding (spec 4.1) ----------------------------------------------
+
+EVENT_THREAD = "magent-relay-events"
+EVENT_BATCH_S = 0.25  # events arriving this close together share one POST
+EVENT_IDLE_WAIT_S = 1.0  # how long one quiet read blocks (bounds the stop latency)
+EVENTS_MAX_BYTES = 256 * 1024  # the relay's cap on one POST /v1/host/events body
+EVENTS_MAX = 500  # ...and on the events in it
+EVENT_FIELD_MAX = 64  # daemonEventId and type, as the relay takes them
+EVENT_RETRY_BASE_S = 1.0  # the backoff after a LinkHost.subscribe or feed failure
+EVENT_RETRY_CAP_S = 60.0
+EVENT_JOIN_S = 5.0  # how long stop() waits for a post in flight
+_EVENTS_FRAME = len('{"events":[]}')
+# Read by the forwarder, never sent: ``hello`` opens a feed, and ``reset``
+# (the feed lost events) is answered with a fresh snapshot instead.
+_LOCAL_ONLY_EVENTS = frozenset({"hello", "reset"})
+# The types whose meta feeds the relay's session mirror (C4): they carry the
+# same routing fields the snapshot already sends in the clear, camelCase. A
+# field the event does not carry is left out (the mirror keeps its value); a
+# state it carries but the mirror cannot take is sent as null.
+_SESSION_ROUTING_EVENTS = frozenset({"session.added", "session.state"})
+_SESSION_STATE_FIELDS = (
+    ("hook_state", "hookState"),
+    ("pane_state", "paneState"),
+    ("node_state", "nodeState"),
+)
+
+
+def event_meta(event: dict[str, object]) -> dict[str, object]:
+    """The routing-only fields of a daemon event the relay may read: the
+    session it is about; for ``session.added`` and ``session.state`` the
+    SessionMeta fields it carries for the relay's session mirror (name, live
+    and the three states, bounded as in the snapshot); for ``attention``,
+    whether it should page and why.
+    Never pane text, paths, models or anything else from ``data``."""
+    raw = event.get("data")
+    data = raw if isinstance(raw, dict) else {}
+    meta: dict[str, object] = {}
+    session = data.get("session")
+    if isinstance(session, str):
+        meta["session"] = session
+    kind = event.get("type")
+    if kind in _SESSION_ROUTING_EVENTS:
+        name = data.get("name")
+        if isinstance(name, str):
+            meta["name"] = name[:SESSION_NAME_MAX]
+        if "live" in data:
+            meta["live"] = data["live"] is True  # as the snapshot maps it
+        for key, wire in _SESSION_STATE_FIELDS:
+            if key in data:
+                meta[wire] = _state_text(data[key])
+    elif kind == "attention":
+        if isinstance(data.get("fire"), bool):
+            meta["fire"] = data["fire"]
+        if isinstance(data.get("hook_state"), str):
+            meta["hookState"] = _state_text(data["hook_state"])
+    return meta
+
+
+def _event_field(value: object) -> bool:
+    return isinstance(value, str) and 1 <= len(value) <= EVENT_FIELD_MAX
+
+
+class EventForwarder:
+    """Daemon events to ``POST /v1/host/events``, on its own thread.
+
+    Events arriving within 250 ms share a batch; a batch is split so no POST
+    holds over 500 events or 256 KiB, and one event too big on its own is
+    dropped with a warning. Each event is sealed once per trusted device (h2d
+    key, AAD ``evt:<hostId>:<eventId>``); the relay sees only ``event_meta``.
+    A ``reset`` from the daemon (its ring moved on without us) re-PUTs the
+    snapshot instead. A batch that fails to post, or arrives while the link
+    is not online, is dropped, and a dropped batch is repaired by a snapshot
+    re-PUT as soon as the link can post: with the next batch, or on the next
+    quiet read (a failed repair backs off). A 429 is waited out inside the
+    call, through the runner's sleep; one whose Retry-After is past the
+    client's cap drops every batch until it has passed (at most
+    RETRY_AFTER_MAX_S), and the repair waits for it too.
+
+    ``subscribe`` (LinkHost.subscribe) is called on the thread: a failing
+    subscribe or feed backs off and is tried again, like any LinkHost
+    failure, and only the first of a run of failures logs a traceback.
+    """
+
+    def __init__(
+        self,
+        runner: LinkRunner,
+        client: RelayClient,
+        subscribe: Callable[[], EventFeed],
+    ) -> None:
+        self._runner = runner
+        self._client = client
+        self._subscribe = subscribe
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=EVENT_THREAD
+        )
+        self._log = get_logger("link")
+        self._backoff = Backoff(base=EVENT_RETRY_BASE_S, cap=EVENT_RETRY_CAP_S)
+        self._hold_until = 0.0
+        self._failing = False
+        self._resync = False  # a batch was dropped: re-PUT the snapshot
+        self._repair_after = 0.0
+        self._repair_backoff = Backoff(base=EVENT_RETRY_BASE_S, cap=EVENT_RETRY_CAP_S)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop and join: within one quiet read (EVENT_IDLE_WAIT_S), or the
+        post in flight, up to EVENT_JOIN_S."""
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(EVENT_IDLE_WAIT_S + EVENT_JOIN_S)
+            if self._thread.is_alive():
+                self._log.warning("link: the event forwarder is still finishing a post")
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            feed: EventFeed | None = None
+            try:
+                feed = self._subscribe()
+                self._pump(feed)
+            except Exception:  # noqa: BLE001  # reason: a LinkHost failure (subscribe, the feed) backs off and retries; it must never end the forwarder, nor the link
+                self._failed("link: the daemon's event feed failed")
+                if self._stop.wait(self._backoff.next_delay()):
+                    break
+            finally:
+                if feed is not None:
+                    with contextlib.suppress(Exception):
+                        feed.close()
+
+    def _pump(self, feed: EventFeed) -> None:
+        """Read, batch and send until stopped."""
+        while not self._stop.is_set():
+            batch = feed.next_batch(EVENT_IDLE_WAIT_S)
+            if not batch:
+                if (
+                    self._resync
+                    and time.monotonic() >= self._repair_after
+                    and self._runner.online()
+                ):
+                    self._send_logged([])  # the repair: just the snapshot
+                continue
+            deadline = time.monotonic() + EVENT_BATCH_S
+            while not self._stop.is_set() and (left := deadline - time.monotonic()) > 0:
+                batch.extend(feed.next_batch(left))
+            if not self._stop.is_set():
+                self._send_logged(batch)
+
+    def _send_logged(self, batch: list[dict[str, object]]) -> None:
+        try:
+            self.send(batch)
+        except Exception:  # noqa: BLE001  # reason: a batch that cannot be sealed or re-snapshotted (a LinkHost failure) is dropped like a failed post; the forwarder goes on
+            self._failed("link: dropped an event batch")
+            self._dropped(failed=True)
+        else:
+            self._failing = False
+            self._backoff.reset()
+
+    def _failed(self, message: str) -> None:
+        """The first failure of a run logs its traceback; the rest one line."""
+        if self._failing:
+            self._log.warning("%s (again)", message)
+        else:
+            self._failing = True
+            self._log.exception("%s", message)
+
+    def _dropped(self, *, failed: bool = False) -> None:
+        """A batch was lost: the next post that can repairs it with a fresh
+        snapshot. ``failed``: the relay or the host failed, so the repair
+        on a quiet read backs off."""
+        self._resync = True
+        if failed:
+            self._repair_after = time.monotonic() + self._repair_backoff.next_delay()
+
+    def send(self, batch: list[dict[str, object]]) -> None:
+        """Seal, split and post one batch; re-snapshot on a reset, or when an
+        earlier batch was dropped (``[]`` is the repair alone)."""
+        events = [e for e in batch if isinstance(e, dict)]
+        if not self._runner.online():
+            if events:
+                self._dropped()
+            return
+        if time.monotonic() < self._hold_until:
+            self._log.debug("link: rate limited; dropped %d events", len(events))
+            self._dropped()
+            return
+        reset = self._resync or any(e.get("type") == "reset" for e in events)
+        sealed = [
+            self._sealed(e) for e in events if e.get("type") not in _LOCAL_ONLY_EVENTS
+        ]
+        try:
+            for chunk in self._chunks([e for e in sealed if e is not None]):
+                self._client.call("POST", "/v1/host/events", {"events": chunk})
+            if reset:
+                self._runner.put_snapshot(self._client)
+                self._resync = False
+                self._repair_backoff.reset()
+        except RelayError as exc:
+            if exc.status == 429:
+                wait = min(exc.retry_after or 0.0, RETRY_AFTER_MAX_S)
+                self._hold_until = time.monotonic() + wait
+            self._log.info("link: dropped an event batch: %s", exc)
+            self._dropped(failed=True)
+
+    def _sealed(self, event: dict[str, object]) -> dict[str, object] | None:
+        event_id, kind = event.get("id"), event.get("type")
+        if not (_event_field(event_id) and _event_field(kind)):
+            self._log.warning("link: dropped an event the relay would refuse")
+            return None
+        plain = json.dumps(event, separators=(",", ":")).encode("utf-8")
+        aad = f"{AAD_EVT}{self._runner.host_id}:{event_id}"
+        return {
+            "daemonEventId": event_id,
+            "type": kind,
+            "meta": event_meta(event),
+            "sealed": self._runner.seal_for_devices(plain, aad),
+        }
+
+    def _chunks(self, events: list[dict[str, object]]) -> list[list[dict[str, object]]]:
+        chunks: list[list[dict[str, object]]] = []
+        current: list[dict[str, object]] = []
+        size = _EVENTS_FRAME
+        for item in events:
+            item_size = len(json.dumps(item, separators=(",", ":")).encode("utf-8")) + 1
+            if _EVENTS_FRAME + item_size > EVENTS_MAX_BYTES:
+                self._log.warning(
+                    "link: dropped event %s (%s): %d bytes is over the %d-byte batch cap",
+                    item["daemonEventId"],
+                    item["type"],
+                    item_size,
+                    EVENTS_MAX_BYTES,
+                )
+                continue
+            if current and (
+                size + item_size > EVENTS_MAX_BYTES or len(current) >= EVENTS_MAX
+            ):
+                chunks.append(current)
+                current, size = [], _EVENTS_FRAME
+            current.append(item)
+            size += item_size
+        if current:
+            chunks.append(current)
+        return chunks

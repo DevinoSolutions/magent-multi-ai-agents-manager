@@ -30,6 +30,7 @@ from tests.unit._link_fakes import (
     open_result,
     save_linked,
     stop_all,
+    stray_forwarders,
     write_link,
 )
 
@@ -37,9 +38,10 @@ from tests.unit._link_fakes import (
 @pytest.fixture(autouse=True)
 def _no_runner_outlives_its_test():
     """Torn down last (autouse), after the relay: a test that failed before
-    finish() leaves no runner thread behind."""
+    finish() leaves no runner thread, and no event forwarder, behind."""
     yield
     assert stop_all() == [], "a link runner did not stop"
+    assert stray_forwarders() == [], "an event forwarder did not stop"
 
 
 @pytest.fixture
