@@ -6,11 +6,20 @@ import json
 import os
 import threading
 import time
+from datetime import datetime
 
 import pytest
 
 from magent import config_io, projects, psmux
 from magent.lockfile import LockHeld, persistent_lock
+
+
+class _OneInstant(datetime):
+    """A clock stuck on one microsecond, as Windows' can be between calls."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return datetime(2026, 10, 15, 12, 0, 0, tzinfo=tz)
 
 
 @pytest.fixture
@@ -73,6 +82,35 @@ class TestConfigIo:
         made = [config_io.backup(cfg, keep=10) for _ in range(5)]
         assert made == sorted(made)
         assert sorted(config_io.backups_dir().glob("config-*.json")) == made
+
+    def test_one_clock_tick_never_overwrites_a_backup(self, cfg, monkeypatch):
+        # Windows' clock can return the same microsecond twice in a row; the
+        # second backup used to land on the first one's name and replace it.
+        monkeypatch.setattr(config_io, "datetime", _OneInstant)
+        made = []
+        for n in range(5):
+            cfg.write_text(json.dumps({"version": 4, "n": n}), encoding="utf-8")
+            made.append(config_io.backup(cfg, keep=10))
+        assert len(set(made)) == 5
+        assert made == sorted(made)
+        assert sorted(config_io.backups_dir().glob("config-*.json")) == made
+        written = [json.loads(p.read_text(encoding="utf-8"))["n"] for p in made]
+        assert written == [0, 1, 2, 3, 4]
+
+    def test_a_name_another_process_took_is_stepped_past(self, cfg, monkeypatch):
+        # The exclusive create is the cross-process half: a file that appears
+        # between the newest-stamp read and the write is never replaced.
+        monkeypatch.setattr(config_io, "datetime", _OneInstant)
+        monkeypatch.setattr(config_io, "_newest_stamp", lambda folder, prefix: None)
+        folder = config_io.backups_dir()
+        folder.mkdir(parents=True)
+        taken = folder / f"{config_io.backup_prefix(cfg)}20261015T120000000000Z.json"
+        taken.write_bytes(b"theirs")
+        made = config_io.backup(cfg, keep=10)
+        assert made is not None
+        assert made.name == f"{config_io.backup_prefix(cfg)}20261015T120000000001Z.json"
+        assert taken.read_bytes() == b"theirs"
+        assert made.read_bytes() == cfg.read_bytes()
 
     def test_each_config_file_keeps_its_own_backups(self, cfg, tmp_path):
         other = tmp_path / "other.json"
