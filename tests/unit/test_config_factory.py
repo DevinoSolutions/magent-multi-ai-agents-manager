@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from magent import config_io
+from magent.cli import main
 from magent.config import (
     _MIGRATIONS,
     DEFAULT_TOOLS,
@@ -18,7 +20,7 @@ from magent.config import (
     default_config,
     layout_to_dict,
     load_config,
-    migrate_config_file,
+    migrate_config_text,
     migrate_raw,
     settings_to_dict,
 )
@@ -94,105 +96,168 @@ class TestSingleSourceSettingsBlock:
         assert generated["layout"] == discovered["layout"] == factory["layout"]
 
 
-class TestMigrateConfigFile:
-    def test_migrate_stamps_version_and_persists_colors(self, tmp_config):
-        path = tmp_config(
-            {
-                "projects": [{"path": "api"}, {"path": "web", "color": "#123456"}],
-            }
-        )
+class TestMigrateConfigText:
+    """The pure half of ``magent config migrate``: text in, migrated dict and
+    a changed flag out, nothing on disk."""
 
-        changed = migrate_config_file(path)
+    def test_migrate_stamps_version_and_backfills_colors(self):
+        raw, changed = migrate_config_text(
+            json.dumps(
+                {"projects": [{"path": "api"}, {"path": "web", "color": "#123456"}]}
+            )
+        )
 
         assert changed is True
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        assert data["version"] == SCHEMA_VERSION
-        assert all("color" in p for p in data["projects"])
-        assert data["projects"][1]["color"] == "#123456"  # pre-existing color untouched
+        assert raw["version"] == SCHEMA_VERSION
+        projects = raw["projects"]
+        assert isinstance(projects, list)
+        assert all("color" in p for p in projects)
+        assert projects[1]["color"] == "#123456"  # pre-existing color untouched
 
-        # A subsequent load_config must still write nothing (R10 stays pure
-        # even for a file migrate just persisted to).
-        before = Path(path).read_bytes()
-        load_config(path)
-        after = Path(path).read_bytes()
-        assert before == after
-
-    def test_migrate_1_to_2_materializes_attention(self, tmp_config):
-        path = tmp_config(
-            {
-                "version": 1,
-                "settings": {"defaultTool": "claude"},
-                "projects": [{"path": "api", "color": "#111111"}],
-            }
+    def test_migrate_1_to_2_materializes_attention(self):
+        raw, changed = migrate_config_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "settings": {"defaultTool": "claude"},
+                    "projects": [{"path": "api", "color": "#111111"}],
+                }
+            )
         )
 
-        assert migrate_config_file(path) is True
-
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        assert data["version"] == SCHEMA_VERSION
-        assert data["settings"]["attention"] == {
+        assert changed is True
+        assert raw["version"] == SCHEMA_VERSION
+        settings = raw["settings"]
+        assert isinstance(settings, dict)
+        assert settings["attention"] == {
             "badge": True,
             "flash": True,
             "toast": False,
             "ntfy": False,
         }
 
-    def test_migrate_is_idempotent(self, tmp_config):
+    def test_migrate_is_idempotent(self):
+        current = {
+            "version": SCHEMA_VERSION,
+            "projects": [{"path": "api", "color": "#111111"}],
+        }
+        raw, changed = migrate_config_text(json.dumps(current))
+        assert changed is False
+        assert raw == current
+
+    def test_migrate_keeps_unknown_keys(self):
+        raw, _changed = migrate_config_text(
+            json.dumps({"projects": [], "settings": {"someFutureKey": 1}})
+        )
+        settings = raw["settings"]
+        assert isinstance(settings, dict)
+        assert settings["someFutureKey"] == 1
+
+    def test_migrate_invalid_json_raises(self):
+        with pytest.raises(ConfigError, match="valid JSON"):
+            migrate_config_text("not json{{{")
+
+    @pytest.mark.parametrize("color", [None, "#22c55e"], ids=["colorless", "colored"])
+    def test_migrate_refuses_text_with_no_utf8_form(self, color):
+        # F-SUR-1: the same refusal load_config gives, before migrate's own
+        # color hash (colorless: it used to raise the codec's words).
+        project: dict[str, object] = {"path": "api", "title": "api\ud83d"}
+        if color:
+            project["color"] = color
+        with pytest.raises(ConfigError) as exc:
+            migrate_config_text(json.dumps({"projects": [project]}))
+        assert str(exc.value) == (
+            "projects[0].title has text with no UTF-8 form (UnicodeEncodeError):"
+            " 'api\\ud83d'"
+        )
+
+    def test_migrate_refuses_before_it_reshapes_anything(self):
+        # The refusal names the field the FILE holds. A v2 legacy window is a
+        # bare string; checked after migrate_raw, it would be named by its v3
+        # shape, projects[0].windows[0].name, which the file does not contain.
+        with pytest.raises(ConfigError) as exc:
+            migrate_config_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "projects": [{"path": "api", "windows": ["x\ud83d"]}],
+                    }
+                )
+            )
+        assert str(exc.value) == (
+            "projects[0].windows[0] has text with no UTF-8 form (UnicodeEncodeError):"
+            " 'x\\ud83d'"
+        )
+
+
+class TestConfigMigrateCommand:
+    """``magent config migrate``: the disk half, written through
+    ``config_io.save`` (validated, backed up, atomic) under the config lock."""
+
+    def test_migrate_writes_the_file_and_a_backup(self, runner, tmp_config):
+        path = tmp_config(
+            {"projects": [{"path": "api"}, {"path": "web", "color": "#123456"}]}
+        )
+        before = Path(path).read_bytes()
+
+        result = runner.invoke(main, ["--config", path, "config", "migrate"])
+
+        assert result.exit_code == 0, result.output
+        assert "Migrated" in result.output
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        assert data["version"] == SCHEMA_VERSION
+        assert all("color" in p for p in data["projects"])
+        [backup] = config_io.backups_dir().glob("config-*.json")
+        assert backup.read_bytes() == before
+
+        # A subsequent load_config must still write nothing (R10 stays pure
+        # even for a file migrate just persisted to).
+        written = Path(path).read_bytes()
+        load_config(path)
+        assert Path(path).read_bytes() == written
+
+    def test_a_current_file_is_left_alone(self, runner, tmp_config):
         path = tmp_config(
             {
                 "version": SCHEMA_VERSION,
                 "projects": [{"path": "api", "color": "#111111"}],
             }
         )
-        assert migrate_config_file(path) is False
+        before = Path(path).read_bytes()
+        result = runner.invoke(main, ["--config", path, "config", "migrate"])
+        assert result.exit_code == 0, result.output
+        assert "Already up to date" in result.output
+        assert Path(path).read_bytes() == before
+        assert not list(config_io.backups_dir().glob("config-*.json"))
 
-    def test_migrate_file_not_found_raises(self):
-        with pytest.raises(FileNotFoundError):
-            migrate_config_file("/nonexistent/config.json")
+    def test_a_missing_file_is_an_error(self, runner, tmp_path):
+        absent = str(tmp_path / "absent.json")
+        result = runner.invoke(main, ["--config", absent, "config", "migrate"])
+        assert result.exit_code == 1
+        assert "Config file not found" in result.output
 
-    def test_migrate_invalid_json_raises(self, tmp_path):
-        p = tmp_path / "bad.json"
-        p.write_text("not json{{{")
-        with pytest.raises(ConfigError, match="valid JSON"):
-            migrate_config_file(str(p))
-
-    @pytest.mark.parametrize("color", [None, "#22c55e"], ids=["colorless", "colored"])
-    def test_migrate_refuses_text_with_no_utf8_form_and_writes_nothing(
-        self, tmp_config, color
+    def test_text_with_no_utf8_form_is_refused_and_nothing_is_written(
+        self, runner, tmp_config
     ):
-        # F-SUR-1: the same refusal load_config gives, before migrate's own
-        # color hash (colorless: it used to raise the codec's words) and before
-        # its write (colored: it used to stamp the version onto the file).
-        project: dict[str, object] = {"path": "api", "title": "api\ud83d"}
-        if color:
-            project["color"] = color
-        path = tmp_config({"projects": [project]})
+        path = tmp_config({"projects": [{"path": "api", "title": "api\ud83d"}]})
         before = Path(path).read_bytes()
-        with pytest.raises(ConfigError) as exc:
-            migrate_config_file(path)
-        assert str(exc.value) == (
-            "projects[0].title has text with no UTF-8 form (UnicodeEncodeError):"
-            " 'api\\ud83d'"
-        )
+        result = runner.invoke(main, ["--config", path, "config", "migrate"])
+        assert result.exit_code == 1
+        assert "no UTF-8 form" in result.output
         assert Path(path).read_bytes() == before
 
-    def test_migrate_refuses_before_it_reshapes_anything(self, tmp_config):
-        # The refusal names the field the FILE holds. A v2 legacy window is a
-        # bare string; checked after migrate_raw, it would be named by its v3
-        # shape, projects[0].windows[0].name, which the file does not contain.
+    def test_a_migration_that_still_would_not_load_is_refused(self, runner, tmp_config):
+        # The migrated text is validated like every other config write: a
+        # config the loader refuses (an unknown node) is not stamped current.
         path = tmp_config(
-            {"version": 2, "projects": [{"path": "api", "windows": ["x\ud83d"]}]}
+            {"version": 3, "projects": [{"path": "api", "node": "nosuchnode"}]}
         )
         before = Path(path).read_bytes()
-        with pytest.raises(ConfigError) as exc:
-            migrate_config_file(path)
-        assert str(exc.value) == (
-            "projects[0].windows[0] has text with no UTF-8 form (UnicodeEncodeError):"
-            " 'x\\ud83d'"
-        )
+        result = runner.invoke(main, ["--config", path, "config", "migrate"])
+        assert result.exit_code == 1
+        assert "Error:" in result.output
         assert Path(path).read_bytes() == before
+        assert not list(config_io.backups_dir().glob("config-*.json"))
 
 
 class TestMigrate2To3Windows:
@@ -326,9 +391,10 @@ class TestMigrateToFour:
     def test_an_unversioned_config_reaches_four(self):
         assert migrate_raw({"projects": []})["version"] == 4
 
-    def test_migrating_a_v3_file_stamps_four_on_disk(self, tmp_config):
+    def test_migrating_a_v3_file_stamps_four_on_disk(self, runner, tmp_config):
         path = tmp_config(
             {"version": 3, "projects": [{"path": "api", "color": "#123456"}]}
         )
-        assert migrate_config_file(path) is True
+        result = runner.invoke(main, ["--config", path, "config", "migrate"])
+        assert result.exit_code == 0, result.output
         assert json.loads(Path(path).read_text(encoding="utf-8"))["version"] == 4

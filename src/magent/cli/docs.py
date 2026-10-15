@@ -470,6 +470,24 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         ),
     ),
     (
+        "magent sessions --v1",
+        (
+            "Print the `/api/v1/sessions?fresh=1` envelope and exit: every "
+            "SessionRow field, hook state and pane state both, the same JSON the "
+            "HTTP route answers. A missing config is an empty list; an "
+            "unreadable (broken) one is an `unavailable` error envelope, exit 1."
+        ),
+    ),
+    (
+        "magent status --v1",
+        (
+            "Print the `/api/v1/status` envelope (`status --json`'s payload under "
+            "`data`) and exit; `--json` keeps its legacy shape until 4.0. Exit "
+            "codes as `status`: an unreadable config is an `unavailable` error "
+            "envelope, exit 1."
+        ),
+    ),
+    (
         "magent send <session> <text>",
         (
             "Paste a prompt into one running agent and press Enter, then confirm it "
@@ -479,7 +497,8 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "one line at a time. `--wait-idle` holds until the agent is between "
             "turns and `--compact` runs `/compact` first, both bounded by "
             "`--timeout` (180s). Exit 2 no such live session, 3 psmux error, 4 the "
-            "send went unconfirmed or the session never went idle."
+            "send went unconfirmed or the session never went idle. `--json` prints "
+            "the `/api/v1` envelope `POST /sessions/<s>/send` answers, same exit codes."
         ),
     ),
     (
@@ -489,7 +508,9 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "then re-read the pane footer to verify the switch took. `--effort` "
             "sets reasoning effort too; `--all` does every live session. A busy "
             "session is retried until `--max-minutes` runs out, and abandoned after "
-            "3 failed attempts. Exit 4 if any session's switch went unconfirmed."
+            "3 failed attempts. Exit 4 if any session's switch went unconfirmed. "
+            "`--json` (one session) prints the last attempt's `/api/v1` result, or "
+            "its refusal when no attempt produced one."
         ),
     ),
     (
@@ -497,7 +518,28 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         (
             "Print the last lines of a session's pane, a read-only glance (`-n` for "
             "how many). Safe to redirect: glyphs this console cannot encode become "
-            "`?` rather than crashing."
+            "`?` rather than crashing. `--json` prints the `/api/v1` pane envelope "
+            "(`text`, `timed_out`, `captured_at`) instead."
+        ),
+    ),
+    (
+        "magent choose <session> <n>",
+        (
+            "Answer the numbered dialog on a session's screen (a permission prompt, "
+            "a menu) with option N, 1-9. The digit is pressed alone, without Enter, "
+            "and only while the pane reads as a dialog, so a digit can never land "
+            "in a half-typed prompt. Exit 2 when no dialog is showing, 4 when the "
+            "dialog is still up afterwards. `--json` prints the `/api/v1` envelope "
+            "`POST /sessions/<s>/choose` answers."
+        ),
+    ),
+    (
+        "magent interrupt <session>",
+        (
+            "Press Escape in a session: Claude Code's interrupt for a running turn. "
+            "The same keystroke as the desktop app's stop button; nothing is typed. "
+            "`--json` prints the `/api/v1` envelope `POST /sessions/<s>/interrupt` "
+            "answers."
         ),
     ),
     (
