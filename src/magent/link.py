@@ -716,8 +716,26 @@ def _api_path(path: str) -> bool:
     )
 
 
+def utf16_len(text: str) -> int:
+    """``text``'s length as the relay counts it: UTF-16 code units, so a
+    character outside the Basic Multilingual Plane (an emoji) counts two."""
+    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
+
+
+def utf16_cut(text: str, limit: int) -> str:
+    """``text`` cut to at most ``limit`` UTF-16 code units (the relay's
+    measure), never through the middle of a surrogate pair: a character that
+    would not fit whole is left out."""
+    units = 0
+    for i, ch in enumerate(text):
+        units += 2 if ord(ch) > 0xFFFF else 1
+        if units > limit:
+            return text[:i]
+    return text
+
+
 def _state_text(value: object) -> str | None:
-    if isinstance(value, str) and len(value) <= SESSION_STATE_MAX:
+    if isinstance(value, str) and utf16_len(value) <= SESSION_STATE_MAX:
         return value
     return None
 
@@ -725,15 +743,16 @@ def _state_text(value: object) -> str | None:
 def session_meta(row: dict[str, object]) -> dict[str, object] | None:
     """The routing-only view of a SessionRow the relay may read (C4), or None
     for a row the relay would refuse (its id is not a session id). Values
-    past the relay's bounds are cut (a name) or dropped (a state); the full
-    row still reaches the devices, sealed."""
+    past the relay's bounds are cut (a name) or dropped (a state), measured
+    as the relay counts, in UTF-16 code units; the full row still reaches the
+    devices, sealed."""
     session = row.get("session")
     if not isinstance(session, str) or not _SESSION_ID.fullmatch(session):
         return None
     name = row.get("name")
     return {
         "session": session,
-        "name": name[:SESSION_NAME_MAX] if isinstance(name, str) else "",
+        "name": utf16_cut(name, SESSION_NAME_MAX) if isinstance(name, str) else "",
         "live": row.get("live") is True,
         "hookState": _state_text(row.get("hook_state")),
         "paneState": _state_text(row.get("pane_state")),
@@ -742,9 +761,10 @@ def session_meta(row: dict[str, object]) -> dict[str, object] | None:
 
 
 def _daemon_field(value: object) -> str:
-    """1-32 characters, as the relay takes ``daemon.*``."""
+    """1-32 characters, as the relay takes ``daemon.*`` (it counts UTF-16
+    code units)."""
     if isinstance(value, str) and value:
-        return value[:DAEMON_FIELD_MAX]
+        return utf16_cut(value, DAEMON_FIELD_MAX)
     return "unknown"
 
 
@@ -1420,7 +1440,7 @@ def event_meta(event: dict[str, object]) -> dict[str, object]:
     if kind in _SESSION_ROUTING_EVENTS:
         name = data.get("name")
         if isinstance(name, str):
-            meta["name"] = name[:SESSION_NAME_MAX]
+            meta["name"] = utf16_cut(name, SESSION_NAME_MAX)
         if "live" in data:
             meta["live"] = data["live"] is True  # as the snapshot maps it
         for key, wire in _SESSION_STATE_FIELDS:
@@ -1435,7 +1455,7 @@ def event_meta(event: dict[str, object]) -> dict[str, object]:
 
 
 def _event_field(value: object) -> bool:
-    return isinstance(value, str) and 1 <= len(value) <= EVENT_FIELD_MAX
+    return isinstance(value, str) and 1 <= utf16_len(value) <= EVENT_FIELD_MAX
 
 
 class EventForwarder:

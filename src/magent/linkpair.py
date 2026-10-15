@@ -41,7 +41,14 @@ from typing import TYPE_CHECKING
 from urllib.parse import quote, urlsplit
 
 from magent import linkcrypto
-from magent.link import RATE_LIMIT_CAP_S, Backoff, RelayError
+from magent.link import (
+    DAEMON_FIELD_MAX,
+    RATE_LIMIT_CAP_S,
+    Backoff,
+    RelayError,
+    utf16_cut,
+    utf16_len,
+)
 from magent.link import app_url as configured_app_url
 from magent.linkfiles import TrustedDevice
 from magent.log import get_logger
@@ -253,7 +260,9 @@ def start_pairing(
 
     A 429 is never waited out here (the relay's limit on new pairings can
     run to an hour): it is PairingRateLimited at once, so the user is told
-    when to come back instead of watching a hang.
+    when to come back instead of watching a hang. ``name`` is trimmed and cut
+    to NAME_MAX, ``platform`` and ``version`` to DAEMON_FIELD_MAX, as the
+    relay counts them (UTF-16 code units).
     """
     try:
         data = client.call(
@@ -262,9 +271,9 @@ def start_pairing(
             {
                 "hostKexPub": linkcrypto.b64u_encode(keys.kex_pub),
                 "hostSignPub": linkcrypto.b64u_encode(keys.sign_pub),
-                "name": name,
-                "platform": platform,
-                "daemonVersion": version,
+                "name": utf16_cut(name.strip(), NAME_MAX),
+                "platform": utf16_cut(platform, DAEMON_FIELD_MAX),
+                "daemonVersion": utf16_cut(version, DAEMON_FIELD_MAX),
             },
             token=host_token,
             retries=0,
@@ -382,12 +391,13 @@ def _device_id(item: dict[str, object]) -> str:
 
 
 def _device_name(item: dict[str, object]) -> str:
-    """1-100 characters, not blank, and no control, format, surrogate or
-    private-use character: the name reaches the terminal and link.json."""
+    """1-100 characters as the relay counts them (UTF-16 code units), not
+    blank, and no control, format, surrogate or private-use character: the
+    name reaches the terminal and link.json."""
     value = item.get("name")
     if (
         not isinstance(value, str)
-        or not 1 <= len(value) <= NAME_MAX
+        or not 1 <= utf16_len(value) <= NAME_MAX
         or not value.strip()
         or any(unicodedata.category(c) in NAME_REFUSED_CATEGORIES for c in value)
     ):

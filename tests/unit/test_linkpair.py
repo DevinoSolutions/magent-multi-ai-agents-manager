@@ -94,6 +94,24 @@ def _deletes(relay: FakeRelay) -> list[str]:
     return [h.get("Authorization", "") for m, p, h in relay.requests if m == "DELETE"]
 
 
+def test_start_cuts_its_strings_as_the_relay_counts(relay):
+    # The relay trims the name, then counts UTF-16 code units: an emoji is
+    # two. Cut by code points, this start would be refused with a 400.
+    client = RelayClient(relay.url, timeout=5)
+    emoji = chr(0x1F600)
+    linkpair.start_pairing(
+        client,
+        HOST,
+        name="  " + emoji * 150 + "  ",
+        platform=emoji * 20,
+        version="a" + emoji * 20,
+    )
+    sent = relay.pair_starts[-1]
+    assert sent["name"] == emoji * 50  # 100 code units
+    assert sent["platform"] == emoji * 16
+    assert sent["daemonVersion"] == "a" + emoji * 15
+
+
 def test_start_sends_the_public_keys_and_reads_the_reply(relay):
     start = _start(relay)
     assert relay.pair_starts == [
@@ -516,6 +534,7 @@ def test_a_device_id_must_be_a_canonical_uuid(relay, device_id):
         pytest.param(ESC + "[2J" + ESC + "]0;pwned" + chr(7), id="ansi-escape"),
         pytest.param("../../x" + NEWLINE, id="path-and-newline"),
         pytest.param("a" * 101, id="101-chars"),
+        pytest.param(chr(0x1F600) * 51, id="51-emoji"),  # 102 UTF-16 units
         pytest.param("a" * 5000, id="5000-chars"),
         pytest.param("Pix" + chr(0x200B) + "el", id="zero-width"),
         pytest.param("Pixel" + chr(0x202E) + "lexiP", id="bidi-override"),
@@ -535,6 +554,7 @@ def test_a_device_name_must_be_short_printable_text(relay, name):
     "name",
     [
         "a" * 100,
+        chr(0x1F600) * 50,  # 100 UTF-16 units
         "Pixel 8 Pr" + chr(0xF3),
         "x",
         "Pixel " + chr(0x1FAE0),  # Unicode 14: unassigned (Cn) to Python 3.10

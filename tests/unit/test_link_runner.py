@@ -34,6 +34,8 @@ from tests.unit._link_fakes import (
     write_link,
 )
 
+EMOJI = chr(0x1F600)  # two UTF-16 code units
+
 
 @pytest.fixture(autouse=True)
 def _no_runner_outlives_its_test():
@@ -232,6 +234,29 @@ class TestSnapshot:
             AAD_SNAP + HOST_ID,
         )
         assert json.loads(plain) == {"sessions": odd}
+        run.finish(relay)
+
+    def test_an_emoji_heavy_row_is_cut_as_the_relay_counts(
+        self, tmp_path, relay, phone
+    ):
+        # The relay counts UTF-16 code units: an emoji is two. Cut by code
+        # points, 150 emoji pass as 150 and the whole PUT is refused, so
+        # the host never gets online.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        row = {**SESSION_ROW, "name": EMOJI * 150, "hook_state": EMOJI * 20}
+        host = FakeHost(
+            sessions=[row, {**SESSION_ROW, "session": "b", "name": "a" + EMOJI * 100}],
+            daemon={"version": EMOJI * 20, "platform": "windows", "epoch": "e1"},
+        )
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.snapshots)  # the relay accepted it
+
+        first, second = relay.snapshots[0]["sessions"]
+        assert first["name"] == EMOJI * 100  # 200 code units
+        assert first["hookState"] is None  # 40 code units, over 32
+        assert second["name"] == "a" + EMOJI * 99  # never half an emoji
+        assert relay.snapshots[0]["daemon"]["version"] == EMOJI * 16
+        relay.wait_for(run.runner.online)
         run.finish(relay)
 
     def test_the_state_file_says_online(self, tmp_path, relay, phone):

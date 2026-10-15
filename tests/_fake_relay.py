@@ -134,8 +134,13 @@ def _seq(value: object) -> int | None:
     return value
 
 
+def _units(text: str) -> int:
+    """A string's length as the relay counts it: UTF-16 code units."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
 def _text(value: object, low: int, high: int) -> bool:
-    return isinstance(value, str) and low <= len(value) <= high
+    return isinstance(value, str) and low <= _units(value) <= high
 
 
 class _Refused(Exception):
@@ -617,7 +622,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not (
             all(isinstance(k, str) and _KEY32.fullmatch(k) for k in keys)
             and isinstance(body.get("name"), str)
-            and 1 <= len(str(body.get("name")).strip()) <= 100
+            and 1 <= _units(str(body.get("name")).strip()) <= 100
             and _text(body.get("platform"), 1, 32)
             and _text(body.get("daemonVersion"), 1, 32)
         ):

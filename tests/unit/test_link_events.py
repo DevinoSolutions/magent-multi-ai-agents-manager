@@ -30,6 +30,8 @@ from tests.unit._link_fakes import (
     write_link,
 )
 
+EMOJI = chr(0x1F600)  # two UTF-16 code units
+
 
 @pytest.fixture(autouse=True)
 def _no_link_thread_outlives_its_test():
@@ -103,6 +105,30 @@ class TestMeta:
             session_id="DECOY-claude-session",
         )
         assert event_meta(changed) == {"session": "magent-alpha", "hookState": None}
+
+    @pytest.mark.parametrize(
+        ("name", "cut"),
+        [
+            (EMOJI * 150, EMOJI * 100),
+            ("a" + EMOJI * 100, "a" + EMOJI * 99),  # the cut falls mid-pair
+            (EMOJI * 100, EMOJI * 100),
+        ],
+        ids=["150-emoji", "mid-pair", "exactly-200"],
+    )
+    def test_a_name_is_cut_as_the_relay_counts(self, name, cut):
+        # The relay counts UTF-16 code units: an emoji is two.
+        meta = event_meta(_event(1, "session.added", session="a", name=name))
+        assert meta["name"] == cut
+
+    def test_a_state_is_measured_as_the_relay_counts(self):
+        over = event_meta(_event(1, session="a", hook_state=EMOJI * 20))
+        at = event_meta(_event(2, session="a", hook_state=EMOJI * 16))
+        assert over["hookState"] is None  # 40 code units
+        assert at["hookState"] == EMOJI * 16  # 32 code units
+        page = event_meta(
+            _event(3, "attention", session="a", hook_state=EMOJI * 20, fire=True)
+        )
+        assert page["hookState"] is None
 
     def test_attention_also_says_whether_to_page(self):
         event = _event(
@@ -195,7 +221,7 @@ class TestForwarding:
         assert any("dropped event e0e0e0e0:1" in r.getMessage() for r in caplog.records)
         run.finish(relay)
 
-    @pytest.mark.parametrize("bad", ["id", "long-id", "type"])
+    @pytest.mark.parametrize("bad", ["id", "long-id", "type", "emoji-type"])
     def test_an_event_the_relay_would_refuse_is_left_out(
         self, tmp_path, relay, phone, bad
     ):
@@ -206,6 +232,8 @@ class TestForwarding:
             broken["id"] = 7
         elif bad == "long-id":
             broken["id"] = "e" * 65
+        elif bad == "emoji-type":
+            broken["type"] = EMOJI * 33  # 66 code units: over 64
         else:
             broken["type"] = "t" * 65
         host.feed.push(broken, _event(2, session="b"))
