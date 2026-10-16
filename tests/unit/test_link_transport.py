@@ -611,6 +611,8 @@ class TestDownloadTargets:
             pytest.param("::", id="unspecified"),
             # Multicast.
             pytest.param("ff02::1", id="multicast-ff02::1"),
+            # Global scope: is_global, so only the multicast check refuses it.
+            pytest.param("ff0e::1", id="multicast-ff0e::1"),
             pytest.param("239.255.255.250", id="multicast-239.255.255.250"),
         ],
     )
@@ -801,6 +803,47 @@ class TestPinnedTls:
             listener.close()
         assert (exc.value.status, exc.value.code) == (0, "timeout")
         assert time.monotonic() - started < 2.5
+
+    def test_a_deadline_already_spent_is_a_timeout_not_a_crash(self, tls_server):
+        # Nothing left for the handshake: its timeout is floored, never a
+        # negative one (a ValueError that would crash the pull unreported).
+        with pytest.raises(RelayError) as exc:
+            RelayClient("https://relay.example.com").get_bytes(
+                "https://storage.test/o", lambda b: None, max_bytes=99, deadline=0.0
+            )
+        assert exc.value.code == "timeout"
+
+    def test_a_tls_setup_that_fails_here_refuses_the_url(self, monkeypatch):
+        # A broken system certificate store is this machine's fault, not the
+        # download's: refused (never retried), and said as such.
+        def broken(*_a, **_k):
+            raise ssl.SSLError("DECOY broken store")
+
+        monkeypatch.setattr(link.ssl, "create_default_context", broken)
+        monkeypatch.setattr(link, "_public_address", lambda host, p: "93.184.216.34")
+        with pytest.raises(RelayError) as exc:
+            RelayClient("https://relay.example.com").get_bytes(
+                "https://storage.test/o", lambda b: None, max_bytes=99
+            )
+        assert (exc.value.status, exc.value.code) == (0, "invalid_response")
+        assert "TLS" in exc.value.message
+
+
+class TestDeadline:
+    def test_a_socket_handed_over_after_the_deadline_is_cut_at_once(self):
+        ours, theirs = socket.socketpair()
+        theirs.settimeout(2)
+        try:
+            with link._Deadline(None, 0.0) as cut:
+                ends = time.monotonic() + 2
+                while not cut.expired and time.monotonic() < ends:
+                    time.sleep(0.01)
+                assert cut.expired
+                cut.watch(ours)
+                assert theirs.recv(1) == b""  # cut: the peer reads the end
+        finally:
+            ours.close()
+            theirs.close()
 
 
 class TestStreamBounds:

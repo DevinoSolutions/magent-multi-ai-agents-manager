@@ -518,10 +518,17 @@ class RelayClient:
         with _Deadline(None, deadline) as cut:
             conn: http.client.HTTPConnection | None = None
             try:
-                if secure:
-                    conn, target = self._public_connection(url, cut.left)
-                else:
-                    conn, target = self._connection(url, self._timeout)
+                try:
+                    if secure:
+                        conn, target = self._public_connection(url, cut.left)
+                    else:
+                        conn, target = self._connection(url, self._timeout)
+                except ssl.SSLError as exc:
+                    # No TLS context here (a broken certificate store): a
+                    # retry would fail the same way, so the URL is refused.
+                    raise RelayError(
+                        0, "invalid_response", "TLS could not be set up here"
+                    ) from exc
                 _connect(conn)
                 cut.watch(conn.sock)
                 total = self._download(conn, target, sink, max_bytes)
@@ -1939,15 +1946,18 @@ _DEVICE_NAMES = frozenset(
 
 def safe_name(name: object) -> str:
     """The base name of the device's file name, safe to create here: no
-    folder part, no character a file system refuses, no leading or trailing
-    dot or space, at most UPLOAD_NAME_MAX UTF-8 bytes (the stem cut, a short
-    extension kept), never a device name."""
+    folder part, no character a file system refuses, no leading space, no
+    trailing dot or space, a leading dot kept behind "_" (a dotfile, as the
+    daemon's own saved names keep it), at most UPLOAD_NAME_MAX UTF-8 bytes
+    (the stem cut, a short extension kept), never a device name."""
     text = name if isinstance(name, str) else ""
     base = text.replace("\\", "/").rsplit("/", 1)[-1]
     base = "".join(c for c in base if c.isprintable() and c not in _NAME_FORBIDDEN)
-    base = base.strip(" .")
+    base = base.rstrip(" .").lstrip(" ")
     if not base:
         return "upload.bin"
+    if base.startswith("."):
+        base = f"_{base}"
     dot = base.rfind(".")
     suffix = base[dot:] if dot > 0 else ""
     if len(suffix.encode("utf-8")) > _SUFFIX_MAX_BYTES:
@@ -2200,7 +2210,6 @@ class UploadPuller:
                     ready.content_key, ready.upload_id, pieces
                 ):
                     dst.write(chunk)
-            blob.unlink()
         except SealError as exc:
             raise _UploadRefused(
                 "the object did not decrypt (tampered or cut short)"
@@ -2209,6 +2218,10 @@ class UploadPuller:
             # A full disk, or a path past MAX_PATH: never remembered, so a
             # resend that can be written still goes through.
             raise _UploadRefused("it could not be written here") from exc
+        with contextlib.suppress(OSError):
+            # Space back now; a .blob held a moment (a scanner on Windows) is
+            # no reason to refuse a file that decrypted: the folder goes anyway.
+            blob.unlink()
         return target
 
     def _sink(self, fh: BinaryIO) -> Callable[[bytes], None]:

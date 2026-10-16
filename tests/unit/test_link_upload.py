@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -119,7 +120,11 @@ class TestHelpers:
             ("photo.png", "photo.png"),
             ("../../etc/passwd", "passwd"),
             ("..\\..\\evil<1>.png", "evil1.png"),
-            ("  .hidden. ", "hidden"),
+            # A dotfile keeps its name behind "_", as the daemon's own saved
+            # names do; it can still never collide with ".blob".
+            ("  .hidden. ", "_.hidden"),
+            (".env", "_.env"),
+            (". . .", "upload.bin"),
             ("", "upload.bin"),
             (None, "upload.bin"),
             ("CON", "_CON"),
@@ -495,6 +500,44 @@ class TestRefusals:
         relay.wait_for(lambda: host.staged)
         assert host.staged[0][3] == b"PNG"
         run.finish(relay)
+
+    def test_a_blob_that_cannot_be_written_is_refused(self, relay, phone, linked):
+        # The download side of "could not be written here" (a full disk
+        # mid-download): refused, not a crash the next connect repeats.
+        uid = up_id(41)
+        (linkfiles.INCOMING_DIR / uid / ".blob").mkdir(parents=True)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"x")
+        )
+        relay.wait_for(lambda: _states(relay, uid) == ["inject_failed"])
+        run.finish(relay)
+        assert host.staged == []
+        assert uid not in linked.state().seen_ids
+
+    def test_a_blob_that_cannot_be_deleted_still_stages_the_file(
+        self, relay, phone, linked, monkeypatch
+    ):
+        # A scanner holding the decrypted-from .blob a moment must not refuse
+        # a file that decrypted fine: the folder is removed anyway.
+        real_unlink = Path.unlink
+
+        def held(self, *args, **kwargs):
+            if self.name == ".blob":
+                raise PermissionError("DECOY held by a scanner")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", held)
+        uid = up_id(42)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        )
+        relay.wait_for(lambda: _states(relay, uid) == ["pulled", "injected"])
+        run.finish(relay)
+        assert host.staged[0][3] == b"PNG"
 
     def test_a_content_key_of_the_wrong_length_is_refused(self, relay, phone, linked):
         uid = up_id(24)
