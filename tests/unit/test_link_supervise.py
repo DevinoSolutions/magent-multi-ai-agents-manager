@@ -3,12 +3,16 @@ key the link owns (settings.link.remoteControl)."""
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
+import os
 import threading
+import time
 
 import pytest
 
-from magent import config_io, env, link, upload_server
+from magent import config_io, env, link, lockfile, upload_server
 from magent.config import ConfigError, Settings, load_config, settings_to_dict
 from magent.link import LinkRunner, RelayClient
 from tests._fake_relay import FakeRelay
@@ -208,6 +212,206 @@ class TestSupervise:
         )
         assert len(made) == 1
 
+    def test_a_run_that_ended_well_resets_the_crash_backoff(self, link_on, monkeypatch):
+        # Full jitter at its ceiling, so every wait is the backoff's ceiling.
+        monkeypatch.setattr(
+            link, "Backoff", functools.partial(link.Backoff, rand=lambda: 1.0)
+        )
+        made: list[object] = []
+        waits: list[float] = []
+        link.supervise(
+            object,
+            threading.Event(),
+            runner_factory=_factory(
+                [
+                    RuntimeError("boom"),
+                    RuntimeError("boom"),
+                    "relinked",
+                    RuntimeError("boom"),
+                    "stopped",
+                ],
+                made,
+            ),
+            sleep=lambda s: waits.append(s) or len(waits) > 5,
+        )
+        base = link.SUPERVISE_BACKOFF_BASE_S
+        assert waits == [base, 2 * base, base]
+
+    def test_a_crash_after_a_long_healthy_run_starts_the_backoff_over(
+        self, link_on, monkeypatch
+    ):
+        monkeypatch.setattr(
+            link, "Backoff", functools.partial(link.Backoff, rand=lambda: 1.0)
+        )
+        now = [1_000.0]
+
+        class _Timed(_Runner):
+            def run(self, stop: threading.Event) -> str:
+                if len(made) == 3:  # the third run lasts a day, then crashes
+                    now[0] += 86_400.0
+                return super().run(stop)
+
+        made: list[object] = []
+        outcomes: list[object] = [
+            RuntimeError("a"),
+            RuntimeError("b"),
+            RuntimeError("c"),
+            "stopped",
+        ]
+        waits: list[float] = []
+        link.supervise(
+            object,
+            threading.Event(),
+            runner_factory=lambda _h: _Timed(outcomes, made),
+            sleep=lambda s: waits.append(s) or len(waits) > 5,
+            clock=lambda: now[0],
+        )
+        base = link.SUPERVISE_BACKOFF_BASE_S
+        assert waits == [base, 2 * base, base]
+
+    def test_a_repair_with_the_same_size_and_mtime_is_seen(self, link_on, tmp_path):
+        # A re-pair replaces link.json atomically: a new file index, even when
+        # its size and mtime match the old file's.
+        link_path = tmp_path / "link.json"
+        link_path.write_text('{"a": 1}', encoding="utf-8")
+        before = link_path.stat()
+        made: list[object] = []
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> bool:
+            sleeps.append(seconds)
+            if len(sleeps) == 1:
+                fresh = tmp_path / "fresh.json"
+                fresh.write_text('{"b": 2}', encoding="utf-8")
+                os.utime(fresh, ns=(before.st_atime_ns, before.st_mtime_ns))
+                os.replace(fresh, link_path)
+                again = link_path.stat()
+                assert (again.st_size, again.st_mtime_ns) == (
+                    before.st_size,
+                    before.st_mtime_ns,
+                )
+            return len(sleeps) > 3  # never forever
+
+        link.supervise(
+            object,
+            threading.Event(),
+            runner_factory=_factory(["revoked", "stopped"], made),
+            sleep=sleep,
+            link_path=link_path,
+        )
+        assert len(made) == 2
+        assert sleeps == [link.IDLE_RECHECK_S]
+
+
+class TestOneLinkPerMachine:
+    """Every serve starts a link thread, and serve is per port: only one of
+    them may run the link. Two runners on one host token would each run a
+    command (typed twice into a session) and paste an upload twice."""
+
+    def test_a_second_serve_stands_by_while_another_holds_the_link(
+        self, link_on, caplog
+    ):
+        made: list[object] = []
+        with (
+            caplog.at_level("INFO", logger="magent.link"),
+            lockfile.persistent_lock(link.LINK_LOCK, wait_s=0.0),
+        ):
+            link.supervise(
+                object,
+                threading.Event(),
+                runner_factory=_factory(["stopped"], made),
+                sleep=lambda _s: True,
+            )
+        assert made == []
+        assert any("stands by" in r.getMessage() for r in caplog.records)
+
+    def test_once_the_link_is_free_the_standing_serve_runs_it(self, link_on, caplog):
+        made: list[object] = []
+        held = contextlib.ExitStack()
+        held.enter_context(lockfile.persistent_lock(link.LINK_LOCK, wait_s=0.0))
+        waits: list[float] = []
+
+        def sleep(seconds: float) -> bool:
+            waits.append(seconds)
+            if len(waits) == 2:
+                held.close()  # the other serve exits
+            return len(waits) > 5  # never forever
+
+        try:
+            with caplog.at_level("INFO", logger="magent.link"):
+                link.supervise(
+                    object,
+                    threading.Event(),
+                    runner_factory=_factory(["stopped"], made),
+                    sleep=sleep,
+                )
+        finally:
+            held.close()
+        assert len(made) == 1
+        assert waits == [link.IDLE_RECHECK_S] * 2
+        stands = [r for r in caplog.records if "stands by" in r.getMessage()]
+        assert len(stands) == 1  # said once, not on every recheck
+
+    def test_two_supervisors_in_one_process_run_one_link(self, link_on):
+        stop = threading.Event()
+        running = threading.Event()
+        runs: list[int] = []
+
+        class _Holding(_Runner):
+            def run(self, stop: threading.Event) -> str:
+                runs.append(1)
+                running.set()
+                stop.wait(10)
+                return "stopped"
+
+        def one() -> None:
+            link.supervise(
+                object,
+                stop,
+                runner_factory=lambda _h: _Holding([], []),
+                sleep=lambda s: stop.wait(min(s, 0.02)),
+            )
+
+        threads = [threading.Thread(target=one, daemon=True) for _ in range(2)]
+        for t in threads:
+            t.start()
+        try:
+            assert running.wait(5)
+            time.sleep(0.2)  # the other thread had its chance to take it
+            assert runs == [1]
+        finally:
+            stop.set()
+            for t in threads:
+                t.join(5)
+        assert not any(t.is_alive() for t in threads)
+
+    def test_the_lock_is_let_go_when_the_thread_ends(self, link_on):
+        link.supervise(
+            object,
+            threading.Event(),
+            runner_factory=_factory(["stopped"], []),
+        )
+        with lockfile.persistent_lock(link.LINK_LOCK, wait_s=0.0):
+            pass  # free again
+
+    def test_a_lock_that_cannot_be_opened_stands_by_and_never_crashes(
+        self, link_on, monkeypatch, caplog
+    ):
+        def broken(*_a, **_k):
+            raise PermissionError("DECOY ~/.magent is read-only")
+
+        monkeypatch.setattr(link.lockfile, "persistent_lock", broken)
+        made: list[object] = []
+        with caplog.at_level("WARNING", logger="magent.link"):
+            link.supervise(
+                object,
+                threading.Event(),
+                runner_factory=_factory(["stopped"], made),
+                sleep=lambda _s: True,
+            )
+        assert made == []
+        assert any("link lock" in r.getMessage() for r in caplog.records)
+
 
 class TestNoDialItWasNotGiven:
     """MAGENT_LINK fails open on a broken MAGENT_* environment, so the thread
@@ -278,6 +482,21 @@ class TestRelink:
         save_linked(linked, host_token=relay.host_token)
         relay.set_devices([phone.wire()])  # any devices frame re-reads link.json
         assert run.wait_done() == "relinked"
+
+    def test_a_new_token_found_at_a_reconnect_ends_the_run(self, tmp_path, relay):
+        # No devices frame: the reconnect itself must read link.json, before
+        # it dials with the old token (which the relay now refuses: a run that
+        # dialled first would end "revoked", not "relinked").
+        phone = new_device()
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: relay.open_streams == 1)  # online, stream held
+        save_linked(linked, host_token="mlh_DECOY_paired_again")
+        relay.host_token = "mlh_DECOY_paired_again"
+        before = len(relay.snapshots)
+        relay.drop_streams()
+        assert run.wait_done() == "relinked"
+        assert len(relay.snapshots) == before  # nothing sent under the old token
 
     def test_supervise_carries_the_new_link_back_online(self, tmp_path, relay, link_on):
         phone = new_device()

@@ -259,6 +259,61 @@ class TestForwarding:
             assert sent["data"]["lines"] == 9  # the rest of the event as it was
         run.finish(relay)
 
+    def test_a_box_drawing_pane_keeps_most_of_what_fits(self, tmp_path, relay, phone):
+        # A real Claude Code pane is full of box-drawing lines and glyphs, and
+        # each costs six bytes once sealed (json.dumps escapes it): a cut sized
+        # in characters kept nothing of a pane whose best tail is ~18k.
+        paired = (
+            phone,
+            new_device(TABLET_ID, "Tablet DECOY"),
+            new_device(OTHER_ID, "Other DECOY"),
+        )
+        host = FakeHost()
+        linked, run = _online(tmp_path, relay, paired, host)
+        lines = [
+            "─" * 100 if i % 2 else f"│ line {i:05d} " + "x" * 80 for i in range(400)
+        ]
+        text = "\n".join(lines)
+        host.feed.push(_event(1, "session.pane", session="a", text=text, lines=9))
+
+        relay.wait_for(lambda: relay.events, timeout=15)
+        posted = relay.events[0]
+        item_size = len(json.dumps(posted, separators=(",", ":")).encode()) + 1
+        assert len('{"events":[]}') + item_size <= link.EVENTS_MAX_BYTES
+        for device in paired:
+            sent = json.loads(
+                linkcrypto.open_sealed(
+                    linked.device_keys(device).h2d,
+                    posted["sealed"][device.device_id],
+                    f"{AAD_EVT}{HOST_ID}:e0e0e0e0:1",
+                )
+            )
+            kept = sent["data"]["text"]
+            assert text.endswith(kept)
+            assert kept.split("\n")[0] in lines  # whole lines only
+            assert len(kept) >= 15_000  # the best whole-line tail is ~18k
+        run.finish(relay)
+
+    def test_a_cut_through_the_last_line_keeps_that_line(self, tmp_path, relay, phone):
+        # One long line ending in a newline: whole lines only would send an
+        # empty pane. The partial last line goes out instead.
+        host = FakeHost()
+        linked, run = _online(tmp_path, relay, (phone,), host)
+        text = "y" * 300_000 + "\n"
+        host.feed.push(_event(1, "session.pane", session="a", text=text))
+        relay.wait_for(lambda: relay.events, timeout=15)
+        sent = json.loads(
+            linkcrypto.open_sealed(
+                linked.device_keys(phone).h2d,
+                relay.events[0]["sealed"][phone.device_id],
+                f"{AAD_EVT}{HOST_ID}:e0e0e0e0:1",
+            )
+        )
+        kept = sent["data"]["text"]
+        assert len(kept) > 100_000
+        assert text.endswith(kept)
+        run.finish(relay)
+
     def test_a_pane_that_fits_is_sent_whole(self, tmp_path, relay, phone):
         host = FakeHost()
         linked, run = _online(tmp_path, relay, (phone,), host)
@@ -493,12 +548,19 @@ class _Stub:
 
     host_id = HOST_ID
 
-    def __init__(self, online: bool) -> None:
+    def __init__(self, online: bool, *, backing_off: bool = False) -> None:
         self.is_online = online
+        self.is_backing_off = backing_off
         self.snapshots = 0
 
     def online(self) -> bool:
         return self.is_online
+
+    def backing_off(self) -> bool:
+        return self.is_backing_off
+
+    def remote_control_changed(self) -> bool:
+        return False
 
     def seal_for_devices(self, plain: bytes, aad: str) -> dict[str, str]:
         return {}
@@ -580,6 +642,68 @@ class TestResync:
         finally:
             forwarder.stop()
         assert relay.requests == []
+
+    def test_a_remote_control_switch_reaches_the_relay_without_a_reconnect(
+        self, tmp_path, relay, phone
+    ):
+        # The relay mirrors remoteControl from the snapshot; on a healthy
+        # stream nothing else would re-PUT it for hours.
+        host = FakeHost(rc=False)
+        _linked, run = _online(tmp_path, relay, (phone,), host)
+        relay.wait_for(lambda: relay.snapshots)
+        before = len(relay.snapshots)
+        assert relay.snapshots[-1]["remoteControl"] is False
+        host.rc = True
+        relay.wait_for(
+            lambda: (
+                len(relay.snapshots) == before + 1
+                and relay.snapshots[-1]["remoteControl"] is True
+            ),
+            timeout=15,
+        )
+        time.sleep(0.3)
+        assert len(relay.snapshots) == before + 1  # once, not on every read
+        run.finish(relay)
+
+
+class TestOfflineFeed:
+    """While the link backs off (minutes to hours with the relay down), the
+    daemon's feed is not read: each read holds a bus subscription, which
+    keeps serve sampling every pane only for the batch to be dropped."""
+
+    def test_the_feed_is_not_read_while_the_link_backs_off(self, relay):
+        runner = _Stub(online=False, backing_off=True)
+        feed = _Feed()
+        forwarder = EventForwarder(
+            runner, RelayClient(relay.url, token=relay.host_token), lambda: feed
+        )
+        forwarder.start()
+        try:
+            time.sleep(1.0)
+            assert feed.reads <= 1
+            # Connected again: the feed is read, and the snapshot repaired
+            # once, since the reads it skipped may have held a drop.
+            runner.is_backing_off = False
+            runner.is_online = True
+            relay.wait_for(lambda: feed.reads >= 3)
+            relay.wait_for(lambda: runner.snapshots == 1)
+        finally:
+            forwarder.stop()
+        assert relay.requests == []
+
+    def test_a_link_still_connecting_reads_the_feed(self, relay):
+        # Before the first connect is through, the feed is read as before:
+        # its cursor must start before the snapshot the connect puts.
+        runner = _Stub(online=False)
+        feed = _Feed()
+        forwarder = EventForwarder(
+            runner, RelayClient(relay.url, token=relay.host_token), lambda: feed
+        )
+        forwarder.start()
+        try:
+            relay.wait_for(lambda: feed.reads >= 3)
+        finally:
+            forwarder.stop()
 
 
 class TestDeviceSet:

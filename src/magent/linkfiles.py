@@ -5,8 +5,8 @@ private keys and the devices it trusts. It is written owner-only
 (fsutil.write_private) and refused on read unless it is still owner-only and
 exactly the expected shape -- the repair is always `magent unlink` then
 `magent link`. ``link-state.json`` is not secret: the stream cursor, the ring
-of command and upload ids already handled, and the state `magent status`
-shows. A bad state file degrades to a fresh one.
+of command and upload ids already handled, the host they belong to, and the
+state `magent status` shows. A bad state file degrades to a fresh one.
 
 The paths are bound at import, like every other ~/.magent path, so
 tests/conftest.py's tripwire redirects them.
@@ -76,6 +76,9 @@ class LinkState:
     last_connected: float | None = None
     state: str = "unlinked"
     retry_at: float | None = None
+    # The pairing whose cursor and seen ring these are; None in a file from
+    # before the field (kept as it is). A runner on another host starts fresh.
+    host_id: str | None = None
 
 
 def _link_path(path: Path | None) -> Path:
@@ -182,6 +185,7 @@ def load_state(path: Path | None = None) -> LinkState:
     last = raw.get("last_connected")
     state = raw.get("state")
     retry = raw.get("retry_at")
+    host_id = raw.get("host_id")
     return LinkState(
         cursor=cursor
         if isinstance(cursor, int) and not isinstance(cursor, bool)
@@ -196,6 +200,7 @@ def load_state(path: Path | None = None) -> LinkState:
         retry_at=float(retry)
         if isinstance(retry, (int, float)) and not isinstance(retry, bool)
         else None,
+        host_id=host_id if isinstance(host_id, str) and host_id else None,
     )
 
 
@@ -208,5 +213,6 @@ def save_state(state: LinkState, path: Path | None = None) -> None:
         "last_connected": state.last_connected,
         "state": state.state,
         "retry_at": state.retry_at,
+        "host_id": state.host_id,
     }
     fsutil.write_atomic(_state_path(path), json.dumps(body).encode("utf-8"))

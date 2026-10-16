@@ -177,9 +177,20 @@ class TestState:
             last_connected=1.5,
             state="online",
             retry_at=None,
+            host_id="hst_DECOY_1",
         )
         linkfiles.save_state(state, path)
         assert linkfiles.load_state(path) == state
+        assert json.loads(path.read_text(encoding="utf-8"))["host_id"] == "hst_DECOY_1"
+
+    @pytest.mark.parametrize("bad", [None, 7, "", ["hst_DECOY_1"]])
+    def test_a_host_id_that_is_not_a_name_is_none(self, tmp_path, bad):
+        # None: a file from before the field, which the runner keeps.
+        path = tmp_path / "s.json"
+        path.write_text(
+            json.dumps({"version": 1, "cursor": 3, "host_id": bad}), encoding="utf-8"
+        )
+        assert linkfiles.load_state(path) == LinkState(cursor=3, host_id=None)
 
     def test_seen_ids_keep_only_the_newest_1024(self, tmp_path):
         path = tmp_path / "s.json"

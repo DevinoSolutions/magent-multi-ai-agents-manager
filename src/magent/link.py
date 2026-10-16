@@ -37,7 +37,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlsplit
 
-from magent import linkcrypto, linkfiles
+from magent import linkcrypto, linkfiles, lockfile
 from magent.linkcrypto import (
     AAD_CMD,
     AAD_EVT,
@@ -51,6 +51,7 @@ from magent.linkfiles import SEEN_MAX, LinkState
 from magent.log import get_logger
 
 if TYPE_CHECKING:
+    import logging
     from collections.abc import Callable, Generator, Iterable, Iterator
     from pathlib import Path
     from typing import BinaryIO
@@ -1046,6 +1047,8 @@ class LinkRunner:
         # mean "still running", and that duplicate must not be acked.
         self._inflight: set[str] = set()
         self._uploads: UploadPuller | None = None
+        # The remoteControl the relay was last told (None: no snapshot yet).
+        self._rc_put: bool | None = None
 
     # -- the loop ------------------------------------------------------------
 
@@ -1538,15 +1541,32 @@ class LinkRunner:
         device. Serialised, the read with its PUT: two threads put snapshots."""
         with self._snapshot_lock:
             rows, daemon = self._host.snapshot()
+            remote_control = self._host.remote_control() is True
             fixed: dict[str, object] = {
                 "daemon": {
                     key: _daemon_field(daemon.get(key))
                     for key in ("version", "platform", "epoch")
                 },
-                "remoteControl": self._host.remote_control() is True,
+                "remoteControl": remote_control,
                 "uploadMaxBytes": max(1, self._host.upload_max_bytes()),
             }
             client.call("PUT", "/v1/host/snapshot", self._snapshot_body(rows, fixed))
+            with self._lock:
+                self._rc_put = remote_control
+
+    def remote_control_changed(self) -> bool:
+        """Has ``settings.link.remoteControl`` changed since the relay was
+        last told (the last snapshot PUT)? The relay mirrors it for the app,
+        and a healthy stream PUTs no snapshot for hours. False before the
+        first PUT, and whenever the setting cannot be read."""
+        with self._lock:
+            told = self._rc_put
+        if told is None:
+            return False
+        try:
+            return (self._host.remote_control() is True) != told
+        except Exception:  # noqa: BLE001  # reason: a LinkHost failure here only delays the re-PUT; the forwarder's quiet read must go on
+            return False
 
     def _snapshot_body(
         self, rows: list[dict[str, object]], fixed: dict[str, object]
@@ -1583,6 +1603,12 @@ class LinkRunner:
     def online(self) -> bool:
         with self._lock:
             return self._state == "online"
+
+    def backing_off(self) -> bool:
+        """Waiting out a backoff between attempts (``offline``), which can
+        last minutes to hours while the relay is down."""
+        with self._lock:
+            return self._state == "offline"
 
     @property
     def host_id(self) -> str:
@@ -1662,6 +1688,14 @@ class LinkRunner:
     def _load(self, link: LinkFile) -> None:
         peers = self._peers_for(link)
         state = linkfiles.load_state(self._state_path)
+        if state.host_id is not None and state.host_id != link.host_id:
+            # Another pairing's cursor would open the new host's stream past
+            # its first commands, and its seen ring holds the old host's ids.
+            # (None: a file from before the field, kept as it is.)
+            self._log.info(
+                "link: link-state.json belongs to another pairing; starting fresh"
+            )
+            state = LinkState()
         with self._lock:
             self._link = link
             self._peers = peers
@@ -1699,6 +1733,7 @@ class LinkRunner:
                 last_connected=self._last_connected,
                 state=self._state,
                 retry_at=self._retry_at,
+                host_id=self._link.host_id if self._link is not None else None,
             )
             for attempt in range(SAVE_ATTEMPTS):
                 try:
@@ -1740,8 +1775,8 @@ EVENT_FIELD_MAX = 64  # daemonEventId and type, as the relay takes them
 EVENT_RETRY_BASE_S = 1.0  # the backoff after a LinkHost.subscribe or feed failure
 EVENT_RETRY_CAP_S = 60.0
 EVENT_JOIN_S = 5.0  # how long stop() waits for a post in flight
-# Characters a too-big pane loses beyond what the size says it must: room for
-# the base64 rounding of each device's copy.
+# Plaintext bytes a too-big pane loses beyond what the size says it must:
+# room for the base64 rounding of each device's copy.
 PANE_CUT_SLACK = 64
 _EVENTS_FRAME = len('{"events":[]}')
 # Read by the forwarder, never sent: ``hello`` opens a feed, and ``reset``
@@ -1864,10 +1899,23 @@ class EventForwarder:
                         feed.close()
 
     def _pump(self, feed: EventFeed) -> None:
-        """Read, batch and send until stopped."""
+        """Read, batch and send until stopped. While the runner backs off
+        the feed is not read at all: each read holds a bus subscription,
+        which keeps serve sampling every pane only for the batch to be
+        dropped. What the daemon published meanwhile is read once the runner
+        connects again (or comes back as a ``reset``), and the snapshot is
+        repaired after it. A remoteControl switch is re-PUT on a quiet read:
+        the relay mirrors it for the app."""
         while not self._stop.is_set():
+            if self._runner.backing_off():
+                self._resync = True
+                if self._stop.wait(EVENT_IDLE_WAIT_S):
+                    break
+                continue
             batch = feed.next_batch(EVENT_IDLE_WAIT_S)
             if not batch:
+                if not self._resync and self._runner.online():
+                    self._resync = self._runner.remote_control_changed()
                 if (
                     self._resync
                     and time.monotonic() >= self._repair_after
@@ -1962,9 +2010,16 @@ class EventForwarder:
     ) -> dict[str, object]:
         """A ``session.pane`` too big for one post once sealed for every
         device keeps the tail of its text, whole lines only, rather than
-        being dropped: the cut is sized from how far over the post is (a
-        plaintext byte costs about 4/3 per device), and a character is at
-        least one byte, so one cut is enough."""
+        being dropped. The cut is sized in what the text costs sealed, not
+        in characters: a plaintext byte costs about 4/3 per device, and
+        json.dumps escapes every non-ASCII character to six bytes (twelve
+        for a surrogate pair: six per UTF-16 code unit), so a pane of box
+        lines and glyphs costs several times its length. The shortest
+        prefix whose escaped cost covers the overage is dropped, found by
+        bisection over character boundaries, so a surrogate pair is never
+        split. A tail whose only newline is its last character keeps that
+        partial line rather than going out empty. One that still does not
+        fit after rounding is dropped by ``_chunks``, as any oversize event."""
         data, sealed = event.get("data"), item.get("sealed")
         text = data.get("text") if isinstance(data, dict) else None
         size = _EVENTS_FRAME + len(json.dumps(item, separators=(",", ":"))) + 1
@@ -1976,14 +2031,22 @@ class EventForwarder:
             or not sealed
         ):
             return item
-        over = -(-(size - EVENTS_MAX_BYTES) * 3 // (4 * len(sealed)))
-        tail = text[over + PANE_CUT_SLACK :]
+        need = -(-(size - EVENTS_MAX_BYTES) * 3 // (4 * len(sealed))) + PANE_CUT_SLACK
+        lo, hi = 0, len(text)
+        while lo < hi:  # the shortest prefix whose escaped cost is >= need
+            mid = (lo + hi) // 2
+            if len(json.dumps(text[:mid])) - 2 >= need:
+                hi = mid
+            else:
+                lo = mid + 1
+        tail = text[lo:]
         _, newline, rest = tail.partition("\n")
-        tail = rest if newline else tail
+        if newline and rest:
+            tail = rest
         self._log.info(
-            "link: a %d-device pane was cut to its last %d characters to fit one post",
+            "link: a %d-device pane was cut to its last %d UTF-16 units to fit one post",
             len(sealed),
-            len(tail),
+            utf16_len(tail),
         )
         return self._seal({**event, "data": {**data, "text": tail}})
 
@@ -2411,18 +2474,19 @@ class UploadPuller:
 # --- The serve thread's supervisor and the config switch ------------------------
 
 LINK_THREAD = "magent-relay-link"  # serve's thread running supervise
+LINK_LOCK = "link"  # ~/.magent/link.lock: held by the one serve running the link
 SUPERVISE_BACKOFF_BASE_S = 5.0
 SUPERVISE_BACKOFF_CAP_S = 300.0
 
 
-def _link_stamp(path: Path | None) -> tuple[int, int] | None:
-    """link.json's mtime and size, None when it is absent: a re-pair (or an
-    unlink) changes it."""
+def _link_stamp(path: Path | None) -> tuple[int, int, int] | None:
+    """link.json's mtime, size and file index, None when it is absent: a
+    re-pair (an atomic replace, so a new file) or an unlink changes it."""
     try:
         info = (path or linkfiles.LINK_PATH).stat()
     except OSError:
         return None
-    return info.st_mtime_ns, info.st_size
+    return info.st_mtime_ns, info.st_size, info.st_ino
 
 
 def supervise(
@@ -2432,17 +2496,28 @@ def supervise(
     runner_factory: Callable[[LinkHost], LinkRunner] = LinkRunner,
     sleep: Callable[[float], bool] | None = None,
     link_path: Path | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
     """``magent serve``'s link thread: run LinkRunner until ``stop``.
 
     MAGENT_LINK=0 logs once and returns (a broken MAGENT_* environment fails
-    open: the runner still dials only the relay link.json names). A crash,
-    of the host or the runner, is logged and the runner restarted with
-    backoff (5 s doubling to 5 min). ``relinked`` starts a new runner at
-    once. After ``revoked`` or ``too_old`` the thread waits for link.json to
-    change (`magent unlink`, `magent link`) instead of hammering a relay
-    that already said no; a link.json that changed while that run was going
-    (paired again, then the old pairing revoked) restarts it at once.
+    open: the runner still dials only the relay link.json names).
+
+    One serve on a machine runs the link: serve is per port, and two runners
+    on one host token would each run a command (typed twice into a session)
+    and paste an upload twice. The loop runs under the machine-wide
+    ``LINK_LOCK``; a serve that finds it held says so once and stands by,
+    trying again every IDLE_RECHECK_S, until the holder exits. A lock that
+    cannot be taken at all stands by the same way: never a second runner.
+
+    A crash, of the host or the runner, is logged and the runner restarted
+    with backoff (5 s doubling to 5 min; a run that ended on its own, or
+    lasted BACKOFF_RESET_AFTER_S, starts it over). ``relinked`` starts a new
+    runner at once. After ``revoked`` or ``too_old`` the thread waits for
+    link.json to change (`magent unlink`, `magent link`) instead of
+    hammering a relay that already said no; a link.json that changed while
+    that run was going (paired again, then the old pairing revoked) restarts
+    it at once.
 
     No join is owed on the way out: the runner sees ``stop`` within one
     stream read (STREAM_READ_TIMEOUT_S) and its forwarder within about 6 s;
@@ -2454,15 +2529,58 @@ def supervise(
     if not link_enabled():
         log.info("link: off (MAGENT_LINK=0); this serve will not dial the relay")
         return
+    told = False
+    while not stop.is_set():
+        with contextlib.ExitStack() as held:
+            try:
+                held.enter_context(lockfile.persistent_lock(LINK_LOCK, wait_s=0.0))
+            except lockfile.LockHeld:
+                if not told:
+                    told = True
+                    log.info(
+                        "link: another magent serve on this machine runs the link;"
+                        " this one stands by"
+                    )
+            except OSError as exc:
+                if not told:
+                    told = True
+                    log.warning(
+                        "link: could not take the link lock (%s); this serve stands by",
+                        exc,
+                    )
+            else:
+                if told:
+                    log.info("link: the link is free; this serve runs it now")
+                _supervise_held(
+                    host_factory, stop, runner_factory, wait, link_path, clock, log
+                )
+                return
+        if wait(IDLE_RECHECK_S):
+            return
+
+
+def _supervise_held(
+    host_factory: Callable[[], LinkHost],
+    stop: threading.Event,
+    runner_factory: Callable[[LinkHost], LinkRunner],
+    wait: Callable[[float], bool],
+    link_path: Path | None,
+    clock: Callable[[], float],
+    log: logging.Logger,
+) -> None:
+    """supervise's loop, run while this serve holds the link lock."""
     backoff = Backoff(base=SUPERVISE_BACKOFF_BASE_S, cap=SUPERVISE_BACKOFF_CAP_S)
     while not stop.is_set():
         began = _link_stamp(link_path)
+        started = clock()
         try:
             outcome = runner_factory(host_factory()).run(stop)
         except Exception:
             # A crashed runner, or a host that cannot be built yet: logged and
             # restarted with backoff, never the end of the thread for serve's life.
             log.exception("link: the link thread crashed; restarting it")
+            if clock() - started >= BACKOFF_RESET_AFTER_S:
+                backoff.reset()  # a long healthy run: two crashes days apart start over
             if wait(backoff.next_delay()):
                 return
             continue

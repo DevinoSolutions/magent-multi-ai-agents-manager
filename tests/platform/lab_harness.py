@@ -142,6 +142,9 @@ def child_env(home: Path) -> dict[str, str]:
     env["HOME"] = home_s
     # The MAGENT_* strip drops conftest's pin: never a child with reaping on.
     env["MAGENT_IDLE_REAP"] = "0"
+    # ...and the relay link, whose reach is the internet.
+    env["MAGENT_LINK"] = "0"
+    env["MAGENT_LINK_URL"] = "http://127.0.0.1:9"
     return env
 
 

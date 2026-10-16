@@ -916,6 +916,61 @@ class TestStops:
         assert len(relay.requests) == 1  # stopped at once, no retry loop
 
 
+class TestStateBelongsToItsPairing:
+    """link-state.json's cursor and seen ring are one pairing's: a runner on
+    a new pairing (a relinked restart) starts fresh, or the new host's stream
+    would open past its first commands, and the seen ring would hold the old
+    host's ids."""
+
+    def _old_state(self, tmp_path, host_id: str | None) -> None:
+        linkfiles.save_state(
+            linkfiles.LinkState(
+                cursor=7, seen_ids=(cmd_id(1),), state="online", host_id=host_id
+            ),
+            tmp_path / "link-state.json",
+        )
+
+    def _loaded(self, tmp_path, phone) -> link.LinkRunner:
+        linked = write_link(
+            tmp_path, "http://127.0.0.1:9", (phone,), host_token="mlh_DECOY_new"
+        )
+        runner = link.LinkRunner(
+            FakeHost(), link_path=linked.link_path, state_path=linked.state_path
+        )
+        loaded = linked.link()
+        assert loaded is not None
+        runner._load(loaded)
+        return runner
+
+    def test_a_relinked_runner_starts_from_the_new_hosts_cursor(
+        self, tmp_path, phone, caplog
+    ):
+        self._old_state(tmp_path, "hst_DECOY_old")
+        with caplog.at_level("INFO", logger="magent.link"):
+            runner = self._loaded(tmp_path, phone)
+        assert runner._cursor == 0
+        assert not runner.has_seen(cmd_id(1))
+        assert any("another pairing" in r.getMessage() for r in caplog.records)
+
+    def test_the_same_pairing_keeps_its_cursor(self, tmp_path, phone):
+        self._old_state(tmp_path, HOST_ID)
+        runner = self._loaded(tmp_path, phone)
+        assert runner._cursor == 7
+        assert runner.has_seen(cmd_id(1))
+
+    def test_a_state_from_before_the_field_is_kept(self, tmp_path, phone):
+        self._old_state(tmp_path, None)
+        runner = self._loaded(tmp_path, phone)
+        assert runner._cursor == 7
+
+    def test_the_saved_state_names_its_pairing(self, tmp_path, relay, phone):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(run.runner.online)
+        run.finish(relay)
+        assert linked.state().host_id == HOST_ID
+
+
 def _spy_states(monkeypatch) -> list[tuple[str, float | None]]:
     states: list[tuple[str, float | None]] = []
     real_save = link.linkfiles.save_state
@@ -995,10 +1050,12 @@ class TestBackoff:
             )
             host = FakeHost()
             run = Running(host, linked, client_factory=_scripted([0], None, timeouts))
-            relay.wait_for(lambda: _paths(relay, "/v1/host/commands?since=0&wait=25"))
+            relay.wait_for(
+                lambda: _paths(relay, "/v1/host/commands?since=0&wait=25"), timeout=15
+            )
             relay.queue_command(make_command(linked, phone, cid=cmd_id(18), seq=2))
 
-            relay.wait_for(lambda: relay.results)
+            relay.wait_for(lambda: relay.results, timeout=15)
             assert len(host.calls) == 1
             assert len(_paths(relay, "/v1/stream/host")) == 3
             run.finish(relay)

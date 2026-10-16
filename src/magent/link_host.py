@@ -30,22 +30,27 @@ import platform
 import re
 import threading
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 from magent import api, wire
 from magent.config import load_config
 from magent.link import EVENT_FIELD_MAX, utf16_len
 from magent.link_staged import CONTENT_TYPE as STAGED_CONTENT_TYPE
 from magent.log import get_logger
+from magent.paths import find_config
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
 CLIENT_NAME = "magent-relay"  # X-Magent-Client: <this>/<deviceId> names the device
 LINK_PEER = "magent-relay"  # ApiRequest.peer/bind for a linked request (no socket)
 FEED_ERROR_PAUSE_S = 1.0
+# The one tunnelled read that would wait. A device command runs on the
+# runner thread, so it is answered at once (wait=0) and without ``panes``
+# (pane capture); events reach devices through the relay stream anyway.
+_POLL_PATH = api.PREFIX + "/events/poll"
 
 # One path segment the relay tunnels in place of a session id or a project
 # name: C3's session-id charset, never "." or "..". No "%" can appear, so no
@@ -124,8 +129,10 @@ class ApiLinkHost:
 
     ``context`` builds the server's ``api.ApiContext`` per call (serve's
     ``UploadHandler._api_context``), so the link sees exactly what a local
-    request would. ``config_path`` is where ``settings.link.remoteControl``
-    is read, re-read whenever the file changes.
+    request would. ``config_path`` is serve's ``--config`` as given (None
+    without one): ``settings.link.remoteControl`` is read from
+    ``paths.find_config(config_path)``, the file the CLI resolves and
+    `magent link --remote-control` writes, re-read whenever it changes.
     """
 
     def __init__(
@@ -135,12 +142,15 @@ class ApiLinkHost:
         self._config_path = config_path
         self._log = get_logger("link")
         self._rc_lock = threading.Lock()
-        self._rc_cache: tuple[int, bool] | None = None
+        self._rc_cache: tuple[tuple[str, int, int, int], bool] | None = None
         self._max_lock = threading.Lock()
         self._max_bytes: int | None = None
         self._rows_lock = threading.Lock()
         self._last_rows: tuple[dict[str, object], ...] = ()
         self._rows_failing = False
+        # /meta's version and epoch as last read: a failed read keeps them,
+        # since the epoch is how a client tells that serve restarted.
+        self._last_daemon: tuple[str, str] = ("", "")
 
     def call(
         self,
@@ -179,23 +189,36 @@ class ApiLinkHost:
         self, method: str, path: str, body: bytes | None, device_id: str
     ) -> tuple[int, dict[str, object]]:
         parts = urlsplit(path)
-        if parts.fragment or not tunnelled(method, parts.path):
+        # An absolute-form or network-path URL ("http://x/...", "//x/...")
+        # leaves a good path once split: refused, never tunnelled.
+        if (
+            parts.scheme
+            or parts.netloc
+            or parts.fragment
+            or not tunnelled(method, parts.path)
+        ):
             return 400, wire.error(
                 "invalid_request",
                 "this request is not served over the link",
                 {"reason": "not_tunnelled"},
             )
+        target = path
+        if parts.path == _POLL_PATH:
+            query = {k: v for k, v in parse_qs(parts.query).items() if k != "panes"}
+            query["wait"] = ["0"]
+            target = f"{parts.path}?{urlencode(query, doseq=True)}"
         # Never a content type of the device's choosing: always JSON.
         status, envelope = self.call(
             method,
-            path,
+            target,
             body=body,
             client=f"{CLIENT_NAME}/{device_id}",
             remote_control=self.remote_control(),
         )
         try:
-            # The runner seals json.dumps of this answer outside its guard.
-            json.dumps(envelope)
+            # The runner seals json.dumps of this answer outside its guard; a
+            # NaN or Infinity would seal text the app's JSON.parse refuses.
+            json.dumps(envelope, allow_nan=False)
         except (TypeError, ValueError):
             self._log.exception("link: %s %s answered no JSON", method, parts.path)
             return 500, wire.error("internal", "internal error")
@@ -222,21 +245,32 @@ class ApiLinkHost:
         return envelope
 
     def snapshot(self) -> tuple[list[dict[str, object]], dict[str, str]]:
-        """``/meta`` and ``/sessions`` as the relay snapshot wants them. A
-        read that fails keeps the last rows it had (none before the first),
-        so a broken config is a stale snapshot, never a crash. Every caller
-        gets rows of its own."""
-        meta: dict[str, object] = {}
+        """``/meta`` and ``/sessions`` as the relay snapshot wants them. Each
+        read that fails keeps what it last had (nothing before the first):
+        the rows, and /meta's version and epoch, so a broken config is a
+        stale snapshot, never a crash. Every caller gets rows of its own."""
+        fresh_daemon: tuple[str, str] | None = None
         rows: list[dict[str, object]] | None = None
         try:
-            _status, meta_env = self.call("GET", api.PREFIX + "/meta")
-            meta = _data(meta_env)
+            status, meta_env = self.call("GET", api.PREFIX + "/meta")
+            if status == 200:
+                meta = _data(meta_env)
+                fresh_daemon = (
+                    str(meta.get("version", "")),
+                    str(meta.get("epoch", "")),
+                )
+        except Exception:  # noqa: BLE001  # reason: the snapshot never raises; a failed /meta keeps the last version and epoch
+            self._log.debug("link: snapshot /meta read failed", exc_info=True)
+        try:
             status, sessions_env = self.call("GET", api.PREFIX + "/sessions")
             if status == 200:
                 rows = _rows(_data(sessions_env).get("sessions"))
         except Exception:  # noqa: BLE001  # reason: the snapshot never raises; a failed read keeps the last rows (logged once per streak)
             self._log.debug("link: snapshot read failed", exc_info=True)
         with self._rows_lock:
+            if fresh_daemon is not None:
+                self._last_daemon = fresh_daemon
+            version, epoch = self._last_daemon
             if rows is None:
                 if not self._rows_failing:
                     self._log.warning(
@@ -250,9 +284,9 @@ class ApiLinkHost:
                 kept = self._last_rows = tuple(dict(r) for r in rows)
             out = [dict(r) for r in kept]
         daemon = {
-            "version": str(meta.get("version", "")),
+            "version": version,
             "platform": platform.system().lower(),
-            "epoch": str(meta.get("epoch", "")),
+            "epoch": epoch,
         }
         return out, daemon
 
@@ -260,20 +294,23 @@ class ApiLinkHost:
         return PollFeed(self)
 
     def remote_control(self) -> bool:
-        """``settings.link.remoteControl``; False whenever it cannot be read.
-        Re-read when the file's mtime changes; callers at once share one
-        read."""
-        if self._config_path is None:
-            return False
+        """``settings.link.remoteControl`` from ``find_config(config_path)``,
+        resolved on every read the way the CLI resolves it; False whenever it
+        cannot be read. Re-read whenever the file changes: its path, mtime,
+        size or file index (an atomic replace is a new file, and two saves
+        inside one coarse clock tick share an mtime). Callers at once share
+        one read."""
         with self._rc_lock:
             try:
-                stamp = Path(self._config_path).stat().st_mtime_ns
-            except OSError:
+                path = find_config(self._config_path)
+                info = path.stat()
+            except Exception:  # noqa: BLE001  # reason: a config that cannot be found or stat'd turns remote control OFF; it must never raise into the link
                 return False
+            stamp = (str(path), info.st_mtime_ns, info.st_size, info.st_ino)
             if self._rc_cache is not None and self._rc_cache[0] == stamp:
                 return self._rc_cache[1]
             try:
-                value = load_config(self._config_path).settings.link.remote_control
+                value = load_config(str(path)).settings.link.remote_control
             except Exception:  # noqa: BLE001  # reason: a config that does not load (ConfigError, a vanished file, anything) turns remote control OFF; it must never raise into the link
                 value = False
             self._rc_cache = (stamp, value)

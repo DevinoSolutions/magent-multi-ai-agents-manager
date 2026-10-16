@@ -203,8 +203,70 @@ class TestRemoteControl:
         config.unlink()
         assert host.remote_control() is False
 
-    def test_no_config_means_off(self):
+    def test_no_config_file_means_off(self, tmp_path, monkeypatch):
+        # A serve started without --config reads the file the CLI would; when
+        # there is none, remote control is off.
+        monkeypatch.setattr(
+            link_host, "find_config", lambda _a: tmp_path / "absent.json"
+        )
         assert ApiLinkHost(lambda: None, None).remote_control() is False
+
+    def test_a_serve_without_config_reads_the_file_serve_would(
+        self, ctx, config, monkeypatch
+    ):
+        # `magent serve` (and every serve --go/up spawns) runs without
+        # --config: the setting comes from the file paths.find_config names,
+        # the one `magent link --remote-control` writes.
+        asked: list[object] = []
+
+        def find(arg):
+            asked.append(arg)
+            return Path(arg) if arg else config
+
+        monkeypatch.setattr(link_host, "find_config", find)
+        _remote_control(config, True)
+        assert ApiLinkHost(lambda: ctx, None).remote_control() is True
+        assert asked == [None]
+
+    def test_an_explicit_config_is_resolved_the_same_way(self, config, monkeypatch):
+        asked: list[object] = []
+        real = link_host.find_config
+        monkeypatch.setattr(
+            link_host, "find_config", lambda arg: asked.append(arg) or real(arg)
+        )
+        _remote_control(config, True)
+        assert ApiLinkHost(lambda: None, str(config)).remote_control() is True
+        assert asked == [str(config)]
+
+    def test_a_rewrite_inside_one_clock_tick_is_still_read(self, host, config):
+        # Windows stamps file times from a coarse clock: two saves within one
+        # tick share an mtime. The write gate must still see the second one.
+        _remote_control(config, True)
+        assert host.remote_control() is True
+        before = config.stat()
+        _remote_control(config, False)
+        os.utime(config, ns=(before.st_atime_ns, before.st_mtime_ns))  # same mtime
+        assert host.remote_control() is False
+
+    def test_an_atomic_replace_of_the_same_size_and_mtime_is_read(
+        self, host, config, tmp_path
+    ):
+        # config_io saves through os.replace: a new file, so a new file index,
+        # even when its size and mtime match the old one's.
+        data = json.loads(config.read_text(encoding="utf-8"))
+        data["settings"] = {"link": {"remoteControl": True}}
+        on = (json.dumps(data) + " ").encode("utf-8")  # "true " is as long as "false"
+        data["settings"] = {"link": {"remoteControl": False}}
+        off = json.dumps(data).encode("utf-8")
+        assert len(on) == len(off)
+        config.write_bytes(on)
+        assert host.remote_control() is True
+        before = config.stat()
+        replacement = tmp_path / "replacement.json"
+        replacement.write_bytes(off)
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, config)
+        assert host.remote_control() is False
 
     def test_callers_at_once_share_one_config_read(self, host, config, monkeypatch):
         _remote_control(config, True)
@@ -293,6 +355,10 @@ class TestTunnel:
             ("DELETE", "/api/v1/sessions"),
             ("GET", "/api/v1/sessions/start/send"),
             ("PATCH", "/api/v1/projects/../x"),
+            # urlsplit moves these into netloc/scheme, leaving a good path.
+            ("GET", "//evil/api/v1/meta"),
+            ("GET", "http://x/api/v1/meta"),
+            ("GET", "magent:/api/v1/meta"),
         ],
     )
     def test_anything_else_is_refused_before_routing(self, host, reached, method, path):
@@ -304,6 +370,43 @@ class TestTunnel:
     def test_a_longest_session_id_is_tunnelled(self, host, reached):
         host.handle("GET", "/api/v1/sessions/" + "s" * 128, None, "dev_DECOY_phone")
         assert len(reached) == 1
+
+
+class TestTunnelledPoll:
+    """A device command runs on the runner thread: a tunnelled long-poll
+    would stall every other command, the acks and the stop check for up to
+    25 s, and its ``panes`` would keep pane capture running. It is answered
+    at once, without ``panes``; events reach devices through the stream."""
+
+    def test_it_never_waits_and_never_subscribes_panes(self, host, seen):
+        began = time.monotonic()
+        status, _envelope = host.handle(
+            "GET",
+            "/api/v1/events/poll?wait=25&panes=magent-alpha&since=deadbeef:0",
+            None,
+            "dev_DECOY_phone",
+        )
+        assert status == 200
+        assert time.monotonic() - began < 1.0
+        [(req, _caller, _raw)] = seen
+        assert req.query["wait"] == ["0"]
+        assert "panes" not in req.query
+        assert req.query["since"] == ["deadbeef:0"]
+
+    def test_a_poll_without_a_query_still_never_waits(self, host, seen):
+        began = time.monotonic()
+        assert (
+            host.handle("GET", "/api/v1/events/poll", None, "dev_DECOY_phone")[0] == 200
+        )
+        assert time.monotonic() - began < 1.0
+        [(req, _caller, _raw)] = seen
+        assert req.query == {"wait": ["0"]}
+
+    def test_the_feed_still_long_polls(self, host, seen):
+        # The forwarder's own feed is not a device command: it keeps its wait.
+        host.subscribe().next_batch(0.05)
+        [(req, _caller, _raw)] = seen
+        assert req.query["wait"] == ["0.050"]
 
 
 def test_a_stream_route_is_not_served_over_the_link(host):
@@ -335,6 +438,17 @@ def test_an_answer_that_is_not_json_is_a_500(host, monkeypatch):
     assert status == 500
     assert envelope["error"]["code"] == "internal"
     json.dumps(envelope)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_an_answer_with_a_number_json_cannot_carry_is_a_500(host, monkeypatch, bad):
+    # Python's json writes NaN/Infinity; the app's JSON.parse refuses them.
+    monkeypatch.setattr(
+        api, "handle", lambda *_a, **_k: api.ApiResponse(200, {"ok": True, "x": bad})
+    )
+    status, envelope = host.handle("GET", "/api/v1/meta", None, "dev_DECOY_phone")
+    assert status == 500
+    assert envelope["error"]["code"] == "internal"
 
 
 class TestStagedFormOverHttp:
@@ -412,6 +526,48 @@ class TestSnapshot:
         rows, daemon = host.snapshot()
         assert [r["session"] for r in rows] == ["magent-alpha"]
         assert daemon["epoch"] == "deadbeef"
+
+    def test_a_failed_meta_read_keeps_the_last_daemon_block(self, host, monkeypatch):
+        # The epoch is how a client tells serve restarted: a /meta read that
+        # fails must not blank it while the rows stay.
+        _rows, daemon = host.snapshot()
+        assert daemon["epoch"] == "deadbeef"
+        real = api.handle
+
+        def no_meta(req, ctx, caller=None):
+            if req.path.endswith("/meta"):
+                raise RuntimeError("DECOY meta broke")
+            return real(req, ctx, caller)
+
+        monkeypatch.setattr(api, "handle", no_meta)
+        rows, daemon = host.snapshot()
+        assert daemon["epoch"] == "deadbeef"
+        assert daemon["version"]
+        assert [r["session"] for r in rows] == ["magent-alpha"]  # read on its own
+
+    def test_a_meta_that_answers_an_error_keeps_the_last_daemon_block(
+        self, host, monkeypatch
+    ):
+        host.snapshot()
+        real = api.handle
+
+        def meta_500(req, ctx, caller=None):
+            if req.path.endswith("/meta"):
+                return api.ApiResponse(
+                    500, {"ok": False, "error": {"code": "internal"}}
+                )
+            return real(req, ctx, caller)
+
+        monkeypatch.setattr(api, "handle", meta_500)
+        _rows, daemon = host.snapshot()
+        assert daemon["epoch"] == "deadbeef"
+
+    def test_a_new_meta_replaces_the_kept_daemon_block(self, host, ctx):
+        host.snapshot()
+        restarted = dataclasses.replace(ctx, bus=events.EventBus("cafebabe"))
+        host._context = lambda: restarted
+        _rows, daemon = host.snapshot()
+        assert daemon["epoch"] == "cafebabe"
 
     def test_a_context_that_fails_is_an_empty_snapshot_not_a_crash(self):
         def no_server():

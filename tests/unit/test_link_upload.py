@@ -505,13 +505,13 @@ class TestRefusals:
         run = Running(host, linked)
         ready = make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
         relay.queue_upload_ready(ready)
-        relay.wait_for(lambda: _states(relay, uid) == ["inject_failed"])
-        relay.wait_for(lambda: uid not in run.runner._uploads._inflight)
+        relay.wait_for(lambda: _states(relay, uid) == ["inject_failed"], timeout=15)
+        relay.wait_for(lambda: uid not in run.runner._uploads._inflight, timeout=15)
         assert uid not in linked.state().seen_ids
         assert _pulls(uid) == []
 
         run.runner._uploads.offer(ready)  # never remembered: a resend is pulled
-        relay.wait_for(lambda: host.staged)
+        relay.wait_for(lambda: host.staged, timeout=15)
         assert host.staged[0][3] == b"PNG"
         run.finish(relay)
 

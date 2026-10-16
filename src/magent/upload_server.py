@@ -2348,11 +2348,13 @@ def run_server(
     ).start()
 
     # ...and the relay link (`magent link`): idle until this machine is
-    # paired, then one outbound stream to the relay. MAGENT_LINK=0 opts out --
+    # paired, then one outbound stream to the relay; one serve per machine
+    # runs it (link.LINK_LOCK), the others stand by. MAGENT_LINK=0 opts out --
     # a test-isolation law like the supervisors above (tests/conftest.py pins
-    # it): a linked developer box would otherwise dial the real relay. Never
-    # joined on the way out: a daemon thread that sees its stop within one
-    # stream read.
+    # it in process, and every explicit child env carries it with the
+    # dead-loopback MAGENT_LINK_URL, pinned by tests/unit/test_child_env_pins.py):
+    # a linked developer box would otherwise dial the real relay. Never joined
+    # on the way out: a daemon thread that sees its stop within one stream read.
     link_stop = threading.Event()
     threading.Thread(
         target=_supervise_link,
