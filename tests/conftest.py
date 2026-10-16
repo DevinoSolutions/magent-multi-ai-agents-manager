@@ -88,6 +88,7 @@ _IMPORT_BOUND_PATHS = (
     ("magent.linkfiles", "LINK_PATH", "link.json"),
     ("magent.linkfiles", "LINK_STATE_PATH", "link-state.json"),
     ("magent.linkfiles", "INCOMING_DIR", "uploads/.incoming"),
+    ("magent.linkfiles", "LINK_SERVE_PATH", "link-serve.json"),
     # win32-only module (it raises ImportError elsewhere by design), so this
     # entry is skipped rather than imported off-Windows.
     ("magent.hotkey", "_PID_PATH", "hotkey.pid"),

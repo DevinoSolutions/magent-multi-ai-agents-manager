@@ -7,6 +7,9 @@ exactly the expected shape -- the repair is always `magent unlink` then
 `magent link`. ``link-state.json`` is not secret: the stream cursor, the ring
 of command and upload ids already handled, the host they belong to, and the
 state `magent status` shows. A bad state file degrades to a fresh one.
+``link-serve.json`` is not secret either: the serve that runs the link (it
+holds ``link.LINK_LOCK``) names itself there -- pid, port, and the config
+file it reads remote control from -- for as long as it holds the lock.
 
 The paths are bound at import, like every other ~/.magent path, so
 tests/conftest.py's tripwire redirects them.
@@ -25,6 +28,7 @@ from magent.log import get_logger
 LINK_PATH = Path.home() / ".magent" / "link.json"
 LINK_STATE_PATH = Path.home() / ".magent" / "link-state.json"
 INCOMING_DIR = Path.home() / ".magent" / "uploads" / ".incoming"
+LINK_SERVE_PATH = Path.home() / ".magent" / "link-serve.json"
 
 FILE_VERSION = 1
 SEEN_MAX = 1024
@@ -216,3 +220,46 @@ def save_state(state: LinkState, path: Path | None = None) -> None:
         "host_id": state.host_id,
     }
     fsutil.write_atomic(_state_path(path), json.dumps(body).encode("utf-8"))
+
+
+def _serve_path(path: Path | None) -> Path:
+    return LINK_SERVE_PATH if path is None else path
+
+
+def save_serve(record: dict[str, object], path: Path | None = None) -> None:
+    """Write link-serve.json atomically: what the serve running the link says
+    about itself (``pid``, ``port``, ``config``)."""
+    body = {"version": FILE_VERSION, **record}
+    fsutil.write_atomic(_serve_path(path), json.dumps(body).encode("utf-8"))
+
+
+def load_serve(path: Path | None = None) -> dict[str, object] | None:
+    """The record, without its version; None when it is missing or not a
+    current record. It only means something while the link lock is held:
+    a serve that died leaves its record behind."""
+    p = _serve_path(path)
+    for attempt in range(READ_ATTEMPTS):
+        try:
+            raw = _read_json(p)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            # A read racing the writer's atomic replace (Windows).
+            if attempt < READ_ATTEMPTS - 1:
+                time.sleep(READ_RETRY_S)
+            continue
+        if not isinstance(raw, dict) or not _is_current(raw):
+            return None
+        return {str(k): v for k, v in raw.items() if k != "version"}
+    return None
+
+
+def clear_serve(pid: int | None = None, path: Path | None = None) -> None:
+    """Delete link-serve.json; with ``pid``, only while it still names that
+    process (a serve that took the link over keeps its own record)."""
+    p = _serve_path(path)
+    if pid is not None:
+        record = load_serve(p)
+        if record is None or record.get("pid") != pid:
+            return
+    p.unlink(missing_ok=True)

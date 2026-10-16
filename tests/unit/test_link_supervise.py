@@ -652,15 +652,36 @@ class TestServeOwnsIt:
         self, monkeypatch, link_on
     ):
         hosts: list[object] = []
+        records: list[object] = []
 
-        def supervise(host_factory, stop):
+        def supervise(host_factory, stop, *, serve):
             hosts.append(host_factory())
+            records.append(serve)
 
         monkeypatch.setattr(link, "supervise", supervise)
+        monkeypatch.setattr(upload_server.UploadHandler, "port", 8044)
         upload_server._supervise_link("C:/cfg/magent.config.json", threading.Event())
         [host] = hosts
         assert host._context == upload_server.UploadHandler._api_context
         assert host._config_path == "C:/cfg/magent.config.json"
+        # What `magent link`, status and doctor read to tell which serve runs
+        # the link and which file it takes remote control from.
+        assert records == [
+            {"port": 8044, "config": os.path.abspath("C:/cfg/magent.config.json")}
+        ]
+
+    def test_a_serve_without_config_records_the_file_it_resolves(
+        self, monkeypatch, link_on, tmp_path
+    ):
+        records: list[dict[str, object]] = []
+        monkeypatch.setattr(
+            link, "supervise", lambda _hf, _stop, *, serve: records.append(serve)
+        )
+        monkeypatch.setattr(
+            "magent.paths.find_config", lambda arg: tmp_path / f"{arg}.json"
+        )
+        upload_server._supervise_link(None, threading.Event())
+        assert records[0]["config"] == str(tmp_path / "None.json")
 
 
 class TestConfig:

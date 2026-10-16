@@ -135,6 +135,12 @@ class PairingRateLimited(Exception):
         self.retry_after = retry_after
 
 
+class AppUrlRefused(RelayError):
+    """pair/start named an app other than MAGENT_LINK_APP_URL (or one the QR
+    must not point at); nothing was started. A RelayError, as before, so a
+    caller that only knows RelayError still refuses it."""
+
+
 @dataclass(frozen=True)
 class PairingStart:
     pairing_id: str
@@ -224,7 +230,9 @@ def _check_app_url(app_url: str, relay_base: str) -> None:
     itself is http, i.e. a local dev or test relay), with no userinfo, query
     or fragment. The QR carries the pairing secret to that page, so a relay
     must not be able to aim it anywhere else."""
-    refused = _bad("pairing reply has an appUrl that is not this host's app")
+    refused = AppUrlRefused(
+        0, "invalid_response", "pairing reply has an appUrl that is not this host's app"
+    )
     odd = (chr(92), "@", "?", "#")
     if not app_url.isascii() or any(c <= " " or c in odd for c in app_url):
         raise refused

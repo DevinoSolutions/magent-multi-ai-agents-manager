@@ -52,6 +52,7 @@ CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 PAIRING_CODE = "ABCD-EFGH"
 HOST_ID = "hst_fake_1"
 PAIRED_AT = "2026-10-08T22:00:00.000Z"
+EXPIRES_AT = "2026-10-08T22:10:00.000Z"
 EVENTS_MAX_BYTES = 256 * 1024
 EVENTS_MAX = 500
 RESULTS_MAX = 100
@@ -206,6 +207,9 @@ class FakeRelay:
         self.deleted = False
         self.objects: dict[str, bytes] = {}
         self.pair_starts: list[dict[str, object]] = []
+        # What pair/start answers as expiresAt. A fixed past instant by default;
+        # a test that waits on the code's real expiry sets a future one.
+        self.expires_at = EXPIRES_AT
         self._cond = threading.Condition()
         self._commands: list[dict[str, object]] = []
         self._uploads: list[dict[str, object]] = []
@@ -643,7 +647,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "pairingId": PAIRING_ID,
                 "code": PAIRING_CODE,
                 "pollToken": self.relay.poll_token,
-                "expiresAt": "2026-10-08T22:10:00.000Z",
+                "expiresAt": self.relay.expires_at,
                 "appUrl": self.relay.url,
             }
         )

@@ -23,6 +23,8 @@ import http.client
 import importlib.metadata
 import ipaddress
 import json
+import math
+import os
 import queue
 import random
 import re
@@ -759,6 +761,21 @@ def app_url() -> str:
     QR may point at."""
     env = _env()
     return DEFAULT_APP_URL if env is None else str(env.link_app_url).rstrip("/")
+
+
+def shown_url(url: str) -> str:
+    """``url`` as a screen may show it: scheme, host, port and path, never
+    the userinfo (a relay URL can carry credentials), query or fragment."""
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return "(unreadable URL)"
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    where = f"{host}:{port}" if port is not None else host
+    return f"{parts.scheme}://{where}{parts.path}".rstrip("/")
 
 
 # --- The serve thread: LinkRunner (spec 4.1) ----------------------------------
@@ -2497,6 +2514,7 @@ def supervise(
     sleep: Callable[[float], bool] | None = None,
     link_path: Path | None = None,
     clock: Callable[[], float] = time.monotonic,
+    serve: dict[str, object] | None = None,
 ) -> None:
     """``magent serve``'s link thread: run LinkRunner until ``stop``.
 
@@ -2509,6 +2527,12 @@ def supervise(
     ``LINK_LOCK``; a serve that finds it held says so once and stands by,
     trying again every IDLE_RECHECK_S, until the holder exits. A lock that
     cannot be taken at all stands by the same way: never a second runner.
+    While it holds the lock the serve names itself in link-serve.json (its
+    pid plus ``serve``: port and config file), which is how `magent link`,
+    `status` and `doctor` tell which serve runs the link; and before its
+    first runner starts it clears the per-pull folders a serve that died
+    mid-pull left behind (no puller can be alive then: pullers only run
+    under the lock).
 
     A crash, of the host or the runner, is logged and the runner restarted
     with backoff (5 s doubling to 5 min; a run that ended on its own, or
@@ -2551,9 +2575,16 @@ def supervise(
             else:
                 if told:
                     log.info("link: the link is free; this serve runs it now")
-                _supervise_held(
-                    host_factory, stop, runner_factory, wait, link_path, clock, log
-                )
+                _take_over(serve, log)
+                try:
+                    _supervise_held(
+                        host_factory, stop, runner_factory, wait, link_path, clock, log
+                    )
+                finally:
+                    # Best effort: a record left behind means nothing once
+                    # the lock is free, which is what every reader checks.
+                    with contextlib.suppress(OSError):
+                        linkfiles.clear_serve(os.getpid())
                 return
         if wait(IDLE_RECHECK_S):
             return
@@ -2614,3 +2645,173 @@ def set_remote_control(config_path: Path, value: bool) -> None:
             settings["link"] = block
         block["remoteControl"] = value
         config_io.save(config_path, data)
+
+
+# --- Who runs the link, and what status, doctor and /api/v1/meta say (C8) ------
+
+# One pull's folder in linkfiles.INCOMING_DIR: <uploadId>.<_pull_token()>.
+_PULL_FOLDER = re.compile(_UPLOAD_ID.pattern + r"\.[0-9a-f]{8}", re.ASCII)
+
+
+def _take_over(serve: dict[str, object] | None, log: logging.Logger) -> None:
+    """What a serve does on taking the link lock, before its first runner:
+    name itself in link-serve.json, then clear left-over pulls."""
+    try:
+        linkfiles.save_serve({"pid": os.getpid(), **(serve or {})})
+    except OSError as exc:
+        log.warning("link: could not write %s (%s)", linkfiles.LINK_SERVE_PATH, exc)
+    _sweep_incoming(log)
+
+
+def _sweep_incoming(log: logging.Logger) -> int:
+    """Remove the per-pull folders (``<uploadId>.<token>``) in
+    linkfiles.INCOMING_DIR; how many went. A puller removes its own folder
+    when the pull ends, so one is left only by a process that died mid-pull,
+    and it holds a decrypted file. Called only while this process holds
+    LINK_LOCK and runs no runner, so no puller can own one. Anything else in
+    the folder, and anything that is not a plain folder, is left alone."""
+    try:
+        entries = list(linkfiles.INCOMING_DIR.iterdir())
+    except OSError:
+        return 0
+    removed = 0
+    for entry in entries:
+        if not _PULL_FOLDER.fullmatch(entry.name):
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        if not entry.exists():
+            removed += 1
+    if removed:
+        log.info("link: removed %d unfinished upload folder(s) left by a stop", removed)
+    return removed
+
+
+def sweep_incoming_if_free() -> int | None:
+    """`magent unlink`'s sweep of left-over pulls: only while no serve runs
+    the link (the lock is taken for the sweep). None when a serve holds it,
+    or the lock cannot be taken: its puller may own a folder."""
+    try:
+        with lockfile.persistent_lock(LINK_LOCK, wait_s=0.0):
+            return _sweep_incoming(get_logger("link"))
+    except OSError:  # LockHeld included
+        return None
+
+
+@dataclass(frozen=True)
+class LinkServe:
+    """Who runs the link on this machine. ``held``: True when a serve holds
+    LINK_LOCK (``pid``, ``port`` and ``config`` from its link-serve.json when
+    it is readable), False when none does, None when the lock could not be
+    probed."""
+
+    held: bool | None
+    pid: int | None = None
+    port: int | None = None
+    config: str | None = None
+
+
+def _int_field(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def link_serve() -> LinkServe:
+    """Probe LINK_LOCK. Taking it for a moment is the probe: free means no
+    serve runs the link (its thread holds the lock for as long as it runs,
+    and a process that dies lets go of it). A machine that never ran the link
+    has no lock file, and the probe creates none. The probe can make a serve
+    that is starting at that very moment stand by for one IDLE_RECHECK_S."""
+    if not lockfile.lock_path(LINK_LOCK).exists():
+        return LinkServe(held=False)
+    try:
+        with lockfile.persistent_lock(LINK_LOCK, wait_s=0.0):
+            return LinkServe(held=False)
+    except lockfile.LockHeld:
+        pass
+    except OSError:
+        return LinkServe(held=None)
+    record = linkfiles.load_serve() or {}
+    config = record.get("config")
+    return LinkServe(
+        held=True,
+        pid=_int_field(record.get("pid")),
+        port=_int_field(record.get("port")),
+        config=config if isinstance(config, str) and config else None,
+    )
+
+
+NOT_SERVING = "magent serve is not running"
+NEVER_CONNECTED_HINT = (
+    "it has not connected since it was paired; if that lasts, see "
+    "~/.magent/logs/link.log (a relay URL or host token that cannot work "
+    "looks like this)"
+)
+
+
+@dataclass(frozen=True)
+class LinkStatus:
+    """``state`` is one of the C8 words: unlinked, connecting, online,
+    offline, revoked, disabled. ``detail`` is the human line, ``hint`` a
+    second line when there is something to do (or to look at)."""
+
+    state: str
+    retry_in_s: int | None
+    detail: str
+    hint: str | None = None
+
+    def as_json(self) -> dict[str, object]:
+        return {"state": self.state, "retry_in_s": self.retry_in_s}
+
+
+def describe_link(
+    *,
+    serving: Callable[[], bool | str],
+    now: float | None = None,
+    link_path: Path | None = None,
+    state_path: Path | None = None,
+) -> LinkStatus:
+    """The link's state from link.json + link-state.json. ``serving`` says
+    whether a ``magent serve`` runs the link: True, False (none is running),
+    or the reason none runs it although one is up. It is only asked when the
+    answer depends on it. A state file that names another pairing reads as
+    fresh, as the runner reads it."""
+    if not link_enabled():
+        return LinkStatus("disabled", None, "disabled (MAGENT_LINK=0)")
+    try:
+        linked = linkfiles.load_link(link_path)
+        if linked is not None:
+            _check_host_token(linked)
+    except linkfiles.LinkFileError:
+        return LinkStatus(
+            "unlinked",
+            None,
+            "unlinked (link.json is unreadable: run `magent unlink`, then `magent link`)",
+        )
+    if linked is None:
+        return LinkStatus("unlinked", None, "unlinked")
+    state = linkfiles.load_state(state_path)
+    if state.host_id is not None and state.host_id != linked.host_id:
+        state = LinkState()
+    if state.state == "revoked":
+        return LinkStatus(
+            "revoked", None, "revoked (run `magent unlink`, then `magent link`)"
+        )
+    if state.state == "too_old":
+        return LinkStatus(
+            "offline", None, "offline (the relay needs a newer magent)", UPGRADE_HINT
+        )
+    served = serving()
+    if served is not True:
+        reason = served if isinstance(served, str) and served else NOT_SERVING
+        return LinkStatus("offline", None, f"offline ({reason})")
+    if state.state == "online":
+        return LinkStatus("online", None, "online")
+    if state.state == "offline":
+        hint = NEVER_CONNECTED_HINT if state.last_connected is None else None
+        if state.retry_at is None:
+            return LinkStatus("offline", None, "offline", hint)
+        clock = time.time() if now is None else now
+        retry = max(0, math.ceil(state.retry_at - clock))
+        return LinkStatus("offline", retry, f"offline (retry in {retry}s)", hint)
+    return LinkStatus("connecting", None, "connecting")

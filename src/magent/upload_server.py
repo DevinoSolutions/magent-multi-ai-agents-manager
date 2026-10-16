@@ -2220,8 +2220,27 @@ def _supervise_link(config_path: str | None, stop: threading.Event) -> None:
     from magent import link, link_host  # heavy subsystem: in-body per policy
 
     link.supervise(
-        lambda: link_host.ApiLinkHost(UploadHandler._api_context, config_path), stop
+        lambda: link_host.ApiLinkHost(UploadHandler._api_context, config_path),
+        stop,
+        serve=_link_record(config_path),
     )
+
+
+def _link_record(config_path: str | None) -> dict[str, object]:
+    """What this serve says about itself in ``link-serve.json`` while it runs
+    the link: its port, and the config file remote control is read from --
+    ``find_config`` of its ``--config``, as ``ApiLinkHost`` resolves it, made
+    absolute so `magent link`, `status` and `doctor`, run from another
+    directory, can tell whether they read the same file. ``config`` is None
+    when it does not resolve (the working directory can be deleted under
+    serve)."""
+    from magent import paths  # heavy subsystem: in-body per policy
+
+    try:
+        config: str | None = os.path.abspath(paths.find_config(config_path))
+    except (OSError, ValueError):
+        config = None
+    return {"port": UploadHandler.port, "config": config}
 
 
 def run_server(

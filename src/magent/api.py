@@ -711,6 +711,28 @@ def _version() -> str:
     return __version__
 
 
+def _link_served() -> bool:
+    """Whether a serve runs the link, asked from inside a serve: while one
+    holds the link lock (this one, or the one this serve stands by for).
+    When the lock cannot be probed, this serve's own link thread
+    (``link.LINK_THREAD``) decides."""
+    from magent import link  # in-body: link.py pulls in http.client and ssl
+
+    held = link.link_serve().held
+    if held is not None:
+        return held
+    return any(
+        t.name == link.LINK_THREAD and t.is_alive() for t in threading.enumerate()
+    )
+
+
+def _link_state() -> str:
+    """The relay link's C8 word (``magent link``) for ``/api/v1/meta``."""
+    from magent import link  # in-body: link.py pulls in http.client and ssl
+
+    return link.describe_link(serving=_link_served).state
+
+
 def _meta(call: Call) -> ApiResponse:
     return ApiResponse.ok(
         Meta(
@@ -720,7 +742,7 @@ def _meta(call: Call) -> ApiResponse:
             caps=list(CAPS),
             write_allowed=write_refusal(call.caller) is None,
             limits=Limits(call.ctx.upload_max_bytes, control.PANE_LINES_MAX),
-            link=LinkInfo(state="off"),
+            link=LinkInfo(state=_link_state()),
         )
     )
 
