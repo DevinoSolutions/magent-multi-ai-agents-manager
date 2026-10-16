@@ -251,6 +251,7 @@ MD011_ALLOW = {
     "src/magent/cli/config_io.py": "the editor's exit-on-error wrappers over config_io.save",
     "src/magent/cli/config_editor.py": "the interactive editor and config set/put/migrate, for keys projects.py does not own",
     "src/magent/cli/node_onboard.py": "node onboarding writes settings.nodes",
+    "src/magent/link.py": "settings.link.remoteControl, which `magent link` sets (P2)",
 }
 _MD011_ATTRS = frozenset({"save", "write_atomic"})
 _MD011_NAMES = frozenset({"_save_raw_config", "_save_raw_config_atomic"})

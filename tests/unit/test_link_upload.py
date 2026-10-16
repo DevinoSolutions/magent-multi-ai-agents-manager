@@ -3,6 +3,7 @@ upload is refused, retried or replayed without a second paste."""
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import threading
@@ -69,6 +70,18 @@ def _states(relay: FakeRelay, upload_id: str) -> list[str]:
         for r in results
         if r.get("type") == "upload" and r.get("uploadId") == upload_id
     ]
+
+
+def _pulls(upload_id: str) -> list[Path]:
+    """What is left of the upload's pull folders under .incoming."""
+    return sorted(linkfiles.INCOMING_DIR.glob(f"{upload_id}*"))
+
+
+@pytest.fixture
+def tokens(monkeypatch):
+    """Name each pull's folder in turn: <uploadId>.t1, <uploadId>.t2, ..."""
+    names = (f"t{n}" for n in itertools.count(1))
+    monkeypatch.setattr(link, "_pull_token", lambda: next(names))
 
 
 def _blob_gets(relay: FakeRelay, upload_id: str) -> int:
@@ -216,7 +229,7 @@ class TestPull:
         assert host.staged == [
             (phone.device_id, "magent-alpha", "photo.png", data, True)
         ]
-        assert not (linkfiles.INCOMING_DIR / uid).exists()
+        assert _pulls(uid) == []
         assert uid in linked.state().seen_ids
         run.finish(relay)
 
@@ -256,7 +269,7 @@ class TestPull:
             make_upload(relay, linked, phone, upload_id=uid, data=b"x")
         )
         relay.wait_for(lambda: _states(relay, uid) == ["pulled", "inject_failed"])
-        assert not (linkfiles.INCOMING_DIR / uid).exists()
+        assert _pulls(uid) == []
         run.finish(relay)
 
     def test_the_name_is_reduced_to_a_safe_base_name(self, relay, phone, linked):
@@ -328,7 +341,7 @@ class TestRefusals:
         )
         relay.wait_for(lambda: _states(relay, uid) == ["inject_failed"])
         assert host.staged == []
-        assert not (linkfiles.INCOMING_DIR / uid).exists()
+        assert _pulls(uid) == []
         assert uid not in linked.state().seen_ids
         run.finish(relay)
 
@@ -482,11 +495,12 @@ class TestRefusals:
         assert uid not in linked.state().seen_ids
 
     def test_a_file_that_cannot_be_written_here_is_refused_and_a_resend_works(
-        self, relay, phone, linked
+        self, relay, phone, linked, tokens
     ):
         uid = up_id(23)
-        # A folder where the decrypted file must go: opening it fails.
-        (linkfiles.INCOMING_DIR / uid / "photo.png").mkdir(parents=True)
+        # A folder where the first pull's decrypted file must go: opening it
+        # fails. The resend pulls into a folder of its own.
+        (linkfiles.INCOMING_DIR / f"{uid}.t1" / "photo.png").mkdir(parents=True)
         host = FakeHost()
         run = Running(host, linked)
         ready = make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
@@ -494,18 +508,20 @@ class TestRefusals:
         relay.wait_for(lambda: _states(relay, uid) == ["inject_failed"])
         relay.wait_for(lambda: uid not in run.runner._uploads._inflight)
         assert uid not in linked.state().seen_ids
-        assert not (linkfiles.INCOMING_DIR / uid).exists()
+        assert _pulls(uid) == []
 
         run.runner._uploads.offer(ready)  # never remembered: a resend is pulled
         relay.wait_for(lambda: host.staged)
         assert host.staged[0][3] == b"PNG"
         run.finish(relay)
 
-    def test_a_blob_that_cannot_be_written_is_refused(self, relay, phone, linked):
+    def test_a_blob_that_cannot_be_written_is_refused(
+        self, relay, phone, linked, tokens
+    ):
         # The download side of "could not be written here" (a full disk
         # mid-download): refused, not a crash the next connect repeats.
         uid = up_id(41)
-        (linkfiles.INCOMING_DIR / uid / ".blob").mkdir(parents=True)
+        (linkfiles.INCOMING_DIR / f"{uid}.t1" / ".blob").mkdir(parents=True)
         host = FakeHost()
         run = Running(host, linked)
         relay.queue_upload_ready(
@@ -611,7 +627,7 @@ class TestRefusals:
         assert host.staged == []
         assert _states(relay, uid) == []
         assert uid not in linked.state().seen_ids
-        assert not (linkfiles.INCOMING_DIR / uid).exists()
+        assert _pulls(uid) == []
 
 
 class TestReplays:
@@ -648,6 +664,64 @@ class TestReplays:
         run.finish(relay)
         assert host.staged == []
         assert _blob_gets(relay, uid) == 0
+
+    def test_each_pull_has_a_folder_of_its_own(self, relay, phone, linked, monkeypatch):
+        # A puller from an earlier run of the link can still be finishing the
+        # same upload: it must never truncate or remove what this one stages.
+        folders: list[Path] = []
+        real = UploadPuller._take
+
+        def spy(self, upload_id, ready, folder):
+            folders.append(folder)
+            return real(self, upload_id, ready, folder)
+
+        monkeypatch.setattr(UploadPuller, "_take", spy)
+        uid = up_id(43)
+        host = FakeHost()
+        run = Running(host, linked, client_factory=_downloads(fails=1))
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        )
+        relay.wait_for(
+            lambda: (
+                (relay.drop_streams() or True)
+                and _states(relay, uid) == ["pulled", "injected"]
+            )
+        )
+        run.finish(relay)
+        assert len(folders) == 2
+        assert folders[0] != folders[1]
+        for folder in folders:
+            assert folder.parent == linkfiles.INCOMING_DIR
+            assert folder.name.startswith(f"{uid}.")
+        assert _pulls(uid) == []
+
+    def test_a_stop_after_the_decrypt_abandons_the_upload(
+        self, relay, phone, linked, monkeypatch
+    ):
+        # Stopped between the decrypt and the ring: neither remembered,
+        # staged nor reported, so the next run of the link pulls it whole.
+        real = UploadPuller._fetch
+
+        def then_stop(self, ready, folder):
+            target = real(self, ready, folder)
+            self._stop.set()
+            return target
+
+        monkeypatch.setattr(UploadPuller, "_fetch", then_stop)
+        uid = up_id(44)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        )
+        relay.wait_for(lambda: _blob_gets(relay, uid) == 1)
+        relay.wait_for(lambda: uid not in run.runner._uploads._inflight)
+        run.finish(relay)
+        assert host.staged == []
+        assert _states(relay, uid) == []
+        assert uid not in linked.state().seen_ids
+        assert _pulls(uid) == []
 
     def test_a_failed_download_is_retried_on_the_next_connect(
         self, relay, phone, linked
@@ -734,7 +808,7 @@ class TestReplays:
         relay.wait_for(lambda: uid not in run.runner._uploads._inflight)
         run.finish(relay)
         assert host.staged == []
-        assert not (linkfiles.INCOMING_DIR / uid).exists()
+        assert _pulls(uid) == []
 
     def test_the_presigned_url_never_reaches_the_log(
         self, relay, phone, linked, caplog

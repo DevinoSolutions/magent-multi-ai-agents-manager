@@ -252,6 +252,18 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "below 30 are raised to 30 (the floor)."
         ),
     ),
+    (
+        "link.remoteControl",
+        "boolean",
+        "`false`",
+        (
+            "Let devices paired with `magent link` send text, choose, interrupt, "
+            "change model, start/stop sessions and edit projects. Off, they can "
+            "only watch and upload. Set by `magent link --remote-control` / "
+            "`--no-remote-control`; any non-boolean is a config error, never "
+            "read as on."
+        ),
+    ),
 ]
 
 

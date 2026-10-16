@@ -18,6 +18,7 @@ from magent.linkcrypto import AAD_EVT
 from tests._fake_relay import FakeRelay
 from tests.unit._link_fakes import (
     HOST_ID,
+    OTHER_ID,
     SESSION_ROW,
     TABLET_ID,
     FakeFeed,
@@ -212,13 +213,66 @@ class TestForwarding:
         _linked, run = _online(tmp_path, relay, (phone,), host)
         with caplog.at_level("WARNING", logger="magent.link"):
             host.feed.push(
-                _event(1, "session.pane", session="a", text="x" * 300_000),
+                # Not a pane (a pane keeps its tail instead): nothing to cut.
+                _event(1, session="a", note="x" * 300_000),
                 _event(2, session="b"),
             )
             relay.wait_for(lambda: relay.events)
             time.sleep(0.3)
         assert [e["daemonEventId"] for e in relay.events] == ["e0e0e0e0:2"]
         assert any("dropped event e0e0e0e0:1" in r.getMessage() for r in caplog.records)
+        run.finish(relay)
+
+    @pytest.mark.parametrize(("devices", "chars"), [(1, 200_000), (3, 70_000)])
+    def test_a_pane_too_big_for_one_post_keeps_its_tail(
+        self, tmp_path, relay, phone, devices, chars
+    ):
+        # Sealed once per device, a pane of about 190 KB (one device) or
+        # 64 KB (three) would pass the 256 KiB post: it keeps its last whole
+        # lines instead of being dropped.
+        paired = (
+            phone,
+            new_device(TABLET_ID, "Tablet DECOY"),
+            new_device(OTHER_ID, "Other DECOY"),
+        )[:devices]
+        host = FakeHost()
+        linked, run = _online(tmp_path, relay, paired, host)
+        lines = [f"line {n:07d} DECOY" for n in range(chars // 18)]
+        text = "\n".join(lines)
+        host.feed.push(_event(1, "session.pane", session="a", text=text, lines=9))
+
+        relay.wait_for(lambda: relay.events)
+        posted = relay.events[0]
+        assert set(posted["sealed"]) == {d.device_id for d in paired}
+        for device in paired:
+            sent = json.loads(
+                linkcrypto.open_sealed(
+                    linked.device_keys(device).h2d,
+                    posted["sealed"][device.device_id],
+                    f"{AAD_EVT}{HOST_ID}:e0e0e0e0:1",
+                )
+            )
+            kept = sent["data"]["text"]
+            assert 0 < len(kept) < len(text)
+            assert text.endswith(kept)
+            assert kept.split("\n")[0] in lines  # whole lines only
+            assert sent["data"]["lines"] == 9  # the rest of the event as it was
+        run.finish(relay)
+
+    def test_a_pane_that_fits_is_sent_whole(self, tmp_path, relay, phone):
+        host = FakeHost()
+        linked, run = _online(tmp_path, relay, (phone,), host)
+        text = "x" * 150_000
+        host.feed.push(_event(1, "session.pane", session="a", text=text))
+        relay.wait_for(lambda: relay.events)
+        sent = json.loads(
+            linkcrypto.open_sealed(
+                linked.device_keys(phone).h2d,
+                relay.events[0]["sealed"][phone.device_id],
+                f"{AAD_EVT}{HOST_ID}:e0e0e0e0:1",
+            )
+        )
+        assert sent["data"]["text"] == text
         run.finish(relay)
 
     @pytest.mark.parametrize("bad", ["id", "long-id", "type", "emoji-type"])

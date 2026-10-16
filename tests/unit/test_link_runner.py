@@ -266,6 +266,55 @@ class TestSnapshot:
         assert linked.state().last_connected is not None
         run.finish(relay)
 
+    def test_a_snapshot_too_big_for_the_relay_keeps_the_rows_that_fit(
+        self, tmp_path, relay, phone, caplog
+    ):
+        # Sealed once per device, a big fleet outgrows the relay's 4 MiB
+        # snapshot cap: refused on every connect, the host would never get
+        # online. The rows that fit go, in order, and the log says so.
+        devices = (
+            phone,
+            new_device(TABLET_ID, "Tablet DECOY"),
+            new_device(OTHER_ID, "Other DECOY"),
+        )
+        linked = write_link(tmp_path, relay.url, devices, host_token=relay.host_token)
+        rows = [
+            {**SESSION_ROW, "session": f"s{n}", "path": "p" * 2_000} for n in range(900)
+        ]
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(FakeHost(sessions=rows), linked)
+            relay.wait_for(run.runner.online, timeout=15)
+        snap = relay.snapshots[0]
+        sent = json.loads(
+            linkcrypto.open_sealed(
+                linked.device_keys(phone).h2d,
+                snap["sealed"][phone.device_id],
+                AAD_SNAP + HOST_ID,
+            )
+        )["sessions"]
+        assert 0 < len(sent) < len(rows)
+        assert sent == rows[: len(sent)]
+        assert [s["session"] for s in snap["sessions"]] == [r["session"] for r in sent]
+        assert len(json.dumps(snap, separators=(",", ":"))) <= 4 * 1024 * 1024
+        assert any("snapshot" in r.getMessage() for r in caplog.records)
+        run.finish(relay)
+
+    def test_no_more_rows_than_the_relay_takes_are_sealed(self, tmp_path, relay, phone):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        rows = [{**SESSION_ROW, "session": f"s{n}"} for n in range(1_100)]
+        run = Running(FakeHost(sessions=rows), linked)
+        relay.wait_for(lambda: relay.snapshots)
+        snap = relay.snapshots[0]
+        sent = json.loads(
+            linkcrypto.open_sealed(
+                linked.device_keys(phone).h2d,
+                snap["sealed"][phone.device_id],
+                AAD_SNAP + HOST_ID,
+            )
+        )["sessions"]
+        assert len(sent) == len(snap["sessions"]) == link.SNAPSHOT_SESSIONS_MAX
+        run.finish(relay)
+
     def test_a_rate_limited_snapshot_waits_through_the_runner_s_sleep(
         self, tmp_path, relay, phone
     ):

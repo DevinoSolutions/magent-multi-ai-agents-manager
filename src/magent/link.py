@@ -5,9 +5,11 @@ The transport first: a stdlib http.client client for the relay's
 parser for ``/v1/stream/host`` (C5), the reconnect backoff and the seen-id
 ring. Then LinkRunner, the serve thread built on it: the relay connection,
 the snapshot, and the commands paired devices send. Then EventForwarder,
-the runner's second thread: the daemon's events, sealed per device. Last,
+the runner's second thread: the daemon's events, sealed per device. Then
 UploadPuller, its third: the files paired devices upload, pulled from
-storage, decrypted and handed to the daemon.
+storage, decrypted and handed to the daemon. Last, supervise, the body of
+serve's link thread around the runner, and the one config key the link
+writes (``settings.link.remoteControl``).
 
 Outbound only: the relay never connects to this machine. MD013 keeps this
 module the only new code that opens an outbound HTTP connection.
@@ -24,6 +26,7 @@ import json
 import queue
 import random
 import re
+import secrets
 import shutil
 import socket
 import ssl
@@ -775,6 +778,7 @@ RESULT_CACHE_MAX = 256  # results kept to re-send when a command is replayed
 SAVE_ATTEMPTS = 5  # link-state.json writes, 20 ms apart (see LinkRunner._save)
 SAVE_RETRY_S = 0.02
 SNAPSHOT_SESSIONS_MAX = 1000  # rows the relay takes in one snapshot (C4)
+SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024  # the relay's cap on one snapshot PUT body
 SESSION_NAME_MAX = 200
 SESSION_STATE_MAX = 32
 DAEMON_FIELD_MAX = 32
@@ -849,6 +853,12 @@ class _Peer:
     device: TrustedDevice
     sign_pub: bytes
     keys: PairKeys
+
+
+class _Relinked(Exception):
+    """link.json names another host or token than the one this run holds
+    (`magent link` paired again): the run ends, and the link thread starts
+    a new one on the new credentials."""
 
 
 class _Refused(Exception):
@@ -976,7 +986,9 @@ class LinkRunner:
 
     State in ``link-state.json`` (contract C8): ``connecting``, ``online``,
     ``offline`` with ``retry_at`` between attempts; ``revoked`` and
-    ``too_old`` end the run. Every (re)connect PUTs a fresh snapshot, then
+    ``too_old`` end the run, and so does a link.json that names another host
+    or token (``relinked``, checked at every connect and device list). Every
+    (re)connect PUTs a fresh snapshot (bounded to what the relay takes), then
     reads the SSE stream from the saved cursor. A failure with no reply, a
     5xx or a 429 is retried after a full-jitter backoff (at least the
     relay's Retry-After); any other 4xx waits PERMANENT_RETRY_S. Three failed
@@ -1038,7 +1050,8 @@ class LinkRunner:
     # -- the loop ------------------------------------------------------------
 
     def run(self, stop: threading.Event) -> str:
-        """Run until ``stop``; the terminal state: revoked, too_old or stopped."""
+        """Run until ``stop``; how it ended: revoked, too_old, stopped, or
+        relinked (link.json now names another host or token: run again)."""
         sleep = self._sleep or stop.wait
         while not stop.is_set():
             # Loading the keys needs cryptography as much as running does, so
@@ -1113,6 +1126,7 @@ class LinkRunner:
             self._frames = 0
             try:
                 if need_snapshot:
+                    self._relinked_on_disk()
                     self._set_state("connecting")
                     self.put_snapshot(client)
                     need_snapshot = False
@@ -1133,6 +1147,9 @@ class LinkRunner:
                 self._set_state("too_old")
                 self._log.warning("%s", UPGRADE_HINT)
                 return "too_old"
+            except _Relinked:
+                self._log.info("link: this machine was paired again; reconnecting")
+                return "relinked"
             except RelayError as exc:
                 need_snapshot = True
                 error = exc
@@ -1446,6 +1463,7 @@ class LinkRunner:
         try:
             current = self._read_link()
             if current is not None:
+                self._check_same_link(current)
                 current = self._forget(current, revoked)
                 peers = self._peers_for(current)
         except linkfiles.LinkFileError as exc:
@@ -1460,6 +1478,28 @@ class LinkRunner:
             self._peers = peers
         if changed:
             self.put_snapshot(client)
+
+    def _check_same_link(self, current: LinkFile) -> None:
+        """_Relinked when ``current`` names another host or token than the
+        one this run connected with: its keys belong to the new pairing, and
+        sealing for them under the old token would be neither link."""
+        with self._lock:
+            held = self._link
+        if held is not None and (current.host_id, current.host_token) != (
+            held.host_id,
+            held.host_token,
+        ):
+            raise _Relinked
+
+    def _relinked_on_disk(self) -> None:
+        """The same check against link.json now (a reconnect); a file that
+        cannot be read here leaves the run alone."""
+        try:
+            current = self._read_link()
+        except linkfiles.LinkFileError:
+            return
+        if current is not None:
+            self._check_same_link(current)
 
     def _forget(self, link: LinkFile, revoked: set[str]) -> LinkFile:
         """``link`` without the revoked devices, saved when that changed it."""
@@ -1498,20 +1538,47 @@ class LinkRunner:
         device. Serialised, the read with its PUT: two threads put snapshots."""
         with self._snapshot_lock:
             rows, daemon = self._host.snapshot()
-            plain = json.dumps({"sessions": rows}, separators=(",", ":")).encode()
-            host_id = self.host_id
-            metas = [m for m in (session_meta(r) for r in rows) if m is not None]
-            body = {
+            fixed: dict[str, object] = {
                 "daemon": {
                     key: _daemon_field(daemon.get(key))
                     for key in ("version", "platform", "epoch")
                 },
                 "remoteControl": self._host.remote_control() is True,
                 "uploadMaxBytes": max(1, self._host.upload_max_bytes()),
-                "sessions": metas[:SNAPSHOT_SESSIONS_MAX],
-                "sealed": self.seal_for_devices(plain, AAD_SNAP + host_id),
             }
-            client.call("PUT", "/v1/host/snapshot", body)
+            client.call("PUT", "/v1/host/snapshot", self._snapshot_body(rows, fixed))
+
+    def _snapshot_body(
+        self, rows: list[dict[str, object]], fixed: dict[str, object]
+    ) -> dict[str, object]:
+        """The PUT body for ``rows``, at most SNAPSHOT_SESSIONS_MAX of them,
+        and, sealed once per device, at most the relay's SNAPSHOT_MAX_BYTES:
+        a fleet too big for that keeps the rows that fit, in order (with a
+        warning), rather than being refused on every connect."""
+        aad = AAD_SNAP + self.host_id
+        rows = rows[:SNAPSHOT_SESSIONS_MAX]
+        total = len(rows)
+        while True:
+            plain = json.dumps({"sessions": rows}, separators=(",", ":")).encode()
+            body = {
+                **fixed,
+                "sessions": [m for m in map(session_meta, rows) if m is not None],
+                "sealed": self.seal_for_devices(plain, aad),
+            }
+            size = len(json.dumps(body, separators=(",", ":")))
+            if size <= SNAPSHOT_MAX_BYTES or not rows:
+                break
+            # Shrunk in proportion, a little past it: rows differ in size.
+            rows = rows[: int(len(rows) * SNAPSHOT_MAX_BYTES / size * 0.95)]
+        if len(rows) < total:
+            self._log.warning(
+                "link: the snapshot holds %d of %d sessions: sealed for every "
+                "device, the rest would pass the relay's %d-byte cap",
+                len(rows),
+                total,
+                SNAPSHOT_MAX_BYTES,
+            )
+        return body
 
     def online(self) -> bool:
         with self._lock:
@@ -1673,6 +1740,9 @@ EVENT_FIELD_MAX = 64  # daemonEventId and type, as the relay takes them
 EVENT_RETRY_BASE_S = 1.0  # the backoff after a LinkHost.subscribe or feed failure
 EVENT_RETRY_CAP_S = 60.0
 EVENT_JOIN_S = 5.0  # how long stop() waits for a post in flight
+# Characters a too-big pane loses beyond what the size says it must: room for
+# the base64 rounding of each device's copy.
+PANE_CUT_SLACK = 64
 _EVENTS_FRAME = len('{"events":[]}')
 # Read by the forwarder, never sent: ``hello`` opens a feed, and ``reset``
 # (the feed lost events) is answered with a fresh snapshot instead.
@@ -1872,14 +1942,50 @@ class EventForwarder:
         if not (_event_field(event_id) and _event_field(kind)):
             self._log.warning("link: dropped an event the relay would refuse")
             return None
+        item = self._seal(event)
+        if kind == "session.pane":
+            item = self._pane_that_fits(event, item)
+        return item
+
+    def _seal(self, event: dict[str, object]) -> dict[str, object]:
         plain = json.dumps(event, separators=(",", ":")).encode("utf-8")
-        aad = f"{AAD_EVT}{self._runner.host_id}:{event_id}"
+        aad = f"{AAD_EVT}{self._runner.host_id}:{event['id']}"
         return {
-            "daemonEventId": event_id,
-            "type": kind,
+            "daemonEventId": event["id"],
+            "type": event["type"],
             "meta": event_meta(event),
             "sealed": self._runner.seal_for_devices(plain, aad),
         }
+
+    def _pane_that_fits(
+        self, event: dict[str, object], item: dict[str, object]
+    ) -> dict[str, object]:
+        """A ``session.pane`` too big for one post once sealed for every
+        device keeps the tail of its text, whole lines only, rather than
+        being dropped: the cut is sized from how far over the post is (a
+        plaintext byte costs about 4/3 per device), and a character is at
+        least one byte, so one cut is enough."""
+        data, sealed = event.get("data"), item.get("sealed")
+        text = data.get("text") if isinstance(data, dict) else None
+        size = _EVENTS_FRAME + len(json.dumps(item, separators=(",", ":"))) + 1
+        if (
+            size <= EVENTS_MAX_BYTES
+            or not isinstance(data, dict)
+            or not isinstance(text, str)
+            or not isinstance(sealed, dict)
+            or not sealed
+        ):
+            return item
+        over = -(-(size - EVENTS_MAX_BYTES) * 3 // (4 * len(sealed)))
+        tail = text[over + PANE_CUT_SLACK :]
+        _, newline, rest = tail.partition("\n")
+        tail = rest if newline else tail
+        self._log.info(
+            "link: a %d-device pane was cut to its last %d characters to fit one post",
+            len(sealed),
+            len(tail),
+        )
+        return self._seal({**event, "data": {**data, "text": tail}})
 
     def _chunks(self, events: list[dict[str, object]]) -> list[list[dict[str, object]]]:
         chunks: list[list[dict[str, object]]] = []
@@ -1942,6 +2048,11 @@ _DEVICE_NAMES = frozenset(
         *(f"LPT{n}" for n in (*range(1, 10), "\u00b9", "\u00b2", "\u00b3")),
     }
 )
+
+
+def _pull_token() -> str:
+    """Names one pull's incoming folder, beside the upload id."""
+    return secrets.token_hex(4)
 
 
 def safe_name(name: object) -> str:
@@ -2017,9 +2128,10 @@ class UploadPuller:
     daemon's upload cap plus 64 KiB of framing (or nothing is fetched), and
     the content key (AAD ``ukey:<id>``) and meta (AAD ``umeta:<id>``) must
     open under that device's d2h key. The object is streamed from its
-    presigned URL into ``~/.magent/uploads/.incoming/<uploadId>/`` under the
-    same cap and decrypted chunk by chunk (a tampered or cut-short object
-    fails whole). Only then does the id enter the seen ring, in one step
+    presigned URL into ``~/.magent/uploads/.incoming/<uploadId>.<token>/``
+    (one folder per pull) under the same cap and decrypted chunk by chunk (a
+    tampered or cut-short object fails whole). Only then, unless the link
+    has stopped meanwhile, does the id enter the seen ring, in one step
     with the seen check; it is reported ``pulled``, handed to
     ``LinkHost.stage_upload``, and its outcome reported: ``injected``,
     ``inject_pending``, ``inject_failed`` (a paste was asked for and did not
@@ -2097,9 +2209,11 @@ class UploadPuller:
                     self._inflight.discard(upload_id)
 
     def _pull(self, upload_id: str, ready: dict[str, object]) -> None:
-        """One upload, start to finish. The incoming folder is gone before
-        the final state is reported."""
-        folder = linkfiles.INCOMING_DIR / upload_id
+        """One upload, start to finish, in a folder of this pull's own: a
+        puller from an earlier run of the link that is still finishing the
+        same upload can never truncate or remove it. The folder is gone
+        before the final state is reported."""
+        folder = linkfiles.INCOMING_DIR / f"{upload_id}.{_pull_token()}"
         try:
             outcome = self._take(upload_id, ready, folder)
         finally:
@@ -2233,9 +2347,13 @@ class UploadPuller:
 
         return sink
 
-    def _stage(self, ready: _Verified, target: Path) -> tuple[str, bool]:
-        """Remember, report ``pulled``, stage: the final state (see _take)."""
+    def _stage(self, ready: _Verified, target: Path) -> tuple[str, bool] | None:
+        """Remember, report ``pulled``, stage: the final state (see _take).
+        None, and nothing remembered, when the link stopped meanwhile: the
+        relay sends it again on the next run."""
         upload_id = ready.upload_id
+        if self._stop.is_set():
+            return None
         fresh = self._runner.remember(upload_id)
         if fresh is None:
             # Another delivery got here first: reported, never pasted again.
@@ -2288,3 +2406,93 @@ class UploadPuller:
             )
             return False
         return True
+
+
+# --- The serve thread's supervisor and the config switch ------------------------
+
+LINK_THREAD = "magent-relay-link"  # serve's thread running supervise
+SUPERVISE_BACKOFF_BASE_S = 5.0
+SUPERVISE_BACKOFF_CAP_S = 300.0
+
+
+def _link_stamp(path: Path | None) -> tuple[int, int] | None:
+    """link.json's mtime and size, None when it is absent: a re-pair (or an
+    unlink) changes it."""
+    try:
+        info = (path or linkfiles.LINK_PATH).stat()
+    except OSError:
+        return None
+    return info.st_mtime_ns, info.st_size
+
+
+def supervise(
+    host_factory: Callable[[], LinkHost],
+    stop: threading.Event,
+    *,
+    runner_factory: Callable[[LinkHost], LinkRunner] = LinkRunner,
+    sleep: Callable[[float], bool] | None = None,
+    link_path: Path | None = None,
+) -> None:
+    """``magent serve``'s link thread: run LinkRunner until ``stop``.
+
+    MAGENT_LINK=0 logs once and returns (a broken MAGENT_* environment fails
+    open: the runner still dials only the relay link.json names). A crash,
+    of the host or the runner, is logged and the runner restarted with
+    backoff (5 s doubling to 5 min). ``relinked`` starts a new runner at
+    once. After ``revoked`` or ``too_old`` the thread waits for link.json to
+    change (`magent unlink`, `magent link`) instead of hammering a relay
+    that already said no; a link.json that changed while that run was going
+    (paired again, then the old pairing revoked) restarts it at once.
+
+    No join is owed on the way out: the runner sees ``stop`` within one
+    stream read (STREAM_READ_TIMEOUT_S) and its forwarder within about 6 s;
+    after a revoke a forwarder may linger one Retry-After plus one request
+    (about 90 s) before its daemon thread ends.
+    """
+    log = get_logger("link")
+    wait = sleep or stop.wait
+    if not link_enabled():
+        log.info("link: off (MAGENT_LINK=0); this serve will not dial the relay")
+        return
+    backoff = Backoff(base=SUPERVISE_BACKOFF_BASE_S, cap=SUPERVISE_BACKOFF_CAP_S)
+    while not stop.is_set():
+        began = _link_stamp(link_path)
+        try:
+            outcome = runner_factory(host_factory()).run(stop)
+        except Exception:
+            # A crashed runner, or a host that cannot be built yet: logged and
+            # restarted with backoff, never the end of the thread for serve's life.
+            log.exception("link: the link thread crashed; restarting it")
+            if wait(backoff.next_delay()):
+                return
+            continue
+        if outcome == "stopped":
+            return
+        backoff.reset()
+        if outcome == "relinked":
+            continue
+        log.info("link: %s; waiting for `magent link` to pair this machine", outcome)
+        while _link_stamp(link_path) == began:
+            if wait(IDLE_RECHECK_S):
+                return
+
+
+def set_remote_control(config_path: Path, value: bool) -> None:
+    """Write ``settings.link.remoteControl`` through ``config_io`` (lock,
+    validate, backup, atomic replace; MD011). Raises ``lockfile.LockHeld``
+    when another writer holds the config, ``config_io.ConfigWriteError``
+    when the result would not load."""
+    from magent import config_io  # the config writer: only `magent link` needs it
+
+    with config_io.locked():
+        data = config_io.load_raw(config_path)
+        settings = data.get("settings")
+        if not isinstance(settings, dict):
+            settings = {}
+            data["settings"] = settings
+        block = settings.get("link")
+        if not isinstance(block, dict):
+            block = {}
+            settings["link"] = block
+        block["remoteControl"] = value
+        config_io.save(config_path, data)
