@@ -535,9 +535,18 @@ def _config_mismatch(owner: LinkServe, config_file: Path) -> str | None:
     """The line saying the serve running the link reads remote control from
     another file than ``config_file`` (the one this command resolved), or
     None. Serve resolves its own ``--config`` from its own directory, so the
-    two can differ."""
-    if not owner.held or owner.config is None:
+    two can differ. A serve that recorded no config file found none when it
+    took the link, and reads remote control as off while it finds none."""
+    if not owner.held:
         return None
+    if owner.config is None:
+        if owner.pid is None:  # no record to compare with
+            return None
+        return (
+            "remote control: the magent serve running the link found no config "
+            "file when it started the link; remote control is off there until "
+            "it finds one"
+        )
     if _same_file(owner.config, config_file):
         return None
     return (

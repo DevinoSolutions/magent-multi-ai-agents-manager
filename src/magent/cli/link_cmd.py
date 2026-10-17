@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
     from magent.link import RelayClient
     from magent.linkcrypto import KeyPairs
-    from magent.linkfiles import LinkFile
+    from magent.linkfiles import LinkFile, LinkState
     from magent.linkpair import ClaimOutcome
 
 PAIR_WAIT_S = 600.0  # the code lives 10 minutes on the relay...
@@ -274,9 +274,10 @@ def _claim(
         _fail(f"magent link: {_shown(str(exc), 300)}")
 
 
-def _release(client: RelayClient, token: str) -> None:
-    """DELETE /v1/host for a new host this machine could not keep. Best
-    effort, one attempt: the host token is never shown either way."""
+def _release(client: RelayClient, token: str) -> bool:
+    """DELETE /v1/host for a new host this machine could not keep; True when
+    the relay took it. Best effort, one attempt: the host token is never
+    shown either way."""
     from magent import link  # heavy subsystem: in-body per policy
 
     try:
@@ -284,11 +285,8 @@ def _release(client: RelayClient, token: str) -> None:
             "DELETE", "/v1/host", token=token, retries=0, timeout=RELEASE_TIMEOUT_S
         )
     except (link.RelayError, ValueError):
-        click.echo(
-            "The relay could not be told to forget the new host; "
-            "remove it on the app's Hosts page.",
-            err=True,
-        )
+        return False
+    return True
 
 
 def _save_new_host(client: RelayClient, keys: KeyPairs, outcome: ClaimOutcome) -> None:
@@ -296,18 +294,25 @@ def _save_new_host(client: RelayClient, keys: KeyPairs, outcome: ClaimOutcome) -
     no seen ids, this host's id): written first, while no runner reads it,
     so the runner the new link.json starts can only load the fresh one. A
     failure, or Ctrl+C, frees the host on the relay and puts the old state
-    back."""
+    back. A link.json the failed save left behind goes too: the write can
+    fail after its rename (the file then holds the new token and keys, but
+    did not prove private), and only no link or a revoked one is ever
+    replaced here."""
     from magent import linkcrypto, linkfiles  # heavy subsystem: in-body per policy
 
     token = outcome.host_token
     if token is None:  # accept_claim refuses a new host without one
         _fail("The relay did not issue a host token; nothing was saved.")
-    had_state = linkfiles.LINK_STATE_PATH.exists()
-    previous = linkfiles.load_state()
+    had_state = False
+    previous: LinkState | None = None  # None: stopped before any write
+    saving_link = False
     try:
+        had_state = linkfiles.LINK_STATE_PATH.exists()
+        previous = linkfiles.load_state()
         linkfiles.save_state(
             linkfiles.LinkState(state="connecting", host_id=outcome.host_id)
         )
+        saving_link = True
         linkfiles.save_link(
             linkfiles.LinkFile(
                 relay_url=client.base_url,
@@ -319,19 +324,30 @@ def _save_new_host(client: RelayClient, keys: KeyPairs, outcome: ClaimOutcome) -
             )
         )
     except BaseException as exc:
-        _release(client, token)
+        if saving_link:  # first, so no serve starts a runner on it
+            with contextlib.suppress(OSError):
+                linkfiles.LINK_PATH.unlink(missing_ok=True)
+        released = _release(client, token)
         # Best effort: the runner reads a state of another pairing as fresh.
-        with contextlib.suppress(OSError):
-            if had_state:
-                linkfiles.save_state(previous)
-            else:
-                linkfiles.LINK_STATE_PATH.unlink(missing_ok=True)
+        if previous is not None:
+            with contextlib.suppress(OSError):
+                if had_state:
+                    linkfiles.save_state(previous)
+                else:
+                    linkfiles.LINK_STATE_PATH.unlink(missing_ok=True)
+        told = (
+            "the relay was told to forget this pairing"
+            if released
+            else "the relay could not be told to forget the new host; remove it "
+            "on the app's Hosts page"
+        )
         if not isinstance(exc, Exception):
+            if not released:
+                click.echo(f"magent link: {told}.", err=True)
             raise  # Ctrl+C stays Ctrl+C
         _fail(
             f"magent link: could not save {linkfiles.LINK_PATH} "
-            f"({type(exc).__name__}); the relay was told to forget this pairing. "
-            "Run `magent link` again."
+            f"({type(exc).__name__}); {told}. Run `magent link` again."
         )
 
 
@@ -405,7 +421,12 @@ def _pair(
     for device in outcome.devices:
         click.echo(f"Paired {_shown(device.name)} ({how}).")
     if remote_control is None and existing is None:
-        remote_control = click.confirm(REMOTE_CONTROL_PROMPT, default=False)
+        try:
+            remote_control = click.confirm(REMOTE_CONTROL_PROMPT, default=False)
+        except click.Abort:  # Ctrl+C here: linked, the setting left alone
+            on = _settings(config_file)[1]
+            click.echo()
+            click.echo(f"Remote control: {'on' if on else 'off'} (unchanged).")
     if remote_control is not None:
         _set_remote_control(config_file, remote_control)
     click.echo(f"This machine is linked as {_shown(outcome.host_id)}.")

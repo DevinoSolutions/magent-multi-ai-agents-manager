@@ -265,6 +265,23 @@ class TestTheServeThatRunsTheLink:
         )
         assert seen[1] == sorted([*(f.name for f in keep), f"{UPLOAD_ID}.0a1b2c3e"])
 
+    def test_a_record_it_cannot_write_leaves_no_stale_one(self, link_on, monkeypatch):
+        linkfiles.save_serve({"pid": 1, "port": 8099, "config": "C:/dead/DECOY.json"})
+
+        def cannot_write(_record):
+            raise OSError("DECOY: read-only")
+
+        monkeypatch.setattr(linkfiles, "save_serve", cannot_write)
+        seen: list[object] = []
+        linkfiles.INCOMING_DIR.mkdir(parents=True)
+        link.supervise(
+            object,
+            threading.Event(),
+            runner_factory=lambda _h: _Stopped(seen),
+            serve={"port": 8044, "config": "C:/cfg/magent.config.json"},
+        )
+        assert seen[0] is None  # held, no record: not the dead serve's facts
+
     def test_a_serve_that_stands_by_neither_writes_nor_sweeps(self, link_on):
         stale = linkfiles.INCOMING_DIR / f"{UPLOAD_ID}.0a1b2c3d"
         stale.mkdir(parents=True)
@@ -318,6 +335,26 @@ class TestSurfaces:
         mine.write_text("{}", encoding="utf-8")
         with _serve_runs_the_link(port=8033, config=str(mine)):
             assert doctor._check_link(None, mine) == ("ok", "online")
+
+    def test_doctor_warns_when_the_link_serve_found_no_config(
+        self, link_on, at_home, tmp_path
+    ):
+        _state(at_home, state="online")
+        with _serve_runs_the_link(port=8033, config=None):
+            status, detail = doctor._check_link(None, tmp_path / "mine.json")
+        assert status == "warn"
+        assert "found no config file" in detail
+        assert "remote control is off there" in detail
+
+    def test_a_held_lock_without_a_record_warns_about_nothing(
+        self, link_on, at_home, tmp_path
+    ):
+        _state(at_home, state="online")
+        with lockfile.persistent_lock(link.LINK_LOCK, wait_s=0.0):
+            assert doctor._check_link(None, tmp_path / "mine.json") == (
+                "ok",
+                "online",
+            )
 
     def test_doctor_says_when_a_serve_is_up_but_runs_no_link(
         self, link_on, at_home, monkeypatch

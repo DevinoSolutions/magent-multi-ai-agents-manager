@@ -1071,11 +1071,11 @@ class TestBackoff:
                 tmp_path, relay.url, (phone, tablet), host_token=relay.host_token
             )
             run = Running(FakeHost(), linked)
-            relay.wait_for(lambda: _paths(relay, "/v1/host/commands"))
+            relay.wait_for(lambda: _paths(relay, "/v1/host/commands"), timeout=15)
             relay.set_devices(
                 [phone.wire(), tablet.wire(revoked_at="2026-10-08T13:00:00.000Z")]
             )
-            relay.wait_for(lambda: linked.device_ids() == [phone.device_id])
+            relay.wait_for(lambda: linked.device_ids() == [phone.device_id], timeout=15)
             run.finish(relay)
 
     def test_after_thirty_minutes_of_polling_the_stream_is_tried_again(
@@ -1161,7 +1161,7 @@ class TestBackoff:
             )
             relay.queue_command(make_command(linked, phone, cid=cmd_id(42), seq=1))
             run = Running(FakeHost(), linked, client_factory=factory)
-            relay.wait_for(lambda: relay.results and len(polls) >= 3)
+            relay.wait_for(lambda: relay.results and len(polls) >= 3, timeout=15)
             run.finish(relay)
 
         def floored(first: int, last: int) -> bool:

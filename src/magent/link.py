@@ -2531,8 +2531,10 @@ def supervise(
     pid plus ``serve``: port and config file), which is how `magent link`,
     `status` and `doctor` tell which serve runs the link; and before its
     first runner starts it clears the per-pull folders a serve that died
-    mid-pull left behind (no puller can be alive then: pullers only run
-    under the lock).
+    mid-pull left behind. Pullers run under the lock, but a stop waits for
+    one only UPLOAD_JOIN_S: a pull still running in a serve that is shutting
+    down can lose its folder to that sweep, and the relay sends that upload
+    again.
 
     A crash, of the host or the runner, is logged and the runner restarted
     with backoff (5 s doubling to 5 min; a run that ended on its own, or
@@ -2660,6 +2662,9 @@ def _take_over(serve: dict[str, object] | None, log: logging.Logger) -> None:
         linkfiles.save_serve({"pid": os.getpid(), **(serve or {})})
     except OSError as exc:
         log.warning("link: could not write %s (%s)", linkfiles.LINK_SERVE_PATH, exc)
+        # A record a dead serve left would name its port and config as ours.
+        with contextlib.suppress(OSError):
+            linkfiles.clear_serve()
     _sweep_incoming(log)
 
 
@@ -2668,8 +2673,11 @@ def _sweep_incoming(log: logging.Logger) -> int:
     linkfiles.INCOMING_DIR; how many went. A puller removes its own folder
     when the pull ends, so one is left only by a process that died mid-pull,
     and it holds a decrypted file. Called only while this process holds
-    LINK_LOCK and runs no runner, so no puller can own one. Anything else in
-    the folder, and anything that is not a plain folder, is left alone."""
+    LINK_LOCK and runs no runner, so no puller of this process owns one. A
+    serve that is shutting down can still be finishing a pull (its stop
+    waits for the puller only UPLOAD_JOIN_S); that pull fails and the relay
+    sends the upload again. Anything else in the folder, and anything that
+    is not a plain folder, is left alone."""
     try:
         entries = list(linkfiles.INCOMING_DIR.iterdir())
     except OSError:
@@ -2691,7 +2699,9 @@ def _sweep_incoming(log: logging.Logger) -> int:
 def sweep_incoming_if_free() -> int | None:
     """`magent unlink`'s sweep of left-over pulls: only while no serve runs
     the link (the lock is taken for the sweep). None when a serve holds it,
-    or the lock cannot be taken: its puller may own a folder."""
+    or the lock cannot be taken: its puller may own a folder. A serve that
+    is shutting down has let go of the lock and may still finish a pull;
+    see _sweep_incoming."""
     try:
         with lockfile.persistent_lock(LINK_LOCK, wait_s=0.0):
             return _sweep_incoming(get_logger("link"))

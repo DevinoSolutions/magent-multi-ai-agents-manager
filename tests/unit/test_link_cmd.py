@@ -5,11 +5,12 @@ from __future__ import annotations
 import contextlib
 import json
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 
-from magent import cli, config, linkcrypto, linkfiles, linkpair, lockfile
+from magent import cli, config, fsutil, link, linkcrypto, linkfiles, linkpair, lockfile
 from magent.cli import link_cmd
 from magent.config import load_config
 from magent.link import LINK_LOCK, UPGRADE_HINT
@@ -316,6 +317,70 @@ class TestPairing:
         assert relay.deleted
         assert not linkfiles.LINK_PATH.exists()
         assert relay.host_token not in result.output
+        if isinstance(fault, OSError):
+            assert "the relay was told to forget this pairing" in result.output
+
+    def test_a_link_file_that_did_not_prove_private_is_removed(
+        self, runner, relay, cfg, monkeypatch
+    ):
+        # The check runs after the rename: link.json already holds the new
+        # token and keys when it fails.
+        relay.stage_pairing(claimed_devices=[_claimed(new_device(), qr=True)])
+
+        def not_private(path):
+            raise fsutil.PrivateFileError(f"DECOY: {path} is readable by others")
+
+        monkeypatch.setattr(fsutil, "check_private", not_private)
+        result = _link(runner, cfg, "--no-qr", "--no-remote-control")
+        assert result.exit_code == 1
+        assert relay.deleted
+        assert not linkfiles.LINK_PATH.exists()
+        assert not linkfiles.LINK_STATE_PATH.exists()
+        assert relay.host_token not in result.output
+        assert "PrivateFileError" in result.output
+
+    @pytest.mark.parametrize("fault", [OSError("disk full"), KeyboardInterrupt()])
+    def test_a_relay_that_cannot_be_told_is_not_said_to_be_told(
+        self, runner, relay, cfg, monkeypatch, fault
+    ):
+        relay.stage_pairing(claimed_devices=[_claimed(new_device(), qr=True)])
+        real_call = link.RelayClient.call
+
+        def call(self, method, path, *args, **kwargs):
+            if method == "DELETE":
+                raise link.RelayError(0, "unreachable", "DECOY: no route")
+            return real_call(self, method, path, *args, **kwargs)
+
+        def save_link(*_a, **_k):
+            raise fault
+
+        monkeypatch.setattr(link.RelayClient, "call", call)
+        monkeypatch.setattr(linkfiles, "save_link", save_link)
+        result = _link(runner, cfg, "--no-qr", "--no-remote-control")
+        assert result.exit_code == 1
+        assert not relay.deleted
+        assert "was told" not in result.output
+        assert (
+            "the relay could not be told to forget the new host; remove it on "
+            "the app's Hosts page"
+        ) in result.output
+        assert relay.host_token not in result.output
+
+    def test_ctrl_c_at_the_remote_control_question_keeps_the_link(
+        self, runner, relay, cfg
+    ):
+        phone = new_device()
+        relay.stage_pairing(claimed_devices=[_claimed(phone, qr=False)])
+
+        result = _link(runner, cfg, "--no-qr", input="y\n")  # EOF at the question
+
+        assert result.exit_code == 0, result.output
+        assert "Remote control: off (unchanged)." in result.output
+        assert "This machine is linked as hst_fake_1." in result.output
+        assert "Aborted" not in result.output
+        assert [d.device_id for d in linkfiles.load_link().devices] == [phone.device_id]
+        assert not relay.deleted
+        assert _remote_control(cfg) is False
 
 
 class TestLinked:
@@ -410,6 +475,33 @@ class TestLinked:
         assert result.exit_code == 1
         assert "nothing was saved" in result.output
         assert [d.device_id for d in linkfiles.load_link().devices] == [PHONE_ID]
+        assert not relay.deleted
+
+    def test_a_link_that_changed_during_add_device_saves_nothing(
+        self, runner, relay, cfg, monkeypatch
+    ):
+        phone = _pair(runner, relay, cfg)
+        relay.stage_pairing(
+            claimed_devices=[_claimed(new_device(TABLET_ID), qr=True)], new_host=False
+        )
+        real_wait = linkpair.wait_for_claim
+
+        def wait_for_claim(*args, **kwargs):
+            # Another `magent link` re-paired this machine meanwhile.
+            saved = linkfiles.load_link()
+            linkfiles.save_link(replace(saved, host_token="mlh_DECOY_moved"))
+            return real_wait(*args, **kwargs)
+
+        monkeypatch.setattr(linkpair, "wait_for_claim", wait_for_claim)
+        result = _link(runner, cfg, "--add-device", "--no-qr")
+        assert result.exit_code == 1
+        assert (
+            "magent link: link.json changed while the device was pairing; "
+            "nothing was saved. Run `magent link --add-device` again."
+        ) in result.output
+        saved = linkfiles.load_link()
+        assert saved.host_token == "mlh_DECOY_moved"
+        assert [d.device_id for d in saved.devices] == [phone.device_id]
         assert not relay.deleted
 
     def test_add_device_keeps_at_most_ten_devices(self, runner, relay, cfg):
