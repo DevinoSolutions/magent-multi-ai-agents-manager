@@ -314,6 +314,19 @@ class TestForwarding:
         assert text.endswith(kept)
         run.finish(relay)
 
+    def test_the_pane_cut_is_logged_once_a_minute(self, tmp_path, relay, phone, caplog):
+        # A busy pane is cut on every capture: one line a minute in link.log.
+        host = FakeHost()
+        with caplog.at_level("INFO", logger="magent.link"):
+            _linked, run = _online(tmp_path, relay, (phone,), host)
+            text = "\n".join(f"line {n:07d} DECOY" for n in range(15_000))
+            for n in (1, 2, 3):
+                host.feed.push(_event(n, "session.pane", session="a", text=text))
+            relay.wait_for(lambda: len(relay.events) == 3)
+            run.finish(relay)
+        cuts = [r for r in caplog.records if "pane was cut" in r.getMessage()]
+        assert len(cuts) == 1
+
     def test_a_pane_that_fits_is_sent_whole(self, tmp_path, relay, phone):
         host = FakeHost()
         linked, run = _online(tmp_path, relay, (phone,), host)
@@ -791,7 +804,10 @@ class TestBatchEdges:
         assert [e["daemonEventId"] for e in relay.events] == ["e0e0e0e0:1"]
         run.finish(relay)
 
-    def test_a_batch_read_while_stopping_is_never_sent(self, relay):
+    def test_a_batch_read_while_stopping_is_never_sent(self, relay, monkeypatch):
+        # A batching window no loaded machine can outrun: the stop below
+        # always lands inside it.
+        monkeypatch.setattr(link, "EVENT_BATCH_S", 60.0)
         feed = _Feed()
         forwarder = EventForwarder(
             _Stub(online=True),
@@ -800,7 +816,7 @@ class TestBatchEdges:
         )
         feed.push(_event(1, session="a"))
         forwarder.start()
-        relay.wait_for(lambda: feed.reads >= 1)  # read, inside its 250 ms window
+        relay.wait_for(lambda: feed.reads >= 1)  # read, inside its batching window
         forwarder.stop()
         assert relay.requests == []
 
@@ -822,3 +838,32 @@ class TestMetaEdges:
     def test_an_unknown_live_is_false_as_in_the_snapshot(self):
         meta = event_meta(_event(1, session="a", live=None))
         assert meta == {"session": "a", "live": False}
+
+
+class TestPaneTail:
+    """link.pane_tail: the cut itself, with an exact cost to cover."""
+
+    @pytest.mark.parametrize(
+        ("text", "need", "tail"),
+        [
+            # The cut lands on a line start: that line is kept whole.
+            ("aaaa\nbbbb\ncccc\n", 5, "bbbb\ncccc\n"),
+            # ...mid-line: the partial line goes.
+            ("aaaa\nbbbb\ncccc\n", 3, "bbbb\ncccc\n"),
+            ("aaaa\nbbbb\ncccc\n", 7, "cccc\n"),
+            # Its only newline is its last character: the partial line stays.
+            ("yyyy\n", 2, "yy\n"),
+            # A newline costs two once escaped, so "aa\n" covers 4.
+            ("aa\nbb\ncc", 4, "bb\ncc"),
+            ("", 3, ""),
+        ],
+    )
+    def test_whole_lines_only(self, text, need, tail):
+        assert link.pane_tail(text, need) == tail
+
+    def test_a_surrogate_pair_is_never_split(self):
+        text = EMOJI * 4 + "\n" + "z" * 4
+        # An emoji costs 12 once escaped: a need of 13 drops two of them,
+        # and the partial first line then goes.
+        assert link.pane_tail(text, 13) == "z" * 4
+        assert link.pane_tail(EMOJI * 4, 13) == EMOJI * 2

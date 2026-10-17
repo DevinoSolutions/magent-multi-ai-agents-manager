@@ -23,6 +23,7 @@ import http.client
 import importlib.metadata
 import ipaddress
 import json
+import logging
 import math
 import os
 import queue
@@ -53,7 +54,6 @@ from magent.linkfiles import SEEN_MAX, LinkState
 from magent.log import get_logger
 
 if TYPE_CHECKING:
-    import logging
     from collections.abc import Callable, Generator, Iterable, Iterator
     from pathlib import Path
     from typing import BinaryIO
@@ -729,6 +729,39 @@ class SeenRing:
         return tuple(self._order)
 
 
+# A log line that can repeat (a refusal per command, a cut per pane) goes out
+# at most once per kind this often.
+LOG_QUIET_S = 60.0
+
+
+class _LogBudget:
+    """At most one line per ``kind`` every LOG_QUIET_S seconds, so a relay
+    replaying junk cannot fill link.log. The lines held back meanwhile are
+    counted, and the next line of that kind that goes out says how many."""
+
+    def __init__(
+        self, log: logging.Logger, *, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        self._log = log
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._last: dict[str, tuple[float, int]] = {}  # kind -> (sent at, held)
+
+    def log(self, level: int, kind: str, message: str, *args: object) -> None:
+        now = self._clock()
+        with self._lock:
+            last = self._last.get(kind)
+            if last is not None and now - last[0] < LOG_QUIET_S:
+                self._last[kind] = (last[0], last[1] + 1)
+                return
+            held = 0 if last is None else last[1]
+            self._last[kind] = (now, 0)
+        if held:
+            message += " (%d more like it since the last one)"
+            args = (*args, held)
+        self._log.log(level, message, *args)
+
+
 def _env() -> MagentEnv | None:
     """The env singleton, or None when it no longer validates (logged)."""
     from pydantic import ValidationError
@@ -797,6 +830,12 @@ SAVE_ATTEMPTS = 5  # link-state.json writes, 20 ms apart (see LinkRunner._save)
 SAVE_RETRY_S = 0.02
 SNAPSHOT_SESSIONS_MAX = 1000  # rows the relay takes in one snapshot (C4)
 SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024  # the relay's cap on one snapshot PUT body
+# The relay's cap on one sealed blob (C4), in base64url characters: a command
+# result, or one device's copy of the snapshot or of an event.
+SEALED_MAX_CHARS = 1_400_000
+# What a device gets instead of an answer too large to reach it: the link, as
+# a gateway, could not deliver what the daemon said.
+RESULT_TOO_LARGE_STATUS = 502
 SESSION_NAME_MAX = 200
 SESSION_STATE_MAX = 32
 DAEMON_FIELD_MAX = 32
@@ -1017,7 +1056,8 @@ class LinkRunner:
     under the API prefix with no control character, an int ts), then verified
     (trusted device, Ed25519 signature, age), decrypted, checked against its
     outer method and path, run through ``LinkHost.handle`` and answered
-    sealed. Each id is saved before it runs, so a command the relay replays
+    sealed (an answer too large for the relay as a sealed 502
+    ``result_too_large`` instead). Each id is saved before it runs, so a command the relay replays
     never runs twice: its cached result is re-sent, or, after a restart, it
     is only acknowledged. The cursor moves only once the relay has the
     answer, so a lost result post is replayed, not dropped, and a second
@@ -1043,6 +1083,7 @@ class LinkRunner:
         self._link_path = link_path
         self._state_path = state_path
         self._log = get_logger("link")
+        self._quiet = _LogBudget(self._log)
         self._lock = threading.RLock()
         self._link: LinkFile | None = None
         self._peers: dict[str, _Peer] = {}
@@ -1139,6 +1180,9 @@ class LinkRunner:
         failures: collections.deque[float] = collections.deque()
         poll_until = 0.0
         need_snapshot = True
+        # The last attempt ended in a LinkHost failure: the next one logs a
+        # line, not the same traceback again.
+        host_failing = False
         while not stop.is_set():
             polling = self._clock() < poll_until
             started: float | None = None
@@ -1150,10 +1194,12 @@ class LinkRunner:
                     self._set_state("connecting")
                     self.put_snapshot(client)
                     need_snapshot = False
+                    self._uploads_connected()
                 started = self._clock()
                 self._set_state("online", last_connected=started)
                 if polling:
                     self._poll_round(client, sleep)
+                    host_failing = False
                     continue
                 need_snapshot = True
                 self._read_stream(client, stop)
@@ -1179,10 +1225,17 @@ class LinkRunner:
                     self._log.warning("link: the relay refused this host: %s", exc)
             except linkcrypto.LinkCryptoUnavailable:
                 raise
-            except Exception:  # noqa: BLE001  # reason: a LinkHost failure (snapshot, settings) backs off and retries like a dropped connection; it must never end the link thread
+            except Exception as exc:  # noqa: BLE001  # reason: a LinkHost failure (snapshot, settings) backs off and retries like a dropped connection; it must never end the link thread
                 need_snapshot = True
-                self._log.exception("link: the daemon side of the link failed")
+                if host_failing:
+                    self._log.warning(
+                        "link: the daemon side of the link failed again (%s)",
+                        type(exc).__name__,
+                    )
+                else:
+                    self._log.exception("link: the daemon side of the link failed")
                 error = RelayError(0, _HOST_FAILED, "the link host failed")
+            host_failing = error is not None and error.code == _HOST_FAILED
             if stop.is_set():
                 break
             now = self._clock()
@@ -1269,12 +1322,19 @@ class LinkRunner:
     def _on_command(self, client: RelayClient, command: dict[str, object]) -> None:
         cid, seq = command.get("id"), command.get("seq")
         if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
-            self._log.warning("link: ignoring a command without a seq")
+            self._quiet.log(
+                logging.WARNING, "no-seq", "link: ignoring a command without a seq"
+            )
             return
         if not isinstance(cid, str) or not _COMMAND_ID.fullmatch(cid):
             # No answer can name it (the relay takes results for UUID ids
             # only), and it never reaches the signature check.
-            self._log.warning("link: acknowledged command seq %d: malformed id", seq)
+            self._quiet.log(
+                logging.WARNING,
+                "malformed-id",
+                "link: acknowledged command seq %d: malformed id",
+                seq,
+            )
             self._ack(client, seq)
             return
         with self._lock:
@@ -1286,10 +1346,15 @@ class LinkRunner:
             self._still_running(cid)
             return
         if seen:
-            self._replay(client, cid, seq, cached)
+            self._replay(client, cid, seq, cached, peer)
             return
         if peer is None:
-            self._log.warning("link: refused command %s from an untrusted device", cid)
+            self._quiet.log(
+                logging.WARNING,
+                "untrusted",
+                "link: refused command %s from an untrusted device",
+                cid,
+            )
             self._ack(client, seq)
             return
         remembered = claimed = False
@@ -1300,7 +1365,13 @@ class LinkRunner:
                 # Never remembered: only a verified id may take a place in the
                 # ring (or the result cache), so a relay cannot flush a real id
                 # out with junk. A replayed refusal is just refused again.
-                self._log.warning("link: refused command %s: %s", cid, refused.reason)
+                self._quiet.log(
+                    logging.WARNING,
+                    "refused",
+                    "link: refused command %s: %s",
+                    cid,
+                    refused.reason,
+                )
                 status, body = (
                     refused.status,
                     _error(refused.code, str(refused), refused.reason),
@@ -1321,7 +1392,7 @@ class LinkRunner:
                     self._still_running(cid)
                     return
                 if not fresh:
-                    self._replay(client, cid, seq, cached)
+                    self._replay(client, cid, seq, cached, peer)
                     return
                 if saved:
                     status, body = self._run_command(cid, peer, *request)
@@ -1335,21 +1406,24 @@ class LinkRunner:
                             "state_unsaved",
                         ),
                     )
-            answer = json.dumps({"status": status, "body": body}, separators=(",", ":"))
-            result: dict[str, object] = {
-                "type": "command",
-                "commandId": cid,
-                "status": status,
-                "sealed": linkcrypto.seal(
-                    peer.keys.h2d, answer.encode(), AAD_RES + cid
-                ),
-            }
+            result = _sealed_result(peer, cid, status, body)
+            if len(str(result["sealed"])) > SEALED_MAX_CHARS:
+                self._quiet.log(
+                    logging.WARNING,
+                    "too-large",
+                    "link: the answer to command %s is %d characters sealed, over"
+                    " the relay's %d; the device gets result_too_large instead",
+                    cid,
+                    len(str(result["sealed"])),
+                    SEALED_MAX_CHARS,
+                )
+                result = _too_large(peer, cid)
             if remembered:
                 with self._lock:
                     self._results[cid] = result
                     while len(self._results) > RESULT_CACHE_MAX:
                         self._results.popitem(last=False)
-            self._answer(client, cid, seq, result)
+            self._answer(client, cid, seq, result, peer)
         finally:
             if claimed:
                 with self._lock:
@@ -1367,10 +1441,11 @@ class LinkRunner:
         cid: str,
         seq: int,
         cached: dict[str, object] | None,
+        peer: _Peer | None,
     ) -> None:
         """A command id already handled: its cached result again, or an ack."""
         if cached is not None:
-            self._answer(client, cid, seq, cached)
+            self._answer(client, cid, seq, cached, peer)
         else:
             self._ack(client, seq)
 
@@ -1436,13 +1511,42 @@ class LinkRunner:
         return method, path, None if body is None else json.dumps(body).encode("utf-8")
 
     def _answer(
-        self, client: RelayClient, cid: str, seq: int, result: dict[str, object]
+        self,
+        client: RelayClient,
+        cid: str,
+        seq: int,
+        result: dict[str, object],
+        peer: _Peer | None = None,
     ) -> None:
-        """Post one result with ``ack=seq``. A permanent refusal (a 4xx) would
-        be replayed on every reconnect, ahead of every later command, so the
-        seq is acknowledged alone instead and the device's command expires."""
+        """Post one result with ``ack=seq``. An answer the relay refuses as too
+        large (413) is replaced, when the device ``peer`` is known, by a
+        sealed 502 ``result_too_large`` (cached in its place), so the device
+        learns why rather than waiting out its command. Any other permanent
+        refusal (a 4xx) would be replayed on every reconnect, ahead of every
+        later command, so the seq is acknowledged alone instead and the
+        device's command expires."""
         try:
-            client.call("POST", "/v1/host/results", {"results": [result], "ack": seq})
+            try:
+                client.call(
+                    "POST", "/v1/host/results", {"results": [result], "ack": seq}
+                )
+            except RelayError as exc:
+                if exc.status != 413 or peer is None:
+                    raise
+                self._quiet.log(
+                    logging.WARNING,
+                    "too-large",
+                    "link: the relay refused the answer to command %s as too"
+                    " large; the device gets result_too_large instead",
+                    cid,
+                )
+                small = _too_large(peer, cid)
+                with self._lock:
+                    if cid in self._results:
+                        self._results[cid] = small
+                client.call(
+                    "POST", "/v1/host/results", {"results": [small], "ack": seq}
+                )
         except (Revoked, TooOld):
             raise
         except RelayError as exc:
@@ -1589,31 +1693,42 @@ class LinkRunner:
         self, rows: list[dict[str, object]], fixed: dict[str, object]
     ) -> dict[str, object]:
         """The PUT body for ``rows``, at most SNAPSHOT_SESSIONS_MAX of them,
-        and, sealed once per device, at most the relay's SNAPSHOT_MAX_BYTES:
-        a fleet too big for that keeps the rows that fit, in order (with a
-        warning), rather than being refused on every connect."""
+        and, sealed once per device, at most the relay's SNAPSHOT_MAX_BYTES,
+        each device's copy at most SEALED_MAX_CHARS: a fleet too big for that
+        keeps the rows that fit, in order (with a warning, at most one per
+        LOG_QUIET_S), rather than being refused on every connect."""
         aad = AAD_SNAP + self.host_id
         rows = rows[:SNAPSHOT_SESSIONS_MAX]
         total = len(rows)
         while True:
             plain = json.dumps({"sessions": rows}, separators=(",", ":")).encode()
+            sealed = self.seal_for_devices(plain, aad)
             body = {
                 **fixed,
                 "sessions": [m for m in map(session_meta, rows) if m is not None],
-                "sealed": self.seal_for_devices(plain, aad),
+                "sealed": sealed,
             }
             size = len(json.dumps(body, separators=(",", ":")))
-            if size <= SNAPSHOT_MAX_BYTES or not rows:
+            # Each cap as a share of what it allows; the worse one decides.
+            over = max(
+                size / SNAPSHOT_MAX_BYTES,
+                max((len(v) for v in sealed.values()), default=0) / SEALED_MAX_CHARS,
+            )
+            if over <= 1 or not rows:
                 break
             # Shrunk in proportion, a little past it: rows differ in size.
-            rows = rows[: int(len(rows) * SNAPSHOT_MAX_BYTES / size * 0.95)]
+            rows = rows[: int(len(rows) / over * 0.95)]
         if len(rows) < total:
-            self._log.warning(
+            self._quiet.log(
+                logging.WARNING,
+                "snapshot-trim",
                 "link: the snapshot holds %d of %d sessions: sealed for every "
-                "device, the rest would pass the relay's %d-byte cap",
+                "device, the rest would pass the relay's caps (%d bytes in all,"
+                " %d characters per device)",
                 len(rows),
                 total,
                 SNAPSHOT_MAX_BYTES,
+                SEALED_MAX_CHARS,
             )
         return body
 
@@ -1648,6 +1763,11 @@ class LinkRunner:
         puller = self._uploads
         if puller is not None:
             puller.offer(ready)
+
+    def _uploads_connected(self) -> None:
+        puller = self._uploads
+        if puller is not None:
+            puller.connected()
 
     def peer(self, device_id: str) -> _Peer | None:
         """The trusted device ``device_id`` and its keys, or None."""
@@ -1767,6 +1887,35 @@ class LinkRunner:
             return False
 
 
+def _sealed_result(
+    peer: _Peer, cid: str, status: int, body: dict[str, object]
+) -> dict[str, object]:
+    """One command's result (C4): ``{status, body}`` sealed for ``peer``
+    with its h2d key, AAD ``res:<commandId>``."""
+    answer = json.dumps({"status": status, "body": body}, separators=(",", ":"))
+    return {
+        "type": "command",
+        "commandId": cid,
+        "status": status,
+        "sealed": linkcrypto.seal(peer.keys.h2d, answer.encode(), AAD_RES + cid),
+    }
+
+
+def _too_large(peer: _Peer, cid: str) -> dict[str, object]:
+    """The small result a device gets in place of an answer too large for
+    the relay to take."""
+    return _sealed_result(
+        peer,
+        cid,
+        RESULT_TOO_LARGE_STATUS,
+        _error(
+            "payload_too_large",
+            "the answer is too large to send over the link",
+            "result_too_large",
+        ),
+    )
+
+
 def _delay(backoff: Backoff, error: RelayError | None) -> float:
     """The wait before the next attempt: the backoff, at least the relay's
     Retry-After on a transient refusal, PERMANENT_RETRY_S on any other."""
@@ -1842,6 +1991,26 @@ def event_meta(event: dict[str, object]) -> dict[str, object]:
     return meta
 
 
+def pane_tail(text: str, need: int) -> str:
+    """``text`` without its shortest prefix whose cost once escaped by
+    json.dumps is at least ``need``, kept to whole lines: a tail that starts
+    mid-line loses that partial line, unless its only newline is its last
+    character (then the partial line stays, rather than nothing)."""
+    lo, hi = 0, len(text)
+    while lo < hi:  # bisection over character boundaries: no split surrogate pair
+        mid = (lo + hi) // 2
+        if len(json.dumps(text[:mid])) - 2 >= need:
+            hi = mid
+        else:
+            lo = mid + 1
+    tail = text[lo:]
+    if lo and text[lo - 1] != "\n":  # the cut landed mid-line
+        _, newline, rest = tail.partition("\n")
+        if newline and rest:
+            tail = rest
+    return tail
+
+
 def _event_field(value: object) -> bool:
     return isinstance(value, str) and 1 <= utf16_len(value) <= EVENT_FIELD_MAX
 
@@ -1881,6 +2050,7 @@ class EventForwarder:
             target=self._run, daemon=True, name=EVENT_THREAD
         )
         self._log = get_logger("link")
+        self._quiet = _LogBudget(self._log)
         self._backoff = Backoff(base=EVENT_RETRY_BASE_S, cap=EVENT_RETRY_CAP_S)
         self._hold_until = 0.0
         self._failing = False
@@ -2034,9 +2204,11 @@ class EventForwarder:
         lines and glyphs costs several times its length. The shortest
         prefix whose escaped cost covers the overage is dropped, found by
         bisection over character boundaries, so a surrogate pair is never
-        split. A tail whose only newline is its last character keeps that
-        partial line rather than going out empty. One that still does not
-        fit after rounding is dropped by ``_chunks``, as any oversize event."""
+        split. A tail that starts mid-line loses that partial line; one whose
+        only newline is its last character keeps it rather than going out
+        empty. One that still does not fit after rounding is dropped by
+        ``_chunks``, as any oversize event. The cut is logged at most once
+        per LOG_QUIET_S: a busy pane is cut on every capture."""
         data, sealed = event.get("data"), item.get("sealed")
         text = data.get("text") if isinstance(data, dict) else None
         size = _EVENTS_FRAME + len(json.dumps(item, separators=(",", ":"))) + 1
@@ -2049,18 +2221,10 @@ class EventForwarder:
         ):
             return item
         need = -(-(size - EVENTS_MAX_BYTES) * 3 // (4 * len(sealed))) + PANE_CUT_SLACK
-        lo, hi = 0, len(text)
-        while lo < hi:  # the shortest prefix whose escaped cost is >= need
-            mid = (lo + hi) // 2
-            if len(json.dumps(text[:mid])) - 2 >= need:
-                hi = mid
-            else:
-                lo = mid + 1
-        tail = text[lo:]
-        _, newline, rest = tail.partition("\n")
-        if newline and rest:
-            tail = rest
-        self._log.info(
+        tail = pane_tail(text, need)
+        self._quiet.log(
+            logging.INFO,
+            "pane-cut",
             "link: a %d-device pane was cut to its last %d UTF-16 units to fit one post",
             len(sealed),
             utf16_len(tail),
@@ -2099,6 +2263,10 @@ class EventForwarder:
 UPLOAD_SLACK_BYTES = 65536  # ciphertext framing allowed over the daemon's upload cap
 UPLOAD_QUEUE_WAIT_S = 0.5  # how long the idle puller blocks (bounds the stop latency)
 UPLOAD_JOIN_S = 5.0  # how long stop() waits for a pull in flight
+# The wait between resends of upload states the relay did not take, while
+# the runner stays connected (a reconnect resends at once).
+UPLOAD_RESEND_BASE_S = 1.0
+UPLOAD_RESEND_CAP_S = 60.0
 # UTF-8 bytes kept of the device's file name, as the daemon's own saved names
 # (uploads.saved_name): the stem is cut, an extension of at most
 # _SUFFIX_MAX_BYTES kept, so the agent still knows what the file is and the
@@ -2197,6 +2365,16 @@ class _Verified:
     name: str
 
 
+@dataclass(frozen=True)
+class _UploadJob:
+    """One piece of the puller's work: ``pull`` an upload (``ready`` set),
+    ``report`` one already taken, or ``resend`` the undelivered states."""
+
+    kind: str
+    upload_id: str = ""
+    ready: dict[str, object] | None = None
+
+
 class UploadPuller:
     """``upload.ready`` -> verify, download, decrypt, stage, report; one at a
     time, on its own thread, so a 100 MB pull never stalls the commands.
@@ -2216,7 +2394,12 @@ class UploadPuller:
     ``LinkHost.stage_upload``, and its outcome reported: ``injected``,
     ``inject_pending``, ``inject_failed`` (a paste was asked for and did not
     happen) or nothing more (none was asked for). Reported states only move
-    forward.
+    forward. A state the relay could not take for now (no reply, a 5xx or a
+    429) is kept, the latest per upload, and sent again: at once when the
+    runner connects again, and meanwhile while the link stays online, after
+    a backoff (1 s doubling to 60 s). A state it refused for good (another
+    4xx) is not. A replay's re-report runs on this thread too, never the
+    runner's, so a 429 waited out there cannot hold up the commands.
 
     A refusal is reported ``inject_failed`` and never remembered, so junk
     under a real id can neither flush the ring nor block the real upload. A
@@ -2232,14 +2415,22 @@ class UploadPuller:
         self._client = client
         self._host = host
         self._lock = threading.Lock()
-        self._inflight: set[str] = set()  # queued or being pulled
+        self._inflight: set[str] = set()  # queued or being pulled or re-reported
         self._states: collections.OrderedDict[str, str] = collections.OrderedDict()
-        self._queue: queue.Queue[dict[str, object] | None] = queue.Queue()
+        # Verified uploads whose latest state the relay has not taken yet.
+        self._undelivered: collections.OrderedDict[str, str] = collections.OrderedDict()
+        self._resend_queued = False
+        self._resend_at = 0.0
+        self._resend_backoff = Backoff(
+            base=UPLOAD_RESEND_BASE_S, cap=UPLOAD_RESEND_CAP_S
+        )
+        self._queue: queue.Queue[_UploadJob | None] = queue.Queue()
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run, daemon=True, name=UPLOAD_THREAD
         )
         self._log = get_logger("link")
+        self._quiet = _LogBudget(self._log)
 
     def start(self) -> None:
         self._thread.start()
@@ -2255,38 +2446,87 @@ class UploadPuller:
                 self._log.warning("link: the upload puller is still finishing a pull")
 
     def offer(self, ready: dict[str, object]) -> None:
-        """Take one ``upload.ready``; returns at once (a replay's report
-        aside)."""
+        """Take one ``upload.ready``; returns at once. An upload already
+        taken is queued for a re-report, any other for a pull."""
         upload_id = ready.get("uploadId")
         if not isinstance(upload_id, str) or not _UPLOAD_ID.fullmatch(upload_id):
-            self._log.warning("link: ignoring an upload.ready without a valid id")
+            self._quiet.log(
+                logging.WARNING,
+                "invalid-id",
+                "link: ignoring an upload.ready without a valid id",
+            )
             return
         with self._lock:
             if upload_id in self._inflight:
                 return
-            if not self._runner.has_seen(upload_id):
-                self._inflight.add(upload_id)
-                self._queue.put(ready)
+            self._inflight.add(upload_id)
+            seen = self._runner.has_seen(upload_id)
+            self._queue.put(
+                _UploadJob("report", upload_id)
+                if seen
+                else _UploadJob("pull", upload_id, ready)
+            )
+
+    def connected(self) -> None:
+        """The runner (re)connected: send the states the relay did not take
+        now, not after the backoff."""
+        with self._lock:
+            if not self._undelivered or self._resend_queued:
                 return
-            state = self._states.get(upload_id, "pulled")
-        self._post(upload_id, state)
+            self._resend_queued = True
+            self._queue.put(_UploadJob("resend"))
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                ready = self._queue.get(timeout=UPLOAD_QUEUE_WAIT_S)
+                job = self._queue.get(timeout=UPLOAD_QUEUE_WAIT_S)
             except queue.Empty:
-                continue
-            if ready is None or self._stop.is_set():
-                continue
-            upload_id = str(ready.get("uploadId"))
-            try:
-                self._pull(upload_id, ready)
-            except Exception:  # noqa: BLE001  # reason: a LinkHost or disk failure ends this pull unreported (the relay resends it on the next connect), never the puller
-                self._log.exception("link: upload %s crashed", upload_id)
-            finally:
+                job = _UploadJob("resend") if self._resend_due() else None
+            if job is not None and not self._stop.is_set():
+                self._work(job)
+
+    def _work(self, job: _UploadJob) -> None:
+        try:
+            if job.kind == "resend":
+                self._resend()
+            elif job.ready is not None:
+                self._pull(job.upload_id, job.ready)
+            else:
+                self._report(job.upload_id)
+        except Exception:  # noqa: BLE001  # reason: a LinkHost or disk failure ends this pull unreported (the relay resends it on the next connect), never the puller
+            self._log.exception("link: upload %s crashed", job.upload_id or job.kind)
+        finally:
+            if job.upload_id:
                 with self._lock:
-                    self._inflight.discard(upload_id)
+                    self._inflight.discard(job.upload_id)
+
+    def _report(self, upload_id: str) -> None:
+        """A replayed ``upload.ready`` of an upload already taken: its last
+        state again (``pulled`` when a restart lost it), never a second
+        fetch or paste."""
+        with self._lock:
+            state = self._states.get(upload_id, "pulled")
+        self._deliver(upload_id, state)
+
+    def _resend_due(self) -> bool:
+        with self._lock:
+            waiting = bool(self._undelivered) and not self._resend_queued
+        return waiting and time.monotonic() >= self._resend_at and self._runner.online()
+
+    def _resend(self) -> None:
+        """One round over the states the relay did not take, oldest first.
+        It stops at the first one the relay still cannot take (the next
+        round waits out the backoff that set)."""
+        with self._lock:
+            self._resend_queued = False
+            pending = list(self._undelivered.items())
+        for upload_id, state in pending:
+            if self._stop.is_set():
+                return
+            if not self._deliver(upload_id, state):
+                with self._lock:
+                    if upload_id in self._undelivered:
+                        return
 
     def _pull(self, upload_id: str, ready: dict[str, object]) -> None:
         """One upload, start to finish, in a folder of this pull's own: a
@@ -2316,7 +2556,13 @@ class UploadPuller:
             verified = self._verify(upload_id, ready)
             target = self._fetch(verified, folder)
         except _UploadRefused as refused:
-            self._log.warning("link: refused upload %s: %s", upload_id, refused)
+            self._quiet.log(
+                logging.WARNING,
+                "refused",
+                "link: refused upload %s: %s",
+                upload_id,
+                refused,
+            )
             return "inject_failed", False
         if target is None:
             return None
@@ -2460,7 +2706,7 @@ class UploadPuller:
 
     def _advance(self, upload_id: str, state: str) -> None:
         if self._record(upload_id, state):
-            self._post(upload_id, state)
+            self._deliver(upload_id, state)
 
     def _record(self, upload_id: str, state: str) -> bool:
         """Keep ``state`` as the upload's latest; False, and no change, when
@@ -2475,8 +2721,33 @@ class UploadPuller:
                 self._states.popitem(last=False)
             return True
 
-    def _post(self, upload_id: str, state: str) -> bool:
-        """POST one upload result; False when the relay did not take it."""
+    def _deliver(self, upload_id: str, state: str) -> bool:
+        """Post a taken upload's state; False when the relay did not take it.
+        One it could not take for now is kept to send again (see the class),
+        unless a later state of that upload is kept already; a state that
+        reached the relay, or that it refused for good, clears what was kept
+        up to its rank. Each miss pushes the next resend back (the backoff);
+        once nothing is kept, the backoff starts over."""
+        error = self._post(upload_id, state)
+        rank = _UPLOAD_RANK[state]
+        with self._lock:
+            kept = self._undelivered.get(upload_id)
+            if error is not None and _transient(error):
+                if kept is None or _UPLOAD_RANK[kept] <= rank:
+                    self._undelivered[upload_id] = state
+                    self._undelivered.move_to_end(upload_id)
+                    while len(self._undelivered) > RESULT_CACHE_MAX:
+                        self._undelivered.popitem(last=False)
+                self._resend_at = time.monotonic() + self._resend_backoff.next_delay()
+                return False
+            if kept is not None and _UPLOAD_RANK[kept] <= rank:
+                del self._undelivered[upload_id]
+            if not self._undelivered:
+                self._resend_backoff.reset()
+        return error is None
+
+    def _post(self, upload_id: str, state: str) -> RelayError | None:
+        """POST one upload result; the error when the relay did not take it."""
         result = {"type": "upload", "uploadId": upload_id, "state": state}
         try:
             self._client.call("POST", "/v1/host/results", {"results": [result]})
@@ -2484,8 +2755,8 @@ class UploadPuller:
             self._log.info(
                 "link: upload %s result %s not delivered: %s", upload_id, state, exc
             )
-            return False
-        return True
+            return exc
+        return None
 
 
 # --- The serve thread's supervisor and the config switch ------------------------

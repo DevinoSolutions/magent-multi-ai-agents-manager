@@ -111,6 +111,43 @@ class _Downloads(RelayClient):
         return super().get_bytes(url, sink, max_bytes=max_bytes, deadline=deadline)
 
 
+class _MissedStates(RelayClient):
+    """Fails the next ``fails[0]`` upload-result posts that carry ``state``
+    with ``error``, before they reach the relay."""
+
+    def __init__(self, url, *, token, sleep, fails, state, error):
+        super().__init__(url, token=token, sleep=sleep)
+        self._fails, self._state, self._error = fails, state, error
+
+    def call(self, method, path, body=None, **kwargs):
+        results = body.get("results") if isinstance(body, dict) else None
+        states = [r.get("state") for r in results or [] if r.get("type") == "upload"]
+        if path == "/v1/host/results" and self._state in states and self._fails[0]:
+            self._fails[0] -= 1
+            raise self._error
+        return super().call(method, path, body, **kwargs)
+
+
+def _missed(fails, state="injected", error=None):
+    def factory(url, token, *, sleep):
+        return _MissedStates(
+            url,
+            token=token,
+            sleep=sleep,
+            fails=fails,
+            state=state,
+            error=error or RelayError(503, "unavailable", "DECOY relay hiccup"),
+        )
+
+    return factory
+
+
+def _stream_opens(relay: FakeRelay) -> int:
+    with relay._cond:
+        requests = list(relay.requests)
+    return sum(1 for _m, path, _h in requests if path.startswith("/v1/stream/host"))
+
+
 def _downloads(fails=0, gate=None, entered=None):
     fails_box = [fails]
     if gate is None:
@@ -213,6 +250,51 @@ class TestStates:
         assert puller._record(uid, first)
         assert not puller._record(uid, then)
         assert puller._states[uid] == first
+
+    def test_a_later_state_that_got_through_clears_an_earlier_miss(
+        self, puller, monkeypatch
+    ):
+        replies = iter([RelayError(503, "unavailable", "DECOY"), None])
+        monkeypatch.setattr(puller, "_post", lambda _uid, _state: next(replies))
+        uid = up_id(92)
+        assert not puller._deliver(uid, "pulled")
+        assert dict(puller._undelivered) == {uid: "pulled"}
+        assert puller._deliver(uid, "injected")
+        assert dict(puller._undelivered) == {}
+
+    def test_a_miss_never_moves_a_kept_state_back(self, puller, monkeypatch):
+        monkeypatch.setattr(
+            puller, "_post", lambda _uid, _state: RelayError(0, "network", "DECOY")
+        )
+        uid = up_id(93)
+        assert not puller._deliver(uid, "injected")
+        assert not puller._deliver(uid, "pulled")
+        assert dict(puller._undelivered) == {uid: "injected"}
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RelayError(400, "invalid_request", "DECOY"),
+            link.Revoked(401, "unauthorized", "DECOY"),
+            link.TooOld(426, "upgrade_required", "DECOY"),
+        ],
+    )
+    def test_a_state_refused_for_good_is_not_kept(self, puller, monkeypatch, error):
+        replies = iter([RelayError(503, "unavailable", "DECOY"), error])
+        monkeypatch.setattr(puller, "_post", lambda _uid, _state: next(replies))
+        uid = up_id(94)
+        assert not puller._deliver(uid, "pulled")
+        assert not puller._deliver(uid, "injected")
+        assert dict(puller._undelivered) == {}
+
+    def test_at_most_the_result_cache_is_kept(self, puller, monkeypatch):
+        monkeypatch.setattr(
+            puller, "_post", lambda _uid, _state: RelayError(0, "network", "DECOY")
+        )
+        for n in range(link.RESULT_CACHE_MAX + 5):
+            puller._deliver(up_id(1000 + n), "pulled")
+        assert len(puller._undelivered) == link.RESULT_CACHE_MAX
+        assert next(iter(puller._undelivered)) == up_id(1005)  # oldest dropped
 
 
 class TestPull:
@@ -422,6 +504,22 @@ class TestRefusals:
         assert _blob_gets(relay, uid) == 0
         assert uid not in linked.state().seen_ids
         run.finish(relay)
+
+    def test_refusals_are_logged_once_a_minute(self, relay, phone, linked, caplog):
+        stranger = new_device(STRANGER_ID, "Stranger DECOY")
+        uids = [up_id(n) for n in (41, 42, 43)]
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(FakeHost(), linked)
+            for uid in uids:
+                relay.queue_upload_ready(
+                    make_upload(relay, linked, stranger, upload_id=uid, data=b"PNG")
+                )
+            relay.wait_for(
+                lambda: all(_states(relay, u) == ["inject_failed"] for u in uids)
+            )
+            run.finish(relay)
+        refused = [r for r in caplog.records if "refused upload" in r.getMessage()]
+        assert len(refused) == 1
 
     def test_a_refusal_never_blocks_the_genuine_upload(self, relay, phone, linked):
         # A relay that sends junk under a real upload's id first gets it
@@ -648,6 +746,104 @@ class TestReplays:
         assert _states(relay, uid)[0] == "injected"
         assert len(host.staged) == 1
         assert _blob_gets(relay, uid) == 1
+        run.finish(relay)
+
+    def test_a_replay_is_reported_from_the_puller_thread(
+        self, relay, phone, linked, monkeypatch
+    ):
+        # Never from the runner's: a 429 waited out in a re-report would hold
+        # up the command stream behind it.
+        threads: list[str] = []
+        real = UploadPuller._post
+
+        def spy(self, upload_id, state):
+            threads.append(threading.current_thread().name)
+            return real(self, upload_id, state)
+
+        monkeypatch.setattr(UploadPuller, "_post", spy)
+        uid = up_id(37)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        )
+        relay.wait_for(lambda: _states(relay, uid) == ["pulled", "injected"])
+        with relay._cond:
+            relay.results.clear()  # the relay lost the results: it replays upload.ready
+        relay.wait_for(lambda: (relay.drop_streams() or True) and _states(relay, uid))
+        run.finish(relay)
+        assert _states(relay, uid)[0] == "injected"
+        assert len(threads) >= 3
+        assert set(threads) == {link.UPLOAD_THREAD}
+        assert len(host.staged) == 1
+
+    def test_a_final_state_the_relay_missed_is_sent_on_the_next_connect(
+        self, relay, phone, linked
+    ):
+        # "pulled" reached the relay, so it never sends this upload.ready
+        # again: only the host can still tell it the paste happened.
+        uid = up_id(38)
+        host = FakeHost()
+        run = Running(host, linked, client_factory=_missed([1]))
+        relay.wait_for(lambda: run.runner._uploads is not None)
+        puller = run.runner._uploads
+        # No resend while this connection lasts: only the reconnect sends it.
+        puller._resend_backoff = link.Backoff(base=3600, cap=3600, rand=lambda: 1.0)
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        )
+        relay.wait_for(lambda: uid in puller._undelivered)
+        time.sleep(1.0)  # two idle reads of the queue: the backoff holds it
+        assert _states(relay, uid) == ["pulled"]
+
+        relay.wait_for(
+            lambda: (
+                (relay.drop_streams() or True)
+                and _states(relay, uid) == ["pulled", "injected"]
+            )
+        )
+        relay.wait_for(lambda: not puller._undelivered)  # cleared once the post returns
+        assert len(host.staged) == 1
+        assert _blob_gets(relay, uid) == 1
+        run.finish(relay)
+
+    def test_a_missed_state_is_sent_again_while_the_link_stays_up(
+        self, relay, phone, linked
+    ):
+        uid = up_id(39)
+        fails = [2]
+        host = FakeHost()
+        run = Running(host, linked, client_factory=_missed(fails))
+        # "online" is saved just before the stream opens: wait for that open.
+        relay.wait_for(lambda: run.runner.online() and _stream_opens(relay) == 1)
+        run.runner._uploads._resend_backoff = link.Backoff(base=0.05, cap=0.05)
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        )
+        relay.wait_for(lambda: _states(relay, uid) == ["pulled", "injected"])
+        assert fails == [0]  # missed twice, then taken
+        assert _stream_opens(relay) == 1  # without a reconnect
+        assert len(host.staged) == 1
+        run.finish(relay)
+
+    def test_a_state_the_relay_refused_for_good_is_not_sent_again(
+        self, relay, phone, linked
+    ):
+        uid = up_id(40)
+        error = RelayError(400, "invalid_request", "DECOY refused")
+        run = Running(FakeHost(), linked, client_factory=_missed([1], error=error))
+        relay.wait_for(run.runner.online)
+        puller = run.runner._uploads
+        puller._resend_backoff = link.Backoff(base=0.05, cap=0.05)
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        )
+        relay.wait_for(
+            lambda: _states(relay, uid) == ["pulled"] and uid not in puller._inflight
+        )
+        time.sleep(0.5)
+        assert _states(relay, uid) == ["pulled"]
+        assert dict(puller._undelivered) == {}
         run.finish(relay)
 
     def test_an_upload_seen_before_a_restart_is_reported_pulled_never_fetched(

@@ -6,6 +6,7 @@ fallback."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -299,6 +300,38 @@ class TestSnapshot:
         assert any("snapshot" in r.getMessage() for r in caplog.records)
         run.finish(relay)
 
+    def test_one_device_s_copy_stays_under_the_relay_s_sealed_cap(
+        self, tmp_path, relay, phone, caplog
+    ):
+        # With one device the body cap alone lets its copy grow past the
+        # relay's cap on one sealed blob, refused on every connect. Rows are
+        # dropped until it fits, and the warning is logged once a minute at
+        # most, however often the host reconnects.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        rows = [
+            {**SESSION_ROW, "session": f"s{n}", "path": "p" * 2_000} for n in range(700)
+        ]
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(FakeHost(sessions=rows), linked)
+            relay.wait_for(run.runner.online)
+            relay.wait_for(
+                lambda: (relay.drop_streams() or True) and len(relay.snapshots) >= 2
+            )
+            run.finish(relay)
+        snap = relay.snapshots[0]
+        assert len(snap["sealed"][phone.device_id]) <= link.SEALED_MAX_CHARS
+        sent = json.loads(
+            linkcrypto.open_sealed(
+                linked.device_keys(phone).h2d,
+                snap["sealed"][phone.device_id],
+                AAD_SNAP + HOST_ID,
+            )
+        )["sessions"]
+        assert 0 < len(sent) < len(rows)
+        assert sent == rows[: len(sent)]
+        trims = [r for r in caplog.records if "the snapshot holds" in r.getMessage()]
+        assert len(trims) == 1
+
     def test_no_more_rows_than_the_relay_takes_are_sealed(self, tmp_path, relay, phone):
         linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
         rows = [{**SESSION_ROW, "session": f"s{n}"} for n in range(1_100)]
@@ -380,7 +413,9 @@ class TestCommands:
         now = int(time.time() * 1000)
         forged = {
             "stale": {"ts": now - 121_000},
-            "future": {"ts": now + 121_000},
+            # Far enough ahead that a slow first delivery cannot bring it
+            # inside the 120 s window.
+            "future": {"ts": now + 180_000},
             "signer": {"signer": new_device(OTHER_ID)},
             "seal": {"seal_key": os.urandom(32)},
             "inner": {
@@ -567,10 +602,11 @@ class TestCommands:
         self, tmp_path, relay, phone, caplog
     ):
         # A permanent refusal would be replayed forever; the seq is acked
-        # alone and the next command still runs.
+        # alone and the next command still runs. (A 413 is answered
+        # result_too_large instead: see below.)
         linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
         host = FakeHost()
-        error = RelayError(413, "payload_too_large", "DECOY too big")
+        error = RelayError(400, "invalid_request", "DECOY refused")
         with caplog.at_level("WARNING", logger="magent.link"):
             run = Running(host, linked, client_factory=_scripted([1], error))
             relay.queue_command(make_command(linked, phone, cid=cmd_id(11), seq=1))
@@ -582,7 +618,49 @@ class TestCommands:
             run.finish(relay)
         assert [r["commandId"] for r in relay.results] == [cmd_id(12)]
         assert len(host.calls) == 2
-        assert any("413" in r.getMessage() for r in caplog.records)
+        assert any("400" in r.getMessage() for r in caplog.records)
+
+    def test_an_answer_too_big_for_the_relay_is_answered_result_too_large(
+        self, tmp_path, relay, phone
+    ):
+        # Sealed, this answer passes the relay's cap on one blob, which it
+        # would refuse: the device gets a small sealed 502 that says why,
+        # not a command that expires unanswered.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        big = {"ok": True, "data": {"text": "x" * 1_100_000}}
+        host = FakeHost(replies={("GET", "/api/v1/sessions"): (200, big)})
+        run = Running(host, linked)
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(13), seq=1))
+
+        relay.wait_for(lambda: relay.results)
+        [result] = relay.results
+        assert result["status"] == 502
+        answer = open_result(linked, phone, result)
+        assert answer["status"] == 502
+        assert answer["body"]["error"]["details"]["reason"] == "result_too_large"
+        assert 1 in relay.acks
+        assert len(host.calls) == 1
+        run.finish(relay)
+
+    def test_a_413_on_an_answer_is_answered_result_too_large(
+        self, tmp_path, relay, phone
+    ):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        error = RelayError(413, "payload_too_large", "DECOY too big")
+        run = Running(host, linked, client_factory=_scripted([1], error))
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(14), seq=1))
+
+        relay.wait_for(lambda: relay.results)
+        [result] = relay.results
+        answer = open_result(linked, phone, result)
+        assert (result["status"], answer["status"]) == (502, 502)
+        assert answer["body"]["error"]["details"]["reason"] == "result_too_large"
+        assert 1 in relay.acks
+        # A replay re-sends the small answer, never the one the relay refused.
+        assert run.runner._results[cmd_id(14)] == result
+        assert len(host.calls) == 1
+        run.finish(relay)
 
     def test_refusals_never_flush_a_real_id_out_of_the_seen_ring(
         self, monkeypatch, tmp_path, relay, phone
@@ -1219,3 +1297,94 @@ class TestResilience:
         assert fails == [0]
         assert _paths(relay, "/v1/host/commands") == []
         assert run.finish(relay) == "stopped"
+
+
+class TestLogBudget:
+    def test_a_repeat_is_held_back_and_counted(self, caplog):
+        now = [0.0]
+        budget = link._LogBudget(link.get_logger("link"), clock=lambda: now[0])
+        with caplog.at_level("INFO", logger="magent.link"):
+            budget.log(logging.WARNING, "a", "link: x %s", 1)
+            budget.log(logging.WARNING, "a", "link: x %s", 2)
+            budget.log(logging.WARNING, "a", "link: x %s", 3)
+            budget.log(logging.INFO, "b", "link: y")  # each kind has its own
+            now[0] = link.LOG_QUIET_S - 0.001
+            budget.log(logging.WARNING, "a", "link: x %s", 4)
+            now[0] = link.LOG_QUIET_S
+            budget.log(logging.WARNING, "a", "link: x %s", 5)
+            budget.log(logging.WARNING, "a", "link: x %s", 6)
+            now[0] = 2 * link.LOG_QUIET_S
+            budget.log(logging.WARNING, "a", "link: x %s", 7)
+        assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+            (logging.WARNING, "link: x 1"),
+            (logging.INFO, "link: y"),
+            (logging.WARNING, "link: x 5 (3 more like it since the last one)"),
+            (logging.WARNING, "link: x 7 (1 more like it since the last one)"),
+        ]
+
+    def test_refusals_are_logged_once_a_minute(self, tmp_path, relay, phone, caplog):
+        # A relay replaying junk gets every command answered, but link.log a
+        # line a minute, which says how many it held back.
+        stranger = new_device(STRANGER_ID, "Stranger DECOY")
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(host, linked)
+            for n in (1, 2, 3):
+                relay.queue_command(
+                    make_command(linked, phone, cid=cmd_id(n), seq=n, signer=stranger)
+                )
+            relay.wait_for(lambda: len(relay.results) == 3)
+            run.runner._quiet._clock = lambda: time.monotonic() + link.LOG_QUIET_S
+            relay.queue_command(
+                make_command(linked, phone, cid=cmd_id(4), seq=4, signer=stranger)
+            )
+            relay.wait_for(lambda: len(relay.results) == 4)
+            run.finish(relay)
+        refused = [
+            r.getMessage()
+            for r in caplog.records
+            if "refused command" in r.getMessage()
+        ]
+        assert refused == [
+            f"link: refused command {cmd_id(1)}: bad_signature",
+            (
+                f"link: refused command {cmd_id(4)}: bad_signature"
+                " (2 more like it since the last one)"
+            ),
+        ]
+        assert host.calls == []
+
+    def test_a_failing_link_host_logs_one_traceback_per_streak(
+        self, tmp_path, relay, phone, caplog
+    ):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        fails = [3]
+
+        class Flaky(FakeHost):
+            def snapshot(self):
+                if fails[0] > 0:
+                    fails[0] -= 1
+                    raise RuntimeError("DECOY snapshot crash")
+                return super().snapshot()
+
+        def failures():
+            return [
+                bool(r.exc_info)
+                for r in caplog.records
+                if "the daemon side of the link failed" in r.getMessage()
+            ]
+
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(Flaky(), linked)
+            relay.wait_for(lambda: relay.snapshots)
+            assert failures() == [True, False, False]
+            # Connected in between: the next failure starts a new streak.
+            fails[0] = 1
+            relay.wait_for(
+                lambda: (relay.drop_streams() or True) and len(relay.snapshots) >= 2
+            )
+            run.finish(relay)
+        assert failures() == [True, False, False, True]
+        again = [r for r in caplog.records if "failed again" in r.getMessage()]
+        assert again[0].getMessage().endswith("(RuntimeError)")
