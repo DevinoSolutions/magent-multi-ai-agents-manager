@@ -62,6 +62,9 @@ HOST_STREAM_LIMIT = 2
 STREAM_LIMIT_RETRY_S = 5
 LONG_POLL_CAP_S = 25
 _WAIT_S = 0.05
+# wait_for's default: room for a loaded machine, where a pull or a reconnect
+# that takes 0.1 s alone can take several seconds.
+WAIT_FOR_S = 15.0
 # How long teardown waits for the serve thread, then for the open streams.
 _STOP_S = 5.0
 # Every server-side socket read and write gives up after this long, so a
@@ -380,7 +383,9 @@ class FakeRelay:
             self._pairing_expired = True
             self._cond.notify_all()
 
-    def wait_for(self, predicate: Callable[[], bool], timeout: float = 5.0) -> None:
+    def wait_for(
+        self, predicate: Callable[[], bool], timeout: float = WAIT_FOR_S
+    ) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if predicate():

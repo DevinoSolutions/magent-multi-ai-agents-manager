@@ -29,6 +29,9 @@ if TYPE_CHECKING:
     from tests._fake_relay import FakeRelay
 
 HOST_ID = "hst_fake_1"  # what tests/_fake_relay.py's pairing hands out
+# How long a stopped runner may take to end: its forwarder and puller join up
+# to about 11 s between them, and a loaded machine stretches every step.
+RUNNER_STOP_S = 15.0
 PAIRED_AT = "2026-10-08T12:00:00+00:00"
 PHONE_ID = "0190f3a2-7b1c-7d4e-8a5b-3c2d1e0f9a01"
 TABLET_ID = "0190f3a2-7b1c-7d4e-8a5b-3c2d1e0f9a02"
@@ -385,7 +388,7 @@ class Running:
         self.sleeps.append(seconds)
         return self.stop.wait(min(seconds, 0.02))
 
-    def wait_done(self, timeout: float = 5.0) -> str:
+    def wait_done(self, timeout: float = RUNNER_STOP_S) -> str:
         """The terminal state, for a run that ends on its own."""
         self.thread.join(timeout)
         assert not self.thread.is_alive(), "the runner did not end"
@@ -396,7 +399,7 @@ class Running:
         next frame, so its connection is cut until the thread is gone (a
         stream that was still opening misses the first cut)."""
         self.stop.set()
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + RUNNER_STOP_S
         while self.thread.is_alive() and time.monotonic() < deadline:
             relay.drop_streams()
             self.thread.join(0.05)
