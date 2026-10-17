@@ -732,6 +732,7 @@ class SeenRing:
 # A log line that can repeat (a refusal per command, a cut per pane) goes out
 # at most once per kind this often.
 LOG_QUIET_S = 60.0
+FRAME_NAME_MAX = 40  # chars of a relay-chosen frame name that reach a log line
 
 
 class _LogBudget:
@@ -1304,7 +1305,12 @@ class LinkRunner:
     def _on_frame(self, client: RelayClient, event: SseEvent) -> None:
         data = _object(event.data)
         if data is None:
-            self._log.warning("link: ignoring a %s frame that is not JSON", event.event)
+            self._quiet.log(
+                logging.WARNING,
+                "not-json",
+                "link: ignoring a %s frame that is not JSON",
+                event.event[:FRAME_NAME_MAX],  # relay-chosen: kept short
+            )
             return
         if event.event == "command":
             self._on_command(client, data)

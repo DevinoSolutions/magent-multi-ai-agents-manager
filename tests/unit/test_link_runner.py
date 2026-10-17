@@ -1322,6 +1322,21 @@ class TestLogBudget:
             (logging.WARNING, "link: x 7 (1 more like it since the last one)"),
         ]
 
+    def test_frames_that_are_not_json_are_logged_once_a_minute(self, tmp_path, caplog):
+        runner = link.LinkRunner(
+            FakeHost(),
+            link_path=tmp_path / "link.json",
+            state_path=tmp_path / "link-state.json",
+        )
+        name = "command" + "x" * 100  # the relay picks the name
+        with caplog.at_level("WARNING", logger="magent.link"):
+            for _ in range(3):
+                runner._on_frame(None, link.SseEvent(name, "not json DECOY", None))
+        junk = [r.getMessage() for r in caplog.records if "not JSON" in r.getMessage()]
+        assert junk == [
+            f"link: ignoring a {name[: link.FRAME_NAME_MAX]} frame that is not JSON"
+        ]
+
     def test_refusals_are_logged_once_a_minute(self, tmp_path, relay, phone, caplog):
         # A relay replaying junk gets every command answered, but link.log a
         # line a minute, which says how many it held back.
