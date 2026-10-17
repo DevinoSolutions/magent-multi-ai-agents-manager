@@ -73,6 +73,7 @@ def _env() -> dict[str, str]:
     env["MAGENT_IDLE_REAP"] = "0"
     # ...and the relay link, whose reach is the internet.
     env["MAGENT_LINK"] = "0"
+    env["MAGENT_EVENTS"] = "0"
     env["MAGENT_LINK_URL"] = "http://127.0.0.1:9"
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"

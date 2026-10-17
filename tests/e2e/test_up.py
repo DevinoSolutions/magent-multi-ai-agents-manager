@@ -45,6 +45,7 @@ def _child_env(home):
     env["MAGENT_IDLE_REAP"] = "0"
     # ...and the relay link, whose reach is the internet.
     env["MAGENT_LINK"] = "0"
+    env["MAGENT_EVENTS"] = "0"
     env["MAGENT_LINK_URL"] = "http://127.0.0.1:9"
     # ...and the Session-0 hand-off must never fire from a test: a runner
     # (or an ssh-driven leg) is legitimately non-interactive, and the

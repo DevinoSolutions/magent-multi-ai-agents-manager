@@ -345,6 +345,7 @@ def _linux_child_env(home: Path, restricted_bin: Path) -> dict[str, str]:
     env["MAGENT_IDLE_REAP"] = "0"
     # ...and the relay link, whose reach is the internet.
     env["MAGENT_LINK"] = "0"
+    env["MAGENT_EVENTS"] = "0"
     env["MAGENT_LINK_URL"] = "http://127.0.0.1:9"
     # Software rasteriser for the GPU terminals under a GL-less Xvfb.
     env["LIBGL_ALWAYS_SOFTWARE"] = "1"
@@ -667,6 +668,7 @@ def _win_child_env(home: Path, shim_dir: Path, base_path: str) -> dict[str, str]
     env["MAGENT_IDLE_REAP"] = "0"
     # ...and the relay link, whose reach is the internet.
     env["MAGENT_LINK"] = "0"
+    env["MAGENT_EVENTS"] = "0"
     env["MAGENT_LINK_URL"] = "http://127.0.0.1:9"
     # ...and the Session-0 hand-off must never fire from a test: a runner
     # (or an ssh-driven leg) is legitimately non-interactive, and the

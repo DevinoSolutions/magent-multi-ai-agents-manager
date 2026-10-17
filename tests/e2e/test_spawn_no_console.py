@@ -217,6 +217,7 @@ def fleet(tmp_path, monkeypatch):
     monkeypatch.setenv("MAGENT_NODE_SYNC", "0")
     monkeypatch.setenv("MAGENT_IDLE_REAP", "0")
     monkeypatch.setenv("MAGENT_LINK", "0")
+    monkeypatch.setenv("MAGENT_EVENTS", "0")
     monkeypatch.setenv("MAGENT_LINK_URL", "http://127.0.0.1:9")
     # ...and the Session-0 hand-off must never fire from a test: a runner
     # (or an ssh-driven leg) is legitimately non-interactive, and the

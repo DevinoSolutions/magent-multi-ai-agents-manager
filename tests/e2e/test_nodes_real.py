@@ -96,6 +96,7 @@ _PIN_LAWS = {
     "MAGENT_NODE_SYNC": "0",
     "MAGENT_IDLE_REAP": "0",
     "MAGENT_LINK": "0",
+    "MAGENT_EVENTS": "0",
     "MAGENT_LINK_URL": "http://127.0.0.1:9",
     "MAGENT_SESSION0_POLICY": "allow",
     "MAGENT_MCP_RELAY": "0",
