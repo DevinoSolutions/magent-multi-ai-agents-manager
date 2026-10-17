@@ -30,6 +30,7 @@ from tests.unit._link_fakes import (
     HOST_ID,
     Linked,
     cmd_id,
+    cut_stream_and_wait,
     make_command,
     make_upload,
     new_device,
@@ -218,9 +219,7 @@ def test_pair_serve_command_upload_replay_revoke(runner, relay, tmp_path, monkey
         # -- the relay loses the results and replays upload.ready: no second paste
         with relay._cond:
             relay.results.clear()
-        relay.wait_for(
-            lambda: (relay.drop_streams() or True) and _states(relay, upload)
-        )
+        cut_stream_and_wait(relay, lambda: _states(relay, upload))
         assert _states(relay, upload) == ["injected"]
         assert len(pastes) == 1
         assert len(list((tmp_path / "uploads").iterdir())) == 1

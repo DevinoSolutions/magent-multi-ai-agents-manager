@@ -406,6 +406,31 @@ class Running:
         return self.wait_done(0)
 
 
+def stream_opens(relay: FakeRelay) -> int:
+    """How many times the host stream has been opened so far."""
+    with relay._cond:
+        requests = list(relay.requests)
+    return sum(1 for _m, path, _h in requests if path.startswith("/v1/stream/host"))
+
+
+def cut_stream_and_wait(relay: FakeRelay, done: Callable[[], object]) -> None:
+    """Cut the host stream once and wait for ``done()``. FakeRelay replays
+    upload.ready only on a NEW stream, so cutting on every poll can cut each
+    new stream before it delivers; this cuts again only while no new stream
+    has opened (the first cut was missed by a stream still opening)."""
+    opens = stream_opens(relay)
+    relay.drop_streams()
+
+    def ready() -> bool:
+        if done():
+            return True
+        if stream_opens(relay) == opens:
+            relay.drop_streams()
+        return False
+
+    relay.wait_for(ready)
+
+
 def stop_all(timeout: float = 5.0) -> list[Running]:
     """Stop and join every runner a test left running; the ones still alive.
 

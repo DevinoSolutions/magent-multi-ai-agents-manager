@@ -28,10 +28,12 @@ from tests.unit._link_fakes import (
     STRANGER_ID,
     FakeHost,
     Running,
+    cut_stream_and_wait,
     make_upload,
     new_device,
     stop_all,
     stray_forwarders,
+    stream_opens,
     up_id,
     write_link,
 )
@@ -140,12 +142,6 @@ def _missed(fails, state="injected", error=None):
         )
 
     return factory
-
-
-def _stream_opens(relay: FakeRelay) -> int:
-    with relay._cond:
-        requests = list(relay.requests)
-    return sum(1 for _m, path, _h in requests if path.startswith("/v1/stream/host"))
 
 
 def _downloads(fails=0, gate=None, entered=None):
@@ -742,7 +738,7 @@ class TestReplays:
 
         with relay._cond:
             relay.results.clear()  # the relay lost the results: it replays upload.ready
-        relay.wait_for(lambda: (relay.drop_streams() or True) and _states(relay, uid))
+        cut_stream_and_wait(relay, lambda: _states(relay, uid))
         assert _states(relay, uid)[0] == "injected"
         assert len(host.staged) == 1
         assert _blob_gets(relay, uid) == 1
@@ -770,7 +766,7 @@ class TestReplays:
         relay.wait_for(lambda: _states(relay, uid) == ["pulled", "injected"])
         with relay._cond:
             relay.results.clear()  # the relay lost the results: it replays upload.ready
-        relay.wait_for(lambda: (relay.drop_streams() or True) and _states(relay, uid))
+        cut_stream_and_wait(relay, lambda: _states(relay, uid))
         run.finish(relay)
         assert _states(relay, uid)[0] == "injected"
         assert len(threads) >= 3
@@ -815,14 +811,14 @@ class TestReplays:
         host = FakeHost()
         run = Running(host, linked, client_factory=_missed(fails))
         # "online" is saved just before the stream opens: wait for that open.
-        relay.wait_for(lambda: run.runner.online() and _stream_opens(relay) == 1)
+        relay.wait_for(lambda: run.runner.online() and stream_opens(relay) == 1)
         run.runner._uploads._resend_backoff = link.Backoff(base=0.05, cap=0.05)
         relay.queue_upload_ready(
             make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
         )
         relay.wait_for(lambda: _states(relay, uid) == ["pulled", "injected"])
         assert fails == [0]  # missed twice, then taken
-        assert _stream_opens(relay) == 1  # without a reconnect
+        assert stream_opens(relay) == 1  # without a reconnect
         assert len(host.staged) == 1
         run.finish(relay)
 
