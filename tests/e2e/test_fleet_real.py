@@ -281,6 +281,9 @@ class _Fleet:
         self.env["MAGENT_PSMUX_BOOST"] = "0"
         self.env["MAGENT_NODE_SYNC"] = "0"
         self.env["MAGENT_IDLE_REAP"] = "0"
+        # ...and the relay link, whose reach is the internet.
+        self.env["MAGENT_LINK"] = "0"
+        self.env["MAGENT_LINK_URL"] = "http://127.0.0.1:9"
         self.env["MAGENT_SESSION0_POLICY"] = "allow"
         self.env.update(extra_env)
 

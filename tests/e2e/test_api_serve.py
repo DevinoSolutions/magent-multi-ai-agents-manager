@@ -93,6 +93,8 @@ class _Serve:
             MAGENT_PSMUX_BOOST="0",
             MAGENT_NODE_SYNC="0",
             MAGENT_IDLE_REAP="0",
+            MAGENT_LINK="0",
+            MAGENT_LINK_URL="http://127.0.0.1:9",
             MAGENT_SESSION0_POLICY="allow",
             # ... and the one this tier exists to turn ON.
             MAGENT_EVENTS="1",

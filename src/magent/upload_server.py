@@ -2210,6 +2210,39 @@ def _learn_hosts(host: str | None) -> None:
         )
 
 
+# link.LINK_THREAD, spelled here so serve's startup does not import the link.
+_LINK_THREAD = "magent-relay-link"
+
+
+def _supervise_link(config_path: str | None, stop: threading.Event) -> None:
+    """The relay link's thread (`magent link`): ``link.supervise`` over an
+    ``ApiLinkHost`` that answers through this server's own ``api.handle``."""
+    from magent import link, link_host  # heavy subsystem: in-body per policy
+
+    link.supervise(
+        lambda: link_host.ApiLinkHost(UploadHandler._api_context, config_path),
+        stop,
+        serve=_link_record(config_path),
+    )
+
+
+def _link_record(config_path: str | None) -> dict[str, object]:
+    """What this serve says about itself in ``link-serve.json`` while it runs
+    the link: its port, and the config file remote control is read from --
+    ``find_config`` of its ``--config``, as ``ApiLinkHost`` resolves it, made
+    absolute so `magent link`, `status` and `doctor`, run from another
+    directory, can tell whether they read the same file. ``config`` is None
+    when it does not resolve (the working directory can be deleted under
+    serve)."""
+    from magent import paths  # heavy subsystem: in-body per policy
+
+    try:
+        config: str | None = os.path.abspath(paths.find_config(config_path))
+    except (OSError, ValueError):
+        config = None
+    return {"port": UploadHandler.port, "config": config}
+
+
 def run_server(
     port: int = 8080,
     config_path: str | None = None,
@@ -2333,6 +2366,22 @@ def run_server(
         name="magent-reaper",
     ).start()
 
+    # ...and the relay link (`magent link`): idle until this machine is
+    # paired, then one outbound stream to the relay; one serve per machine
+    # runs it (link.LINK_LOCK), the others stand by. MAGENT_LINK=0 opts out --
+    # a test-isolation law like the supervisors above (tests/conftest.py pins
+    # it in process, and every explicit child env carries it with the
+    # dead-loopback MAGENT_LINK_URL, pinned by tests/unit/test_child_env_pins.py):
+    # a linked developer box would otherwise dial the real relay. Never joined
+    # on the way out: a daemon thread that sees its stop within one stream read.
+    link_stop = threading.Event()
+    threading.Thread(
+        target=_supervise_link,
+        args=(config_path, link_stop),
+        daemon=True,
+        name=_LINK_THREAD,
+    ).start()
+
     # ...and the /api/v1 event stream, which only polls while a client
     # listens. MAGENT_EVENTS=0 opts out (a test-isolation law, like the
     # supervisors above: pinned in tests/conftest.py).
@@ -2380,6 +2429,7 @@ def run_server(
         boost_stop.set()
         node_sync_stop.set()
         reap_stop.set()
+        link_stop.set()
         events_stop.set()
         watchdog_stop.set()
         for s in servers[1:]:
