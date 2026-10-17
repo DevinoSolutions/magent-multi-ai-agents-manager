@@ -235,6 +235,26 @@ To own the listener's lifetime yourself, set `MAGENT_HOTKEY_SUPERVISOR=0`; `stat
 
 `magent status` tells the cases apart. `CRASHED` (exit 3) means the daemon died while the machine stayed up; the line says when a running upload server will restart it. `not running since the last restart` (exit 0) means a reboot stopped it. A plain `off` means it was never started or was stopped on purpose.
 
+## Remote access with magent link
+
+`magent link` pairs this machine with the magent app through the magent relay at `api.magent.now`, so you can watch your sessions and send them files from anywhere -- no Tailscale and no open port. It needs the optional `link` extra:
+
+```bash
+pip install "magent-multi-ai-agents-manager[link]"
+magent link
+```
+
+`magent link` prints a QR code and an 8-character code. Scan the QR code with the app, or open the app's pair page and type the code; on the typed path both screens show a 6-digit safety number and you confirm they match (`Does the app show 482 913? [y/N]`). Then it asks whether paired devices may also drive your sessions -- send text, answer dialogs, interrupt, change model, start and stop sessions, edit projects. That is **remote control**, and it stays off unless you say yes; change it later with `magent link --remote-control` or `magent link --no-remote-control`. The setting lives in the config file `magent` resolves (`settings.link.remoteControl`), and it counts as off whenever that file cannot be read.
+
+`magent serve` holds the link: one outbound HTTPS connection to the relay, nothing listening on your machine. Session rows, events, command results and uploaded files are end-to-end encrypted between this machine and your paired devices, so the relay only routes ciphertext plus the session names and states it needs for the host list. A command runs only when it is signed by a paired device and less than two minutes old, and a command or upload the relay delivers twice is acted on once. If you run several `magent serve`s, one of them holds the link and the others stand by until it exits.
+
+- `magent link --status` (add `--json` for scripts) shows the state, the relay, this host's id, the paired devices and whether remote control is on. `magent status` and `magent doctor` show a `Link` line too: `unlinked`, `connecting`, `online`, `offline (retry in Ns)`, `revoked` or `disabled`.
+- `magent link --add-device` pairs another phone or computer with the same host.
+- `magent unlink` asks the relay to revoke this machine and deletes the local link file.
+- `MAGENT_LINK=0` keeps `magent serve` from opening the link without unlinking. `MAGENT_LINK_URL` points `magent link` at a different relay, and `MAGENT_LINK_APP_URL` names the only app address a pairing link may open: set both for a relay of your own.
+
+`~/.magent/link.json` holds this host's token and private keys. It is written owner-only; never copy, commit or share it. If it is ever damaged or the host is revoked, run `magent unlink`, then `magent link`.
+
 ## Nodes
 
 ### Three commands
