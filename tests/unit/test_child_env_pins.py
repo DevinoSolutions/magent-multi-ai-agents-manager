@@ -8,7 +8,7 @@ linked machine (the real_home tier, or a fixture without a HOME redirect)
 would run a second link on the developer's own host token, and a child
 running ``magent link`` would get the production relay URL. It also runs the
 event poller, which captures every live pane on the machine while a client
-listens. A file that pins any serve opt-out (the psmux boost, the hotkey or
+listens. A file that pins any serve opt-out (the psmux boost or node sync, the hotkey or
 upload supervisor, the idle reaper) is a builder; it pins MAGENT_LINK=0, the
 dead-loopback MAGENT_LINK_URL and MAGENT_EVENTS=0 at least once, and at
 least as often as it pins the idle reaper (one per builder). The one tier
@@ -48,6 +48,7 @@ POLLER_TIER = "tests/e2e/test_api_serve.py"
 OPT_OUTS = (
     REAPER,
     _pins("MAGENT_PSMUX_BOOST", "0"),
+    _pins("MAGENT_NODE_SYNC", "0"),
     _pins("MAGENT_HOTKEY_SUPERVISOR", "0"),
     _pins("MAGENT_UPLOAD_SUPERVISOR", "0"),
 )
@@ -121,6 +122,7 @@ _POLLER_ON = (
     [
         ('env["MAGENT_UPLOAD_SUPERVISOR"] = "1"', "", False),  # no opt-out pinned
         ('env["MAGENT_PSMUX_BOOST"] = "0"', "", True),  # a builder without the reaper
+        ('env["MAGENT_NODE_SYNC"] = "0"', "", True),  # a builder without the reaper
         (_POLLER_ON, POLLER_TIER, False),  # the poller on, in the tier about it
         (_POLLER_ON, "tests/e2e/test_up.py", True),  # the poller on anywhere else
         (
