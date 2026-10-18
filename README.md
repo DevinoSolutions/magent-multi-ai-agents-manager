@@ -255,6 +255,8 @@ magent link
 
 `~/.magent/link.json` holds this host's token and private keys. It is written owner-only; never copy, commit or share it. If it is ever damaged or the host is revoked, run `magent unlink`, then `magent link`.
 
+To try a preview build of the link against a trial relay, step by step, see [docs/link-trial.md](docs/link-trial.md).
+
 ## Nodes
 
 ### Three commands
