@@ -6,8 +6,9 @@ another PC can see live session states, peek at a pane and upload a file
 sends is end-to-end encrypted to the paired devices; the relay only routes.
 
 - `magent link [--no-qr] [--add-device] [--remote-control/--no-remote-control]`
-- `magent link --status` (add `--json` for scripts): the `Link` line is one of
-  `unlinked`, `connecting`, `online`, `offline (retry in Ns)`,
+- `magent link --status` (add `--json` for scripts): the `Link` line shows one
+  of six states (`unlinked`, `connecting`, `online`, `offline`, `revoked`,
+  `disabled`), for example `online`, `offline (retry in Ns)`,
   `offline (magent serve is not running)`,
   ``revoked (run `magent unlink`, then `magent link`)`` or
   `disabled (MAGENT_LINK=0)`
@@ -22,15 +23,42 @@ it is out of scope for this trial.
 
 ## Try it
 
+Install the branch the same way you installed magent, into the same place:
+the `magent` that runs when you type `magent` is the one that must change.
+If `magent attention -d` is running, stop it first, or its watchdog restarts
+the old `magent serve` while you install:
+
+```bash
+magent attention --stop
+```
+
+With pip (add `--user` if you installed magent with `pip install --user`):
+
+```bash
+python -m pip install --force-reinstall "magent-multi-ai-agents-manager[link,qr] @ git+https://github.com/DevinoSolutions/magent-multi-ai-agents-manager@feat/link"
+```
+
+Or, if you installed magent with `uv tool`:
+
 ```bash
 uv tool install --force "magent-multi-ai-agents-manager[link,qr] @ git+https://github.com/DevinoSolutions/magent-multi-ai-agents-manager@feat/link"
+```
+
+Then end the running `magent serve` and the Alt+V listener (their pids are in
+`~/.magent/upload_server-<port>.pid` and `~/.magent/hotkey.pid`), start them
+again with `magent serve --ensure`, and start `magent attention -d` again if
+you stopped it. Check the branch is the one that runs:
+
+```bash
 magent link --help
 ```
 
-`magent link --help` proves the branch is installed (`magent --version` prints
-the release number either way). Restart `magent serve` so the link thread
-loads, then link with the trial relay URL and the trial app URL the
-maintainer gave you:
+`magent --version` prints the release number either way, so it cannot tell.
+To go back after the trial, reinstall the release the same way (for pip:
+`python -m pip install --force-reinstall magent-multi-ai-agents-manager`) and
+restart in the same order.
+
+Link with the trial relay URL and the trial app URL the maintainer gave you:
 
 ```powershell
 $env:MAGENT_LINK_URL = "<the trial relay URL>"; $env:MAGENT_LINK_APP_URL = "<the trial app URL>"; magent link
