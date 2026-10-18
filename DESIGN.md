@@ -3170,6 +3170,65 @@ name `magent attach` was given -- an alias the server cannot know. Writes
 cannot send, and the write verbs answer only a caller whose peer AND Host are
 loopback: the tailnet bind stays read-only plus upload, as it always was.
 
+### The link dials out, one serve per machine runs it, and a device writes only with remote control (2026-10-17)
+
+`magent link` pairs this machine with the magent app; `magent serve` then
+holds the link on its `magent-relay-link` thread (`link.LINK_THREAD`). The
+link is outbound only: one HTTPS connection from this machine to the relay,
+nothing listening here, so it needs no open port and no tailnet. Session
+rows, events, command results and uploaded files are sealed per paired
+device, and `link.py` is the only module that opens that connection (lint
+rule MD013). A device's command reaches the daemon through the same
+`api.handle` as a local `/api/v1` request, as a `linked` caller, so the link
+can never do more than the API already allows.
+
+**One serve per machine.** Serve is per port, and two link runners on one
+host token would each run a command (typed twice into a session) and paste
+an upload twice. So the thread runs under the machine-wide `link.LINK_LOCK`;
+a second serve logs once and stands by, retrying every `IDLE_RECHECK_S`,
+until the holder exits. The holder names itself in `~/.magent/link-serve.json`
+(pid, port, and the config file it reads), which is how `magent link
+--status`, `status` and `doctor` say which serve runs the link. The lock, not
+the record, is the truth: a record left by a dead serve means nothing once
+the lock is free, and every reader probes the lock first.
+
+**Remote control is read from the file the CLI resolves.** The write gate
+`settings.link.remoteControl` is read from `paths.find_config(<serve's
+--config>)`, the file `magent link --remote-control` writes, re-read whenever
+that file changes. It is off by default and off whenever the file cannot be
+read or the value is not a boolean: an unreadable config never opens writes.
+When the serve that runs the link reads another file than the CLI resolves
+(or found none), `status`, `doctor` and the `--remote-control` note WARN,
+because a flip in the CLI's file would not reach that serve.
+
+**Decrypted pulls never outlive the process that made them.** Each pull has
+its own folder in `uploads/.incoming` (`<uploadId>.<token>`), removed when the
+pull ends. One is left only by a process that died mid-pull, and it holds a
+decrypted file, so a serve sweeps them when it takes the link (before its
+first runner, so no puller of its own owns one) and `magent unlink` sweeps
+them while the lock is free. A stop waits for a pull in flight only
+`UPLOAD_JOIN_S`: a serve that is shutting down can still be finishing one
+when the next serve sweeps, that pull fails, and the relay sends the upload
+again.
+
+**A device always learns what became of its command or upload.** An answer
+too large for the relay to take (over its cap on one sealed blob, or refused
+with a 413) is replaced by a small sealed `502 result_too_large`, so the
+device is told why instead of waiting out its command. An upload state the
+relay could not take for now (no reply, a 5xx, a 429) is kept, the latest per
+upload, and sent again when the runner reconnects and, meanwhile, after a
+backoff while it stays connected: once `pulled` has reached the relay it
+never offers that upload again, so only the host can still report the paste.
+Re-reporting an upload the relay replays runs on the puller's thread, never
+the runner's, where a 429 waited out would hold up the commands.
+
+**The log is a record, not a firehose.** A relay that replays junk, a pane
+cut on every capture, or a fleet too big for one snapshot would each write a
+line per occurrence. Those lines go through `link._LogBudget`: one per kind
+per `LOG_QUIET_S`, and the next one says how many it held back. A failing
+LinkHost logs its traceback on the first failure of a streak and one line
+after, the same rule the event forwarder already kept.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.

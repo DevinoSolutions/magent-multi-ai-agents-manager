@@ -410,7 +410,7 @@ class TestMetaHealthStatus:
         assert data["write_allowed"] is True
         assert data["limits"] == {"upload_max_bytes": 1000, "pane_lines_max": 2000}
         assert "choose" in data["caps"]
-        assert data["link"] == {"state": "off"}
+        assert data["link"] == {"state": "disabled"}  # MAGENT_LINK=0 (conftest)
 
     def test_health_mirrors_the_legacy_route(self, ctx):
         data = assert_wire(api.handle(make_req(path="/api/v1/health"), ctx), "Health")

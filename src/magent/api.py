@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import unquote
 
-from magent import control, events, fleetview, projects, uploads, wire
+from magent import control, events, fleetview, link_staged, projects, uploads, wire
 from magent.log import get_logger, log_safe
 from magent.sessions import upload_limit_text
 from magent.wire import WireError
@@ -711,6 +711,28 @@ def _version() -> str:
     return __version__
 
 
+def _link_served() -> bool:
+    """Whether a serve runs the link, asked from inside a serve: while one
+    holds the link lock (this one, or the one this serve stands by for).
+    When the lock cannot be probed, this serve's own link thread
+    (``link.LINK_THREAD``) decides."""
+    from magent import link  # in-body: link.py pulls in http.client and ssl
+
+    held = link.link_serve().held
+    if held is not None:
+        return held
+    return any(
+        t.name == link.LINK_THREAD and t.is_alive() for t in threading.enumerate()
+    )
+
+
+def _link_state() -> str:
+    """The relay link's C8 word (``magent link``) for ``/api/v1/meta``."""
+    from magent import link  # in-body: link.py pulls in http.client and ssl
+
+    return link.describe_link(serving=_link_served).state
+
+
 def _meta(call: Call) -> ApiResponse:
     return ApiResponse.ok(
         Meta(
@@ -720,7 +742,7 @@ def _meta(call: Call) -> ApiResponse:
             caps=list(CAPS),
             write_allowed=write_refusal(call.caller) is None,
             limits=Limits(call.ctx.upload_max_bytes, control.PANE_LINES_MAX),
-            link=LinkInfo(state="off"),
+            link=LinkInfo(state=_link_state()),
         )
     )
 
@@ -898,6 +920,8 @@ def _poll(call: Call) -> ApiResponse:
 
 
 def _upload(call: Call) -> ApiResponse:
+    if link_staged.is_staged(call.req.header("content-type")):
+        return _upload_staged(call)
     req, ctx = call.req, call.ctx
     length = req.body.length
     if length is None:
@@ -960,6 +984,43 @@ def _upload(call: Call) -> ApiResponse:
     ctx.bus.publish(
         "upload",
         {"upload_id": result.upload_id, "session": session, "paste": result.paste},
+    )
+    return ApiResponse.ok(result)
+
+
+def _upload_staged(call: Call) -> ApiResponse:
+    """A file ``link.py`` pulled from the relay and decrypted, named by path
+    (``link_staged``): then the multipart form's session check, save, paste
+    and event."""
+    ctx = call.ctx
+    staged = link_staged.load(call.caller.kind, _json(call.req))
+    if staged.session not in ctx.upload_sessions():
+        raise WireError(
+            "not_found",
+            f"no live session named {staged.session!r}",
+            {"reason": "unknown_session"},
+        )
+    result = uploads.save(
+        [(staged.name, staged.path.read_bytes())],
+        staged.session,
+        inject=staged.inject,
+        upload_dir=ctx.upload_dir,
+        max_bytes=ctx.upload_max_bytes,
+        inject_fn=ctx.inject_fn,
+    )
+    get_logger("upload").info(
+        "upload api=v1 via=link project=%s files=%d paste=%s",
+        log_safe(staged.session),
+        len(result.paths),
+        result.paste,
+    )
+    ctx.bus.publish(
+        "upload",
+        {
+            "upload_id": result.upload_id,
+            "session": staged.session,
+            "paste": result.paste,
+        },
     )
     return ApiResponse.ok(result)
 

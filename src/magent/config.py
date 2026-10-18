@@ -123,6 +123,16 @@ class IdleReapSettings:
 
 
 @dataclass
+class LinkSettings:
+    """magent link (P2). ``remote_control``: may devices paired with this
+    host send text, choose, interrupt, change model, start/stop sessions and
+    edit projects? Off by default; only `magent link` writes it, and a value
+    of the wrong type is a ConfigError, never read as on."""
+
+    remote_control: bool = False
+
+
+@dataclass
 class Settings:
     default_tool: str = "claude"
     settle_seconds: int = 3
@@ -137,6 +147,7 @@ class Settings:
     nodes: dict[str, NodeConfig] = field(default_factory=dict)
     node_sync: NodeSyncConfig = field(default_factory=NodeSyncConfig)
     idle_reap: IdleReapSettings = field(default_factory=IdleReapSettings)
+    link: LinkSettings = field(default_factory=LinkSettings)
     tools: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_TOOLS))
 
 
@@ -463,6 +474,9 @@ def _parse_settings(raw: dict[str, object] | None) -> Settings:
         nodes=_parse_nodes(_obj(raw, "nodes")),
         node_sync=_parse_node_sync(_obj(raw, "nodeSync")),
         idle_reap=_parse_idle_reap(raw.get("idleReap")),
+        link=LinkSettings(
+            remote_control=_bool(_obj(raw, "link"), "remoteControl", False)
+        ),
         tools=_tools(raw, DEFAULT_TOOLS),
     )
 
@@ -517,6 +531,7 @@ def settings_to_dict(settings: Settings) -> dict[str, object]:
             "enabled": settings.idle_reap.enabled,
             "afterMinutes": settings.idle_reap.after_minutes,
         },
+        "link": {"remoteControl": settings.link.remote_control},
         "tools": dict(settings.tools),
     }
 
@@ -639,6 +654,7 @@ _ALLOWED_SETTINGS_KEYS = {
     "nodes",
     "nodeSync",
     "idleReap",
+    "link",
     "tools",
 }
 _ALLOWED_SSH_KEYS = {"shell"}
@@ -655,6 +671,7 @@ _ALLOWED_ATTENTION_KEYS = {
     "stateTtlDays",
 }
 _ALLOWED_IDLE_REAP_KEYS = {"enabled", "afterMinutes"}
+_ALLOWED_LINK_KEYS = {"remoteControl"}
 _ALLOWED_PROJECT_KEYS = {
     "path",
     "group",
@@ -943,6 +960,13 @@ def load_config(path: str) -> MagentConfig:
     _require_type(idle_raw, "enabled", bool, "settings.idleReap.enabled")
     _require_type(idle_raw, "afterMinutes", int, "settings.idleReap.afterMinutes")
     _warn_unknown_keys(idle_raw, _ALLOWED_IDLE_REAP_KEYS, "settings.idleReap")
+
+    # Remote control fails CLOSED like idleReap: a wrong type is an error
+    # naming the key, never a value read as on.
+    link_raw = _obj(settings_raw, "link")
+    _require_type(settings_raw, "link", dict, "settings.link")
+    _require_type(link_raw, "remoteControl", bool, "settings.link.remoteControl")
+    _warn_unknown_keys(link_raw, _ALLOWED_LINK_KEYS, "settings.link")
 
     projects: list[ProjectConfig] = []
     for i, p in enumerate(projects_raw):
