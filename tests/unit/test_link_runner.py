@@ -857,18 +857,31 @@ class TestDevices:
         run.finish(relay)
 
     def test_a_device_saved_after_the_relay_announced_it_is_trusted_at_once(
-        self, tmp_path, relay, phone
+        self, monkeypatch, tmp_path, relay, phone
     ):
         # `magent link --add-device`: the relay announces the device before
         # the CLI has verified and saved it, so that devices frame reads the
         # old list. The save itself must be picked up, without a reconnect.
         tablet = new_device(TABLET_ID, "Tablet DECOY")
         linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        announced = threading.Event()
+        real_on_devices = link.LinkRunner._on_devices
+
+        def spy(self, client, data):
+            try:
+                real_on_devices(self, client, data)
+            finally:
+                listed = [d.get("deviceId") for d in data.get("devices") or []]
+                if TABLET_ID in listed:
+                    announced.set()
+
+        monkeypatch.setattr(link.LinkRunner, "_on_devices", spy)
         host = FakeHost()
         run = Running(host, linked)
         relay.wait_for(lambda: relay.open_streams == 1)
         relay.set_devices([phone.wire(), tablet.wire()])
-        time.sleep(0.2)  # the frame is read before the save, as in the field
+        # The frame is read, against the old list, before the save.
+        assert announced.wait(15), "the devices frame never reached the runner"
 
         save_linked(
             linked,
@@ -950,6 +963,37 @@ class TestDevices:
         relay.wait_for(lambda: 1 in relay.acks)
         assert host.calls == []
         run.finish(relay)
+
+    def test_an_unlink_between_the_read_and_the_save_is_not_undone(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        # Forgetting a revoked device rewrites link.json from what was read.
+        # `magent unlink` deleting the file in between must not see it
+        # brought back by that save.
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, relay.url, (phone, tablet), host_token=relay.host_token
+        )
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: relay.open_streams == 1)
+        real_load = link.linkfiles.load_link
+        armed = [True]
+
+        def read_then_unlinked(path=None):
+            result = real_load(path)
+            if threading.current_thread() is run.thread and armed[0]:
+                armed[0] = False
+                linkfiles.delete_link(linked.link_path, linked.state_path)
+            return result
+
+        monkeypatch.setattr(link.linkfiles, "load_link", read_then_unlinked)
+        relay.set_devices(
+            [phone.wire(), tablet.wire(revoked_at="2026-10-08T13:00:00.000Z")]
+        )
+
+        assert run.wait_done() == "unlinked"
+        assert armed == [False]
+        assert not linked.link_path.exists()
 
     def test_a_link_json_read_that_fails_once_is_retried(
         self, monkeypatch, tmp_path, relay, phone

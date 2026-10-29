@@ -1163,6 +1163,13 @@ class LinkRunner:
         # Every device the relay listed revoked during this run: a later
         # link.json that still lists one (a revocation that could only apply
         # in memory) never trusts it again. One trust refresh at a time.
+        # Safe only because of a relay invariant: the one revoke path (the
+        # device's DELETE) revokes that whole installation, and a revoked id
+        # comes back only by registering again, with new keys, under a new
+        # id. The relay's pairing claim upserts the device and resets its
+        # revokedAt, so a future per-host unpair that lets an id be paired
+        # again must revisit this set: it would keep refusing that device
+        # until the run ends.
         self._revoked: set[str] = set()
         self._trust_lock = threading.Lock()
 
@@ -1697,7 +1704,7 @@ class LinkRunner:
                     self._end_run("unlinked")
                     raise _Unlinked
                 self._check_same_link(current)
-                current = self._forget(current, gone)
+                current = self._forget(current, gone, stamp)
                 peers = self._peers_for(current)
             except linkfiles.LinkFileError as exc:
                 if revoked is not None:
@@ -1783,13 +1790,27 @@ class LinkRunner:
             self._log.info("link: this machine was paired again; reconnecting")
         return end
 
-    def _forget(self, link: LinkFile, revoked: set[str]) -> LinkFile:
-        """``link`` without the revoked devices, saved when that changed it."""
+    def _forget(
+        self,
+        link: LinkFile,
+        revoked: set[str],
+        stamp: tuple[int, int, int] | None,
+    ) -> LinkFile:
+        """``link`` without the revoked devices, saved when that changed it.
+        ``stamp`` is link.json's as it was before ``link`` was read: when the
+        file has moved since (`magent unlink` deleted it, `magent link`
+        saved a device), the save is skipped, as it would bring back the
+        deleted file or drop the new device. The revocation still applies in
+        memory, and the next look at link.json (it changed) applies it to
+        the new file."""
         kept = tuple(d for d in link.devices if d.device_id not in revoked)
         if len(kept) == len(link.devices):
             return link
         link = replace(link, devices=kept)
         self._log.info("link: the relay revoked a paired device; forgetting it")
+        if _link_stamp(self._link_path) != stamp:
+            self._log.info("link: link.json changed meanwhile; not rewriting it")
+            return link
         # Retried like _save: on Windows a reader holding link.json open makes
         # the atomic replace fail for a moment.
         for attempt in range(SAVE_ATTEMPTS):
