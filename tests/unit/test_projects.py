@@ -351,6 +351,25 @@ class TestRemove:
         )
         assert cfg.read_bytes() == before
 
+    def test_a_session_that_survives_the_stop_refuses_the_removal(
+        self, cfg, monkeypatch
+    ):
+        # The verified shutdown names its survivors; a removal that went
+        # ahead anyway would drop the project from the config while its
+        # session kept running, unreachable by every config-driven verb.
+        monkeypatch.setattr(
+            psmux, "stop_sessions", lambda names, psmux=None: ([], list(names))
+        )
+        before = cfg.read_bytes()
+        with pytest.raises(projects.ProjectError) as err:
+            projects.remove(str(cfg), "api", stop=True)
+        assert (err.value.code, err.value.details) == (
+            "unavailable",
+            {"reason": "still_running", "still_running": ["api"]},
+        )
+        assert "api" in err.value.message
+        assert cfg.read_bytes() == before
+
 
 class TestSetEnabled:
     def test_disables_and_enables(self, cfg):
