@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING
 import click
 
 from magent.cli.app import main
-from magent.cli.attention_cmd import engine_from_config
 from magent.cli.config_io import _load_config_or_exit
 from magent.paths import find_config
 from magent.style import style
@@ -119,12 +118,13 @@ def watch_cmd(ctx: click.Context, interval: float, once: bool) -> None:
     (needs-input and errors on top, time-in-state alongside). Press a row
     number to focus that session's window; q quits.
     """
+    from magent import fleetview  # heavy subsystem: in-body per policy
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
     config_file = find_config(ctx.obj.get("config_path"))
     cfg = _load_config_or_exit(config_file)
     plat = get_platform()
-    engine = engine_from_config(cfg)
+    engine = fleetview.engine_from_config(cfg)
 
     while True:
         views = engine.poll()

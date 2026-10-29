@@ -178,6 +178,16 @@ class MagentEnv(BaseSettings):
     # that FAILS to validate turns reaping OFF, not on (reap.env_enabled):
     # the one supervisor whose verb is destructive fails closed.
     idle_reap: bool = True
+    # Should `magent serve` run the event poller behind /api/v1/events?
+    # (default: 1 / on.) The poller only works while a client listens (an SSE
+    # stream, a long-poll waiter); it reads the agent-state store every second
+    # and captures each live pane every fifth. Set to 0 to keep serve from
+    # ever polling: the stream then carries only `hello`, heartbeats and the
+    # upload/project events serve publishes itself. Like the supervisors
+    # above, 0 is also a TEST-ISOLATION law -- a test that starts a real serve
+    # must not have it capturing the developer's live panes -- so
+    # tests/conftest.py pins it to 0 for every tier.
+    events: bool = True
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:

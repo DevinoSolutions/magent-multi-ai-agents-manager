@@ -24,7 +24,11 @@ convention-following.
 ```
 pure leaves:  grid · paths · style · titles · log · terminals · agent_state · config
                           ^
-subsystems:   tiling · platform/ · sessions/ · discover · init_config · launch · upload_server · hotkey
+subsystems:   tiling · platform/ · sessions/ · discover · init_config · launch · hotkey
+                          ^
+/api/v1:      wire · fleetview · events · control · config_io · projects · uploads · api
+                          ^
+server:       upload_server  (delegates /api/v1/* to api.handle)
                           ^
 cli/ command modules:  app · config_io · ui · background · config_editor · menu · attach · docs · mobile · session_picker · status
                           ^
@@ -127,8 +131,8 @@ None of these imports any other `magent` module (`style.py` imports
   `ProjectConfig`/`LayoutConfig`/`SSHConfig`), one envelope factory
   (`default_config`), one pair of serializers (`layout_to_dict`/
   `settings_to_dict`) that every config generator delegates through, a pure
-  `load_config` reader, and `migrate_config_file` as the single disk-writing
-  function in the module. `DEFAULT_TOOLS` is the one dict of built-in
+  `load_config` reader, and the pure `migrate_config_text` (no function in
+  the module writes to disk). `DEFAULT_TOOLS` is the one dict of built-in
   tool commands (`claude`, `codex`, `cursor-agent`, `agy`); `Settings.tools`'
   default factory and `_parse_settings`'s fallback both copy it
   (`dict(DEFAULT_TOOLS)`) rather than sharing one mutable dict (LS-B-002).
@@ -249,6 +253,38 @@ None of these imports any other `magent` module (`style.py` imports
   `_attach_markers` scans for and the command a pane actually runs cannot
   drift apart.
 
+### The `/api/v1` layer (2026-10-08)
+
+Lifted out of the cli shells and the upload handler so the HTTP API and the CLI
+`--json` shells call the same functions. None of these
+imports the cli package (LS-A-001); none prints, prompts or exits (MD001).
+
+- **`wire.py`** — the envelope (`ok`/`error`/`from_exc`), `ErrorCode`, the
+  code->HTTP status map, and `WireError`, which every leaf's own error
+  (`ControlError`, `ProjectError`, `UploadError`) subclasses.
+- **`fleetview.py`** — the one `SessionRow`: `hook_state` (the agent-state
+  vocabulary, through `AttentionEngine`) and `pane_state` (the pane
+  classifier's) side by side and never merged. `rows()`/`row_for()`; the
+  only `AttentionEngine(` call (MD012); `to_legacy()` keeps `sessions --json`.
+- **`events.py`** — `EventBus` (ring of 1024, ids `<epoch>:<n>`, `since`
+  answers `reset` on a foreign epoch or an evicted id, `wait` for long-poll)
+  and `EventPoller`, which diffs `fleetview.rows` into `session.*` and
+  `attention` events: hooks every second, panes every fifth, subscribed pane
+  tails on hash change. It only ticks while somebody listens.
+- **`control.py`** — the verbs as frozen results, exact socket ids only.
+  `send`, `choose`, `interrupt` and `set_model` refuse node and cloud rows with
+  `conflict`; `read_pane` reads a live node pane over one bounded ssh capture,
+  and `start`/`stop` drive node sessions too. `choose` refuses unless the pane
+  reads `dialog` and presses the digit alone.
+- **`config_io.py` / `projects.py`** — the one config write (validate, back
+  up, atomic replace) under `config_io.locked()`: a thread lock, then the
+  persistent `config.lock` sidecar with a 2 s wait; MD011.
+- **`uploads.py`** — the upload save + one-shot paste with its three states,
+  lifted out of `upload_server._handle_post` with the contract unchanged.
+- **`api.py`** — `handle(ApiRequest, ApiContext) -> ApiResponse | ApiStream`,
+  the route table, `PREFIX` (MD009), and `guard()`; the SSE generator holds a
+  bus subscription for exactly as long as its connection.
+
 ### `cli/` command modules
 
 Each imports `main` from `cli/app.py` (to attach its own commands) plus
@@ -335,12 +371,13 @@ The two paths are the fix, not the disease. Anyone who "deduplicates" the
 editor onto `load_config`/a typed writer will cause silent data loss for any
 hand-added or forward-compatible config key.
 
-**`load_config` never writes; `migrate_config_file` is the only writer
-(R10).** `load_config` is a pure read: on a schema version below current, it
+**`load_config` never writes; nothing in `config.py` does (R10).**
+`load_config` is a pure read: on a schema version below current, it
 prints `Warning: config schema v<N> < v<CURRENT>; run: magent config
 migrate` to stderr and returns in-memory data — it never touches the file.
 Persisting a migration (or backfilled colors) requires `magent config
-migrate` (or a save through the config editor's raw path). A load that
+migrate`, which migrates in memory (`migrate_config_text`) and writes through
+`config_io.save` under the config lock. A load that
 rewrites the file as a side effect was one of the audited defects; do not
 reintroduce it.
 
@@ -3108,6 +3145,30 @@ member), `tests/unit/test_node_onboard.py`, `tests/unit/test_node_ready_gate.py`
 `tests/unit/test_node_token_renewal.py`, `tests/unit/test_config_node_pin.py`,
 `tests/unit/test_node_sync_lifetime.py`, and `tests/e2e/test_nodes_real.py`
 D7 (the session starts on the node, the folder trusted).
+
+### The API is a pure function, and only a browser is judged by its Host (2026-10-08)
+
+`upload_server` grew one route at a time on a handler class whose state lived
+in class attributes, so nothing but a socket could test a route. `/api/v1` is
+the opposite: `api.handle` takes an `ApiRequest` and an `ApiContext` and
+returns data, and the handler's whole job for it is one method (`_serve_api`)
+that builds the request and writes the answer. The CLI `--json` shells call the same leaves,
+and a parity test holds the two to one JSON.
+
+The origin guard closes two holes the loopback + Tailscale bind never closed:
+DNS rebinding (a page whose name resolves to 127.0.0.1 reads the fleet) and
+CSRF on the GET side effects (`<img src=/api/flash>`, `/focus`). Host,
+Origin and `Sec-Fetch-Site` are checked on every route, legacy included.
+The Host allowlist applies only to a request that looks like a browser (an
+Origin, any `Sec-Fetch-*` header, or a `Mozilla/` User-Agent). Origin and
+`Sec-Fetch-*` are set by the browser, and page script cannot drop them. The
+User-Agent is a weaker tell, since page script can set it, so it can add a
+check but never remove one. Rebinding needs a browser, a non-browser client can
+send any Host it likes, and the remote Alt+V listener posts to whatever ssh
+name `magent attach` was given -- an alias the server cannot know. Writes
+(`POST/PATCH/DELETE`) also need `X-Magent-Client`, which a form or an `<img>`
+cannot send, and the write verbs answer only a caller whose peer AND Host are
+loopback: the tailnet bind stays read-only plus upload, as it always was.
 
 ## 3. Known debt
 

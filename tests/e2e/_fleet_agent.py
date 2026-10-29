@@ -121,6 +121,10 @@ def _own_the_input_line() -> None:
 
         enable_line_input = 0x0002
         enable_echo_input = 0x0004
+        # Keys as VT input, like a real TUI. Without it a key event that
+        # carries no character never reaches os.read: measured on real psmux
+        # 3.3.8, `send-keys Escape` arrived as nothing; with it, as b"\x1b".
+        enable_virtual_terminal_input = 0x0200
         with contextlib.suppress(OSError, AttributeError, ValueError):
             # `windll` exists only on Windows, which the branch above has
             # already established; AttributeError is suppressed regardless.
@@ -129,7 +133,9 @@ def _own_the_input_line() -> None:
             mode = ctypes.c_uint32()
             if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
                 kernel32.SetConsoleMode(
-                    handle, mode.value & ~(enable_line_input | enable_echo_input)
+                    handle,
+                    (mode.value & ~(enable_line_input | enable_echo_input))
+                    | enable_virtual_terminal_input,
                 )
         return
     import termios
@@ -170,6 +176,7 @@ class Pane:
         self.menu = menu  # a numbered permission menu in place of the input line
         self.transcript: list[str] = ["  stand-in agent ready."]
         self.busy: str | None = None
+        self.interrupted = False
         self.hold_until = 0.0
         self._buf = b""
         self._eof = False
@@ -235,6 +242,20 @@ class Pane:
                 break
             if not chunk:
                 break
+            if chunk == b"\x1b":
+                # A LONE ESC is a KEY, not text: Claude Code's interrupt
+                # (measured: psmux's `send-keys Escape` arrives as exactly
+                # this one byte). An ESC leading a longer chunk is the start
+                # of a CSI sequence (`\\x1b[A`), left to the text path.
+                self.on_escape()
+                continue
+            if self.menu and len(chunk.strip()) == 1 and chunk.strip().isdigit():
+                # A numbered menu acts on the digit alone, no Enter -- what
+                # `magent choose` relies on.
+                self.on_choice(chunk.strip().decode("ascii"))
+                continue
+            if not chunk:
+                continue
             with self._lock:
                 self._buf += chunk
             self.echo(
@@ -261,19 +282,36 @@ class Pane:
         with self.log.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps({"line": line, "ts": time.time()}) + "\n")
 
+    def on_escape(self) -> None:
+        """ESC arrived: recorded as ``<Escape>``; a running turn stops."""
+        self.record("<Escape>")
+        if self.busy:
+            self.interrupted = True
+
+    def on_choice(self, digit: str) -> None:
+        """A digit answered the numbered menu: recorded, menu closed."""
+        self.record(f"<choice {digit}>")
+        self.menu = False
+        self.transcript.append(f"\u25cf chose {digit}")
+        self.paint()
+
     # -- behaviour ------------------------------------------------------------
 
     def run_busy(self, message: str, seconds: float, done: str) -> None:
-        """Show a mid-turn screen for ``seconds``, then go idle with ``done``.
+        """Show a mid-turn screen for ``seconds``, then go idle with ``done``
+        -- or with ``INTERRUPTED`` the moment an ESC arrives.
 
-        A real sleep, and the queued keystrokes that arrive during it are read
+        A real wait, and the queued keystrokes that arrive during it are read
         afterwards -- that ordering is part of what the tier proves.
         """
         self.busy = message
+        self.interrupted = False
         self.paint()
-        time.sleep(seconds)
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not self.interrupted:
+            time.sleep(POLL_S)
         self.busy = None
-        self.transcript.append(done)
+        self.transcript.append("INTERRUPTED" if self.interrupted else done)
         self.paint()
 
     def handle(self, line: str) -> None:
@@ -303,6 +341,10 @@ class Pane:
                 _seconds(arg, 3.0),
                 "\u25cf Done working.",
             )
+        elif head == "/menu":
+            # What Claude Code shows while a turn waits on a permission.
+            self.menu = True
+            self.paint()
         elif head == "/hold":
             # Submit this command (so its own echo is cleared), then stop
             # consuming stdin WITHOUT repainting: whatever is pasted next is

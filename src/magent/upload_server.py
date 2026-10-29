@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import errno
 import html
 import json
 import os
-import re
 import socket
 import socketserver
 import sys
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     import logging
     from collections.abc import Callable, Sequence
 
-from magent import pidfile, psmux, tailnet
+from magent import api, events, pidfile, psmux, tailnet, uploads
 from magent.icons import render_icon
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger, log_safe
@@ -30,10 +30,10 @@ from magent.sessions import (
     FLASH_MSG_MAX,
     FLASH_TINT_ERR,
     FLASH_TINT_OK,
-    paths_line,
     upload_limit_text,
 )
 from magent.sessions import MAX_UPLOAD_BYTES as _SHARED_MAX_UPLOAD_BYTES
+from magent.uploads import UploadIncomplete
 
 
 def _pid_path(port: int) -> Path:
@@ -1015,145 +1015,18 @@ def _mobileconfig(host: str) -> bytes:
 """.encode()
 
 
-# How long the HTTP response will wait for the paste before answering anyway.
-#
-# The file is already on disk by the time this wait starts, so everything past
-# it is a courtesy: waiting a beat lets the overwhelmingly common fast paste be
-# reported as the plain `injected: true` it is, and the bound is what stops a
-# stalled multiplexer from turning a successful upload into a client timeout.
-# Must stay comfortably under `altv.UPLOAD_HTTP_TIMEOUT_S` (a test pins that) --
-# the whole defect being fixed here is a server that outlived its client's
-# patience and left the user reading "upload failed" about a file that landed.
-INJECT_GRACE_S = 3.0
-
-# The whole life of one paste attempt, wherever it finishes. Deliberately ONE
-# attempt: a `send-keys` that is merely slow is still in flight, and a retry on
-# top of it pastes the same image twice into the agent's prompt. Past this the
-# worker gives up and says so in upload.log, so a paste can never arrive
-# minutes later on top of whatever the user did in the meantime.
-INJECT_TIMEOUT_S = 60.0
+# The paste's two clocks, owned by ``uploads`` and read here AT CALL TIME so a
+# test that sets them on this module still governs the handler's paste (see
+# ``uploads.INJECT_GRACE_S`` / ``INJECT_TIMEOUT_S`` for why each exists).
+INJECT_GRACE_S = uploads.INJECT_GRACE_S
+INJECT_TIMEOUT_S = uploads.INJECT_TIMEOUT_S
 
 
 def _inject_paste(project: str, text: str) -> tuple[bool, bool]:
-    """Paste ``text`` -- the saved file paths as ONE line (``paths_line``) --
-    into ``project``'s pane. Returns ``(injected, pending)``.
-
-    The paste runs on its own thread and the caller waits only ``INJECT_GRACE_S``
-    for it, because an HTTP handler must not be hostage to a multiplexer: this
-    call used to be inline and unbounded, and a control command that stalled for
-    74 s answered a listener that had given up at 20 s -- so a screenshot that
-    was safely on disk, and that psmux eventually pasted, was reported to the
-    user as "upload failed".
-
-    The two flags are exhaustive and honest: ``(True, False)`` pasted,
-    ``(False, True)`` still trying (the reply is early, not wrong), and
-    ``(False, False)`` a real refusal the caller may name as one. Nothing is
-    retried and nothing is re-sent -- see ``INJECT_TIMEOUT_S``.
-    """
-    log = get_logger("upload")
-    done = threading.Event()
-    outcome: list[bool] = []
-
-    def _run() -> None:
-        started = time.monotonic()
-        try:
-            # `literal`: the line is TEXT -- quoted paths, several of them --
-            # and must never be read back as a psmux key name. Same `-l` wire
-            # as the local Alt+V paste and `magent send`; no Enter is sent.
-            pasted = psmux.send_keys(
-                project, text, target=project, literal=True, timeout=INJECT_TIMEOUT_S
-            )
-            outcome.append(pasted)
-        finally:
-            done.set()
-            elapsed = time.monotonic() - started
-            if elapsed >= INJECT_GRACE_S:
-                # The reply already said `inject_pending`; this line is the only
-                # place that late verdict is recorded, so it is a WARNING and it
-                # carries the wait it cost.
-                log.warning(
-                    "inject project=%s finished late after %.1fs pasted=%s",
-                    project,
-                    elapsed,
-                    outcome[-1] if outcome else False,
-                )
-
-    threading.Thread(target=_run, name="magent-upload-inject", daemon=True).start()
-    if done.wait(INJECT_GRACE_S):
-        return (bool(outcome and outcome[0]), False)
-    return (False, True)
-
-
-# How much of the original name a saved file keeps, in UTF-8 bytes. One path
-# component is capped at 255 (bytes on Linux, UTF-16 units on Windows), and
-# `<stamp>_<n>_` rides in front; 150 also keeps the whole path under Windows'
-# 260-character MAX_PATH from a typical home directory.
-_NAME_MAX_BYTES = 150
-# A "suffix" longer than this is not an extension worth keeping whole (a name
-# like `notes.from-the-meeting-with-everyone`), so it is truncated as the stem.
-_SUFFIX_MAX_BYTES = 20
-
-
-def _saved_name(filename: str) -> str:
-    """The part of a saved file's name that comes from the original: path
-    stripped, anything but a word character, dot or dash made ``_`` (so no
-    control character, quote, separator or line break survives into a pasted
-    path), and capped at ``_NAME_MAX_BYTES`` by trimming the stem -- the
-    suffix is what tells the agent what the file is, so it is kept.
-
-    A dotfile keeps its name (``.env`` arrives as ``<stamp>_.env``; the prefix
-    already stops it being hidden). Only a name that is nothing but dots
-    becomes ``upload``, and trailing dots go: Windows drops them on create,
-    and the returned path must name the file that exists.
-    """
-    basename = re.sub(r"[^\w.\-]", "_", Path(filename).name).rstrip(".")
-    if not basename:
-        return "upload"
-    suffix = Path(basename).suffix
-    if len(suffix.encode()) > _SUFFIX_MAX_BYTES:
-        suffix = ""
-    stem = basename[: len(basename) - len(suffix)]
-    budget = _NAME_MAX_BYTES - len(suffix.encode())
-    stem = stem.encode()[:budget].decode("utf-8", errors="ignore")
-    if not suffix:
-        stem = stem.rstrip(".")  # a cut can land on a dot, too
-    return (stem + suffix) or "upload"
-
-
-def _dest_for(upload_root: Path, stamp: int, filename: str) -> Path | None:
-    """Reserve where one uploaded file lands and return it:
-    ``<stamp>_<saved name>`` under the uploads dir, created empty, or ``None``
-    if the name would escape it.
-
-    Two files with one name must never overwrite each other -- the paste would
-    then name one file twice -- whether they came in one request or in two in
-    the same second. Only an exclusive create settles that across requests
-    (an ``exists()`` check cannot see a name another request chose but has not
-    written yet), so a clash bumps to ``<stamp>_<n>_<name>`` until one create
-    wins. That also covers a case-insensitive filesystem, where ``A.txt`` and
-    ``a.txt`` are one file. The caller writes into the reservation, and
-    removes it if the request is refused.
-    """
-    basename = _saved_name(filename)
-    name = f"{stamp}_{basename}"
-    n = 1
-    while True:
-        dest = (upload_root / name).resolve()
-        if not dest.is_relative_to(upload_root):
-            return None
-        try:
-            with dest.open("xb"):
-                return dest
-        except FileExistsError:
-            n += 1
-            name = f"{stamp}_{n}_{basename}"
-
-
-def _discard(dests: list[Path]) -> None:
-    """Remove a refused request's reservations: best-effort, never raises."""
-    for dest in dests:
-        with contextlib.suppress(OSError):
-            dest.unlink()
+    """``uploads.inject_paste`` on this module's clocks: ``(injected, pending)``."""
+    return uploads.inject_paste(
+        project, text, grace_s=INJECT_GRACE_S, timeout_s=INJECT_TIMEOUT_S
+    )
 
 
 # Suffixes a single upload is announced as an "image" for. The phone's everyday
@@ -1169,29 +1042,6 @@ def _uploaded_what(file_count: int, suffix: str) -> str:
     if file_count != 1:
         return f"{file_count} files"
     return "image" if suffix.lower() in _IMAGE_SUFFIXES else "file"
-
-
-# A quoted filename taken whole, so a name with a `;` in it (legal on every OS,
-# and now that any file uploads, a real case) is not cut at the `;` by the
-# token split below. Browsers percent-encode a `"` inside it.
-_FILENAME_RE = re.compile(r'\bfilename="([^"]*)"')
-
-
-_BODY_CHUNK_BYTES = 256 * 1024
-
-
-class UploadIncomplete(Exception):
-    """The body ended before its declared length, or before the delimiter that
-    closes its last part. What did arrive is not the file the user sent, so
-    nothing of it is saved or pasted.
-
-    ``received``/``declared`` carry the byte counts so the one log line the
-    handler writes can say how far the client got before it went away."""
-
-    def __init__(self, reason: str, *, received: int = 0, declared: int = 0) -> None:
-        super().__init__(reason)
-        self.received = received
-        self.declared = declared
 
 
 # Windows socket errors for "the peer went away": WSAECONNABORTED / WSAECONNRESET.
@@ -1219,114 +1069,17 @@ def _client_went_away(exc: BaseException) -> bool:
     )
 
 
-def _disposition(header_str: str) -> tuple[str, str]:
-    """``(name, filename)`` from one part's headers."""
-    name = ""
-    filename = ""
-    for line in header_str.split("\r\n"):
-        if "Content-Disposition:" in line:
-            for raw_token in line.split(";"):
-                token = raw_token.strip()
-                if token.startswith("name="):
-                    name = token.split("=", 1)[1].strip('"')
-                elif token.startswith("filename="):
-                    filename = token.split("=", 1)[1].strip('"')
-            quoted = _FILENAME_RE.search(line)
-            if quoted:
-                filename = quoted.group(1)
-    return name, filename
-
-
-def _next_delimiter(body: bytes | bytearray, delim: bytes, start: int) -> int:
-    """Index of the CRLF that opens the next real delimiter at or after
-    ``start``, or -1. A delimiter is ``CRLF--boundary`` followed by CRLF (another
-    part) or ``--`` (the end); the same bytes followed by anything else are the
-    file's own content."""
-    needle = b"\r\n" + delim
-    at = body.find(needle, start)
-    while at >= 0:
-        after = at + len(needle)
-        if body.startswith((b"\r\n", b"--"), after):
-            return at
-        at = body.find(needle, at + 1)
-    return -1
-
-
 def _parse_multipart(
     handler: BaseHTTPRequestHandler,
 ) -> tuple[dict[str, str], dict[str, list[tuple[str, memoryview]]]]:
-    """Minimal multipart/form-data parser. Returns (fields, files).
-
-    ``files`` keeps EVERY part sent under a name, in order: one Alt+V press
-    carries a whole Explorer selection as several ``file`` parts of one request.
-    Each file's data is a ``memoryview`` into the one body read off the socket:
-    at 100 MB a request, splitting and slicing copies held four bodies at once.
-
-    Raises ``UploadIncomplete`` when fewer bytes arrived than were declared, or
-    the closing delimiter never came -- a cut-short last part still has its
-    headers, and saving it would announce a truncated file as uploaded.
-    """
-    content_type = handler.headers.get("Content-Type", "")
-    if "boundary=" not in content_type:
-        return {}, {}
-
-    boundary = content_type.split("boundary=")[1].strip()
-    if boundary.startswith('"') and boundary.endswith('"'):
-        boundary = boundary[1:-1]
-
-    try:
-        length = int(handler.headers.get("Content-Length", 0))
-    except (TypeError, ValueError):
-        length = 0
-    if length <= 0:
-        return {}, {}
-    # Read in chunks (one raw recv each) rather than one rfile.read(length): when
-    # the client vanishes mid-body the exception would carry none of what had
-    # already arrived, and the log line needs the byte count.
-    want = min(length, _request_limit())
-    body = bytearray()
-    try:
-        while len(body) < want:
-            chunk = handler.rfile.read1(min(_BODY_CHUNK_BYTES, want - len(body)))
-            if not chunk:
-                break
-            body += chunk
-    except OSError as exc:  # a stalled or reset client, mid-body
-        raise UploadIncomplete(str(exc), received=len(body), declared=length) from exc
-    if len(body) < length:
-        raise UploadIncomplete(
-            f"{len(body)} of {length} bytes arrived",
-            received=len(body),
-            declared=length,
-        )
-
-    view = memoryview(body)
-    delim = f"--{boundary}".encode()
-    fields: dict[str, str] = {}
-    files: dict[str, list[tuple[str, memoryview]]] = {}
-
-    # The first delimiter has no CRLF before it (it may follow a preamble).
-    at = body.find(delim)
-    while at >= 0:
-        after = at + len(delim)
-        if body.startswith(b"--", after):
-            return fields, files  # the closing delimiter: the body is whole
-        start = after + 2  # past the CRLF that ends the delimiter line
-        end = _next_delimiter(body, delim, start)
-        if end < 0:
-            break
-        head_end = body.find(b"\r\n\r\n", start, end)
-        if head_end >= 0:
-            name, filename = _disposition(
-                str(view[start:head_end], "utf-8", errors="replace")
-            )
-            data = view[head_end + 4 : end]
-            if filename:
-                files.setdefault(name, []).append((filename, data))
-            elif name:
-                fields[name] = str(data, "utf-8", errors="replace")
-        at = end + 2
-    raise UploadIncomplete("the closing delimiter never arrived")
+    """``uploads.parse_multipart`` over one request's headers and socket, read
+    up to the request ceiling. Raises ``UploadIncomplete`` on a short body."""
+    return uploads.parse_multipart(
+        handler.headers.get("Content-Type", ""),
+        handler.headers.get("Content-Length"),
+        handler.rfile.read1,
+        limit=_request_limit(),
+    )
 
 
 _FOCUS_TARGET_FILE = Path.home() / ".magent" / "focus-target"
@@ -1349,6 +1102,38 @@ def _request_focus(project: str) -> None:
         psmux.detach_client(current)
 
 
+def _is_api(path: str) -> bool:
+    return path == api.PREFIX or path.startswith(api.PREFIX + "/")
+
+
+def _bound_port(address: object) -> int:
+    """The port of a bound socket address (``(host, port[, ...])``)."""
+    if isinstance(address, tuple) and len(address) > 1 and isinstance(address[1], int):
+        return address[1]
+    return 0
+
+
+def _health() -> api.Health:
+    """``/health`` and ``/api/v1/health``.
+
+    Lock-free and sweep-free on purpose: this is a liveness probe, and the
+    sessions lock is held for as long as psmux takes to answer.
+    ``sessions_ts`` is written AFTER the list, so a nonzero stamp means the
+    list read below is a real sweep's result. P3-18: ``session_count`` is a
+    COUNT, named distinctly from the /api/sessions LIST; ``None`` = unknown
+    (no sweep has landed yet), never a false 0."""
+    swept_at = UploadHandler.sessions_ts
+    started = UploadHandler.started_at
+    return api.Health(
+        service="magent-upload",
+        port=UploadHandler.port,
+        pid=UploadHandler.pid,
+        uptime_s=time.time() - started if started else 0.0,
+        session_count=len(UploadHandler.cached_sessions) if swept_at else None,
+        sessions_age_s=max(0.0, time.time() - swept_at) if swept_at else None,
+    )
+
+
 class UploadHandler(BaseHTTPRequestHandler):
     # Per socket OPERATION, not per request (StreamRequestHandler applies it
     # with settimeout): a slow 100 MB upload that keeps moving is never cut
@@ -1362,6 +1147,15 @@ class UploadHandler(BaseHTTPRequestHandler):
     port: int | None = None
     pid: int | None = None
     started_at: float = 0.0
+    # The /api/v1 state. run_server replaces all four at start: a fresh bus
+    # (new epoch), the Host names read once from tailscale, the status
+    # callback the command shell handed down, and the one FleetSource every
+    # request thread builds rows through. These defaults are what an
+    # in-process test server answers with.
+    bus: ClassVar[events.EventBus] = events.EventBus()
+    allowed_hosts: ClassVar[frozenset[str]] = api.LOOPBACK_NAMES
+    status_provider: ClassVar[Callable[[], dict[str, object]] | None] = None
+    fleet: ClassVar[api.FleetSource | None] = None
 
     @staticmethod
     def _sessions_snapshot() -> list[dict[str, object]]:
@@ -1376,6 +1170,160 @@ class UploadHandler(BaseHTTPRequestHandler):
 
     def _sessions(self) -> list[dict[str, object]]:
         return self._sessions_snapshot()
+
+    @classmethod
+    def _api_context(cls) -> api.ApiContext:
+        """This server, as the routes in ``api`` see it. Built per request
+        from the class state, so a test that sets an attribute (or
+        ``_UPLOAD_DIR``) is what the next request reads."""
+        return api.ApiContext(
+            config_path=cls.config_path,
+            bus=cls.bus,
+            allowed_hosts=cls.allowed_hosts,
+            upload_dir=_UPLOAD_DIR,
+            upload_max_bytes=MAX_UPLOAD_BYTES,
+            request_limit=_request_limit(),
+            health=_health,
+            upload_sessions=lambda: {_sid(s) for s in cls._sessions_snapshot()},
+            status_provider=cls.status_provider,
+            inject_fn=_inject_paste,
+            fleet=cls.fleet,
+        )
+
+    def _api_request(self, method: str) -> api.ApiRequest:
+        parsed = urlparse(self.path)
+        try:
+            length: int | None = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            length = None
+        return api.ApiRequest(
+            method=method,
+            path=parsed.path,
+            query=parse_qs(parsed.query),
+            headers={k.lower(): v for k, v in self.headers.items()},
+            body=api.Body(self.rfile.read1, length),
+            peer=str(self.client_address[0]),
+            bind=str(self.connection.getsockname()[0]),
+            port=_bound_port(self.server.server_address),
+        )
+
+    def _serve_api(self, method: str) -> None:
+        """Every ``/api/v1`` request: ``api.handle``, then its answer on the
+        wire. A refused body is drained (no RST); SSE frames are flushed one
+        by one until the client goes."""
+        req = self._api_request(method)
+        answer = api.handle(req, self._api_context())
+        if isinstance(answer, api.ApiStream):
+            self._stream(answer)
+            return
+        if req.body.unread:
+            if req.body.consumed:
+                # A body read PART way (an UploadError other than a short
+                # body: a bad part, an oversized file): close instead of
+                # draining what may be 100 MB. The handler speaks HTTP/1.0
+                # today, so the connection closes after every reply anyway;
+                # this close is defence for a future HTTP/1.1 switch, where
+                # the unread rest of the body, left on a kept-alive socket,
+                # would be parsed as the next request.
+                self.close_connection = True
+            else:
+                self._drain_request_body()
+        if answer.close:
+            # ``answer.close`` is the contract: the route says the connection
+            # is out of step with HTTP (a short upload body, the client may
+            # already be gone). Close, and answer only if it can still hear,
+            # as the legacy /upload branch does. The handler speaks HTTP/1.0
+            # today, so the connection closes after every reply anyway; the
+            # explicit close is defence for a future HTTP/1.1 switch, where a
+            # short body would otherwise leave unread bytes on a kept-alive
+            # socket: after a read timeout the next readline raises inside
+            # the server (a traceback, pinned by TestAnIncompleteUpload), and
+            # without one the rest of the body is parsed as a request.
+            self.close_connection = True
+            with contextlib.suppress(OSError):
+                self._write_answer(answer)
+            return
+        self._write_answer(answer)
+
+    def _write_answer(self, answer: api.ApiResponse) -> None:
+        body = answer.encode()
+        self.send_response(answer.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _stream(self, stream: api.ApiStream) -> None:
+        # One response per connection; the socket's per-operation timeout
+        # stays on, so a client that stops READING is dropped after
+        # CONNECTION_TIMEOUT_S while a quiet stream is kept alive by its pings.
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", stream.content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        # Said on the wire too: no Content-Length, no chunking, so the client
+        # (and any proxy) knows the stream ends with the connection.
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            for frame in stream.frames:
+                self.wfile.write(frame)
+                self.wfile.flush()
+        except OSError as exc:
+            get_logger("upload").debug("events: client left: %s", log_safe(repr(exc)))
+        finally:
+            stream.frames.close()
+
+    def _legacy_allowed(self, method: str) -> bool:
+        """The origin guard for a legacy route: False (and a 403 already
+        sent, in the legacy error shape) when ``api.guard`` refuses."""
+        refusal = api.guard(self._api_request(method), self._api_context())
+        if refusal is None:
+            return True
+        reason = refusal.details.get("reason")
+        get_logger("upload").warning(
+            "refused %s %s: %s", method, log_safe(self.path), reason
+        )
+        if method == "POST":
+            self._drain_request_body()
+        self._json_response(
+            {"ok": False, "error": refusal.message, "reason": reason}, 403
+        )
+        return False
+
+    def _api_only(self, method: str) -> None:
+        """PATCH, DELETE and OPTIONS exist only under /api/v1 (where OPTIONS
+        is answered 405: no CORS); anywhere else they are 405 or 404."""
+        try:
+            path = urlparse(self.path).path
+            if _is_api(path):
+                self._serve_api(method)
+                return
+            self._drain_request_body()
+            if path in _GET_PATHS or path in _POST_PATHS:
+                self._json_response({"ok": False, "error": "Method not allowed"}, 405)
+            else:
+                self._json_response({"ok": False, "error": "Not found"}, 404)
+        except Exception as exc:
+            log = get_logger("upload")
+            if _client_went_away(exc):
+                self.close_connection = True
+                log.warning("upload client went away during %s", method)
+                return
+            log.exception("%s handler crashed for %s", method, log_safe(self.path))
+            with contextlib.suppress(OSError):
+                self._json_response({"ok": False, "error": "internal"}, 500)
+
+    def do_PATCH(self) -> None:
+        self._api_only("PATCH")
+
+    def do_DELETE(self) -> None:
+        self._api_only("DELETE")
+
+    def do_OPTIONS(self) -> None:
+        self._api_only("OPTIONS")
 
     def _send_bytes(self, data: bytes, content_type: str, cache: bool = False) -> None:
         self.send_response(200)
@@ -1424,6 +1372,11 @@ class UploadHandler(BaseHTTPRequestHandler):
 
     def _handle_get(self) -> None:
         path = urlparse(self.path).path
+        if _is_api(path):
+            self._serve_api("GET")
+            return
+        if not self._legacy_allowed("GET"):
+            return
         if path == "/" or path == "":
             self._send_bytes(
                 _build_html(self._sessions()).encode("utf-8"),
@@ -1503,34 +1456,8 @@ class UploadHandler(BaseHTTPRequestHandler):
             else:
                 self._json_response({"ok": False, "error": "Unknown project"}, 404)
         elif path == "/health":
-            uptime = (
-                time.time() - UploadHandler.started_at
-                if UploadHandler.started_at
-                else 0.0
-            )
-            # Lock-free and sweep-free on purpose: this is a liveness probe, and
-            # the sessions lock is held for as long as psmux takes to answer.
-            # `sessions_ts` is written AFTER the list, so a nonzero stamp means
-            # the list read below is a real sweep's result.
-            swept_at = UploadHandler.sessions_ts
-            body = json.dumps(
-                {
-                    "ok": True,
-                    "service": "magent-upload",
-                    "port": UploadHandler.port,
-                    "pid": UploadHandler.pid,
-                    "uptime_s": uptime,
-                    # P3-18: a COUNT, named distinctly from the /api/sessions
-                    # LIST. `null` = unknown (no sweep has landed yet), never a
-                    # false 0; `sessions_age_s` says how old a known count is.
-                    "session_count": (
-                        len(UploadHandler.cached_sessions) if swept_at else None
-                    ),
-                    "sessions_age_s": (
-                        max(0.0, time.time() - swept_at) if swept_at else None
-                    ),
-                }
-            ).encode()
+            # Lock-free and sweep-free: see _health.
+            body = json.dumps({"ok": True, **dataclasses.asdict(_health())}).encode()
             self._send_bytes(body, "application/json")
         elif path in _PWA_ROUTES:
             content_type, factory = _PWA_ROUTES[path]
@@ -1568,6 +1495,11 @@ class UploadHandler(BaseHTTPRequestHandler):
     def _handle_post(self) -> None:
         log = get_logger("upload")
         parsed = urlparse(self.path)
+        if _is_api(parsed.path):
+            self._serve_api("POST")
+            return
+        if not self._legacy_allowed("POST"):
+            return
         if parsed.path != "/upload":
             self._drain_request_body()  # reject-before-read: avoid a Windows RST
             self._reject("POST", parsed.path)
@@ -1651,61 +1583,31 @@ class UploadHandler(BaseHTTPRequestHandler):
             byte_count = sum(len(data) for _name, data in parts)
             file_count = len(parts)
             suffix = ",".join(Path(name).suffix for name, _data in parts)
-            if byte_count > MAX_UPLOAD_BYTES:
-                # The files, not the envelope: the same sum the page and the
-                # Alt+V listener checked, so the three can never disagree. The
-                # body is already read, so there is nothing left to drain.
-                self._json_response(_too_large(), 413)
-                return
-
-            _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-            upload_root = _UPLOAD_DIR.resolve()
-            stamp = int(time.time())
-            dests: list[Path] = []
-            # Every name is reserved before any byte is written, so an invalid
-            # one refuses the request whole instead of leaving half of it
-            # saved -- and a request that fails part-way takes its files back.
             try:
-                for filename, _data in parts:
-                    dest = _dest_for(upload_root, stamp, filename)
-                    if dest is None:
-                        _discard(dests)
-                        self._json_response(
-                            {"ok": False, "error": "Invalid filename"}, 400
-                        )
-                        return
-                    dests.append(dest)
-                for dest, (_name, data) in zip(dests, parts, strict=True):
-                    dest.write_bytes(data)
-            except BaseException:
-                _discard(dests)
-                raise
-
-            if inject and psmux.find_psmux():
-                injected, inject_pending = _inject_paste(
-                    project, paths_line([str(d) for d in dests])
+                result = uploads.save(
+                    parts,
+                    project,
+                    inject=inject,
+                    upload_dir=_UPLOAD_DIR,
+                    max_bytes=MAX_UPLOAD_BYTES,
+                    inject_fn=_inject_paste,
                 )
-            elif inject:
-                log.warning(
-                    "upload project=%s requested inject but psmux is unavailable",
-                    log_safe(project),
-                )
-
+            except uploads.UploadError as exc:
+                # The files, not the envelope, for a 413: the same sum the
+                # page and the Alt+V listener checked, so the three can never
+                # disagree. The body is already read; nothing to drain.
+                if exc.code == "payload_too_large":
+                    self._json_response(_too_large(), 413)
+                else:
+                    self._json_response({"ok": False, "error": exc.message}, 400)
+                return
+            injected = result.paste == "injected"
+            inject_pending = result.paste == "pending"
             ok = True
-            self._json_response(
-                {
-                    "ok": True,
-                    # `path` is the first file, as it always was; `paths` is
-                    # every file, in the order they were sent.
-                    "path": str(dests[0]),
-                    "paths": [str(d) for d in dests],
-                    "injected": injected,
-                    # Three states, not two: pasted, definitely not pasted, and
-                    # "still trying". A client that cannot tell the last two
-                    # apart has to call a slow paste a failed upload.
-                    "inject_pending": inject_pending,
-                }
-            )
+            # `path` is the first file, as it always was; `paths` is every
+            # file, in the order they were sent; THREE paste states (pasted,
+            # definitely not pasted, still trying) as two flags.
+            self._json_response(result.legacy())
         finally:
             # INFO outcome line -- project + counts + injected + suffixes only,
             # NEVER an original filename (personal data; F-hygiene).
@@ -2295,14 +2197,29 @@ def _warm_sessions() -> None:
         )
 
 
+def _learn_hosts(host: str | None) -> None:
+    """Add the tailnet IPv4 and MagicDNS name to the Host allowlist, once,
+    off-thread: ``tailscale`` is a subprocess and serve must not wait on it.
+    Meanwhile a request is judged against loopback, ``--host`` and the
+    address it arrived on, which already covers the tailnet IP."""
+    try:
+        UploadHandler.allowed_hosts = api.allowed_hosts(host)
+    except Exception:  # noqa: BLE001  # reason: a daemon-thread probe must never kill serve; the allowlist just stays loopback + bound addresses
+        get_logger("upload").warning(
+            "upload server: could not read the tailnet names", exc_info=True
+        )
+
+
 def run_server(
     port: int = 8080,
     config_path: str | None = None,
     host: str | None = None,
     watchdogs: Sequence[Callable[[], None]] = (),
+    status_provider: Callable[[], dict[str, object]] | None = None,
 ) -> None:
     log = get_logger("upload")
     UploadHandler.config_path = config_path
+    UploadHandler.status_provider = status_provider
 
     servers: list[ThreadingHTTPServer] = []
     bound_addrs: list[str] = []
@@ -2356,6 +2273,14 @@ def run_server(
     UploadHandler.port = port
     UploadHandler.pid = os.getpid()
     UploadHandler.started_at = time.time()
+    # /api/v1: a fresh epoch per serve, so a client resuming against a
+    # restarted server is told to refetch. Loopback and --host answer at
+    # once; the tailnet names are learned off-thread (see _learn_hosts).
+    UploadHandler.bus = events.EventBus()
+    UploadHandler.allowed_hosts = api.allowed_hosts(host, tailnet_names=False)
+    # One typed config + engine for every request thread, kept for this
+    # serve; never the poller's, which belongs to the poller thread.
+    UploadHandler.fleet = api.FleetSource(config_path)
     log.info(
         "listening on %s:%d pid %d", ", ".join(bound_addrs), port, UploadHandler.pid
     )
@@ -2364,6 +2289,10 @@ def run_server(
 
     for s in servers[1:]:
         threading.Thread(target=_serve_bind, args=(s, log), daemon=True).start()
+
+    threading.Thread(
+        target=_learn_hosts, args=(host,), daemon=True, name="magent-hosts"
+    ).start()
 
     # /health's session count comes from this cache; fill it now rather than
     # when the first phone happens to load the page. Daemon: it must not hold
@@ -2404,6 +2333,21 @@ def run_server(
         name="magent-reaper",
     ).start()
 
+    # ...and the /api/v1 event stream, which only polls while a client
+    # listens. MAGENT_EVENTS=0 opts out (a test-isolation law, like the
+    # supervisors above: pinned in tests/conftest.py).
+    events_stop = threading.Event()
+    if events.events_enabled():
+        threading.Thread(
+            target=events.run_poller,
+            args=(
+                events.EventPoller.for_config(UploadHandler.bus, config_path),
+                events_stop,
+            ),
+            daemon=True,
+            name="magent-events",
+        ).start()
+
     # ...and whatever the command shell asked this server to keep an eye on.
     # After the bind, like the ones above: a serve that lost the port to another
     # one exits with PortInUse and must not have started anything on the way.
@@ -2436,6 +2380,7 @@ def run_server(
         boost_stop.set()
         node_sync_stop.set()
         reap_stop.set()
+        events_stop.set()
         watchdog_stop.set()
         for s in servers[1:]:
             s.shutdown()  # called from a different thread than its serve_forever -> safe
