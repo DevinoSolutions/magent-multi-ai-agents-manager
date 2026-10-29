@@ -303,12 +303,41 @@ class _Deadline:
         self._cut()
 
     def _cut(self) -> None:
-        sock = self._sock
-        if sock is not None:
-            with contextlib.suppress(OSError):
-                # The plain socket's shutdown: a TLS socket's own would also
-                # drop its TLS state under the thread still reading it.
-                socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        _shutdown(self._sock)
+
+
+def _shutdown(sock: socket.socket | None) -> None:
+    """Shut ``sock`` down, which wakes a read blocked on it on any thread."""
+    if sock is not None:
+        with contextlib.suppress(OSError):
+            # The plain socket's shutdown: a TLS socket's own would also
+            # drop its TLS state under the thread still reading it.
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+
+
+class StreamCut:
+    """A stream another thread can end: ``cut`` shuts its socket down, which
+    wakes the read blocked on it, and the stream ends (or raises RelayError
+    ``stream_lost``). A cut before the stream has its socket takes effect
+    as soon as ``watch`` hands it one."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sock: socket.socket | None = None
+        self._done = False
+
+    def watch(self, sock: socket.socket | None) -> None:
+        with self._lock:
+            self._sock = sock
+            done = self._done
+        if done:
+            _shutdown(sock)
+
+    def cut(self) -> None:
+        with self._lock:
+            self._done = True
+            sock = self._sock
+        _shutdown(sock)
 
 
 class RelayClient:
@@ -453,17 +482,25 @@ class RelayClient:
                 return _decode(status, raw, retry_after=retry_after)
 
     def stream(
-        self, path: str, *, read_timeout: float = 60.0
+        self,
+        path: str,
+        *,
+        read_timeout: float = 60.0,
+        cut: StreamCut | None = None,
     ) -> Generator[SseEvent, None, None]:
         """The relay's SSE stream. Ends when the relay closes it; RelayError
         when it is refused or the connection drops; ``read_timeout`` bounds the
         silence between two frames (the relay sends a ping every 15 s).
+        ``cut`` lets another thread end it at once.
 
         A 429 refusal is not retried here: it raises with ``retry_after`` set,
         for the reconnect loop to wait out.
         """
         conn, target = self._connection(self.base_url + path, read_timeout)
         try:
+            _connect(conn)
+            if cut is not None:
+                cut.watch(conn.sock)
             resp = _send(
                 conn,
                 "GET",
@@ -919,6 +956,10 @@ class _Relinked(Exception):
     a new one on the new credentials."""
 
 
+class _Unlinked(Exception):
+    """link.json is gone (`magent unlink`): the run ends, holding nothing."""
+
+
 class _Refused(Exception):
     """A command this host will not run; answered with a sealed error."""
 
@@ -1045,7 +1086,12 @@ class LinkRunner:
     State in ``link-state.json`` (contract C8): ``connecting``, ``online``,
     ``offline`` with ``retry_at`` between attempts; ``revoked`` and
     ``too_old`` end the run, and so does a link.json that names another host
-    or token (``relinked``, checked at every connect and device list). Every
+    or token (``relinked``) or is gone (``unlinked``: `magent unlink` deletes
+    it even when the relay could not be told). link.json is checked at every
+    connect, device list and command, and by the event forwarder every
+    LINK_CHECK_S, so a quiet stream is closed too; a run that ends on it
+    drops its link (token and keys) and trusted devices from memory and
+    writes no more state. Every
     (re)connect PUTs a fresh snapshot (bounded to what the relay takes), then
     reads the SSE stream from the saved cursor. A failure with no reply, a
     5xx or a 429 is retried after a full-jitter backoff (at least the
@@ -1108,12 +1154,19 @@ class LinkRunner:
         self._uploads: UploadPuller | None = None
         # The remoteControl the relay was last told (None: no snapshot yet).
         self._rc_put: bool | None = None
+        # link.json's stamp when this run last read it, how the run was ended
+        # from link.json ("unlinked", "relinked"; None: it was not), and the
+        # cut for the stream being read (None between streams).
+        self._stamp: tuple[int, int, int] | None = None
+        self._end: str | None = None
+        self._cut: StreamCut | None = None
 
     # -- the loop ------------------------------------------------------------
 
     def run(self, stop: threading.Event) -> str:
-        """Run until ``stop``; how it ended: revoked, too_old, stopped, or
-        relinked (link.json now names another host or token: run again)."""
+        """Run until ``stop``; how it ended: revoked, too_old, stopped,
+        relinked (link.json now names another host or token: run again) or
+        unlinked (link.json is gone: run again, which idles until linked)."""
         sleep = self._sleep or stop.wait
         while not stop.is_set():
             # Loading the keys needs cryptography as much as running does, so
@@ -1139,11 +1192,15 @@ class LinkRunner:
         """The client for the saved link, with its keys loaded; None while
         unlinked or while link.json is unusable (reported once)."""
         try:
+            # Taken before the read: a change after it is seen next time.
+            stamp = _link_stamp(self._link_path)
             link = self._read_link()
             if link is None:
                 return None
             _check_host_token(link)
             self._load(link)
+            with self._lock:
+                self._stamp = stamp
             return self._client_factory(link.relay_url, link.host_token, sleep=sleep)
         except (linkfiles.LinkFileError, ValueError) as exc:
             if not self._warned_bad_file:
@@ -1185,6 +1242,8 @@ class LinkRunner:
         # line, not the same traceback again.
         host_failing = False
         while not stop.is_set():
+            if (end := self._ended()) is not None:
+                return end
             polling = self._clock() < poll_until
             started: float | None = None
             error: RelayError | None = None
@@ -1214,9 +1273,8 @@ class LinkRunner:
                 self._set_state("too_old")
                 self._log.warning("%s", UPGRADE_HINT)
                 return "too_old"
-            except _Relinked:
-                self._log.info("link: this machine was paired again; reconnecting")
-                return "relinked"
+            except (_Relinked, _Unlinked):
+                return self._ended() or "relinked"
             except RelayError as exc:
                 need_snapshot = True
                 error = exc
@@ -1236,6 +1294,9 @@ class LinkRunner:
                 else:
                     self._log.exception("link: the daemon side of the link failed")
                 error = RelayError(0, _HOST_FAILED, "the link host failed")
+            if (end := self._ended()) is not None:
+                # Ended from link.json on another thread, which cut the stream.
+                return end
             host_failing = error is not None and error.code == _HOST_FAILED
             if stop.is_set():
                 break
@@ -1273,14 +1334,24 @@ class LinkRunner:
         # Closed on the way out, whatever ends it: the relay holds two streams
         # per host, and a redial must not find this one still counted.
         path = f"/v1/stream/host?since={self._cursor}"
-        with contextlib.closing(
-            client.stream(path, read_timeout=STREAM_READ_TIMEOUT_S)
-        ) as frames:
-            for event in frames:
-                self._frames += 1
-                self._on_frame(client, event)
-                if stop.is_set():
-                    return
+        cut = StreamCut()
+        with self._lock:
+            self._cut = cut
+        try:
+            # Checked once the cut is in place: an end set before it would
+            # find no stream to cut.
+            self._check_end()
+            with contextlib.closing(
+                client.stream(path, read_timeout=STREAM_READ_TIMEOUT_S, cut=cut)
+            ) as frames:
+                for event in frames:
+                    self._frames += 1
+                    self._on_frame(client, event)
+                    if stop.is_set():
+                        return
+        finally:
+            with self._lock:
+                self._cut = None
 
     def _poll_round(self, client: RelayClient, sleep: Callable[[float], bool]) -> None:
         """One long-poll of ``/v1/host/commands`` (the stream's fallback): its
@@ -1303,6 +1374,7 @@ class LinkRunner:
             sleep(POLL_MIN_INTERVAL_S - quick)
 
     def _on_frame(self, client: RelayClient, event: SseEvent) -> None:
+        self._check_end()
         data = _object(event.data)
         if data is None:
             self._quiet.log(
@@ -1326,6 +1398,9 @@ class LinkRunner:
     # -- commands --------------------------------------------------------------
 
     def _on_command(self, client: RelayClient, command: dict[str, object]) -> None:
+        # link.json first: a command that arrives after `magent unlink`
+        # must not run on the keys the run still holds.
+        self.watch_link()
         cid, seq = command.get("id"), command.get("seq")
         if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
             self._quiet.log(
@@ -1590,12 +1665,15 @@ class LinkRunner:
             for d in _objects(data.get("devices"))
             if d.get("revokedAt") is not None
         }
+        self._check_end()
         try:
             current = self._read_link()
-            if current is not None:
-                self._check_same_link(current)
-                current = self._forget(current, revoked)
-                peers = self._peers_for(current)
+            if current is None:
+                self._end_run("unlinked")
+                raise _Unlinked
+            self._check_same_link(current)
+            current = self._forget(current, revoked)
+            peers = self._peers_for(current)
         except linkfiles.LinkFileError as exc:
             self._log.warning("link: %s; applying revocations in memory only", exc)
             current = None
@@ -1619,17 +1697,83 @@ class LinkRunner:
             held.host_id,
             held.host_token,
         ):
+            self._end_run("relinked")
             raise _Relinked
 
     def _relinked_on_disk(self) -> None:
-        """The same check against link.json now (a reconnect); a file that
-        cannot be read here leaves the run alone."""
+        """The same check against link.json now (a reconnect), which also
+        ends the run when the file is gone; a file that cannot be read here
+        leaves the run alone."""
+        self._check_end()
         try:
             current = self._read_link()
         except linkfiles.LinkFileError:
             return
-        if current is not None:
-            self._check_same_link(current)
+        if current is None:
+            self._end_run("unlinked")
+            raise _Unlinked
+        self._check_same_link(current)
+
+    def watch_link(self) -> None:
+        """Look at link.json again if it changed since this run read it (a
+        stat when it did not). Gone, or naming another pairing, it ends the
+        run (_Unlinked, _Relinked; see _end_run). Called on every command,
+        and by the event forwarder every LINK_CHECK_S, which is what closes
+        a quiet stream. A file that cannot be read now is looked at again
+        next time."""
+        self._check_end()
+        with self._lock:
+            stamp = self._stamp
+        now = _link_stamp(self._link_path)
+        if now == stamp:
+            return
+        try:
+            current = self._read_link()
+        except linkfiles.LinkFileError:
+            return
+        if current is None:
+            self._end_run("unlinked")
+            raise _Unlinked
+        self._check_same_link(current)
+        with self._lock:
+            self._stamp = now
+
+    def _end_run(self, outcome: str) -> None:
+        """End this run from link.json (``unlinked``, ``relinked``): drop the
+        link (host token and keys), the trusted devices and the cached
+        results from memory, stop writing state, and cut the stream being
+        read, from whichever thread found it. The first outcome stands."""
+        with self._lock:
+            if self._end is None:
+                self._end = outcome
+            self._link = None
+            self._peers = {}
+            self._results.clear()
+            self._state = outcome  # in memory only: the forwarder stops posting
+            cut = self._cut
+        if cut is not None:
+            cut.cut()
+
+    def _check_end(self) -> None:
+        """Raise how the run was ended from link.json, if it was."""
+        with self._lock:
+            end = self._end
+        if end == "unlinked":
+            raise _Unlinked
+        if end is not None:
+            raise _Relinked
+
+    def _ended(self) -> str | None:
+        """How the run was ended from link.json (logged), or None."""
+        with self._lock:
+            end = self._end
+        if end == "unlinked":
+            self._log.info(
+                "link: this machine was unlinked; the relay connection is closed"
+            )
+        elif end is not None:
+            self._log.info("link: this machine was paired again; reconnecting")
+        return end
 
     def _forget(self, link: LinkFile, revoked: set[str]) -> LinkFile:
         """``link`` without the revoked devices, saved when that changed it."""
@@ -1870,6 +2014,10 @@ class LinkRunner:
         logged: the file is rewritten on the next change, and the in-memory
         state stays right meanwhile."""
         with self._lock:
+            if self._end is not None:
+                # Ended from link.json: `magent unlink` deleted this file,
+                # or it belongs to the new pairing now.
+                return False
             state = LinkState(
                 cursor=self._cursor,
                 seen_ids=self._seen.items(),
@@ -1941,6 +2089,7 @@ EVENT_THREAD = "magent-relay-events"
 UPLOAD_THREAD = "magent-relay-uploads"
 EVENT_BATCH_S = 0.25  # events arriving this close together share one POST
 EVENT_IDLE_WAIT_S = 1.0  # how long one quiet read blocks (bounds the stop latency)
+LINK_CHECK_S = 1.0  # how often the forwarder looks at link.json, batches or not
 EVENTS_MAX_BYTES = 256 * 1024  # the relay's cap on one POST /v1/host/events body
 EVENTS_MAX = 500  # ...and on the events in it
 EVENT_FIELD_MAX = 64  # daemonEventId and type, as the relay takes them
@@ -2063,6 +2212,7 @@ class EventForwarder:
         self._resync = False  # a batch was dropped: re-PUT the snapshot
         self._repair_after = 0.0
         self._repair_backoff = Backoff(base=EVENT_RETRY_BASE_S, cap=EVENT_RETRY_CAP_S)
+        self._check_after = 0.0  # the next look at link.json
 
     def start(self) -> None:
         self._thread.start()
@@ -2100,6 +2250,7 @@ class EventForwarder:
         repaired after it. A remoteControl switch is re-PUT on a quiet read:
         the relay mirrors it for the app."""
         while not self._stop.is_set():
+            self._check_link()
             if self._runner.backing_off():
                 self._resync = True
                 if self._stop.wait(EVENT_IDLE_WAIT_S):
@@ -2121,6 +2272,17 @@ class EventForwarder:
                 batch.extend(feed.next_batch(left))
             if not self._stop.is_set():
                 self._send_logged(batch)
+
+    def _check_link(self) -> None:
+        """The runner's look at link.json, at most every LINK_CHECK_S however
+        busy the feed is: on a quiet stream nothing else would notice a
+        `magent unlink` (a run it ends cuts its own stream)."""
+        now = time.monotonic()
+        if now < self._check_after:
+            return
+        self._check_after = now + LINK_CHECK_S
+        with contextlib.suppress(_Unlinked, _Relinked):
+            self._runner.watch_link()
 
     def _send_logged(self, batch: list[dict[str, object]]) -> None:
         try:
@@ -2815,8 +2977,9 @@ def supervise(
 
     A crash, of the host or the runner, is logged and the runner restarted
     with backoff (5 s doubling to 5 min; a run that ended on its own, or
-    lasted BACKOFF_RESET_AFTER_S, starts it over). ``relinked`` starts a new
-    runner at once. After ``revoked`` or ``too_old`` the thread waits for
+    lasted BACKOFF_RESET_AFTER_S, starts it over). ``relinked`` and
+    ``unlinked`` start a new runner at once (unlinked, it idles until
+    `magent link`). After ``revoked`` or ``too_old`` the thread waits for
     link.json to change (`magent unlink`, `magent link`) instead of
     hammering a relay that already said no; a link.json that changed while
     that run was going (paired again, then the old pairing revoked) restarts
@@ -2897,7 +3060,7 @@ def _supervise_held(
         if outcome == "stopped":
             return
         backoff.reset()
-        if outcome == "relinked":
+        if outcome in ("relinked", "unlinked"):
             continue
         log.info("link: %s; waiting for `magent link` to pair this machine", outcome)
         while _link_stamp(link_path) == began:

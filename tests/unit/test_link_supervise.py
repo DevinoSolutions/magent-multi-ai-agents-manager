@@ -191,6 +191,20 @@ class TestSupervise:
         assert len(made) == 2
         assert sleeps == []
 
+    def test_an_unlinked_runner_restarts_at_once(self, link_on, tmp_path):
+        # The new runner idles until `magent link` pairs this machine again.
+        made: list[object] = []
+        sleeps: list[float] = []
+        link.supervise(
+            object,
+            threading.Event(),
+            runner_factory=_factory(["unlinked", "stopped"], made),
+            sleep=lambda s: sleeps.append(s) or len(sleeps) > 3,  # never forever
+            link_path=tmp_path / "link.json",
+        )
+        assert len(made) == 2
+        assert sleeps == []
+
     def test_stop_during_the_wait_ends_the_thread(self, link_on, tmp_path):
         made: list[object] = []
         link.supervise(

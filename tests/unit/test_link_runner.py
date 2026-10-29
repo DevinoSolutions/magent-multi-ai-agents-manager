@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from magent import link, linkcrypto, linkfiles
+from magent import env, link, linkcrypto, linkfiles
 from magent.link import UPGRADE_HINT, RelayClient, RelayError
 from magent.linkcrypto import AAD_SNAP
 from tests._fake_relay import FakeRelay
@@ -32,6 +32,7 @@ from tests.unit._link_fakes import (
     save_linked,
     stop_all,
     stray_forwarders,
+    stream_opens,
     write_link,
 )
 
@@ -992,6 +993,76 @@ class TestStops:
         assert [r.getMessage() for r in caplog.records].count(UPGRADE_HINT) == 1
         assert linked.state().state == "too_old"
         assert len(relay.requests) == 1  # stopped at once, no retry loop
+
+
+class TestUnlinkWhileRunning:
+    """`magent unlink` deletes link.json even when the relay could not be
+    told. The running link must not outlive it: its token, keys and trusted
+    devices go from memory, its stream is closed, and nothing a device sends
+    after that runs, whether the run notices on a quiet stream, on the next
+    command or on the next reconnect."""
+
+    def test_a_quiet_stream_is_closed_once_link_json_is_gone(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: relay.open_streams == 1)  # online, stream held
+        before = len(relay.snapshots)
+
+        linkfiles.delete_link(linked.link_path, linked.state_path)
+
+        assert run.wait_done() == "unlinked"  # well inside the 60 s read timeout
+        relay.wait_for(lambda: relay.open_streams == 0)
+        assert run.runner.peer(phone.device_id) is None
+        assert run.runner.host_id == ""  # the link, token and keys with it
+        assert len(relay.snapshots) == before
+        assert not linked.state_path.exists()  # not written back by the run
+        # MAGENT_LINK=1 in process only (conftest pins 0 for every tier).
+        monkeypatch.setenv("MAGENT_LINK", "1")
+        monkeypatch.setattr(env, "_cached_env", None)
+        status = link.describe_link(
+            serving=lambda: True,
+            link_path=linked.link_path,
+            state_path=linked.state_path,
+        )
+        assert status.state == "unlinked"
+
+    def test_a_command_after_the_unlink_is_never_run(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        # The quiet-stream check is pushed out of reach: the command itself
+        # must find link.json gone before it is verified and run.
+        monkeypatch.setattr(link, "LINK_CHECK_S", 3600.0)
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.open_streams == 1)
+
+        linkfiles.delete_link(linked.link_path, linked.state_path)
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(90), seq=1))
+
+        assert run.wait_done() == "unlinked"
+        assert host.calls == []
+        assert relay.results == []
+        assert 1 not in relay.acks  # not even acknowledged under the old token
+        assert not linked.state_path.exists()
+
+    def test_a_reconnect_after_the_unlink_ends_the_run(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        monkeypatch.setattr(link, "LINK_CHECK_S", 3600.0)
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: relay.open_streams == 1)
+        before = len(relay.snapshots)
+
+        linkfiles.delete_link(linked.link_path, linked.state_path)
+        relay.drop_streams()
+
+        assert run.wait_done() == "unlinked"
+        assert len(relay.snapshots) == before  # no snapshot under the old token
+        assert stream_opens(relay) == 1
 
 
 class TestStateBelongsToItsPairing:
