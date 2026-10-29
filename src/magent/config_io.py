@@ -27,7 +27,7 @@ import os
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -41,6 +41,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 BACKUP_KEEP = 20
+# Fixed-width, so a lexical sort of the names is a sort by time.
+BACKUP_STAMP = "%Y%m%dT%H%M%S%f"
+BACKUP_TICK = timedelta(microseconds=1)
 LOCK_NAME = "config"
 # How long one writer waits for another process's config lock before giving
 # up with ``LockHeld``. Far longer than one validate + backup + write; a
@@ -97,19 +100,49 @@ def backup_prefix(path: Path) -> str:
     return f"config-{digest}-"
 
 
+def _newest_stamp(folder: Path, prefix: str) -> datetime | None:
+    """The stamp of PREFIX's newest backup in FOLDER, None when it has none
+    (a name that does not parse as a stamp is not one of ours)."""
+    newest: datetime | None = None
+    for p in folder.glob(f"{prefix}*Z.json"):
+        with contextlib.suppress(ValueError):
+            stamp = p.name[len(prefix) : -len("Z.json")]
+            at = datetime.strptime(stamp, BACKUP_STAMP).replace(tzinfo=timezone.utc)
+            if newest is None or at > newest:
+                newest = at
+    return newest
+
+
 def backup(path: Path, *, keep: int = BACKUP_KEEP) -> Path | None:
     """Copy the current config to ``backups/<prefix><UTC stamp>Z.json`` and
     drop all but the newest ``keep`` of that config's backups. None when
-    there is no file to back up yet. The stamp is read from one clock, so
-    two backups in one second still sort in the order they were made."""
+    there is no file to back up yet.
+
+    Never overwrites a backup: the stamp is stepped 1 µs past the newest one
+    already there (Windows' clock can return one microsecond twice, and a
+    clock stepped back would sort a new backup before an old one), and the
+    file is created exclusively, stepping again if another process took the
+    name first. So two backups in one tick still sort in the order they were
+    made."""
     if not path.exists():
         return None
     folder = backups_dir()
     folder.mkdir(parents=True, exist_ok=True)
     prefix = backup_prefix(path)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-    dest = folder / f"{prefix}{stamp}Z.json"
-    dest.write_bytes(path.read_bytes())
+    content = path.read_bytes()
+    at = datetime.now(timezone.utc)
+    newest = _newest_stamp(folder, prefix)
+    if newest is not None and at <= newest:
+        at = newest + BACKUP_TICK
+    while True:
+        dest = folder / f"{prefix}{at.strftime(BACKUP_STAMP)}Z.json"
+        try:
+            with dest.open("xb") as fh:
+                fh.write(content)
+        except FileExistsError:
+            at += BACKUP_TICK
+        else:
+            break
     for old in sorted(folder.glob(f"{prefix}*.json"))[:-keep]:
         with contextlib.suppress(OSError):
             old.unlink()

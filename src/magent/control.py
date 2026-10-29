@@ -51,9 +51,37 @@ _MODEL_RE = re.compile(r"^[A-Za-z0-9][\w.\-\[\]]*$")
 # layer must not add a second lock of its own around these verbs.
 _FLEET_LOCK = threading.Lock()
 
+# Keystrokes into one pane, one verb at a time. A send is two psmux calls
+# (the literal paste, then Enter); two overlapping sends to one session landed
+# as paste, paste, Enter, Enter and submitted ONE merged prompt while both
+# reported confirmed. Every control verb holds its session's lock for exactly
+# its keystrokes -- never across a wait or a read-back -- so different
+# sessions still run in parallel. The one exception is ``set_model``: it holds
+# the lock across ``switch_model``'s settle between ``/model`` and ``/effort``,
+# so no prompt lands between the two commands.
+#
+# A stalled psmux holds a session's lock for as long as its own send-keys
+# budgets: about 50s for a send (the literal paste's 30s, then Enter's 20s)
+# and about twice that for a model switch with an effort. That is acceptable,
+# because a concurrent send would stall on the same pane anyway.
+#
+# Only these verbs take the lock. The ``/upload`` paste (``uploads.py``) and
+# the idle reaper's post-kill reset (``reap.py``) type into panes without it,
+# and an Alt+V press (``altv.py``) runs in another process, where a
+# threading.Lock cannot reach; two CLI ``magent send``s at once can still
+# interleave too. A cross-process lock in the ``fleet``/``psmux`` layer is the
+# real follow-up.
+_KEYS_LOCKS: dict[str, threading.Lock] = {}
+_KEYS_LOCKS_GUARD = threading.Lock()
+
 
 class ControlError(WireError):
     """A refused control action, carrying the wire error code."""
+
+
+def _keys_lock(session: str) -> threading.Lock:
+    with _KEYS_LOCKS_GUARD:
+        return _KEYS_LOCKS.setdefault(session, threading.Lock())
 
 
 @dataclass(frozen=True)
@@ -251,7 +279,9 @@ def send(
     timeout_s = _valid_timeout(timeout_s)
     binary = _writable(config_path, session)
     if compact:
-        if not fleet.paste_and_enter(session, "/compact", psmux_bin=binary):
+        with _keys_lock(session):
+            compacted = fleet.paste_and_enter(session, "/compact", psmux_bin=binary)
+        if not compacted:
             raise _send_failed(session, binary)
         idle = fleet.wait_for_idle(
             session,
@@ -277,7 +307,9 @@ def send(
             f"{session} did not go idle within {timeout_s:g}s",
             {"reason": "not_idle"},
         )
-    if not fleet.paste_and_enter(session, text, psmux_bin=binary):
+    with _keys_lock(session):
+        sent = fleet.paste_and_enter(session, text, psmux_bin=binary)
+    if not sent:
         raise _send_failed(session, binary)
     time.sleep(SEND_SETTLE_S)
     capture = psmux.read_pane(session, psmux=binary)
@@ -305,9 +337,11 @@ def choose(config_path: str | None, session: str, option: int) -> ChooseResult:
             f"{session} is not showing a dialog (pane is {before})",
             {"reason": "not_in_dialog", "pane_state": before},
         )
-    if not psmux.send_keys(
-        session, str(option), target=session, literal=True, psmux=binary
-    ):
+    with _keys_lock(session):
+        pressed = psmux.send_keys(
+            session, str(option), target=session, literal=True, psmux=binary
+        )
+    if not pressed:
         raise _send_failed(session, binary)
     time.sleep(REACT_S)
     after = _pane_state(session, binary, delivered=True)
@@ -318,7 +352,9 @@ def interrupt(config_path: str | None, session: str) -> InterruptResult:
     """Press Escape in the pane -- Claude Code's interrupt for a running
     turn -- and report the pane state a moment later."""
     binary = _writable(config_path, session)
-    if not psmux.send_key(session, "Escape", psmux=binary):
+    with _keys_lock(session):
+        pressed = psmux.send_key(session, "Escape", psmux=binary)
+    if not pressed:
         raise _send_failed(session, binary)
     time.sleep(REACT_S)
     return InterruptResult(
@@ -350,7 +386,10 @@ def set_model(
             f"{session} is not idle (pane is {state})",
             {"reason": "busy", "pane_state": state},
         )
-    if not fleet.switch_model(session, model, effort, psmux_bin=binary):
+    # Held across switch_model's settles on purpose: see _KEYS_LOCKS.
+    with _keys_lock(session):
+        switched = fleet.switch_model(session, model, effort, psmux_bin=binary)
+    if not switched:
         raise _send_failed(session, binary)
     time.sleep(MODEL_SETTLE_S)
     pane = psmux.capture_pane(session, psmux=binary)
@@ -428,14 +467,18 @@ def start(
     no terminal, no tiling, nothing printed -- node outcomes come back as
     data. A session already live is reported, not touched. With both
     ``sessions`` and ``group``, a named session outside the group is a
-    failure of its own ("not in group")."""
+    failure of its own ("not in group"), and so is a local session this host
+    cannot launch at all (no psmux, folder not found, no agent command):
+    ``bring_up`` skips those, so ``psmux_status``'s reason is the answer.
+    Node liveness is not read before the bring-up, so a node session it found
+    already running (``attached_existing``) is reported live afterwards."""
     from magent import launch  # in-body: launch is heavy
 
     if sessions is None and group is None:
         raise ControlError("invalid_request", "name sessions or a group")
     cfg = _typed(config_path)
     with _FLEET_LOCK:
-        up, _down, projects = psmux.psmux_status(cfg, group)
+        up, down, projects = psmux.psmux_status(cfg, group)
         local = [psmux.socket_id(p) for p in projects]
         remote = launch.node_session_ids(cfg, group)
         wanted = sessions if sessions is not None else [*local, *remote]
@@ -456,10 +499,15 @@ def start(
             for s in wanted
             if s not in known
         ]
+        blocked = {
+            psmux.socket_id(d): str(d["reason"]) for d in down if d.get("reason")
+        }
         already = [s for s in wanted if s in live]
         todo = [s for s in wanted if s in known and s not in live]
+        prelaunch = [StartFailure(s, blocked[s]) for s in todo if s in blocked]
+        todo = [s for s in todo if s not in blocked]
         if not todo:
-            return StartResult([], already, unknown)
+            return StartResult([], already, prelaunch + unknown)
         result = launch.bring_up_psmux_quiet(
             cfg, only=todo, group=group, config_path=config_path
         )
@@ -472,7 +520,12 @@ def start(
             for o in result.node_outcomes
             if not o.ok
         ]
-        return StartResult(result.created, already, failed + unknown)
+        attached = {o.sid for o in result.node_outcomes if o.ok and o.attached_existing}
+        return StartResult(
+            [s for s in result.created if s not in attached],
+            already + [s for s in todo if s in attached],
+            failed + prelaunch + unknown,
+        )
 
 
 def stop(config_path: str | None, sessions: list[str]) -> StopResult:

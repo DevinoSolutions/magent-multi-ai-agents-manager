@@ -136,14 +136,19 @@ def _resolve_or_exit(session: str, live: list[str], as_json: bool = False) -> st
     sys.exit(_EXIT_NOT_FOUND)
 
 
-def _node_sessions(config_path: str | None) -> dict[str, Node]:
+def _node_sessions(config_path: str | None, as_json: bool = False) -> dict[str, Node]:
     """The node sessions a fleet command may name: session id -> the Node it
     runs on, for every node row the sync daemon did not last see dead (live,
     or stale -- not heard from, so worth one bounded try). Reads files only;
-    never dials."""
+    never dials. With ``as_json`` a config that fails validation is the
+    error envelope, not a stderr line."""
+    try:
+        targets = _node_session_targets(config_path, as_json=as_json)
+    except WireError as exc:
+        _fail(exc, as_json)
     return {
         str(row["name"]): node
-        for row, node in _node_session_targets(config_path)
+        for row, node in targets
         if node is not None and row["state"] != "dead"
     }
 
@@ -158,7 +163,7 @@ def _resolve_target(
     both kinds."""
     from magent import fleet, psmux  # heavy subsystem: in-body per policy
 
-    remote = _node_sessions(config_path)
+    remote = _node_sessions(config_path, as_json)
     psmux_bin = psmux.find_psmux() if remote else _require_psmux(as_json)
     local = _live_names(config_path, psmux_bin) if psmux_bin else []
     names = [*local, *(n for n in remote if n not in local)]

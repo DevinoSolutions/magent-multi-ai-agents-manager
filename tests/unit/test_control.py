@@ -217,6 +217,46 @@ class TestSend:
         assert sends[1][-1] == "Enter"
         assert "-l" not in sends[1]
 
+    def test_two_sends_to_one_session_never_interleave(self, fleet, monkeypatch):
+        """Two overlapping sends (two API requests) must land as paste, Enter,
+        paste, Enter -- never paste, paste, Enter, Enter, which submits ONE
+        merged prompt while both report confirmed. After its paste, each
+        send waits (bounded) for the other to paste too: unserialised that
+        rendezvous meets and forces the interleave; serialised it times out,
+        because the other send cannot paste until this one's Enter is in."""
+        fake, cfg = fleet
+        real = psmux.send_keys
+        order: list[str] = []
+        guard = threading.Lock()
+        both_pasted = threading.Condition(guard)
+        pasted = [0]
+
+        def _recorded(session, keys, *, literal=False, **kw):
+            ok = real(session, keys, literal=literal, **kw)
+            with both_pasted:
+                order.append("paste" if literal else keys)
+                if literal:
+                    pasted[0] += 1
+                    both_pasted.notify_all()
+                    both_pasted.wait_for(lambda: pasted[0] >= 2, timeout=1.0)
+            return ok
+
+        monkeypatch.setattr(psmux, "send_keys", _recorded)
+        results: list[control.SendResult] = []
+        threads = [
+            threading.Thread(
+                target=lambda t=text: results.append(control.send(cfg, "caramel", t))
+            )
+            for text in ("first prompt here", "second prompt here")
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert len(results) == 2
+        assert order == ["paste", "Enter", "paste", "Enter"]
+        assert len(fake.send_key_calls()) == 4
+
     def test_a_prompt_still_on_the_input_line_is_not_confirmed(self, fleet):
         fake, cfg = fleet
         fake.set_pane(
@@ -666,6 +706,55 @@ class TestStartStop:
             started=["upup"],
             already_live=["caramel"],
             failed=[control.StartFailure("ghost", "not a configured session")],
+        )
+
+    def test_a_session_that_cannot_be_launched_here_is_a_failure(
+        self, typed, tmp_path, monkeypatch
+    ):
+        # psmux_status names why an unprobeable project is down; bring_up
+        # skips exactly those, so dropping the reason answered a start with
+        # started, already_live and failed all empty.
+        _fake, cfg = typed
+        (tmp_path / "upup").rmdir()
+        called = []
+        monkeypatch.setattr(
+            launch, "bring_up_psmux_quiet", lambda *a, **k: called.append((a, k))
+        )
+        result = control.start(cfg, ["caramel", "upup"])
+        assert called == []
+        assert result == control.StartResult(
+            started=[],
+            already_live=["caramel"],
+            failed=[control.StartFailure("upup", "folder not found")],
+        )
+
+    def test_a_node_session_found_running_is_already_live(self, typed, monkeypatch):
+        # No remote liveness is read before the bring-up, so every node
+        # session reaches it; the node outcome is the only place that says
+        # the session was attached to, not started.
+        _fake, cfg = typed
+        monkeypatch.setattr(
+            launch, "node_session_ids", lambda *_a, **_k: ["remote1", "remote2"]
+        )
+
+        def _quiet(config, only=None, group=None, **_kw):
+            return launch.BringUp(
+                created=["upup", "remote1", "remote2"],
+                local_failed={},
+                node_outcomes=[
+                    launch.NodeBringUpOutcome(
+                        ok=True, sid="remote1", node="box", attached_existing=True
+                    ),
+                    launch.NodeBringUpOutcome(ok=True, sid="remote2", node="box"),
+                ],
+            )
+
+        monkeypatch.setattr(launch, "bring_up_psmux_quiet", _quiet)
+        result = control.start(cfg, ["caramel", "upup", "remote1", "remote2"])
+        assert result == control.StartResult(
+            started=["upup", "remote2"],
+            already_live=["caramel", "remote1"],
+            failed=[],
         )
 
     def test_start_needs_names_or_a_group(self, typed):

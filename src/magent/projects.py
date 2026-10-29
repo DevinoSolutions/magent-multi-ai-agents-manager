@@ -216,7 +216,9 @@ def remove(config_path: str | None, query: str, *, stop: bool = False) -> Remove
     shutdown can take seconds, and every other writer would wait on it or be
     refused), then the lock is taken and the match is made again on a fresh
     read, so a project that another writer removed meanwhile is not removed
-    twice. ``not_found`` when nothing matches on either read."""
+    twice. ``not_found`` when nothing matches on either read; a session the
+    verified shutdown names as still running refuses the removal
+    (``unavailable``, reason ``still_running``)."""
     config_file = _config_file(config_path)
     doomed = [p for p in _entries(_load(config_file)) if _matches(p, query)]
     if not doomed:
@@ -242,23 +244,33 @@ def _stop(projects: list[Project], config_path: str) -> list[str]:
     load (``ConfigError``, a ``ValueError``), a node map or lock problem
     (``OSError``, ``LockHeld`` included), a kill that ran out of time
     (``subprocess.SubprocessError``) -- is ``unavailable`` with reason
-    ``stop_failed``; nothing is removed from the config then."""
+    ``stop_failed``; a session the shutdown names as a survivor is
+    ``unavailable`` with reason ``still_running`` and the survivors listed.
+    Nothing is removed from the config either way: a project dropped while its
+    session runs is out of reach of every config-driven verb."""
     from magent import launch  # in-body: launch is heavy
     from magent.config import load_config, node_is_pool
 
     local = [p.session for p in projects if not node_is_pool(p.node)]
     on_nodes = [p.session for p in projects if node_is_pool(p.node)]
     try:
-        stopped, _still = psmux.stop_sessions(local)
+        stopped, still = psmux.stop_sessions(local)
         if on_nodes:
-            node_stopped, _node_still = launch.stop_node_sessions(
+            node_stopped, node_still = launch.stop_node_sessions(
                 load_config(config_path), on_nodes
             )
             stopped += node_stopped
+            still += node_still
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         raise ProjectError(
             "unavailable", f"sessions not stopped: {exc}", {"reason": "stop_failed"}
         ) from exc
+    if still:
+        raise ProjectError(
+            "unavailable",
+            f"still running after the stop: {', '.join(still)}; nothing removed",
+            {"reason": "still_running", "still_running": still},
+        )
     return stopped
 
 
