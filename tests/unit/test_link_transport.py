@@ -829,6 +829,35 @@ class TestPinnedTls:
         assert "TLS" in exc.value.message
 
 
+class TestTlsFloor:
+    """Every TLS context the link builds refuses TLS 1.0 and 1.1."""
+
+    def test_the_context_helper_sets_tls_1_2_as_the_floor(self):
+        context = link._tls_context()
+        assert context.minimum_version == ssl.TLSVersion.TLSv1_2
+        assert context.verify_mode == ssl.CERT_REQUIRED
+        assert context.check_hostname
+
+    def test_the_relay_connection_uses_it(self, monkeypatch):
+        # This Python's own default floor may already be 1.2: what is pinned
+        # is that the connection takes the helper's context, not a default.
+        made = link._tls_context()
+        monkeypatch.setattr(link, "_tls_context", lambda: made)
+        conn, _target = RelayClient("https://relay.example.com")._connection(
+            "https://relay.example.com/v1/host", 5.0
+        )
+        assert conn._context is made
+
+    def test_the_pinned_download_connection_uses_it(self, monkeypatch):
+        made = link._tls_context()
+        monkeypatch.setattr(link, "_tls_context", lambda: made)
+        monkeypatch.setattr(link, "_public_address", lambda host, port: "192.0.2.10")
+        conn, _target = RelayClient("https://relay.example.com")._public_connection(
+            "https://storage.example.com/o?sig=DECOY_s", lambda: 5.0
+        )
+        assert conn._context is made
+
+
 class TestDeadline:
     def test_a_socket_handed_over_after_the_deadline_is_cut_at_once(self):
         ours, theirs = socket.socketpair()

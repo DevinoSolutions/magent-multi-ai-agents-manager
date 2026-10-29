@@ -249,6 +249,15 @@ def _connect(conn: http.client.HTTPConnection) -> None:
         raise RelayError(0, "network", type(exc).__name__) from exc
 
 
+def _tls_context() -> ssl.SSLContext:
+    """The TLS context for every link connection: the system's trust store
+    and hostname check, and never below TLS 1.2 (said here, not left to
+    the Python or OpenSSL default)."""
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
+
+
 def _too_slow() -> RelayError:
     return RelayError(0, "timeout", "the relay did not answer in time")
 
@@ -376,7 +385,7 @@ class RelayClient:
         host = parts.hostname or ""
         if parts.scheme == "https":
             conn: http.client.HTTPConnection = http.client.HTTPSConnection(
-                host, parts.port, timeout=timeout, context=ssl.create_default_context()
+                host, parts.port, timeout=timeout, context=_tls_context()
             )
         else:
             conn = http.client.HTTPConnection(host, parts.port, timeout=timeout)
@@ -599,7 +608,7 @@ class RelayClient:
             443,
             address=address,
             timeout=self._timeout,
-            context=ssl.create_default_context(),
+            context=_tls_context(),
             budget=budget,
         )
         return conn, target
