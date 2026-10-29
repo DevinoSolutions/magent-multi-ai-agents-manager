@@ -54,10 +54,23 @@ _FLEET_LOCK = threading.Lock()
 # Keystrokes into one pane, one verb at a time. A send is two psmux calls
 # (the literal paste, then Enter); two overlapping sends to one session landed
 # as paste, paste, Enter, Enter and submitted ONE merged prompt while both
-# reported confirmed. Every verb that types into a pane holds its session's
-# lock for exactly its keystrokes -- never across a wait or a read-back -- so
-# different sessions still run in parallel. A threading.Lock does not reach a
-# second magent process; two CLI ``magent send``s at once can still interleave.
+# reported confirmed. Every control verb holds its session's lock for exactly
+# its keystrokes -- never across a wait or a read-back -- so different
+# sessions still run in parallel. The one exception is ``set_model``: it holds
+# the lock across ``switch_model``'s settle between ``/model`` and ``/effort``,
+# so no prompt lands between the two commands.
+#
+# A stalled psmux holds a session's lock for as long as its own send-keys
+# budgets: about 50s for a send (the literal paste's 30s, then Enter's 20s)
+# and about twice that for a model switch with an effort. That is acceptable,
+# because a concurrent send would stall on the same pane anyway.
+#
+# Only these verbs take the lock. The ``/upload`` paste (``uploads.py``) and
+# the idle reaper's post-kill reset (``reap.py``) type into panes without it,
+# and an Alt+V press (``altv.py``) runs in another process, where a
+# threading.Lock cannot reach; two CLI ``magent send``s at once can still
+# interleave too. A cross-process lock in the ``fleet``/``psmux`` layer is the
+# real follow-up.
 _KEYS_LOCKS: dict[str, threading.Lock] = {}
 _KEYS_LOCKS_GUARD = threading.Lock()
 
@@ -373,6 +386,7 @@ def set_model(
             f"{session} is not idle (pane is {state})",
             {"reason": "busy", "pane_state": state},
         )
+    # Held across switch_model's settles on purpose: see _KEYS_LOCKS.
     with _keys_lock(session):
         switched = fleet.switch_model(session, model, effort, psmux_bin=binary)
     if not switched:

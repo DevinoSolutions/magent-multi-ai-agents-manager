@@ -145,7 +145,7 @@ def _node_sessions(config_path: str | None, as_json: bool = False) -> dict[str, 
     try:
         targets = _node_session_targets(config_path, as_json=as_json)
     except WireError as exc:
-        _fail(exc, True)
+        _fail(exc, as_json)
     return {
         str(row["name"]): node
         for row, node in targets
