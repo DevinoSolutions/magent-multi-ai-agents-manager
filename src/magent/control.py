@@ -455,7 +455,9 @@ def start(
     ``sessions`` and ``group``, a named session outside the group is a
     failure of its own ("not in group"), and so is a local session this host
     cannot launch at all (no psmux, folder not found, no agent command):
-    ``bring_up`` skips those, so ``psmux_status``'s reason is the answer."""
+    ``bring_up`` skips those, so ``psmux_status``'s reason is the answer.
+    Node liveness is not read before the bring-up, so a node session it found
+    already running (``attached_existing``) is reported live afterwards."""
     from magent import launch  # in-body: launch is heavy
 
     if sessions is None and group is None:
@@ -504,7 +506,12 @@ def start(
             for o in result.node_outcomes
             if not o.ok
         ]
-        return StartResult(result.created, already, failed + prelaunch + unknown)
+        attached = {o.sid for o in result.node_outcomes if o.ok and o.attached_existing}
+        return StartResult(
+            [s for s in result.created if s not in attached],
+            already + [s for s in todo if s in attached],
+            failed + prelaunch + unknown,
+        )
 
 
 def stop(config_path: str | None, sessions: list[str]) -> StopResult:

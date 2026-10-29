@@ -728,6 +728,35 @@ class TestStartStop:
             failed=[control.StartFailure("upup", "folder not found")],
         )
 
+    def test_a_node_session_found_running_is_already_live(self, typed, monkeypatch):
+        # No remote liveness is read before the bring-up, so every node
+        # session reaches it; the node outcome is the only place that says
+        # the session was attached to, not started.
+        _fake, cfg = typed
+        monkeypatch.setattr(
+            launch, "node_session_ids", lambda *_a, **_k: ["remote1", "remote2"]
+        )
+
+        def _quiet(config, only=None, group=None, **_kw):
+            return launch.BringUp(
+                created=["upup", "remote1", "remote2"],
+                local_failed={},
+                node_outcomes=[
+                    launch.NodeBringUpOutcome(
+                        ok=True, sid="remote1", node="box", attached_existing=True
+                    ),
+                    launch.NodeBringUpOutcome(ok=True, sid="remote2", node="box"),
+                ],
+            )
+
+        monkeypatch.setattr(launch, "bring_up_psmux_quiet", _quiet)
+        result = control.start(cfg, ["caramel", "upup", "remote1", "remote2"])
+        assert result == control.StartResult(
+            started=["upup", "remote2"],
+            already_live=["caramel", "remote1"],
+            failed=[],
+        )
+
     def test_start_needs_names_or_a_group(self, typed):
         _fake, cfg = typed
         with pytest.raises(control.ControlError) as err:
