@@ -681,6 +681,36 @@ class TestResync:
         assert len(relay.snapshots) == before + 1  # once, not on every read
         run.finish(relay)
 
+    def test_a_remote_control_switch_reaches_the_relay_on_a_feed_that_never_rests(
+        self, tmp_path, relay, phone
+    ):
+        # Every read returns a batch, so there is never a quiet read: the
+        # switch must still be noticed within LINK_CHECK_S.
+        host = FakeHost(rc=False, feed=_Busy())
+        _linked, run = _online(tmp_path, relay, (phone,), host)
+        relay.wait_for(lambda: relay.snapshots)
+        relay.wait_for(lambda: _event_posts(relay) >= 2)  # batches flowing
+        assert relay.snapshots[-1]["remoteControl"] is False
+        host.rc = True
+        relay.wait_for(
+            lambda: relay.snapshots[-1]["remoteControl"] is True,
+            timeout=link.LINK_CHECK_S + 5,
+        )
+        run.finish(relay)
+
+
+class _Busy(FakeFeed):
+    """A feed that is never quiet: every read returns one new event."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._n = 0
+
+    def next_batch(self, timeout):
+        time.sleep(min(timeout, 0.05))
+        self._n += 1
+        return [_event(self._n, session="a")]
+
 
 class TestOfflineFeed:
     """While the link backs off (minutes to hours with the relay down), the

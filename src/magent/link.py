@@ -2097,7 +2097,7 @@ EVENT_THREAD = "magent-relay-events"
 UPLOAD_THREAD = "magent-relay-uploads"
 EVENT_BATCH_S = 0.25  # events arriving this close together share one POST
 EVENT_IDLE_WAIT_S = 1.0  # how long one quiet read blocks (bounds the stop latency)
-LINK_CHECK_S = 1.0  # how often the forwarder looks at link.json, batches or not
+LINK_CHECK_S = 1.0  # link.json and remoteControl checks, busy feed or not
 EVENTS_MAX_BYTES = 256 * 1024  # the relay's cap on one POST /v1/host/events body
 EVENTS_MAX = 500  # ...and on the events in it
 EVENT_FIELD_MAX = 64  # daemonEventId and type, as the relay takes them
@@ -2255,8 +2255,8 @@ class EventForwarder:
         which keeps serve sampling every pane only for the batch to be
         dropped. What the daemon published meanwhile is read once the runner
         connects again (or comes back as a ``reset``), and the snapshot is
-        repaired after it. A remoteControl switch is re-PUT on a quiet read:
-        the relay mirrors it for the app."""
+        repaired after it. A remoteControl switch is re-PUT within
+        LINK_CHECK_S, quiet or busy: the relay mirrors it for the app."""
         while not self._stop.is_set():
             self._check_link()
             if self._runner.backing_off():
@@ -2266,8 +2266,6 @@ class EventForwarder:
                 continue
             batch = feed.next_batch(EVENT_IDLE_WAIT_S)
             if not batch:
-                if not self._resync and self._runner.online():
-                    self._resync = self._runner.remote_control_changed()
                 if (
                     self._resync
                     and time.monotonic() >= self._repair_after
@@ -2285,7 +2283,10 @@ class EventForwarder:
         """The runner's look at link.json, at most every LINK_CHECK_S however
         busy the feed is: on a quiet stream nothing else would notice a
         `magent unlink` (a run it ends cuts its own stream), or a device
-        `magent link --add-device` saved after the relay announced it."""
+        `magent link --add-device` saved after the relay announced it. A
+        remoteControl switch is checked on the same clock: a feed that never
+        has a quiet read must not keep the relay's copy stale; the next post
+        (a batch, or the repair on a quiet read) re-PUTs the snapshot."""
         now = time.monotonic()
         if now < self._check_after:
             return
@@ -2299,6 +2300,8 @@ class EventForwarder:
         except Exception:  # noqa: BLE001  # reason: a snapshot for a changed trust that fails (relay or LinkHost) is repaired like a dropped batch; the forwarder goes on
             self._failed("link: could not send the snapshot for a changed link.json")
             self._dropped(failed=True)
+        if not self._resync and self._runner.online():
+            self._resync = self._runner.remote_control_changed()
 
     def _send_logged(self, batch: list[dict[str, object]]) -> None:
         try:
