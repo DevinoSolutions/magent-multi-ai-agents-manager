@@ -856,6 +856,101 @@ class TestDevices:
         assert [call[3] for call in host.calls] == [TABLET_ID]
         run.finish(relay)
 
+    def test_a_device_saved_after_the_relay_announced_it_is_trusted_at_once(
+        self, tmp_path, relay, phone
+    ):
+        # `magent link --add-device`: the relay announces the device before
+        # the CLI has verified and saved it, so that devices frame reads the
+        # old list. The save itself must be picked up, without a reconnect.
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.open_streams == 1)
+        relay.set_devices([phone.wire(), tablet.wire()])
+        time.sleep(0.2)  # the frame is read before the save, as in the field
+
+        save_linked(
+            linked,
+            host_token=relay.host_token,
+            devices=(phone.trusted(), tablet.trusted()),
+        )
+
+        relay.wait_for(
+            lambda: set(relay.snapshots[-1]["sealed"]) == {phone.device_id, TABLET_ID}
+        )
+        relay.queue_command(make_command(linked, tablet, cid=cmd_id(91), seq=1))
+        relay.wait_for(lambda: relay.results)
+        assert [call[3] for call in host.calls] == [TABLET_ID]
+        assert stream_opens(relay) == 1  # no reconnect
+        run.finish(relay)
+
+    def test_the_first_command_from_a_device_just_saved_runs(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        # The forwarder's look at link.json pushed out of reach: the command
+        # itself finds the new trust, and the device gets its snapshot.
+        monkeypatch.setattr(link, "LINK_CHECK_S", 3600.0)
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.open_streams == 1)
+
+        save_linked(
+            linked,
+            host_token=relay.host_token,
+            devices=(phone.trusted(), tablet.trusted()),
+        )
+        relay.queue_command(make_command(linked, tablet, cid=cmd_id(92), seq=1))
+
+        relay.wait_for(lambda: relay.results)
+        assert [call[3] for call in host.calls] == [TABLET_ID]
+        assert TABLET_ID in relay.snapshots[-1]["sealed"]
+        assert stream_opens(relay) == 1
+        run.finish(relay)
+
+    def test_a_device_the_relay_revoked_is_not_trusted_again_by_a_later_save(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        # The revocation could only apply in memory (link.json unreadable);
+        # a later save that still lists the device must not bring it back.
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, relay.url, (phone, tablet), host_token=relay.host_token
+        )
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.open_streams == 1)
+        real_load = link.linkfiles.load_link
+
+        def unreadable(path=None):
+            if threading.current_thread() is run.thread:
+                raise linkfiles.LinkFileError("DECOY unreadable")
+            return real_load(path)
+
+        monkeypatch.setattr(link, "SAVE_RETRY_S", 0.0)
+        monkeypatch.setattr(link.linkfiles, "load_link", unreadable)
+        relay.set_devices(
+            [phone.wire(), tablet.wire(revoked_at="2026-10-08T13:00:00.000Z")]
+        )
+        relay.wait_for(lambda: set(relay.snapshots[-1]["sealed"]) == {phone.device_id})
+        monkeypatch.setattr(link.linkfiles, "load_link", real_load)
+        other = new_device(OTHER_ID, "Laptop DECOY")
+        save_linked(
+            linked,
+            host_token=relay.host_token,
+            devices=(phone.trusted(), tablet.trusted(), other.trusted()),
+        )
+
+        relay.wait_for(
+            lambda: set(relay.snapshots[-1]["sealed"]) == {phone.device_id, OTHER_ID}
+        )
+        relay.queue_command(make_command(linked, tablet, cid=cmd_id(93), seq=1))
+        relay.wait_for(lambda: 1 in relay.acks)
+        assert host.calls == []
+        run.finish(relay)
+
     def test_a_link_json_read_that_fails_once_is_retried(
         self, monkeypatch, tmp_path, relay, phone
     ):

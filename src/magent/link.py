@@ -1160,6 +1160,11 @@ class LinkRunner:
         self._stamp: tuple[int, int, int] | None = None
         self._end: str | None = None
         self._cut: StreamCut | None = None
+        # Every device the relay listed revoked during this run: a later
+        # link.json that still lists one (a revocation that could only apply
+        # in memory) never trusts it again. One trust refresh at a time.
+        self._revoked: set[str] = set()
+        self._trust_lock = threading.Lock()
 
     # -- the loop ------------------------------------------------------------
 
@@ -1250,7 +1255,7 @@ class LinkRunner:
             self._frames = 0
             try:
                 if need_snapshot:
-                    self._relinked_on_disk()
+                    self._refresh_trust(None)
                     self._set_state("connecting")
                     self.put_snapshot(client)
                     need_snapshot = False
@@ -1398,9 +1403,10 @@ class LinkRunner:
     # -- commands --------------------------------------------------------------
 
     def _on_command(self, client: RelayClient, command: dict[str, object]) -> None:
-        # link.json first: a command that arrives after `magent unlink`
-        # must not run on the keys the run still holds.
-        self.watch_link()
+        # link.json first: a command that arrives after `magent unlink` must
+        # not run on the keys the run still holds, and one from a device
+        # `magent link --add-device` just saved must not be refused.
+        self.watch_link(client)
         cid, seq = command.get("id"), command.get("seq")
         if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
             self._quiet.log(
@@ -1665,26 +1671,52 @@ class LinkRunner:
             for d in _objects(data.get("devices"))
             if d.get("revokedAt") is not None
         }
+        self._refresh_trust(client, revoked)
+
+    def _refresh_trust(
+        self, client: RelayClient | None, revoked: set[str] | None = None
+    ) -> None:
+        """Trust what link.json lists now, less every device the relay has
+        listed revoked during this run (``revoked``: the device list just
+        received; None for a look of this host's own, which stays quiet when
+        the file cannot be read). A file that is gone, or names another
+        pairing, ends the run (see _end_run). A change in who is trusted
+        re-PUTs the snapshot through ``client`` (None: the caller PUTs one
+        next), so a device just paired gets its sessions at once. When
+        link.json cannot be read, the revocations apply in memory only."""
         self._check_end()
-        try:
-            current = self._read_link()
-            if current is None:
-                self._end_run("unlinked")
-                raise _Unlinked
-            self._check_same_link(current)
-            current = self._forget(current, revoked)
-            peers = self._peers_for(current)
-        except linkfiles.LinkFileError as exc:
-            self._log.warning("link: %s; applying revocations in memory only", exc)
-            current = None
-        with self._lock:
-            if current is None:
-                peers = {k: p for k, p in self._peers.items() if k not in revoked}
-            else:
-                self._link = current
-            changed = set(peers) != set(self._peers)
-            self._peers = peers
-        if changed:
+        with self._trust_lock:
+            with self._lock:
+                self._revoked |= revoked or set()
+                gone = set(self._revoked)
+            # Taken before the read: a change after it is seen next time.
+            stamp = _link_stamp(self._link_path)
+            try:
+                current = self._read_link()
+                if current is None:
+                    self._end_run("unlinked")
+                    raise _Unlinked
+                self._check_same_link(current)
+                current = self._forget(current, gone)
+                peers = self._peers_for(current)
+            except linkfiles.LinkFileError as exc:
+                if revoked is not None:
+                    self._log.warning(
+                        "link: %s; applying revocations in memory only", exc
+                    )
+                current = None
+            with self._lock:
+                changed = False
+                if self._end is None:  # not ended on another thread meanwhile
+                    if current is None:
+                        peers = {k: p for k, p in self._peers.items() if k not in gone}
+                    else:
+                        self._link = current
+                        self._stamp = stamp
+                    changed = set(peers) != set(self._peers)
+                    self._peers = peers
+        self._check_end()
+        if changed and client is not None:
             self.put_snapshot(client)
 
     def _check_same_link(self, current: LinkFile) -> None:
@@ -1700,43 +1732,19 @@ class LinkRunner:
             self._end_run("relinked")
             raise _Relinked
 
-    def _relinked_on_disk(self) -> None:
-        """The same check against link.json now (a reconnect), which also
-        ends the run when the file is gone; a file that cannot be read here
-        leaves the run alone."""
-        self._check_end()
-        try:
-            current = self._read_link()
-        except linkfiles.LinkFileError:
-            return
-        if current is None:
-            self._end_run("unlinked")
-            raise _Unlinked
-        self._check_same_link(current)
-
-    def watch_link(self) -> None:
-        """Look at link.json again if it changed since this run read it (a
-        stat when it did not). Gone, or naming another pairing, it ends the
-        run (_Unlinked, _Relinked; see _end_run). Called on every command,
-        and by the event forwarder every LINK_CHECK_S, which is what closes
-        a quiet stream. A file that cannot be read now is looked at again
-        next time."""
+    def watch_link(self, client: RelayClient | None) -> None:
+        """Refresh trust from link.json if it changed since this run read it
+        (a stat when it did not): see _refresh_trust. Called on every
+        command, and by the event forwarder every LINK_CHECK_S, so a device
+        `magent link --add-device` saved is trusted, and sent a snapshot,
+        without a reconnect (the relay announces it before it is saved), and
+        a quiet stream is closed once link.json is gone. A file that cannot
+        be read now is looked at again next time."""
         self._check_end()
         with self._lock:
             stamp = self._stamp
-        now = _link_stamp(self._link_path)
-        if now == stamp:
-            return
-        try:
-            current = self._read_link()
-        except linkfiles.LinkFileError:
-            return
-        if current is None:
-            self._end_run("unlinked")
-            raise _Unlinked
-        self._check_same_link(current)
-        with self._lock:
-            self._stamp = now
+        if _link_stamp(self._link_path) != stamp:
+            self._refresh_trust(client)
 
     def _end_run(self, outcome: str) -> None:
         """End this run from link.json (``unlinked``, ``relinked``): drop the
@@ -2276,13 +2284,21 @@ class EventForwarder:
     def _check_link(self) -> None:
         """The runner's look at link.json, at most every LINK_CHECK_S however
         busy the feed is: on a quiet stream nothing else would notice a
-        `magent unlink` (a run it ends cuts its own stream)."""
+        `magent unlink` (a run it ends cuts its own stream), or a device
+        `magent link --add-device` saved after the relay announced it."""
         now = time.monotonic()
         if now < self._check_after:
             return
         self._check_after = now + LINK_CHECK_S
-        with contextlib.suppress(_Unlinked, _Relinked):
-            self._runner.watch_link()
+        try:
+            # Offline, the reconnect PUTs the snapshot for the new trust.
+            online = self._runner.online()
+            self._runner.watch_link(self._client if online else None)
+        except (_Unlinked, _Relinked):
+            pass
+        except Exception:  # noqa: BLE001  # reason: a snapshot for a changed trust that fails (relay or LinkHost) is repaired like a dropped batch; the forwarder goes on
+            self._failed("link: could not send the snapshot for a changed link.json")
+            self._dropped(failed=True)
 
     def _send_logged(self, batch: list[dict[str, object]]) -> None:
         try:

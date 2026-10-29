@@ -575,7 +575,7 @@ class _Stub:
     def remote_control_changed(self) -> bool:
         return False
 
-    def watch_link(self) -> None:
+    def watch_link(self, client: RelayClient | None) -> None:
         pass
 
     def seal_for_devices(self, plain: bytes, aad: str) -> dict[str, str]:
