@@ -20,7 +20,7 @@ import time
 
 import pytest
 
-from magent import env, node_auth
+from magent import env, fsutil, node_auth
 from tests.unit._fake_ssh import env_sha256
 
 # 19 + 96 characters: long enough that the Ink UI wraps it at 80 columns.
@@ -218,9 +218,9 @@ class TestTheTokenFile:
     @WINDOWS
     def test_its_dacl_names_this_user_alone_and_inherits_nothing(self, tmp_path):
         node_auth.write_token(TOKEN, home=tmp_path)
-        sddl = node_auth._win_dacl(node_auth.token_path(tmp_path))
+        sddl = fsutil._win_dacl(node_auth.token_path(tmp_path))
         # Windows spells some SIDs as an alias, so compare in its own spelling.
-        ace = node_auth._win_canonical_sddl(f"D:P(A;;FA;;;{node_auth._win_user_sid()})")
+        ace = fsutil._win_canonical_sddl(f"D:P(A;;FA;;;{fsutil._win_user_sid()})")
         assert sddl.startswith("D:P"), sddl
         assert sddl.endswith(ace[len("D:P") :]), sddl
         assert sddl.count("(") == 1, sddl
@@ -232,32 +232,29 @@ class TestTheTokenFile:
         # The hosted runner's user is the machine's RID-500 account, which
         # SDDL reads back as the alias ``LA`` -- not the SID string written.
         # magent refused the token file it had just made for that user.
-        builtin = node_auth._win_user_sid().rsplit("-", 1)[0] + "-500"
-        if (
-            node_auth._win_canonical_sddl(f"D:P(A;;FA;;;{builtin})")
-            != "D:P(A;;FA;;;LA)"
-        ):
+        builtin = fsutil._win_user_sid().rsplit("-", 1)[0] + "-500"
+        if fsutil._win_canonical_sddl(f"D:P(A;;FA;;;{builtin})") != "D:P(A;;FA;;;LA)":
             pytest.skip("this account's machine SID is not the local one")
         node_auth.write_token(TOKEN, home=tmp_path)
         path = node_auth.token_path(tmp_path)
-        monkeypatch.setattr(node_auth, "_win_user_sid", lambda: builtin)
-        monkeypatch.setattr(node_auth, "_win_dacl", lambda _p: "D:P(A;;FA;;;LA)")
-        assert node_auth._win_dacl_is_private(path)
+        monkeypatch.setattr(fsutil, "_win_user_sid", lambda: builtin)
+        monkeypatch.setattr(fsutil, "_win_dacl", lambda _p: "D:P(A;;FA;;;LA)")
+        assert fsutil._win_dacl_is_private(path)
         # ...and it is still one ACE, for that user alone.
         monkeypatch.setattr(
-            node_auth, "_win_dacl", lambda _p: "D:P(A;;FA;;;LA)(A;;FR;;;WD)"
+            fsutil, "_win_dacl", lambda _p: "D:P(A;;FA;;;LA)(A;;FR;;;WD)"
         )
-        assert not node_auth._win_dacl_is_private(path)
+        assert not fsutil._win_dacl_is_private(path)
 
     @WINDOWS
     def test_another_users_ace_is_still_refused_under_an_alias(
         self, tmp_path, monkeypatch
     ):
-        own = node_auth._win_user_sid()
+        own = fsutil._win_user_sid()
         builtin = own.rsplit("-", 1)[0] + "-500"
         node_auth.write_token(TOKEN, home=tmp_path)
         # The file is this user's; now ask as someone else.
-        monkeypatch.setattr(node_auth, "_win_user_sid", lambda: builtin)
+        monkeypatch.setattr(fsutil, "_win_user_sid", lambda: builtin)
         if builtin == own:
             pytest.skip("this user is the RID-500 account")
         with pytest.raises(node_auth.TokenFileError):
