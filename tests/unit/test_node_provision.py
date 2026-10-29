@@ -7778,9 +7778,12 @@ def _doctor_box(
         path.write_text(token, encoding="utf-8")
         path.chmod(token_mode)
     sysbin = _sysbin(tmp_path, base_tools, python=False, name="doctorbin")
+    # The doctor's temp directory lands here, never in the runner's /tmp.
+    (tmp_path / "doctor-tmp").mkdir(exist_ok=True)
     env = {
         "HOME": str(tmp_path / "node"),
         "PATH": os.pathsep.join([*(str(f.base) for f in fakes.values()), str(sysbin)]),
+        "TMPDIR": str(tmp_path / "doctor-tmp"),
     }
     return fakes, env
 
@@ -8170,12 +8173,7 @@ class TestDoctorShUnderRealBash:
                 f"#!{BASH}\n{script}", encoding="utf-8", newline="\n"
             )
             (shims / tool).chmod(0o755)
-        tmp = tmp_path / "tmp"
-        tmp.mkdir()
-        env |= {
-            "PATH": os.pathsep.join([str(shims), env["PATH"]]),
-            "TMPDIR": str(tmp),
-        }
+        env["PATH"] = os.pathsep.join([str(shims), env["PATH"]])
         start = time.monotonic()
         r = _run_doctor(env)
         elapsed = time.monotonic() - start
@@ -8185,19 +8183,16 @@ class TestDoctorShUnderRealBash:
         (row,) = [ln for ln in _report(r).lines if ln.item == item]
         assert row.detail == detail
         # The capture the child still holds open went with the doctor.
-        assert list(tmp.iterdir()) == []
+        assert list(Path(env["TMPDIR"]).iterdir()) == []
 
     def test_its_probe_captures_leave_with_it(self, tmp_path):
         # Probe output is read through files, not pipes. Those include git's
         # github.com credential: nothing of them may outlive the doctor.
         _, env = _doctor_box(tmp_path)
-        tmp = tmp_path / "tmp"
-        tmp.mkdir()
-        env["TMPDIR"] = str(tmp)
         r = _run_doctor(env)
         assert r.returncode == 0, r.stderr
         assert _rows(r) == dict.fromkeys(DOCTOR_ITEMS, "ok")
-        assert list(tmp.iterdir()) == []
+        assert list(Path(env["TMPDIR"]).iterdir()) == []
 
     def test_nowhere_to_capture_probes_is_one_row_and_no_probe(self, tmp_path):
         # Without its private directory no probe could be bounded: one row
