@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, NoReturn
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -48,9 +49,10 @@ from magent.psmux import session0_message, session0_server_pids
 from magent.style import style
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from magent.config import MagentConfig
+    from magent.link import LinkServe, LinkStatus
     from magent.node_auth import TokenHealth
 
 
@@ -387,9 +389,9 @@ def _agents_snapshot(cfg: MagentConfig) -> list[dict[str, object]]:
     """One-shot engine poll — the scripting face of `magent watch`. Builds
     the engine via the shared config-driven builder so `status` ages states
     with settings.attention staleness/debounce, not the module defaults."""
-    from magent.cli.attention_cmd import engine_from_config
+    from magent import fleetview  # heavy subsystem: in-body per policy
 
-    engine = engine_from_config(cfg)
+    engine = fleetview.engine_from_config(cfg)
     return [
         {"name": v.name, "state": v.state, "age_s": round(v.age_s, 1)}
         for v in engine.poll()
@@ -500,6 +502,131 @@ def _gather_status(cfg: MagentConfig) -> dict[str, str]:
     }
 
 
+LINK_NOT_RUN = (
+    "magent serve is up but is not running the link; see ~/.magent/logs/link.log"
+)
+LINK_LOCK_UNREADABLE = (
+    "the link lock (~/.magent/link.lock) cannot be probed, so which serve runs "
+    "the link is not known; see ~/.magent/logs/link.log"
+)
+
+
+class LinkReport(NamedTuple):
+    """What status, doctor and `magent link --status` say about the link:
+    the C8 words, facts about who runs it, and the warnings (each a WARN in
+    doctor): a serve running it that reads another config file, a lock that
+    cannot be probed."""
+
+    status: LinkStatus
+    notes: tuple[str, ...]
+    warnings: tuple[str, ...]
+
+
+def _same_file(a: str, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:  # one of them does not exist (yet)
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(
+            os.path.abspath(b)
+        )
+
+
+def _config_mismatch(owner: LinkServe, config_file: Path) -> str | None:
+    """The line saying the serve running the link reads remote control from
+    another file than ``config_file`` (the one this command resolved), or
+    None. Serve resolves its own ``--config`` from its own directory, so the
+    two can differ. A serve that recorded no config file found none when it
+    took the link, and reads remote control as off while it finds none."""
+    if not owner.held:
+        return None
+    if owner.config is None:
+        if owner.pid is None:  # no record to compare with
+            return None
+        return (
+            "remote control: the magent serve running the link found no config "
+            "file when it started the link; remote control is off there until "
+            "it finds one"
+        )
+    if _same_file(owner.config, config_file):
+        return None
+    return (
+        f"remote control: the magent serve running the link reads "
+        f"{owner.config}, not {config_file}"
+    )
+
+
+def _link_report(
+    upload_on: Callable[[], bool], *, port: int | None, config_file: Path | None
+) -> LinkReport:
+    """The relay link (`magent link`, contract C8 words). Whether a serve
+    runs it is the link lock's answer (``link.link_serve``): the serve that
+    runs the link holds it, a serve that stands by does not.
+    ``upload_on`` (the configured port's serve answers) is asked only when
+    that matters: when the lock cannot be probed, to tell "no serve" from "a
+    serve whose link thread is not running", and to say a serve stands by.
+    Never part of the degraded verdict -- a link waiting to reconnect is not
+    a dead daemon."""
+    from magent import link  # in-body: link.py pulls in http.client and ssl
+
+    probed: list[LinkServe] = []
+    answers: list[bool] = []
+
+    def serve_up() -> bool:
+        if not answers:
+            answers.append(upload_on())
+        return answers[0]
+
+    def serving() -> bool | str:
+        owner = link.link_serve()
+        probed.append(owner)
+        if owner.held is None:
+            return serve_up()
+        if owner.held:
+            return True
+        return LINK_NOT_RUN if serve_up() else False
+
+    status = link.describe_link(serving=serving)
+    notes: list[str] = []
+    warnings: list[str] = []
+    owner = probed[0] if probed else None
+    if owner is not None and owner.held is None:
+        warnings.append(LINK_LOCK_UNREADABLE)
+    if owner is not None and owner.held:
+        if owner.port is not None and port is not None and owner.port != port:
+            line = f"the magent serve on port {owner.port} runs the link"
+            if serve_up():
+                line += f"; the one on port {port} stands by"
+            notes.append(line)
+        mismatch = None if config_file is None else _config_mismatch(owner, config_file)
+        if mismatch is not None:
+            warnings.append(mismatch)
+    return LinkReport(status, tuple(notes), tuple(warnings))
+
+
+_LINK_TINT = {
+    "online": "green",
+    "connecting": "yellow",
+    "offline": "yellow",
+    "revoked": "red",
+}
+
+
+def _render_link(report: LinkReport) -> None:
+    status = report.status
+    tint = _LINK_TINT.get(status.state)
+    label = (
+        style(status.detail, fg=tint)
+        if tint is not None
+        else style(status.detail, dim=True)
+    )
+    click.echo(f"  {style('Link', bold=True)}             {label}")
+    for line in (*report.notes, status.hint):
+        if line:
+            click.echo(f"  {style(line, dim=True)}")
+    for warning in report.warnings:
+        click.echo(f"  {style('!', fg='yellow')} {style(warning, fg='yellow')}")
+
+
 # G-MERGE: a paused node sync degrades too (Q1 ruling on the round-2 report-back); keep it at the K/F merges
 def _is_degraded(status: dict[str, str], *, sync_paused: bool = False) -> bool:
     """Exit 3's verdict. ``sync_paused`` is the node sync pulling nothing
@@ -542,14 +669,14 @@ def _render_status(config_file: Path) -> StatusReport:
     """Prints the status report; reports whether any daemon is degraded
     (dead/stale) plus the live psmux sessions it listed, in display order.
     Never exits -- shared with the menu's _menu_status."""
-    from magent.cli.attention_cmd import staleness_from_config
+    from magent import fleetview  # heavy subsystem: in-body per policy
     from magent.launch import psmux_status  # heavy subsystem: in-body per policy
 
     cfg = _load_config_or_exit(config_file)
     up, down, projects = psmux_status(cfg)
     rows = {
         _as_str(r.get("name")): r
-        for r in _psmux_sessions(up, projects, staleness_from_config(cfg))
+        for r in _psmux_sessions(up, projects, fleetview.staleness_from_config(cfg))
     }
     listed: list[dict[str, object]] = []
     # Node sessions (PR-D): read from the sync daemon's last pull, never over
@@ -756,6 +883,14 @@ def _render_status(config_file: Path) -> StatusReport:
         f"  {style('Attention', bold=True)}        {attention_labels[status['attention']]}"
     )
 
+    _render_link(
+        _link_report(
+            lambda: status["upload_server"] == "on",
+            port=cfg.settings.upload_port,
+            config_file=config_file,
+        )
+    )
+
     _agents_attention_rollup(cfg)
 
     # stderr, and deliberately NOT part of the degraded verdict: these servers
@@ -778,12 +913,93 @@ def _render_status(config_file: Path) -> StatusReport:
     return StatusReport(_is_degraded(status, sync_paused=paused is not None), listed)
 
 
+def _status_payload(cfg: MagentConfig) -> tuple[dict[str, object], bool]:
+    """The ``status --json`` payload without its ``ok`` key, and whether it
+    is degraded (exit 3). Shared by ``status --json``, ``status --v1`` and
+    serve's ``GET /api/v1/status`` (handed down as ``status_provider``)."""
+    from magent import fleetview  # heavy subsystem: in-body per policy
+    from magent.launch import psmux_status  # heavy subsystem: in-body per policy
+
+    status = _gather_status(cfg)
+    payload: dict[str, object] = dict(status)
+    payload["agents"] = _agents_snapshot(cfg)
+    # Additive (P3-04): a new key alongside the existing envelope, never a
+    # change to its shape or to the 0/1/3 exit contract -- a dead psmux
+    # session is a "not running" row, not a degraded daemon.
+    up, _down, projects = psmux_status(cfg)
+    payload["psmux_sessions"] = _psmux_sessions(
+        up, projects, fleetview.staleness_from_config(cfg)
+    )
+    # Additive too, and for the same reason the human line is on stderr and
+    # not in the verdict: a count of psmux servers stranded in logon
+    # Session 0 is a fact about the machine, not about magent's daemons, so
+    # it changes neither the envelope's shape nor the exit contract.
+    payload["psmux_session0"] = len(session0_server_pids())
+    # Additive, like psmux_sessions: a dead or stale node session is a row
+    # state, never a degraded daemon; only the sync daemon can degrade
+    # (exit 3): its own `node_sync` field, or `node_sync_paused` below.
+    from magent import nodes  # heavy subsystem: in-body per policy
+
+    map_errors: list[OSError | ValueError] = []
+    payload["node_sessions"] = nodes.session_rows(
+        cfg, now=time.time(), on_unreadable=map_errors.append
+    )
+    # Additive too: a paused sync says why (round-2 ruling 3), and is
+    # degraded like a stale daemon (Q1): every row is frozen until the
+    # map is repaired.
+    paused = _node_sync_pause(status["node_sync"], map_errors)
+    payload["node_sync_paused"] = _node_sync_pause_json(paused)
+    # Additive, as psmux_session0 is: never the verdict, never the exit code.
+    payload["daemons_session0"] = len(session0_daemons())
+    # Additive: the token nodes sign in with, null when no node is
+    # configured (nobody's business then). Never part of the verdict.
+    token = _node_token(cfg)
+    payload["claude_token"] = None if token is None else token.state
+    # Additive: the relay link's state (C8), never part of the verdict.
+    payload["link"] = _link_report(
+        lambda: status["upload_server"] == "on",
+        port=cfg.settings.upload_port,
+        config_file=None,
+    ).status.as_json()
+    return payload, _is_degraded(status, sync_paused=paused is not None)
+
+
+def _status_v1(config_file: Path) -> NoReturn:
+    """``status --v1``: the ``/api/v1/status`` envelope, same exit codes.
+
+    A missing or broken config is the same ``unavailable`` envelope (same
+    ``config:`` text) ``GET /api/v1/status`` answers, with ``status``'s
+    legacy exit 1 rather than the fleet shells' 3."""
+    from magent import wire
+    from magent.config import load_config
+
+    try:
+        cfg = load_config(str(config_file))
+    except (ValueError, OSError) as e:
+        click.echo(json.dumps(wire.error("unavailable", f"config: {e}")))
+        sys.exit(1)
+    payload, degraded = _status_payload(cfg)
+    click.echo(json.dumps(wire.ok(payload)))
+    sys.exit(3 if degraded else 0)
+
+
 @main.command("status")
 @click.option("--json", "as_json", is_flag=True, help="Print daemon status as JSON")
+@click.option(
+    "--v1",
+    "v1",
+    is_flag=True,
+    help=(
+        "Print the /api/v1/status envelope ({ok, data}); --json keeps its shape "
+        "until 4.0. An unreadable config is an unavailable envelope, exit 1."
+    ),
+)
 @click.pass_context
-def status_cmd(ctx: click.Context, as_json: bool) -> None:
+def status_cmd(ctx: click.Context, as_json: bool, v1: bool) -> None:
     """Show which psmux sessions and services are currently running."""
     config_file = find_config(ctx.obj.get("config_path"))
+    if v1:
+        _status_v1(config_file)
     if not config_file.exists():
         if as_json:
             # P3-04: one error envelope shape across every CLI JSON surface.
@@ -793,51 +1009,12 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         sys.exit(1)
 
     if as_json:
-        from magent.cli.attention_cmd import staleness_from_config
-        from magent.launch import (
-            psmux_status,  # heavy subsystem: in-body per policy
-        )
-
         cfg = _load_config_or_exit(config_file, as_json=True)
-        status = _gather_status(cfg)
+        payload, degraded = _status_payload(cfg)
         # P3-04: `ok: true` is the success discriminator (only errors carry
         # ok: false); degraded is still signalled by the state fields + exit 3.
-        payload: dict[str, object] = {"ok": True, **status}
-        payload["agents"] = _agents_snapshot(cfg)
-        # Additive (P3-04): a new key alongside the existing envelope, never a
-        # change to its shape or to the 0/1/3 exit contract -- a dead psmux
-        # session is a "not running" row, not a degraded daemon.
-        up, _down, projects = psmux_status(cfg)
-        payload["psmux_sessions"] = _psmux_sessions(
-            up, projects, staleness_from_config(cfg)
-        )
-        # Additive too, and for the same reason the human line is on stderr and
-        # not in the verdict: a count of psmux servers stranded in logon
-        # Session 0 is a fact about the machine, not about magent's daemons, so
-        # it changes neither the envelope's shape nor the exit contract.
-        payload["psmux_session0"] = len(session0_server_pids())
-        # Additive, like psmux_sessions: a dead or stale node session is a row
-        # state, never a degraded daemon; only the sync daemon can degrade
-        # (exit 3): its own `node_sync` field, or `node_sync_paused` below.
-        from magent import nodes  # heavy subsystem: in-body per policy
-
-        map_errors: list[OSError | ValueError] = []
-        payload["node_sessions"] = nodes.session_rows(
-            cfg, now=time.time(), on_unreadable=map_errors.append
-        )
-        # Additive too: a paused sync says why (round-2 ruling 3), and is
-        # degraded like a stale daemon (Q1): every row is frozen until the
-        # map is repaired.
-        paused = _node_sync_pause(status["node_sync"], map_errors)
-        payload["node_sync_paused"] = _node_sync_pause_json(paused)
-        # Additive, as psmux_session0 is: never the verdict, never the exit code.
-        payload["daemons_session0"] = len(session0_daemons())
-        # Additive: the token nodes sign in with, null when no node is
-        # configured (nobody's business then). Never part of the verdict.
-        token = _node_token(cfg)
-        payload["claude_token"] = None if token is None else token.state
-        click.echo(json.dumps(payload))
-        sys.exit(3 if _is_degraded(status, sync_paused=paused is not None) else 0)
+        click.echo(json.dumps({"ok": True, **payload}))
+        sys.exit(3 if degraded else 0)
 
     if _render_status(config_file).degraded:
         sys.exit(3)

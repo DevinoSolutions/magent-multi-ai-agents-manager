@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`magent link` pairs this machine with the magent app over the relay.**
+  It prints a QR code and an 8-character code, waits for the app to claim it
+  (a typed code is confirmed with a 6-digit safety number on both screens),
+  and asks whether paired devices may drive sessions: remote control, off
+  unless you say yes (`--remote-control` / `--no-remote-control` change it
+  later, stored as `settings.link.remoteControl` in the config file the CLI
+  resolves; off whenever that file cannot be read). `--add-device` pairs
+  another device, `--status [--json]` shows the link, and `magent unlink`
+  revokes it. Needs the new `[link]` extra.
+- **`magent serve` keeps the link open.** One outbound connection to
+  `api.magent.now`, nothing listening: session rows, events, command results
+  and uploaded files are end-to-end encrypted for the paired devices, and a
+  device's command runs only if its signature verifies, it is under two
+  minutes old and it comes from a paired device. A command the relay replays
+  never runs twice, and an upload is pasted once. An answer too large to send
+  comes back as `502 result_too_large`, and an upload state the relay missed
+  is sent again. One serve per machine runs the link and any other stands by;
+  `magent link --status`, `status` and `doctor` name it, and warn when it
+  reads remote control from another config file than the CLI. Decrypted
+  files a serve left behind mid-pull are removed when the next serve takes
+  the link, or by `magent unlink`. `MAGENT_LINK=0` keeps a linked machine
+  offline; `MAGENT_LINK_URL` points at another relay.
+- **`magent status`, `magent doctor` and `status --json` report the link:**
+  `unlinked`, `connecting`, `online`, `offline (retry in Ns)`, `revoked` or
+  `disabled`. Error reports sent to Sentry have the link's token and keys
+  stripped.
+- **A versioned local API: `/api/v1`.** `magent serve` now answers
+  `/api/v1/meta`, `health`, `status`, `sessions` (each row carries the hook
+  state and, with `?fresh=1`, the pane state, side by side), a session's pane, `projects`, an
+  SSE event stream (`/api/v1/events`, resumable with `Last-Event-ID`) and its
+  long-poll twin, and uploads -- every reply one `{ok, data}` /
+  `{ok, error: {code, message}}` envelope, described by
+  `docs/api/v1.schema.json`. From this machine only, it also drives the
+  fleet: send, choose, interrupt, model, start, stop, and project
+  add / enable / disable / remove. `MAGENT_EVENTS=0` turns the event poller off.
+- **`magent choose <session> <n>` and `magent interrupt <session>`.** Answer a
+  numbered dialog (only while one is on screen) or press Escape mid-turn.
+- **`--json` on `send`, `model`, `peek`, `choose` and `interrupt`, and `--v1` on
+  `status` and `sessions`,** printing exactly what the matching `/api/v1` route
+  returns. The existing `status --json` and `sessions --json` shapes are
+  unchanged.
+
 - **Where to get help is now one link away.** `magent --help` ends with the
   mAgent Discord invite, a failing `magent doctor` points there under its
   summary, the PyPI page lists it under Project links, and the README has a
@@ -16,6 +58,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The upload server refuses cross-site and rebound requests.** A browser
+  request whose Host, Origin or `Sec-Fetch-Site` does not belong to this
+  server gets 403, on the legacy routes too -- a web page can no longer flash
+  your status bar through `<img src=.../api/flash>` or switch the picker through
+  `/focus`.
+  Scripts and the Alt+V listener are unaffected, and so is the phone page when
+  it uses the tailnet name or IP, this machine's hostname, or the address
+  `magent serve` binds. A `magent mobile --host` name outside that list, such
+  as another mDNS `.local` name, now gets 403.
+- **Config edits are backed up and written atomically; add/remove/enable/disable/migrate are validated first.**
+  `config add`, `remove`, `enable`, `disable` and `migrate` (and the API)
+  refuse a change that would not load. Every config write keeps the previous
+  file in `~/.magent/backups` (newest 20 per config file) and swaps the new one
+  in with one rename.
 - **Every psmux argv is now built in `psmux.py`.** The attach, new-session and
   agent-command send argvs that `platform/windows.py` and the session picker
   hand-built are named builders there, and custom lint rule MD007 fails the gate

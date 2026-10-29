@@ -1,0 +1,1645 @@
+"""LinkRunner against the in-process fake relay: states, snapshot, commands
+(validate, verify, decrypt, run, answer sealed), replays, devices,
+revocation, the too-old stop, error classes, backoff and the long-poll
+fallback."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import time
+
+import pytest
+
+from magent import env, link, linkcrypto, linkfiles
+from magent.link import UPGRADE_HINT, RelayClient, RelayError
+from magent.linkcrypto import AAD_SNAP
+from tests._fake_relay import FakeRelay
+from tests.unit._link_fakes import (
+    HOST_ID,
+    OTHER_ID,
+    SESSION_ROW,
+    STRANGER_ID,
+    TABLET_ID,
+    FakeHost,
+    Running,
+    cmd_id,
+    make_command,
+    new_device,
+    open_result,
+    save_linked,
+    stop_all,
+    stray_forwarders,
+    stream_opens,
+    write_link,
+)
+
+EMOJI = chr(0x1F600)  # two UTF-16 code units
+
+
+@pytest.fixture(autouse=True)
+def _no_runner_outlives_its_test():
+    """Torn down last (autouse), after the relay: a test that failed before
+    finish() leaves no runner thread, and no event forwarder, behind."""
+    yield
+    assert stop_all() == [], "a link runner did not stop"
+    assert stray_forwarders() == [], "an event forwarder did not stop"
+
+
+@pytest.fixture
+def relay():
+    with FakeRelay() as fake:
+        yield fake
+
+
+@pytest.fixture
+def phone():
+    return new_device()
+
+
+def _paths(relay: FakeRelay, prefix: str) -> list[str]:
+    return [
+        path
+        for _method, path, _headers in list(relay.requests)
+        if path.startswith(prefix)
+    ]
+
+
+def _queue_raw(relay: FakeRelay, command: dict[str, object]) -> None:
+    """Queue a command as a broken relay would: past queue_command's UUID check."""
+    with relay._cond:
+        relay._commands.append(command)
+        relay._cond.notify_all()
+
+
+def _sealed_reasons(linked, device, relay: FakeRelay) -> list[tuple[int, str]]:
+    out = []
+    for result in list(relay.results):
+        answer = open_result(linked, device, result)
+        out.append((answer["status"], answer["body"]["error"]["details"]["reason"]))
+    return out
+
+
+class _Scripted(RelayClient):
+    """A real client whose result posts fail as scripted: ``fails[0]`` more
+    posts raise ``error``. Also records the timeout of every call."""
+
+    def __init__(self, url, *, token, sleep, fails, error, timeouts):
+        super().__init__(url, token=token, sleep=sleep)
+        self._fails = fails
+        self._error = error
+        self._timeouts = timeouts
+
+    def call(self, method, path, body=None, *, token=None, timeout=None, retries=None):
+        self._timeouts.append((method, path.partition("?")[0], timeout))
+        if method == "POST" and path == "/v1/host/results" and self._fails[0] > 0:
+            self._fails[0] -= 1
+            raise self._error
+        return super().call(
+            method, path, body, token=token, timeout=timeout, retries=retries
+        )
+
+
+def _scripted(
+    fails: list[int],
+    error: RelayError | None = None,
+    timeouts: list[tuple[str, str, float | None]] | None = None,
+):
+    def factory(url, token, *, sleep):
+        return _Scripted(
+            url,
+            token=token,
+            sleep=sleep,
+            fails=fails,
+            error=error or RelayError(0, "network", "scripted drop"),
+            timeouts=[] if timeouts is None else timeouts,
+        )
+
+    return factory
+
+
+class TestIdle:
+    def test_it_waits_for_link_json_then_connects(self, tmp_path, relay, phone):
+        linked = write_link(
+            tmp_path, relay.url, (phone,), host_token=relay.host_token, write=False
+        )
+        run = Running(FakeHost(), linked)
+        time.sleep(0.2)
+        assert relay.requests == []
+        assert run.thread.is_alive()
+
+        save_linked(linked, host_token=relay.host_token)
+
+        relay.wait_for(lambda: relay.snapshots)
+        assert run.finish(relay) == "stopped"
+
+    def test_a_broken_link_json_is_reported_once_and_never_dialled(
+        self, tmp_path, relay, phone, caplog
+    ):
+        linked = write_link(
+            tmp_path, relay.url, (phone,), host_token=relay.host_token, write=False
+        )
+        linked.link_path.write_text("{not json", encoding="utf-8")
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(FakeHost(), linked)
+            relay.wait_for(lambda: len(run.sleeps) >= 3)
+            assert run.finish(relay) == "stopped"
+        assert relay.requests == []
+        assert sum("magent unlink" in r.getMessage() for r in caplog.records) == 1
+
+    @pytest.mark.parametrize("bad", ["token", "port"])
+    def test_a_hand_edited_link_json_is_reported_once_without_a_traceback(
+        self, tmp_path, relay, phone, caplog, bad
+    ):
+        # Pairing never writes either; a hand edit can. The client would
+        # refuse them on every call, so they are a bad file, not a host fault.
+        url = "http://127.0.0.1:99999" if bad == "port" else relay.url
+        token = "bad token DECOY" if bad == "token" else relay.host_token
+        linked = write_link(tmp_path, url, (phone,), host_token=token)
+        with caplog.at_level("INFO", logger="magent.link"):
+            run = Running(FakeHost(), linked)
+            relay.wait_for(lambda: len(run.sleeps) >= 3)
+            assert run.finish(relay) == "stopped"
+        assert relay.requests == []
+        assert sum("repair with" in r.getMessage() for r in caplog.records) == 1
+        assert [r for r in caplog.records if r.exc_info] == []
+
+
+class TestSnapshot:
+    def test_every_connect_puts_a_sealed_snapshot(self, tmp_path, relay, phone):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost(sessions=[SESSION_ROW], rc=True, max_bytes=5_000_000)
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.snapshots)
+
+        snap = relay.snapshots[0]
+        assert snap["daemon"] == {
+            "version": "9.9.9",
+            "platform": "windows",
+            "epoch": "e0e0e0e0",
+        }
+        assert snap["remoteControl"] is True
+        assert snap["uploadMaxBytes"] == 5_000_000
+        # Routing-only metadata: no path, no model, nothing from the pane.
+        assert snap["sessions"] == [
+            {
+                "session": "magent-alpha",
+                "name": "alpha",
+                "live": True,
+                "hookState": "working",
+                "paneState": "busy",
+                "nodeState": None,
+            }
+        ]
+        assert set(snap["sealed"]) == {phone.device_id}
+        plain = linkcrypto.open_sealed(
+            linked.device_keys(phone).h2d,
+            snap["sealed"][phone.device_id],
+            AAD_SNAP + HOST_ID,
+        )
+        assert json.loads(plain) == {"sessions": [SESSION_ROW]}
+
+        relay.wait_for(
+            lambda: (relay.drop_streams() or True) and len(relay.snapshots) >= 2
+        )
+        run.finish(relay)
+
+    def test_rows_the_relay_would_refuse_stay_sealed_only(self, tmp_path, relay, phone):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        odd = [
+            {**SESSION_ROW, "session": "..", "name": "dots"},
+            {**SESSION_ROW, "session": "has space"},
+            {**SESSION_ROW, "session": "long-name", "name": "n" * 300},
+            {**SESSION_ROW, "session": "long-state", "hook_state": "x" * 33},
+        ]
+        host = FakeHost(
+            sessions=odd,
+            daemon={"version": "v" * 40, "platform": "", "epoch": "e1"},
+        )
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.snapshots)  # the relay accepted it
+
+        snap = relay.snapshots[0]
+        assert [s["session"] for s in snap["sessions"]] == ["long-name", "long-state"]
+        assert snap["sessions"][0]["name"] == "n" * 200
+        assert snap["sessions"][1]["hookState"] is None
+        assert snap["daemon"] == {
+            "version": "v" * 32,
+            "platform": "unknown",
+            "epoch": "e1",
+        }
+        plain = linkcrypto.open_sealed(
+            linked.device_keys(phone).h2d,
+            snap["sealed"][phone.device_id],
+            AAD_SNAP + HOST_ID,
+        )
+        assert json.loads(plain) == {"sessions": odd}
+        run.finish(relay)
+
+    def test_an_emoji_heavy_row_is_cut_as_the_relay_counts(
+        self, tmp_path, relay, phone
+    ):
+        # The relay counts UTF-16 code units: an emoji is two. Cut by code
+        # points, 150 emoji pass as 150 and the whole PUT is refused, so
+        # the host never gets online.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        row = {**SESSION_ROW, "name": EMOJI * 150, "hook_state": EMOJI * 20}
+        host = FakeHost(
+            sessions=[row, {**SESSION_ROW, "session": "b", "name": "a" + EMOJI * 100}],
+            daemon={"version": EMOJI * 20, "platform": "windows", "epoch": "e1"},
+        )
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.snapshots)  # the relay accepted it
+
+        first, second = relay.snapshots[0]["sessions"]
+        assert first["name"] == EMOJI * 100  # 200 code units
+        assert first["hookState"] is None  # 40 code units, over 32
+        assert second["name"] == "a" + EMOJI * 99  # never half an emoji
+        assert relay.snapshots[0]["daemon"]["version"] == EMOJI * 16
+        relay.wait_for(run.runner.online)
+        run.finish(relay)
+
+    def test_the_state_file_says_online(self, tmp_path, relay, phone):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: linked.state().state == "online")
+        assert linked.state().last_connected is not None
+        run.finish(relay)
+
+    def test_a_snapshot_too_big_for_the_relay_keeps_the_rows_that_fit(
+        self, tmp_path, relay, phone, caplog
+    ):
+        # Sealed once per device, a big fleet outgrows the relay's 4 MiB
+        # snapshot cap: refused on every connect, the host would never get
+        # online. The rows that fit go, in order, and the log says so.
+        devices = (
+            phone,
+            new_device(TABLET_ID, "Tablet DECOY"),
+            new_device(OTHER_ID, "Other DECOY"),
+        )
+        linked = write_link(tmp_path, relay.url, devices, host_token=relay.host_token)
+        rows = [
+            {**SESSION_ROW, "session": f"s{n}", "path": "p" * 2_000} for n in range(900)
+        ]
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(FakeHost(sessions=rows), linked)
+            relay.wait_for(run.runner.online, timeout=15)
+        snap = relay.snapshots[0]
+        sent = json.loads(
+            linkcrypto.open_sealed(
+                linked.device_keys(phone).h2d,
+                snap["sealed"][phone.device_id],
+                AAD_SNAP + HOST_ID,
+            )
+        )["sessions"]
+        assert 0 < len(sent) < len(rows)
+        assert sent == rows[: len(sent)]
+        assert [s["session"] for s in snap["sessions"]] == [r["session"] for r in sent]
+        assert len(json.dumps(snap, separators=(",", ":"))) <= 4 * 1024 * 1024
+        assert any("snapshot" in r.getMessage() for r in caplog.records)
+        run.finish(relay)
+
+    def test_one_device_s_copy_stays_under_the_relay_s_sealed_cap(
+        self, tmp_path, relay, phone, caplog
+    ):
+        # With one device the body cap alone lets its copy grow past the
+        # relay's cap on one sealed blob, refused on every connect. Rows are
+        # dropped until it fits, and the warning is logged once a minute at
+        # most, however often the host reconnects.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        rows = [
+            {**SESSION_ROW, "session": f"s{n}", "path": "p" * 2_000} for n in range(700)
+        ]
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(FakeHost(sessions=rows), linked)
+            relay.wait_for(run.runner.online)
+            relay.wait_for(
+                lambda: (relay.drop_streams() or True) and len(relay.snapshots) >= 2
+            )
+            run.finish(relay)
+        snap = relay.snapshots[0]
+        assert len(snap["sealed"][phone.device_id]) <= link.SEALED_MAX_CHARS
+        sent = json.loads(
+            linkcrypto.open_sealed(
+                linked.device_keys(phone).h2d,
+                snap["sealed"][phone.device_id],
+                AAD_SNAP + HOST_ID,
+            )
+        )["sessions"]
+        assert 0 < len(sent) < len(rows)
+        assert sent == rows[: len(sent)]
+        trims = [r for r in caplog.records if "the snapshot holds" in r.getMessage()]
+        assert len(trims) == 1
+
+    def test_no_more_rows_than_the_relay_takes_are_sealed(self, tmp_path, relay, phone):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        rows = [{**SESSION_ROW, "session": f"s{n}"} for n in range(1_100)]
+        run = Running(FakeHost(sessions=rows), linked)
+        relay.wait_for(lambda: relay.snapshots)
+        snap = relay.snapshots[0]
+        sent = json.loads(
+            linkcrypto.open_sealed(
+                linked.device_keys(phone).h2d,
+                snap["sealed"][phone.device_id],
+                AAD_SNAP + HOST_ID,
+            )
+        )["sessions"]
+        assert len(sent) == len(snap["sessions"]) == link.SNAPSHOT_SESSIONS_MAX
+        run.finish(relay)
+
+    def test_a_rate_limited_snapshot_waits_through_the_runner_s_sleep(
+        self, tmp_path, relay, phone
+    ):
+        # The client sleeps through the runner's stop-aware sleep, so a
+        # Retry-After never outlives a stop.
+        relay.rate_limit_next_calls(1, retry_after=30)
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: relay.snapshots)
+        assert 30.0 in run.sleeps
+        run.finish(relay)
+
+
+class TestCommands:
+    def test_a_command_runs_once_and_its_result_decrypts(self, tmp_path, relay, phone):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        run = Running(host, linked)
+        path = "/api/v1/sessions/magent-alpha/send"
+        relay.queue_command(
+            make_command(
+                linked,
+                phone,
+                cid=cmd_id(1),
+                seq=5,
+                method="POST",
+                path=path,
+                body={"text": "hi"},
+            )
+        )
+
+        relay.wait_for(lambda: relay.results)
+        assert host.calls == [("POST", path, b'{"text": "hi"}', phone.device_id)]
+        result = relay.results[0]
+        assert (result["type"], result["commandId"], result["status"]) == (
+            "command",
+            cmd_id(1),
+            200,
+        )
+        assert open_result(linked, phone, result) == {
+            "status": 200,
+            "body": {"ok": True, "data": {"path": path}},
+        }
+        assert 5 in relay.acks
+        relay.wait_for(lambda: linked.state().cursor == 5)
+        assert cmd_id(1) in linked.state().seen_ids
+        run.finish(relay)
+
+    @pytest.mark.parametrize(
+        ("forge", "status", "code", "reason"),
+        [
+            ("stale", 410, "expired", "stale"),
+            ("future", 410, "expired", "stale"),
+            ("signer", 403, "forbidden", "bad_signature"),
+            ("seal", 403, "forbidden", "bad_seal"),
+            ("inner", 403, "forbidden", "mismatch"),
+        ],
+    )
+    def test_a_bad_command_is_answered_sealed_and_never_runs(
+        self, tmp_path, relay, phone, forge, status, code, reason
+    ):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        now = int(time.time() * 1000)
+        forged = {
+            "stale": {"ts": now - 121_000},
+            # Far enough ahead that a slow first delivery cannot bring it
+            # inside the 120 s window.
+            "future": {"ts": now + 180_000},
+            "signer": {"signer": new_device(OTHER_ID)},
+            "seal": {"seal_key": os.urandom(32)},
+            "inner": {
+                "inner": {"method": "GET", "path": "/api/v1/projects", "body": None}
+            },
+        }[forge]
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(2), seq=2, **forged))
+
+        relay.wait_for(lambda: relay.results)
+        assert host.calls == []
+        answer = open_result(linked, phone, relay.results[0])
+        assert answer["status"] == status
+        assert answer["body"]["error"]["code"] == code
+        assert answer["body"]["error"]["details"] == {"reason": reason}
+        run.finish(relay)
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"method": "GET\n"},
+            {"method": "TRACE"},
+            {"method": "get"},
+            {"path": "/api/v1/sessions\n/api/v1/projects"},
+            {"path": "/api/v1/sessions\x7f"},
+            {"path": "/api/v1/sessions\x85"},
+            {"path": "/upload"},
+            {"path": "/api/v10/sessions"},
+            {"ts": f"{int(time.time() * 1000)}\n"},
+            {"ts": True},
+            {"ts": float(int(time.time() * 1000))},
+        ],
+        ids=lambda f: repr(f)[:40],
+    )
+    def test_a_malformed_field_is_answered_400_and_never_runs(
+        self, tmp_path, relay, phone, fields
+    ):
+        # Each command is signed over its own fields, so only the field
+        # checks stand between it and LinkHost.handle.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        inner = {
+            "method": fields.get("method", "GET"),
+            "path": fields.get("path", "/api/v1/sessions"),
+            "body": None,
+        }
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.queue_command(
+            make_command(linked, phone, cid=cmd_id(3), seq=1, inner=inner, **fields)
+        )
+
+        relay.wait_for(lambda: relay.results)
+        assert host.calls == []
+        answer = open_result(linked, phone, relay.results[0])
+        assert answer["status"] == 400
+        assert answer["body"]["error"]["code"] == "invalid_request"
+        assert answer["body"]["error"]["details"] == {"reason": "malformed"}
+        run.finish(relay)
+
+    @pytest.mark.parametrize(
+        "cid",
+        [
+            cmd_id(4) + "\n",
+            "\n" + cmd_id(4),
+            cmd_id(4).replace("-", "\n", 1),
+            "not-a-uuid",
+            cmd_id(4).replace("-", ""),
+            "{" + cmd_id(4) + "}",
+        ],
+    )
+    def test_a_malformed_id_is_only_acknowledged(self, tmp_path, relay, phone, cid):
+        # No answer can carry it (the relay takes UUID command ids only), and
+        # it never runs, though its signature is good.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        run = Running(host, linked)
+        _queue_raw(relay, make_command(linked, phone, cid=cid, seq=4))
+
+        relay.wait_for(lambda: 4 in relay.acks)
+        assert host.calls == []
+        assert relay.results == []
+        relay.wait_for(lambda: linked.state().cursor == 4)
+        run.finish(relay)
+
+    def test_a_command_from_an_untrusted_device_is_only_acknowledged(
+        self, tmp_path, relay, phone
+    ):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        stranger = new_device(STRANGER_ID)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.queue_command(make_command(linked, stranger, cid=cmd_id(5), seq=3))
+
+        relay.wait_for(lambda: 3 in relay.acks)
+        assert host.calls == []
+        assert relay.results == []
+        run.finish(relay)
+
+    def test_the_id_is_on_disk_before_the_command_runs(self, tmp_path, relay, phone):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        on_disk: list[bool] = []
+        host = FakeHost(
+            on_handle=lambda m, p: on_disk.append(cmd_id(6) in linked.state().seen_ids)
+        )
+        run = Running(host, linked)
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(6), seq=1))
+
+        relay.wait_for(lambda: relay.results)
+        assert on_disk == [True]
+        run.finish(relay)
+
+    def test_an_id_that_cannot_be_saved_never_runs(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        # Without the id on disk a restart could run it again, so it is
+        # answered 503 instead (the device may send it again as a new one).
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+
+        def full_disk(state, path=None):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(link.linkfiles, "save_state", full_disk)
+        monkeypatch.setattr(link, "SAVE_RETRY_S", 0.0)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(7), seq=1))
+
+        relay.wait_for(lambda: relay.results)
+        assert host.calls == []
+        assert _sealed_reasons(linked, phone, relay) == [(503, "state_unsaved")]
+        run.finish(relay)
+
+    def test_a_crashing_handler_is_answered_500(self, tmp_path, relay, phone):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+
+        def boom(method, path):
+            raise RuntimeError("DECOY handler crash")
+
+        run = Running(FakeHost(on_handle=boom), linked)
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(8), seq=1))
+
+        relay.wait_for(lambda: relay.results)
+        assert _sealed_reasons(linked, phone, relay) == [(500, "crashed")]
+        assert run.thread.is_alive()
+        run.finish(relay)
+
+    def test_a_lost_result_is_resent_from_the_cache_not_run_again(
+        self, tmp_path, relay, phone
+    ):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        fails = [1]
+        host = FakeHost()
+        run = Running(host, linked, client_factory=_scripted(fails))
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(9), seq=4))
+
+        relay.wait_for(lambda: relay.results)
+        assert fails == [0]
+        assert len(host.calls) == 1
+        assert relay.results[0]["commandId"] == cmd_id(9)
+        # Replayed on a reconnect from the unmoved cursor.
+        assert len(_paths(relay, "/v1/stream/host?since=0")) >= 2
+        run.finish(relay)
+
+    def test_after_a_restart_a_replayed_command_is_only_acknowledged(
+        self, tmp_path, relay, phone
+    ):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        first = Running(host, linked, client_factory=_scripted([10**6]))
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(10), seq=6))
+        relay.wait_for(lambda: host.calls and cmd_id(10) in linked.state().seen_ids)
+        first.finish(relay)
+        assert relay.results == []
+        assert linked.state().cursor == 0  # no ack, so the cursor never moved
+
+        second = Running(host, linked)
+        relay.wait_for(lambda: 6 in relay.acks)
+        assert len(host.calls) == 1  # remembered across the restart: never run twice
+        assert relay.results == []
+        second.finish(relay)
+
+    def test_a_refused_result_is_acknowledged_so_the_stream_moves_on(
+        self, tmp_path, relay, phone, caplog
+    ):
+        # A permanent refusal would be replayed forever; the seq is acked
+        # alone and the next command still runs. (A 413 is answered
+        # result_too_large instead: see below.)
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        error = RelayError(400, "invalid_request", "DECOY refused")
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(host, linked, client_factory=_scripted([1], error))
+            relay.queue_command(make_command(linked, phone, cid=cmd_id(11), seq=1))
+            relay.wait_for(lambda: 1 in relay.acks)
+            assert relay.results == []
+
+            relay.queue_command(make_command(linked, phone, cid=cmd_id(12), seq=2))
+            relay.wait_for(lambda: relay.results)
+            run.finish(relay)
+        assert [r["commandId"] for r in relay.results] == [cmd_id(12)]
+        assert len(host.calls) == 2
+        assert any("400" in r.getMessage() for r in caplog.records)
+
+    def test_an_answer_too_big_for_the_relay_is_answered_result_too_large(
+        self, tmp_path, relay, phone
+    ):
+        # Sealed, this answer passes the relay's cap on one blob, which it
+        # would refuse: the device gets a small sealed 502 that says why,
+        # not a command that expires unanswered.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        big = {"ok": True, "data": {"text": "x" * 1_100_000}}
+        host = FakeHost(replies={("GET", "/api/v1/sessions"): (200, big)})
+        run = Running(host, linked)
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(13), seq=1))
+
+        relay.wait_for(lambda: relay.results)
+        [result] = relay.results
+        assert result["status"] == 502
+        answer = open_result(linked, phone, result)
+        assert answer["status"] == 502
+        assert answer["body"]["error"]["details"]["reason"] == "result_too_large"
+        assert 1 in relay.acks
+        assert len(host.calls) == 1
+        run.finish(relay)
+
+    def test_a_413_on_an_answer_is_answered_result_too_large(
+        self, tmp_path, relay, phone
+    ):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        error = RelayError(413, "payload_too_large", "DECOY too big")
+        run = Running(host, linked, client_factory=_scripted([1], error))
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(14), seq=1))
+
+        relay.wait_for(lambda: relay.results)
+        [result] = relay.results
+        answer = open_result(linked, phone, result)
+        assert (result["status"], answer["status"]) == (502, 502)
+        assert answer["body"]["error"]["details"]["reason"] == "result_too_large"
+        assert 1 in relay.acks
+        # A replay re-sends the small answer, never the one the relay refused.
+        assert run.runner._results[cmd_id(14)] == result
+        assert len(host.calls) == 1
+        run.finish(relay)
+
+    def test_refusals_never_flush_a_real_id_out_of_the_seen_ring(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        # Only a verified command takes a place in the ring. A relay that
+        # floods refusals (forged or untrusted) and then replays a real signed
+        # command under a new seq gets the cached answer, never a second run.
+        # Refusals stay out of the result cache too, or they would evict the
+        # real answer and the replay would only be acknowledged.
+        monkeypatch.setattr(link, "SEEN_MAX", 4)
+        monkeypatch.setattr(link, "RESULT_CACHE_MAX", 4)
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        run = Running(host, linked)
+        real = make_command(linked, phone, cid=cmd_id(20), seq=1)
+        relay.queue_command(real)
+        relay.wait_for(lambda: relay.results)
+        stranger, forger = new_device(STRANGER_ID), new_device(OTHER_ID)
+        for n in range(5):
+            relay.queue_command(
+                make_command(linked, stranger, cid=cmd_id(21 + n), seq=2 + n)
+            )
+            relay.queue_command(
+                make_command(
+                    linked, phone, cid=cmd_id(31 + n), seq=7 + n, signer=forger
+                )
+            )
+        relay.wait_for(lambda: 11 in relay.acks)
+
+        with relay._cond:
+            relay.results[:] = [
+                r for r in relay.results if r["commandId"] != cmd_id(20)
+            ]
+        _queue_raw(relay, {**real, "seq": 12})
+        relay.drop_streams()
+
+        relay.wait_for(lambda: 12 in relay.acks)
+        assert len(host.calls) == 1
+        assert [r["commandId"] for r in relay.results if r["commandId"] == cmd_id(20)]
+        assert linked.state().seen_ids == (cmd_id(20),)
+        run.finish(relay)
+
+    def test_a_duplicate_of_a_command_still_running_is_left_unacknowledged(
+        self, tmp_path, relay, phone
+    ):
+        # Once a second thread can deliver an id (uploads run on their own),
+        # "seen but no cached result" no longer means "ran before a restart":
+        # it can mean "still running". Acking that duplicate would move the
+        # cursor past an answer that is not posted yet, and lose it if the
+        # post then fails. So it stays unacknowledged; the relay redelivers.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        entered, release = threading.Event(), threading.Event()
+
+        def hold(method: str, path: str) -> None:
+            entered.set()
+            assert release.wait(5)
+
+        host = FakeHost(on_handle=hold)
+        run = Running(host, linked)
+        command = make_command(linked, phone, cid=cmd_id(40), seq=1)
+        relay.queue_command(command)
+        assert entered.wait(5)
+
+        client = RelayClient(relay.url, token=relay.host_token)
+        try:
+            run.runner._on_command(client, command)  # a second delivery, elsewhere
+            assert (relay.acks, relay.results) == ([], [])
+            assert linked.state().cursor == 0
+        finally:
+            release.set()
+        relay.wait_for(lambda: relay.results)
+        assert relay.acks == [1]
+        assert len(host.calls) == 1
+        run.finish(relay)
+
+        run.runner._on_command(client, command)  # done now: the cached answer
+        assert [r["commandId"] for r in relay.results] == [cmd_id(40)] * 2
+
+    def test_a_duplicate_that_lost_the_race_to_the_ring_is_left_unacknowledged(
+        self, tmp_path, relay, phone, monkeypatch
+    ):
+        # The same, one step later: this delivery passed the first seen check
+        # before the other one ran, and finds it running at the ring's add.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        entered, release = threading.Event(), threading.Event()
+
+        def hold(method: str, path: str) -> None:
+            entered.set()
+            assert release.wait(5)
+
+        host = FakeHost(on_handle=hold)
+        run = Running(host, linked)
+        relay.wait_for(run.runner.online)
+        command = make_command(linked, phone, cid=cmd_id(41), seq=1)
+        real_open = run.runner._open_command
+        here = threading.current_thread()
+
+        def open_late(cid, peer, cmd):
+            if threading.current_thread() is here:
+                # Past the first check: now the other delivery starts running.
+                relay.queue_command(command)
+                assert entered.wait(5)
+            return real_open(cid, peer, cmd)
+
+        monkeypatch.setattr(run.runner, "_open_command", open_late)
+        client = RelayClient(relay.url, token=relay.host_token)
+        try:
+            run.runner._on_command(client, command)
+            assert (relay.acks, relay.results) == ([], [])
+        finally:
+            release.set()
+        relay.wait_for(lambda: relay.results)
+        assert relay.acks == [1]
+        assert len(host.calls) == 1
+        run.finish(relay)
+
+    def test_a_reconnect_resumes_from_the_cursor_with_a_fresh_snapshot(
+        self, tmp_path, relay, phone
+    ):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(13), seq=9))
+        relay.wait_for(lambda: linked.state().cursor == 9)
+
+        relay.wait_for(
+            lambda: (
+                (relay.drop_streams() or True)
+                and _paths(relay, "/v1/stream/host?since=9")
+            )
+        )
+        assert len(relay.snapshots) >= 2
+        run.finish(relay)
+
+
+class TestDevices:
+    def test_a_revoked_device_is_forgotten_and_refused(self, tmp_path, relay, phone):
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, relay.url, (phone, tablet), host_token=relay.host_token
+        )
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.snapshots)
+
+        relay.set_devices(
+            [phone.wire(), tablet.wire(revoked_at="2026-10-08T13:00:00.000Z")]
+        )
+
+        relay.wait_for(lambda: linked.device_ids() == [phone.device_id])
+        relay.wait_for(lambda: set(relay.snapshots[-1]["sealed"]) == {phone.device_id})
+        relay.queue_command(make_command(linked, tablet, cid=cmd_id(14), seq=7))
+        relay.wait_for(lambda: 7 in relay.acks)
+        assert host.calls == []
+        run.finish(relay)
+
+    def test_trust_is_never_added_from_the_relay(self, tmp_path, relay, phone):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        stranger = new_device(STRANGER_ID)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.snapshots)
+        relay.set_devices([phone.wire(), stranger.wire()])
+
+        relay.queue_command(make_command(linked, stranger, cid=cmd_id(15), seq=1))
+        relay.wait_for(lambda: 1 in relay.acks)
+        assert host.calls == []
+        assert relay.results == []
+        assert linked.device_ids() == [phone.device_id]
+        assert all(set(s["sealed"]) == {phone.device_id} for s in relay.snapshots)
+        run.finish(relay)
+
+    def test_a_device_paired_while_running_is_picked_up(self, tmp_path, relay, phone):
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.snapshots)
+
+        # `magent link` (add device) saved it; the relay announces the pairing.
+        save_linked(
+            linked,
+            host_token=relay.host_token,
+            devices=(phone.trusted(), tablet.trusted()),
+        )
+        relay.set_devices([phone.wire(), tablet.wire()])
+
+        relay.wait_for(
+            lambda: set(relay.snapshots[-1]["sealed"]) == {phone.device_id, TABLET_ID}
+        )
+        relay.queue_command(make_command(linked, tablet, cid=cmd_id(16), seq=1))
+        relay.wait_for(lambda: relay.results)
+        assert [call[3] for call in host.calls] == [TABLET_ID]
+        run.finish(relay)
+
+    def test_a_device_saved_after_the_relay_announced_it_is_trusted_at_once(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        # `magent link --add-device`: the relay announces the device before
+        # the CLI has verified and saved it, so that devices frame reads the
+        # old list. The save itself must be picked up, without a reconnect.
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        announced = threading.Event()
+        real_on_devices = link.LinkRunner._on_devices
+
+        def spy(self, client, data):
+            try:
+                real_on_devices(self, client, data)
+            finally:
+                listed = [d.get("deviceId") for d in data.get("devices") or []]
+                if TABLET_ID in listed:
+                    announced.set()
+
+        monkeypatch.setattr(link.LinkRunner, "_on_devices", spy)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.open_streams == 1)
+        relay.set_devices([phone.wire(), tablet.wire()])
+        # The frame is read, against the old list, before the save.
+        assert announced.wait(15), "the devices frame never reached the runner"
+
+        save_linked(
+            linked,
+            host_token=relay.host_token,
+            devices=(phone.trusted(), tablet.trusted()),
+        )
+
+        relay.wait_for(
+            lambda: set(relay.snapshots[-1]["sealed"]) == {phone.device_id, TABLET_ID}
+        )
+        relay.queue_command(make_command(linked, tablet, cid=cmd_id(91), seq=1))
+        relay.wait_for(lambda: relay.results)
+        assert [call[3] for call in host.calls] == [TABLET_ID]
+        assert stream_opens(relay) == 1  # no reconnect
+        run.finish(relay)
+
+    def test_the_first_command_from_a_device_just_saved_runs(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        # The forwarder's look at link.json pushed out of reach: the command
+        # itself finds the new trust, and the device gets its snapshot.
+        monkeypatch.setattr(link, "LINK_CHECK_S", 3600.0)
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.open_streams == 1)
+
+        save_linked(
+            linked,
+            host_token=relay.host_token,
+            devices=(phone.trusted(), tablet.trusted()),
+        )
+        relay.queue_command(make_command(linked, tablet, cid=cmd_id(92), seq=1))
+
+        relay.wait_for(lambda: relay.results)
+        assert [call[3] for call in host.calls] == [TABLET_ID]
+        assert TABLET_ID in relay.snapshots[-1]["sealed"]
+        assert stream_opens(relay) == 1
+        run.finish(relay)
+
+    def test_a_device_the_relay_revoked_is_not_trusted_again_by_a_later_save(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        # The revocation could only apply in memory (link.json unreadable);
+        # a later save that still lists the device must not bring it back.
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, relay.url, (phone, tablet), host_token=relay.host_token
+        )
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.open_streams == 1)
+        real_load = link.linkfiles.load_link
+
+        def unreadable(path=None):
+            if threading.current_thread() is run.thread:
+                raise linkfiles.LinkFileError("DECOY unreadable")
+            return real_load(path)
+
+        monkeypatch.setattr(link, "SAVE_RETRY_S", 0.0)
+        monkeypatch.setattr(link.linkfiles, "load_link", unreadable)
+        relay.set_devices(
+            [phone.wire(), tablet.wire(revoked_at="2026-10-08T13:00:00.000Z")]
+        )
+        relay.wait_for(lambda: set(relay.snapshots[-1]["sealed"]) == {phone.device_id})
+        monkeypatch.setattr(link.linkfiles, "load_link", real_load)
+        other = new_device(OTHER_ID, "Laptop DECOY")
+        save_linked(
+            linked,
+            host_token=relay.host_token,
+            devices=(phone.trusted(), tablet.trusted(), other.trusted()),
+        )
+
+        relay.wait_for(
+            lambda: set(relay.snapshots[-1]["sealed"]) == {phone.device_id, OTHER_ID}
+        )
+        relay.queue_command(make_command(linked, tablet, cid=cmd_id(93), seq=1))
+        relay.wait_for(lambda: 1 in relay.acks)
+        assert host.calls == []
+        run.finish(relay)
+
+    def test_an_unlink_between_the_read_and_the_save_is_not_undone(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        # Forgetting a revoked device rewrites link.json from what was read.
+        # `magent unlink` deleting the file in between must not see it
+        # brought back by that save.
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, relay.url, (phone, tablet), host_token=relay.host_token
+        )
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: relay.open_streams == 1)
+        real_load = link.linkfiles.load_link
+        armed = [True]
+
+        def read_then_unlinked(path=None):
+            result = real_load(path)
+            if threading.current_thread() is run.thread and armed[0]:
+                armed[0] = False
+                linkfiles.delete_link(linked.link_path, linked.state_path)
+            return result
+
+        monkeypatch.setattr(link.linkfiles, "load_link", read_then_unlinked)
+        relay.set_devices(
+            [phone.wire(), tablet.wire(revoked_at="2026-10-08T13:00:00.000Z")]
+        )
+
+        assert run.wait_done() == "unlinked"
+        assert armed == [False]
+        assert not linked.link_path.exists()
+
+    def test_a_link_json_read_that_fails_once_is_retried(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        # On Windows a read during another writer's atomic swap fails for a
+        # moment; the revocation must still reach link.json.
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, relay.url, (phone, tablet), host_token=relay.host_token
+        )
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: relay.snapshots)
+        real_load = link.linkfiles.load_link
+        fails = [1]
+
+        def flaky_load(path=None):
+            # Only the runner's reads fail: the test's own reads stay out of it.
+            if threading.current_thread() is run.thread and fails[0] > 0:
+                fails[0] -= 1
+                raise linkfiles.LinkFileError("DECOY sharing violation")
+            return real_load(path)
+
+        monkeypatch.setattr(link.linkfiles, "load_link", flaky_load)
+        relay.set_devices(
+            [phone.wire(), tablet.wire(revoked_at="2026-10-08T13:00:00.000Z")]
+        )
+        relay.wait_for(lambda: linked.device_ids() == [phone.device_id])
+        assert fails == [0]
+        run.finish(relay)
+
+    def test_a_revocation_save_that_fails_once_is_retried(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, relay.url, (phone, tablet), host_token=relay.host_token
+        )
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: relay.snapshots)
+        real_save = link.linkfiles.save_link
+        fails = [1]
+
+        def flaky_save(link_file, path=None):
+            if threading.current_thread() is run.thread and fails[0] > 0:
+                fails[0] -= 1
+                raise PermissionError(13, "DECOY sharing violation")
+            real_save(link_file, path)
+
+        monkeypatch.setattr(link.linkfiles, "save_link", flaky_save)
+        relay.set_devices(
+            [phone.wire(), tablet.wire(revoked_at="2026-10-08T13:00:00.000Z")]
+        )
+        relay.wait_for(lambda: linked.device_ids() == [phone.device_id])
+        assert fails == [0]
+        run.finish(relay)
+
+    def test_a_revocation_applies_even_when_link_json_cannot_be_read(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, relay.url, (phone, tablet), host_token=relay.host_token
+        )
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.snapshots)
+
+        def unreadable(path=None):
+            raise linkfiles.LinkFileError("DECOY unreadable")
+
+        monkeypatch.setattr(link, "SAVE_RETRY_S", 0.0)
+        monkeypatch.setattr(link.linkfiles, "load_link", unreadable)
+        relay.set_devices(
+            [phone.wire(), tablet.wire(revoked_at="2026-10-08T13:00:00.000Z")]
+        )
+
+        relay.wait_for(lambda: set(relay.snapshots[-1]["sealed"]) == {phone.device_id})
+        relay.queue_command(make_command(linked, tablet, cid=cmd_id(19), seq=1))
+        relay.wait_for(lambda: 1 in relay.acks)
+        assert host.calls == []
+        assert relay.results == []
+        run.finish(relay)
+
+    def test_a_device_with_unusable_keys_is_skipped_not_fatal(
+        self, tmp_path, relay, phone, caplog
+    ):
+        # A link.json written before pairing refused weak keys: an all-zero
+        # kexPub gives a zero shared secret, which pair_keys refuses.
+        bad = new_device(TABLET_ID, "Weak DECOY")
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        weak = bad.trusted()
+        weak = linkfiles.TrustedDevice(
+            device_id=weak.device_id,
+            name=weak.name,
+            kex_pub=linkcrypto.b64u_encode(bytes(32)),
+            sign_pub=weak.sign_pub,
+            paired_at=weak.paired_at,
+        )
+        save_linked(
+            linked, host_token=relay.host_token, devices=(phone.trusted(), weak)
+        )
+        host = FakeHost()
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(host, linked)
+            relay.wait_for(lambda: relay.snapshots)
+            relay.queue_command(make_command(linked, phone, cid=cmd_id(17), seq=1))
+            relay.wait_for(lambda: relay.results)
+            run.finish(relay)
+        assert set(relay.snapshots[0]["sealed"]) == {phone.device_id}
+        assert len(host.calls) == 1
+        assert any(TABLET_ID in r.getMessage() for r in caplog.records)
+
+
+class TestStops:
+    def test_a_revoked_frame_stops_the_runner(self, tmp_path, relay, phone):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: relay.snapshots)
+        relay.revoke()
+        assert run.wait_done() == "revoked"
+        assert linked.state().state == "revoked"
+
+    def test_a_401_on_connect_stops_the_runner(self, tmp_path, relay, phone):
+        relay.revoke()
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        assert run.wait_done() == "revoked"
+        assert linked.state().state == "revoked"
+
+    def test_a_426_stops_with_one_upgrade_hint(self, tmp_path, relay, phone, caplog):
+        relay.set_protocol_too_old()
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(FakeHost(), linked)
+            assert run.wait_done() == "too_old"
+        assert [r.getMessage() for r in caplog.records].count(UPGRADE_HINT) == 1
+        assert linked.state().state == "too_old"
+        assert len(relay.requests) == 1  # stopped at once, no retry loop
+
+
+class TestUnlinkWhileRunning:
+    """`magent unlink` deletes link.json even when the relay could not be
+    told. The running link must not outlive it: its token, keys and trusted
+    devices go from memory, its stream is closed, and nothing a device sends
+    after that runs, whether the run notices on a quiet stream, on the next
+    command or on the next reconnect."""
+
+    def test_a_quiet_stream_is_closed_once_link_json_is_gone(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: relay.open_streams == 1)  # online, stream held
+        before = len(relay.snapshots)
+
+        linkfiles.delete_link(linked.link_path, linked.state_path)
+
+        assert run.wait_done() == "unlinked"  # well inside the 60 s read timeout
+        relay.wait_for(lambda: relay.open_streams == 0)
+        assert run.runner.peer(phone.device_id) is None
+        assert run.runner.host_id == ""  # the link, token and keys with it
+        assert len(relay.snapshots) == before
+        assert not linked.state_path.exists()  # not written back by the run
+        # MAGENT_LINK=1 in process only (conftest pins 0 for every tier).
+        monkeypatch.setenv("MAGENT_LINK", "1")
+        monkeypatch.setattr(env, "_cached_env", None)
+        status = link.describe_link(
+            serving=lambda: True,
+            link_path=linked.link_path,
+            state_path=linked.state_path,
+        )
+        assert status.state == "unlinked"
+
+    def test_a_command_after_the_unlink_is_never_run(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        # The quiet-stream check is pushed out of reach: the command itself
+        # must find link.json gone before it is verified and run.
+        monkeypatch.setattr(link, "LINK_CHECK_S", 3600.0)
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.wait_for(lambda: relay.open_streams == 1)
+
+        linkfiles.delete_link(linked.link_path, linked.state_path)
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(90), seq=1))
+
+        assert run.wait_done() == "unlinked"
+        assert host.calls == []
+        assert relay.results == []
+        assert 1 not in relay.acks  # not even acknowledged under the old token
+        assert not linked.state_path.exists()
+
+    def test_a_reconnect_after_the_unlink_ends_the_run(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        monkeypatch.setattr(link, "LINK_CHECK_S", 3600.0)
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: relay.open_streams == 1)
+        before = len(relay.snapshots)
+
+        linkfiles.delete_link(linked.link_path, linked.state_path)
+        relay.drop_streams()
+
+        assert run.wait_done() == "unlinked"
+        assert len(relay.snapshots) == before  # no snapshot under the old token
+        assert stream_opens(relay) == 1
+
+    def test_an_unlink_during_the_connect_sends_nothing_under_the_old_token(
+        self, tmp_path, relay, phone
+    ):
+        # The end lands after the connect's look at link.json and before the
+        # state goes online (here: while the snapshot is being read). Nothing
+        # may then reach the relay under the abandoned token: no snapshot,
+        # no event batch, and the state must not come back online.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        holder: list[link.LinkRunner] = []
+        ready = threading.Event()
+
+        class _EndsMidConnect(FakeHost):
+            def snapshot(self):
+                ready.wait(5)
+                linkfiles.delete_link(linked.link_path, linked.state_path)
+                holder[0]._end_run("unlinked")  # as the forwarder's look would
+                return super().snapshot()
+
+        host = _EndsMidConnect()
+        host.feed.push({"id": "e0e0e0e0:1", "type": "session.state", "ts": 1.0})
+        run = Running(host, linked)
+        holder.append(run.runner)
+        ready.set()
+
+        assert run.wait_done() == "unlinked"
+        assert relay.snapshots == []
+        assert not any(path == "/v1/host/events" for _m, path, _h in relay.requests)
+        assert not run.runner.online()
+        assert not linked.state_path.exists()
+
+
+class TestStateBelongsToItsPairing:
+    """link-state.json's cursor and seen ring are one pairing's: a runner on
+    a new pairing (a relinked restart) starts fresh, or the new host's stream
+    would open past its first commands, and the seen ring would hold the old
+    host's ids."""
+
+    def _old_state(self, tmp_path, host_id: str | None) -> None:
+        linkfiles.save_state(
+            linkfiles.LinkState(
+                cursor=7, seen_ids=(cmd_id(1),), state="online", host_id=host_id
+            ),
+            tmp_path / "link-state.json",
+        )
+
+    def _loaded(self, tmp_path, phone) -> link.LinkRunner:
+        linked = write_link(
+            tmp_path, "http://127.0.0.1:9", (phone,), host_token="mlh_DECOY_new"
+        )
+        runner = link.LinkRunner(
+            FakeHost(), link_path=linked.link_path, state_path=linked.state_path
+        )
+        loaded = linked.link()
+        assert loaded is not None
+        runner._load(loaded)
+        return runner
+
+    def test_a_relinked_runner_starts_from_the_new_hosts_cursor(
+        self, tmp_path, phone, caplog
+    ):
+        self._old_state(tmp_path, "hst_DECOY_old")
+        with caplog.at_level("INFO", logger="magent.link"):
+            runner = self._loaded(tmp_path, phone)
+        assert runner._cursor == 0
+        assert not runner.has_seen(cmd_id(1))
+        assert any("another pairing" in r.getMessage() for r in caplog.records)
+
+    def test_the_same_pairing_keeps_its_cursor(self, tmp_path, phone):
+        self._old_state(tmp_path, HOST_ID)
+        runner = self._loaded(tmp_path, phone)
+        assert runner._cursor == 7
+        assert runner.has_seen(cmd_id(1))
+
+    def test_a_state_from_before_the_field_is_kept(self, tmp_path, phone):
+        self._old_state(tmp_path, None)
+        runner = self._loaded(tmp_path, phone)
+        assert runner._cursor == 7
+
+    def test_the_saved_state_names_its_pairing(self, tmp_path, relay, phone):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(run.runner.online)
+        run.finish(relay)
+        assert linked.state().host_id == HOST_ID
+
+
+def _spy_states(monkeypatch) -> list[tuple[str, float | None]]:
+    states: list[tuple[str, float | None]] = []
+    real_save = link.linkfiles.save_state
+
+    def spy(state, path=None):
+        states.append((state.state, state.retry_at))
+        real_save(state, path)
+
+    monkeypatch.setattr(link.linkfiles, "save_state", spy)
+    return states
+
+
+class TestBackoff:
+    def test_offline_carries_a_retry_time(self, monkeypatch, tmp_path, relay, phone):
+        relay.fail_next_connects(1)
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        states = _spy_states(monkeypatch)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: len(_paths(relay, "/v1/stream/host")) >= 2)
+        run.finish(relay)
+        offline = [retry for state, retry in states if state == "offline"]
+        assert offline
+        assert all(retry is not None for retry in offline)
+        # A 503 is transient: the first wait is a jittered second, at most.
+        assert run.sleeps[0] <= 1.0
+
+    def test_a_stream_refusal_honours_its_retry_after(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        relay.fail_next_connects(1, 429, retry_after=7)
+        now = [2_000.0]
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        states = _spy_states(monkeypatch)
+        run = Running(FakeHost(), linked, clock=lambda: now[0])
+        relay.wait_for(lambda: len(_paths(relay, "/v1/stream/host")) >= 2)
+        run.finish(relay)
+        assert run.sleeps[0] == 7.0
+        assert ("offline", 2_007.0) in states
+
+    def test_a_permanent_refusal_waits_the_long_retry(self, tmp_path, relay, phone):
+        relay.fail_next_connects(1, 404)
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: len(_paths(relay, "/v1/stream/host")) >= 2)
+        run.finish(relay)
+        assert run.sleeps[0] == link.PERMANENT_RETRY_S
+
+    def test_a_connection_that_lasted_a_minute_resets_the_backoff(
+        self, monkeypatch, tmp_path, relay, phone
+    ):
+        resets: list[int] = []
+
+        class Recording(link.Backoff):
+            def reset(self) -> None:
+                resets.append(1)
+                super().reset()
+
+        monkeypatch.setattr(link, "Backoff", Recording)
+        now = [1_000.0]
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked, clock=lambda: now[0])
+        relay.wait_for(lambda: _paths(relay, "/v1/stream/host"))
+        relay.drop_streams()
+        relay.wait_for(lambda: len(_paths(relay, "/v1/stream/host")) >= 2)
+        assert resets == []
+        now[0] += 61
+
+        relay.wait_for(lambda: (relay.drop_streams() or True) and resets)
+        run.finish(relay)
+
+    def test_three_failed_connects_switch_to_long_polling(self, tmp_path, phone):
+        timeouts: list[tuple[str, str, float | None]] = []
+        with FakeRelay(long_poll_s=1.0) as relay:
+            relay.fail_next_connects(3)
+            linked = write_link(
+                tmp_path, relay.url, (phone,), host_token=relay.host_token
+            )
+            host = FakeHost()
+            run = Running(host, linked, client_factory=_scripted([0], None, timeouts))
+            relay.wait_for(
+                lambda: _paths(relay, "/v1/host/commands?since=0&wait=25"), timeout=15
+            )
+            relay.queue_command(make_command(linked, phone, cid=cmd_id(18), seq=2))
+
+            relay.wait_for(lambda: relay.results, timeout=15)
+            assert len(host.calls) == 1
+            assert len(_paths(relay, "/v1/stream/host")) == 3
+            run.finish(relay)
+        polls = [t for m, p, t in timeouts if p == "/v1/host/commands"]
+        assert polls
+        assert set(polls) == {link.LONG_POLL_TIMEOUT_S}
+
+    def test_long_polling_applies_revocations_too(self, tmp_path, phone):
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        with FakeRelay(long_poll_s=0.2) as relay:
+            relay.fail_next_connects(3)
+            linked = write_link(
+                tmp_path, relay.url, (phone, tablet), host_token=relay.host_token
+            )
+            run = Running(FakeHost(), linked)
+            relay.wait_for(lambda: _paths(relay, "/v1/host/commands"), timeout=15)
+            relay.set_devices(
+                [phone.wire(), tablet.wire(revoked_at="2026-10-08T13:00:00.000Z")]
+            )
+            relay.wait_for(lambda: linked.device_ids() == [phone.device_id], timeout=15)
+            run.finish(relay)
+
+    def test_after_thirty_minutes_of_polling_the_stream_is_tried_again(
+        self, tmp_path, phone
+    ):
+        with FakeRelay(long_poll_s=0.2) as relay:
+            relay.fail_next_connects(3)
+            now = [5_000.0]
+            linked = write_link(
+                tmp_path, relay.url, (phone,), host_token=relay.host_token
+            )
+            run = Running(FakeHost(), linked, clock=lambda: now[0])
+            relay.wait_for(lambda: _paths(relay, "/v1/host/commands"))
+            assert len(_paths(relay, "/v1/stream/host")) == 3
+
+            now[0] += link.LONG_POLL_FOR_S + 1
+
+            relay.wait_for(lambda: len(_paths(relay, "/v1/stream/host")) == 4)
+            run.finish(relay)
+
+    def test_mid_stream_drops_never_switch_to_long_polling(
+        self, tmp_path, relay, phone
+    ):
+        # Each connection delivers frames, then is lost (its result post
+        # fails): that is not a failed connect, however often it happens.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        fails = [3]
+        host = FakeHost()
+        run = Running(host, linked, client_factory=_scripted(fails))
+        relay.queue_command(make_command(linked, phone, cid=cmd_id(40), seq=1))
+        relay.wait_for(lambda: relay.results)
+        assert fails == [0]
+        assert len(_paths(relay, "/v1/stream/host")) >= 4
+        assert _paths(relay, "/v1/host/commands") == []
+        run.finish(relay)
+
+    @pytest.mark.parametrize("unackable", [False, True], ids=["empty", "unackable"])
+    def test_a_poll_that_moves_nothing_waits_out_the_floor(
+        self, monkeypatch, tmp_path, phone, unackable
+    ):
+        # The relay answers at once (long_poll_s=0): a round that came back
+        # empty, or with nothing the runner could ack, waits out the rest of
+        # POLL_MIN_INTERVAL_S instead of polling again in a tight loop.
+        monkeypatch.setattr(link, "POLL_MIN_INTERVAL_S", 1234.0)
+        with FakeRelay() as relay:
+            relay.fail_next_connects(3)
+            linked = write_link(
+                tmp_path, relay.url, (phone,), host_token=relay.host_token
+            )
+            if unackable:
+                # The relay returns it on every poll; the runner cannot ack
+                # a seq that is not an int, so it never moves the cursor.
+                bad = make_command(linked, phone, cid=cmd_id(41), seq=1)
+                _queue_raw(relay, {**bad, "seq": "1"})
+            run = Running(FakeHost(), linked)
+            relay.wait_for(lambda: len(_paths(relay, "/v1/host/commands")) >= 2)
+            run.finish(relay)
+        floors = [s for s in run.sleeps if 1233.0 < s <= 1234.0]
+        assert len(floors) >= 1
+
+    def test_a_poll_that_moved_the_cursor_is_not_floored(
+        self, monkeypatch, tmp_path, phone
+    ):
+        # The other half of the floor: a round that answered a command moved
+        # the cursor, so the next poll goes out at once. The round after it
+        # comes back empty and is floored, which proves the patch took.
+        monkeypatch.setattr(link, "POLL_MIN_INTERVAL_S", 1234.0)
+        polls: list[int] = []  # len(run.sleeps) as each poll went out
+
+        class Marking(RelayClient):
+            def call(self, method, path, body=None, **kwargs):
+                if path.startswith("/v1/host/commands"):
+                    polls.append(len(self._sleep.__self__.sleeps))
+                return super().call(method, path, body, **kwargs)
+
+        def factory(url, token, *, sleep):
+            return Marking(url, token=token, sleep=sleep)
+
+        with FakeRelay() as relay:
+            relay.fail_next_connects(3)
+            linked = write_link(
+                tmp_path, relay.url, (phone,), host_token=relay.host_token
+            )
+            relay.queue_command(make_command(linked, phone, cid=cmd_id(42), seq=1))
+            run = Running(FakeHost(), linked, client_factory=factory)
+            relay.wait_for(lambda: relay.results and len(polls) >= 3, timeout=15)
+            run.finish(relay)
+
+        def floored(first: int, last: int) -> bool:
+            return any(1233.0 < s <= 1234.0 for s in run.sleeps[first:last])
+
+        assert not floored(polls[0], polls[1])  # the productive round
+        assert floored(polls[1], polls[2])  # the empty one after it
+
+    def test_a_huge_retry_after_is_capped(self, tmp_path, relay, phone):
+        relay.fail_next_connects(1, 429, retry_after=99999)
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        run = Running(FakeHost(), linked)
+        relay.wait_for(lambda: len(_paths(relay, "/v1/stream/host")) >= 2)
+        run.finish(relay)
+        assert run.sleeps[0] == link.RETRY_AFTER_MAX_S
+
+
+class TestResilience:
+    def test_without_cryptography_the_thread_idles(
+        self, monkeypatch, tmp_path, relay, phone, caplog
+    ):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+
+        def missing():
+            raise linkcrypto.LinkCryptoUnavailable("DECOY no cryptography")
+
+        monkeypatch.setattr(linkcrypto, "_require", missing)
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(FakeHost(), linked)
+            time.sleep(0.5)
+            assert run.thread.is_alive()
+            assert run.finish(relay) == "stopped"
+        hints = [r for r in caplog.records if linkcrypto.INSTALL_HINT in r.getMessage()]
+        assert len(hints) == 1
+        assert relay.requests == []
+
+    def test_a_failing_link_host_backs_off_and_retries(self, tmp_path, relay, phone):
+        # A LinkHost failure outside handle() (the snapshot here) is retried
+        # like a dropped connection; it neither ends the thread nor counts
+        # toward the long-poll switch.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        fails = [3]
+
+        class Flaky(FakeHost):
+            def snapshot(self):
+                if fails[0] > 0:
+                    fails[0] -= 1
+                    raise RuntimeError("DECOY snapshot crash")
+                return super().snapshot()
+
+        run = Running(Flaky(), linked)
+        relay.wait_for(lambda: relay.snapshots)
+        relay.wait_for(lambda: _paths(relay, "/v1/stream/host"))
+        assert run.thread.is_alive()
+        assert fails == [0]
+        assert _paths(relay, "/v1/host/commands") == []
+        assert run.finish(relay) == "stopped"
+
+
+class TestLogBudget:
+    def test_a_repeat_is_held_back_and_counted(self, caplog):
+        now = [0.0]
+        budget = link._LogBudget(link.get_logger("link"), clock=lambda: now[0])
+        with caplog.at_level("INFO", logger="magent.link"):
+            budget.log(logging.WARNING, "a", "link: x %s", 1)
+            budget.log(logging.WARNING, "a", "link: x %s", 2)
+            budget.log(logging.WARNING, "a", "link: x %s", 3)
+            budget.log(logging.INFO, "b", "link: y")  # each kind has its own
+            now[0] = link.LOG_QUIET_S - 0.001
+            budget.log(logging.WARNING, "a", "link: x %s", 4)
+            now[0] = link.LOG_QUIET_S
+            budget.log(logging.WARNING, "a", "link: x %s", 5)
+            budget.log(logging.WARNING, "a", "link: x %s", 6)
+            now[0] = 2 * link.LOG_QUIET_S
+            budget.log(logging.WARNING, "a", "link: x %s", 7)
+        assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+            (logging.WARNING, "link: x 1"),
+            (logging.INFO, "link: y"),
+            (logging.WARNING, "link: x 5 (3 more like it since the last one)"),
+            (logging.WARNING, "link: x 7 (1 more like it since the last one)"),
+        ]
+
+    def test_frames_that_are_not_json_are_logged_once_a_minute(self, tmp_path, caplog):
+        runner = link.LinkRunner(
+            FakeHost(),
+            link_path=tmp_path / "link.json",
+            state_path=tmp_path / "link-state.json",
+        )
+        name = "command" + "x" * 100  # the relay picks the name
+        with caplog.at_level("WARNING", logger="magent.link"):
+            for _ in range(3):
+                runner._on_frame(None, link.SseEvent(name, "not json DECOY", None))
+        junk = [r.getMessage() for r in caplog.records if "not JSON" in r.getMessage()]
+        assert junk == [
+            f"link: ignoring a {name[: link.FRAME_NAME_MAX]} frame that is not JSON"
+        ]
+
+    def test_refusals_are_logged_once_a_minute(self, tmp_path, relay, phone, caplog):
+        # A relay replaying junk gets every command answered, but link.log a
+        # line a minute, which says how many it held back.
+        stranger = new_device(STRANGER_ID, "Stranger DECOY")
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        host = FakeHost()
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(host, linked)
+            for n in (1, 2, 3):
+                relay.queue_command(
+                    make_command(linked, phone, cid=cmd_id(n), seq=n, signer=stranger)
+                )
+            relay.wait_for(lambda: len(relay.results) == 3)
+            run.runner._quiet._clock = lambda: time.monotonic() + link.LOG_QUIET_S
+            relay.queue_command(
+                make_command(linked, phone, cid=cmd_id(4), seq=4, signer=stranger)
+            )
+            relay.wait_for(lambda: len(relay.results) == 4)
+            run.finish(relay)
+        refused = [
+            r.getMessage()
+            for r in caplog.records
+            if "refused command" in r.getMessage()
+        ]
+        assert refused == [
+            f"link: refused command {cmd_id(1)}: bad_signature",
+            (
+                f"link: refused command {cmd_id(4)}: bad_signature"
+                " (2 more like it since the last one)"
+            ),
+        ]
+        assert host.calls == []
+
+    def test_a_failing_link_host_logs_one_traceback_per_streak(
+        self, tmp_path, relay, phone, caplog
+    ):
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        fails = [3]
+
+        class Flaky(FakeHost):
+            def snapshot(self):
+                if fails[0] > 0:
+                    fails[0] -= 1
+                    raise RuntimeError("DECOY snapshot crash")
+                return super().snapshot()
+
+        def failures():
+            return [
+                bool(r.exc_info)
+                for r in caplog.records
+                if "the daemon side of the link failed" in r.getMessage()
+            ]
+
+        with caplog.at_level("WARNING", logger="magent.link"):
+            run = Running(Flaky(), linked)
+            relay.wait_for(lambda: relay.snapshots)
+            assert failures() == [True, False, False]
+            # Connected in between: the next failure starts a new streak.
+            fails[0] = 1
+            relay.wait_for(
+                lambda: (relay.drop_streams() or True) and len(relay.snapshots) >= 2
+            )
+            run.finish(relay)
+        assert failures() == [True, False, False, True]
+        again = [r for r in caplog.records if "failed again" in r.getMessage()]
+        assert again[0].getMessage().endswith("(RuntimeError)")
