@@ -382,7 +382,7 @@ def _emit_sessions_v1(config_path: str | None) -> None:
 
 
 def _node_session_targets(
-    config_path: str | None,
+    config_path: str | None, *, as_json: bool = False
 ) -> list[tuple[dict[str, object], Node | None]]:
     """Each node project's ``sessions --json`` row (``model``/``effort`` None)
     with the Node its session runs on -- None when it is placed nowhere or
@@ -392,7 +392,10 @@ def _node_session_targets(
 
     The typed config is loaded only when the raw file names a pool node, so
     every config without one keeps the raw loader's no-version-warning path;
-    a failed validation exits through ``_load_config_or_exit``."""
+    a failed validation exits through ``_load_config_or_exit`` -- or, with
+    ``as_json``, raises the ``unavailable`` ``WireError`` that ``control``
+    gives for the same config, for the ``--json`` shell to emit as its
+    envelope."""
     import json
 
     from magent import env, nodes  # heavy subsystem: in-body per policy
@@ -411,7 +414,16 @@ def _node_session_targets(
         for p in raw.get("projects", [])
     ):
         return []
-    cfg = _load_config_or_exit(config_file)
+    if as_json:
+        from magent.config import load_config
+        from magent.wire import WireError
+
+        try:
+            cfg = load_config(str(config_file))
+        except (ValueError, FileNotFoundError) as exc:
+            raise WireError("unavailable", f"config: {exc}") from exc
+    else:
+        cfg = _load_config_or_exit(config_file)
     # The state is nodes.session_rows' (the one answer `status` gives too);
     # the map is read again only for the folder, which status does not show.
     entries = nodes.read_node_map()

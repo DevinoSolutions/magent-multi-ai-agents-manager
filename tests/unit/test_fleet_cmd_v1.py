@@ -220,3 +220,40 @@ class TestJsonRefusals:
         result = runner.invoke(cli.main, ["--config", str(bad), "sessions", "--v1"])
         assert result.exit_code == 1
         assert json.loads(result.stdout)["error"]["code"] == "unavailable"
+
+
+class TestAConfigThatFailsValidation:
+    """Target resolution loads the typed config when a project names a pool
+    node; a config that then fails validation must still answer ``--json``
+    with ONE envelope on stdout -- the ``unavailable`` refusal the leaf gives
+    for the same config -- never empty stdout and a stderr line."""
+
+    @pytest.fixture
+    def bad_node_config(self, tmp_config, tmp_path, monkeypatch):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        return tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "api"), "title": "api", "node": "nope"}
+                ],
+                "settings": {
+                    "nodes": {"second": {"host": "box-second", "user": "demo"}}
+                },
+            }
+        )
+
+    @pytest.mark.parametrize("verb", [["peek", "api"], ["interrupt", "api"]])
+    def test_json_answers_the_error_envelope(self, runner, bad_node_config, verb):
+        result = runner.invoke(cli.main, ["--config", bad_node_config, *verb, "--json"])
+        assert result.exit_code == 3
+        body = json.loads(result.stdout)
+        assert body["ok"] is False
+        assert body["error"]["code"] == "unavailable"
+        assert body["error"]["message"].startswith("config: ")
+
+    def test_text_mode_keeps_its_stderr_error(self, runner, bad_node_config):
+        result = runner.invoke(cli.main, ["--config", bad_node_config, "peek", "api"])
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "Error:" in result.stderr
