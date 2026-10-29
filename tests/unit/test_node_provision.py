@@ -6994,6 +6994,30 @@ class TestSetupShUnderRealBash:
         assert self._row(r, "gh") == ("fail", "gh --version timed out after 4s")
         assert set(_report(r).keys()) == {"demo"}
 
+    def test_a_hung_gh_whose_child_outlives_the_kill_is_still_bounded(self, tmp_path):
+        # uutils' timeout (Ubuntu 26.04's coreutils) KILLs the tool but not its
+        # process group, so the hung gh's `sleep` -- TERM ignored, inherited --
+        # lives on holding whatever stdout it was given. `--foreground` gives
+        # any coreutils those same semantics, so this pins the bound on every
+        # runner image: the probe's read must not wait on that child.
+        state, env = _setup_box(tmp_path)
+        real = shutil.which("timeout")
+        assert real is not None
+        shim = tmp_path / "shims" / "timeout"
+        shim.write_text(
+            f'#!{BASH}\nexec {shlex.quote(real)} --foreground "$@"\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+        shim.chmod(0o755)
+        (state / "gh-hangs").touch()
+        started = time.monotonic()
+        r = _run_setup(env)
+        assert time.monotonic() - started < 25
+        assert r.returncode == 1
+        assert self._row(r, "gh") == ("fail", "gh --version timed out after 4s")
+        assert set(_report(r).keys()) == {"demo"}
+
     def test_a_hung_claude_is_its_own_fail_row_and_the_key_still_comes(self, tmp_path):
         state, env = _setup_box(tmp_path)
         _run_setup(env)
