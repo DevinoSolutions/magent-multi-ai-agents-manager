@@ -1817,7 +1817,9 @@ class LinkRunner:
 
     def put_snapshot(self, client: RelayClient) -> None:
         """PUT /v1/host/snapshot: routing metadata, plus the rows sealed per
-        device. Serialised, the read with its PUT: two threads put snapshots."""
+        device. Serialised, the read with its PUT: two threads put snapshots.
+        A run ended from link.json PUTs nothing (_Unlinked, _Relinked): the
+        token it would go under is abandoned."""
         with self._snapshot_lock:
             rows, daemon = self._host.snapshot()
             remote_control = self._host.remote_control() is True
@@ -1829,7 +1831,9 @@ class LinkRunner:
                 "remoteControl": remote_control,
                 "uploadMaxBytes": max(1, self._host.upload_max_bytes()),
             }
-            client.call("PUT", "/v1/host/snapshot", self._snapshot_body(rows, fixed))
+            body = self._snapshot_body(rows, fixed)
+            self._check_end()  # last, the reads above may have raced the end
+            client.call("PUT", "/v1/host/snapshot", body)
             with self._lock:
                 self._rc_put = remote_control
 
@@ -2006,6 +2010,10 @@ class LinkRunner:
         last_connected: float | None = None,
     ) -> None:
         with self._lock:
+            if self._end is not None:
+                # Ended from link.json: the state _end_run set stands, or a
+                # connect it raced would put the run back online.
+                return
             unchanged = state == self._state and retry_at == self._retry_at
             if unchanged and last_connected is None:
                 return
@@ -2306,6 +2314,8 @@ class EventForwarder:
     def _send_logged(self, batch: list[dict[str, object]]) -> None:
         try:
             self.send(batch)
+        except (_Unlinked, _Relinked):
+            return  # the run is ending: nothing goes under its token now
         except Exception:  # noqa: BLE001  # reason: a batch that cannot be sealed or re-snapshotted (a LinkHost failure) is dropped like a failed post; the forwarder goes on
             self._failed("link: dropped an event batch")
             self._dropped(failed=True)

@@ -1159,6 +1159,36 @@ class TestUnlinkWhileRunning:
         assert len(relay.snapshots) == before  # no snapshot under the old token
         assert stream_opens(relay) == 1
 
+    def test_an_unlink_during_the_connect_sends_nothing_under_the_old_token(
+        self, tmp_path, relay, phone
+    ):
+        # The end lands after the connect's look at link.json and before the
+        # state goes online (here: while the snapshot is being read). Nothing
+        # may then reach the relay under the abandoned token: no snapshot,
+        # no event batch, and the state must not come back online.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        holder: list[link.LinkRunner] = []
+        ready = threading.Event()
+
+        class _EndsMidConnect(FakeHost):
+            def snapshot(self):
+                ready.wait(5)
+                linkfiles.delete_link(linked.link_path, linked.state_path)
+                holder[0]._end_run("unlinked")  # as the forwarder's look would
+                return super().snapshot()
+
+        host = _EndsMidConnect()
+        host.feed.push({"id": "e0e0e0e0:1", "type": "session.state", "ts": 1.0})
+        run = Running(host, linked)
+        holder.append(run.runner)
+        ready.set()
+
+        assert run.wait_done() == "unlinked"
+        assert relay.snapshots == []
+        assert not any(path == "/v1/host/events" for _m, path, _h in relay.requests)
+        assert not run.runner.online()
+        assert not linked.state_path.exists()
+
 
 class TestStateBelongsToItsPairing:
     """link-state.json's cursor and seen ring are one pairing's: a runner on
