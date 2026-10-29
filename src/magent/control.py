@@ -51,9 +51,24 @@ _MODEL_RE = re.compile(r"^[A-Za-z0-9][\w.\-\[\]]*$")
 # layer must not add a second lock of its own around these verbs.
 _FLEET_LOCK = threading.Lock()
 
+# Keystrokes into one pane, one verb at a time. A send is two psmux calls
+# (the literal paste, then Enter); two overlapping sends to one session landed
+# as paste, paste, Enter, Enter and submitted ONE merged prompt while both
+# reported confirmed. Every verb that types into a pane holds its session's
+# lock for exactly its keystrokes -- never across a wait or a read-back -- so
+# different sessions still run in parallel. A threading.Lock does not reach a
+# second magent process; two CLI ``magent send``s at once can still interleave.
+_KEYS_LOCKS: dict[str, threading.Lock] = {}
+_KEYS_LOCKS_GUARD = threading.Lock()
+
 
 class ControlError(WireError):
     """A refused control action, carrying the wire error code."""
+
+
+def _keys_lock(session: str) -> threading.Lock:
+    with _KEYS_LOCKS_GUARD:
+        return _KEYS_LOCKS.setdefault(session, threading.Lock())
 
 
 @dataclass(frozen=True)
@@ -251,7 +266,9 @@ def send(
     timeout_s = _valid_timeout(timeout_s)
     binary = _writable(config_path, session)
     if compact:
-        if not fleet.paste_and_enter(session, "/compact", psmux_bin=binary):
+        with _keys_lock(session):
+            compacted = fleet.paste_and_enter(session, "/compact", psmux_bin=binary)
+        if not compacted:
             raise _send_failed(session, binary)
         idle = fleet.wait_for_idle(
             session,
@@ -277,7 +294,9 @@ def send(
             f"{session} did not go idle within {timeout_s:g}s",
             {"reason": "not_idle"},
         )
-    if not fleet.paste_and_enter(session, text, psmux_bin=binary):
+    with _keys_lock(session):
+        sent = fleet.paste_and_enter(session, text, psmux_bin=binary)
+    if not sent:
         raise _send_failed(session, binary)
     time.sleep(SEND_SETTLE_S)
     capture = psmux.read_pane(session, psmux=binary)
@@ -305,9 +324,11 @@ def choose(config_path: str | None, session: str, option: int) -> ChooseResult:
             f"{session} is not showing a dialog (pane is {before})",
             {"reason": "not_in_dialog", "pane_state": before},
         )
-    if not psmux.send_keys(
-        session, str(option), target=session, literal=True, psmux=binary
-    ):
+    with _keys_lock(session):
+        pressed = psmux.send_keys(
+            session, str(option), target=session, literal=True, psmux=binary
+        )
+    if not pressed:
         raise _send_failed(session, binary)
     time.sleep(REACT_S)
     after = _pane_state(session, binary, delivered=True)
@@ -318,7 +339,9 @@ def interrupt(config_path: str | None, session: str) -> InterruptResult:
     """Press Escape in the pane -- Claude Code's interrupt for a running
     turn -- and report the pane state a moment later."""
     binary = _writable(config_path, session)
-    if not psmux.send_key(session, "Escape", psmux=binary):
+    with _keys_lock(session):
+        pressed = psmux.send_key(session, "Escape", psmux=binary)
+    if not pressed:
         raise _send_failed(session, binary)
     time.sleep(REACT_S)
     return InterruptResult(
@@ -350,7 +373,9 @@ def set_model(
             f"{session} is not idle (pane is {state})",
             {"reason": "busy", "pane_state": state},
         )
-    if not fleet.switch_model(session, model, effort, psmux_bin=binary):
+    with _keys_lock(session):
+        switched = fleet.switch_model(session, model, effort, psmux_bin=binary)
+    if not switched:
         raise _send_failed(session, binary)
     time.sleep(MODEL_SETTLE_S)
     pane = psmux.capture_pane(session, psmux=binary)

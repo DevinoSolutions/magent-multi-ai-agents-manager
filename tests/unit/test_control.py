@@ -217,6 +217,46 @@ class TestSend:
         assert sends[1][-1] == "Enter"
         assert "-l" not in sends[1]
 
+    def test_two_sends_to_one_session_never_interleave(self, fleet, monkeypatch):
+        """Two overlapping sends (two API requests) must land as paste, Enter,
+        paste, Enter -- never paste, paste, Enter, Enter, which submits ONE
+        merged prompt while both report confirmed. After its paste, each
+        send waits (bounded) for the other to paste too: unserialised that
+        rendezvous meets and forces the interleave; serialised it times out,
+        because the other send cannot paste until this one's Enter is in."""
+        fake, cfg = fleet
+        real = psmux.send_keys
+        order: list[str] = []
+        guard = threading.Lock()
+        both_pasted = threading.Condition(guard)
+        pasted = [0]
+
+        def _recorded(session, keys, *, literal=False, **kw):
+            ok = real(session, keys, literal=literal, **kw)
+            with both_pasted:
+                order.append("paste" if literal else keys)
+                if literal:
+                    pasted[0] += 1
+                    both_pasted.notify_all()
+                    both_pasted.wait_for(lambda: pasted[0] >= 2, timeout=1.0)
+            return ok
+
+        monkeypatch.setattr(psmux, "send_keys", _recorded)
+        results: list[control.SendResult] = []
+        threads = [
+            threading.Thread(
+                target=lambda t=text: results.append(control.send(cfg, "caramel", t))
+            )
+            for text in ("first prompt here", "second prompt here")
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert len(results) == 2
+        assert order == ["paste", "Enter", "paste", "Enter"]
+        assert len(fake.send_key_calls()) == 4
+
     def test_a_prompt_still_on_the_input_line_is_not_confirmed(self, fleet):
         fake, cfg = fleet
         fake.set_pane(
