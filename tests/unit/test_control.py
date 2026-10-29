@@ -708,6 +708,26 @@ class TestStartStop:
             failed=[control.StartFailure("ghost", "not a configured session")],
         )
 
+    def test_a_session_that_cannot_be_launched_here_is_a_failure(
+        self, typed, tmp_path, monkeypatch
+    ):
+        # psmux_status names why an unprobeable project is down; bring_up
+        # skips exactly those, so dropping the reason answered a start with
+        # started, already_live and failed all empty.
+        _fake, cfg = typed
+        (tmp_path / "upup").rmdir()
+        called = []
+        monkeypatch.setattr(
+            launch, "bring_up_psmux_quiet", lambda *a, **k: called.append((a, k))
+        )
+        result = control.start(cfg, ["caramel", "upup"])
+        assert called == []
+        assert result == control.StartResult(
+            started=[],
+            already_live=["caramel"],
+            failed=[control.StartFailure("upup", "folder not found")],
+        )
+
     def test_start_needs_names_or_a_group(self, typed):
         _fake, cfg = typed
         with pytest.raises(control.ControlError) as err:

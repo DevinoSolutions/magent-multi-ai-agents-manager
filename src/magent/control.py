@@ -453,14 +453,16 @@ def start(
     no terminal, no tiling, nothing printed -- node outcomes come back as
     data. A session already live is reported, not touched. With both
     ``sessions`` and ``group``, a named session outside the group is a
-    failure of its own ("not in group")."""
+    failure of its own ("not in group"), and so is a local session this host
+    cannot launch at all (no psmux, folder not found, no agent command):
+    ``bring_up`` skips those, so ``psmux_status``'s reason is the answer."""
     from magent import launch  # in-body: launch is heavy
 
     if sessions is None and group is None:
         raise ControlError("invalid_request", "name sessions or a group")
     cfg = _typed(config_path)
     with _FLEET_LOCK:
-        up, _down, projects = psmux.psmux_status(cfg, group)
+        up, down, projects = psmux.psmux_status(cfg, group)
         local = [psmux.socket_id(p) for p in projects]
         remote = launch.node_session_ids(cfg, group)
         wanted = sessions if sessions is not None else [*local, *remote]
@@ -481,10 +483,15 @@ def start(
             for s in wanted
             if s not in known
         ]
+        blocked = {
+            psmux.socket_id(d): str(d["reason"]) for d in down if d.get("reason")
+        }
         already = [s for s in wanted if s in live]
         todo = [s for s in wanted if s in known and s not in live]
+        prelaunch = [StartFailure(s, blocked[s]) for s in todo if s in blocked]
+        todo = [s for s in todo if s not in blocked]
         if not todo:
-            return StartResult([], already, unknown)
+            return StartResult([], already, prelaunch + unknown)
         result = launch.bring_up_psmux_quiet(
             cfg, only=todo, group=group, config_path=config_path
         )
@@ -497,7 +504,7 @@ def start(
             for o in result.node_outcomes
             if not o.ok
         ]
-        return StartResult(result.created, already, failed + unknown)
+        return StartResult(result.created, already, failed + prelaunch + unknown)
 
 
 def stop(config_path: str | None, sessions: list[str]) -> StopResult:
