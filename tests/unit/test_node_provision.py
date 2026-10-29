@@ -7616,7 +7616,17 @@ class TestRegisterSshKey:
         assert row == ScriptLine("skip", "github-key", "already registered to demo")
 
 
-DOCTOR_TOOLS = ("bash", "awk", "dirname", "head", "wc", "timeout", "stat")
+DOCTOR_TOOLS = (
+    "bash",
+    "awk",
+    "dirname",
+    "head",
+    "wc",
+    "timeout",
+    "stat",
+    "mktemp",
+    "rm",
+)
 NODE_TOOLS = ("tmux", "git", "claude", "python3", "gh", "curl", "locale", "df")
 GIB_KB = 1024 * 1024
 DOCTOR_TOKEN = "sk-ant-oat01-DECOY-" + "cd34_-" * 16
@@ -7659,6 +7669,45 @@ HUNG_PROBES = {
     "gh-version": ("gh", "--version"),
 }
 HANG_S = 30.0
+
+# Each HUNG_PROBES key's row once its probe runs out of time: (key, item,
+# status, bound in seconds, detail).
+HUNG_ROWS = [
+    (
+        "tmux",
+        "sessions",
+        "warn",
+        4,
+        f"tmux server on socket {remote_mux.SOCKET} did not answer in 4s",
+    ),
+    (
+        "claude",
+        "claude-auth",
+        "warn",
+        8,
+        "claude auth status did not answer in 8s",
+    ),
+    (
+        "anthropic",
+        "claude-auth",
+        "warn",
+        12,
+        "the Anthropic API did not answer in 12s",
+    ),
+    ("cred", "github", "warn", 6, "git credential fill did not answer in 6s"),
+    (
+        "github-api",
+        "github",
+        "warn",
+        12,
+        "the GitHub API did not answer in 12s",
+    ),
+    ("df", "disk", "warn", 4, "df did not answer in 4s under ~/magent"),
+    ("tmux-version", "tmux", "fail", 4, "tmux -V timed out after 4s"),
+    ("git-version", "git", "fail", 4, "git --version timed out after 4s"),
+    # A hung read has a missing tool's status: gh only warns.
+    ("gh-version", "gh", "warn", 4, "gh --version timed out after 4s"),
+]
 
 
 def _df(avail_kb: int) -> str:
@@ -8074,45 +8123,7 @@ class TestDoctorShUnderRealBash:
             seen.add(key)
         assert seen == {None, *fed}
 
-    @pytest.mark.parametrize(
-        ("hang", "item", "status", "bound_s", "detail"),
-        [
-            (
-                "tmux",
-                "sessions",
-                "warn",
-                4,
-                f"tmux server on socket {remote_mux.SOCKET} did not answer in 4s",
-            ),
-            (
-                "claude",
-                "claude-auth",
-                "warn",
-                8,
-                "claude auth status did not answer in 8s",
-            ),
-            (
-                "anthropic",
-                "claude-auth",
-                "warn",
-                12,
-                "the Anthropic API did not answer in 12s",
-            ),
-            ("cred", "github", "warn", 6, "git credential fill did not answer in 6s"),
-            (
-                "github-api",
-                "github",
-                "warn",
-                12,
-                "the GitHub API did not answer in 12s",
-            ),
-            ("df", "disk", "warn", 4, "df did not answer in 4s under ~/magent"),
-            ("tmux-version", "tmux", "fail", 4, "tmux -V timed out after 4s"),
-            ("git-version", "git", "fail", 4, "git --version timed out after 4s"),
-            # A hung read has a missing tool's status: gh only warns.
-            ("gh-version", "gh", "warn", 4, "gh --version timed out after 4s"),
-        ],
-    )
+    @pytest.mark.parametrize(("hang", "item", "status", "bound_s", "detail"), HUNG_ROWS)
     def test_a_hung_probe_is_its_own_row_inside_the_budget(
         self, tmp_path, hang, item, status, bound_s, detail
     ):
@@ -8127,6 +8138,82 @@ class TestDoctorShUnderRealBash:
         assert _rows(r) == {**dict.fromkeys(DOCTOR_ITEMS, "ok"), item: status}
         (row,) = [ln for ln in _report(r).lines if ln.item == item]
         assert row.detail == detail
+
+    @pytest.mark.parametrize(("hang", "item", "status", "bound_s", "detail"), HUNG_ROWS)
+    def test_a_hung_probe_whose_child_outlives_the_kill_is_still_bounded(
+        self, tmp_path, hang, item, status, bound_s, detail
+    ):
+        # uutils' timeout (Ubuntu 26.04's coreutils) KILLs the probe but not
+        # its process group, so a hung probe's child -- TERM ignored,
+        # inherited -- lives on holding whatever stdout it was given.
+        # `--foreground` gives any coreutils those same semantics, so this
+        # pins the bound on every runner image: no probe's read may wait on
+        # that child.
+        fakes, env = _doctor_box(tmp_path)
+        name, match = HUNG_PROBES[hang]
+        real, sleep = shutil.which("timeout", path=env["PATH"]), shutil.which("sleep")
+        assert real
+        assert sleep
+        shims = tmp_path / "outliving"
+        shims.mkdir()
+        scripts = {
+            "timeout": f'exec {shlex.quote(real)} --foreground "$@"\n',
+            # The matching call hangs in a child; every other one answers.
+            name: (
+                f'case " $* " in *{shlex.quote(match)}*)\n'
+                f"  trap '' TERM\n  {shlex.quote(sleep)} {int(HANG_S)}\n  exit 0 ;;\n"
+                f'esac\nexec {shlex.quote(fakes[name].path)} "$@"\n'
+            ),
+        }
+        for tool, script in scripts.items():
+            (shims / tool).write_text(
+                f"#!{BASH}\n{script}", encoding="utf-8", newline="\n"
+            )
+            (shims / tool).chmod(0o755)
+        tmp = tmp_path / "tmp"
+        tmp.mkdir()
+        env |= {
+            "PATH": os.pathsep.join([str(shims), env["PATH"]]),
+            "TMPDIR": str(tmp),
+        }
+        start = time.monotonic()
+        r = _run_doctor(env)
+        elapsed = time.monotonic() - start
+        assert r.returncode == 0, r.stderr
+        assert elapsed < bound_s + 2 + 5  # the bound, the kill grace, slack
+        assert _rows(r) == {**dict.fromkeys(DOCTOR_ITEMS, "ok"), item: status}
+        (row,) = [ln for ln in _report(r).lines if ln.item == item]
+        assert row.detail == detail
+        # The capture the child still holds open went with the doctor.
+        assert list(tmp.iterdir()) == []
+
+    def test_its_probe_captures_leave_with_it(self, tmp_path):
+        # Probe output is read through files, not pipes. Those include git's
+        # github.com credential: nothing of them may outlive the doctor.
+        _, env = _doctor_box(tmp_path)
+        tmp = tmp_path / "tmp"
+        tmp.mkdir()
+        env["TMPDIR"] = str(tmp)
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert _rows(r) == dict.fromkeys(DOCTOR_ITEMS, "ok")
+        assert list(tmp.iterdir()) == []
+
+    def test_nowhere_to_capture_probes_is_one_row_and_no_probe(self, tmp_path):
+        # Without its private directory no probe could be bounded: one row
+        # naming why, rather than every probe read as its own wrong finding.
+        fakes, env = _doctor_box(tmp_path)
+        env["TMPDIR"] = str(tmp_path / "no-such-dir")
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert _report(r).lines == (
+            ScriptLine(
+                "fail",
+                "doctor",
+                "mktemp -d failed: nowhere to capture probe output -- check this node's temp directory",
+            ),
+        )
+        assert not [c for f in fakes.values() for c in f.calls()]
 
     def test_a_probe_deaf_to_term_is_killed_after_its_grace(self, tmp_path):
         # timeout's TERM is ignored, so only `-k`'s KILL ends it (rc 137):
