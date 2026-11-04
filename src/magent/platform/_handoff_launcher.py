@@ -27,6 +27,14 @@ is skipped, never fatal: the exit code is what the caller is waiting for. A
 command that cannot be started gets its reason appended to ``err.txt`` and
 ``rc.txt`` = 1, with no ``pid.txt``: the answer comes at once instead of after
 the start grace.
+
+One more job: the launcher puts ITSELF back at Normal CPU and I/O priority
+before it starts anything. A task registered without an explicit priority gets
+Task Scheduler's default of 7, which runs it BelowNormal and at Low I/O -- and
+a child inherits both, so a hand-off's psmux server, its pane shells and its
+agents all did (measured: a ``claude --continue`` reading a 424 MB transcript
+at 0.4 MB/s, 46 MB/s once the same process was set to Normal/2). The fleet is
+interactive work; it must not inherit a background task's class.
 """
 
 from __future__ import annotations
@@ -51,6 +59,43 @@ RC = "rc.txt"
 # 0.4s in all, well inside the poll's graces.
 _RECORD_TRIES = 5
 _RECORD_RETRY_S = 0.1
+
+
+# NORMAL_PRIORITY_CLASS, and the ProcessIoPriority information class with
+# IoPriorityNormal (0 = very low, 1 = low, 2 = normal; 3 = high needs a
+# privilege and is never asked for).
+_NORMAL_PRIORITY_CLASS = 0x00000020
+_PROCESS_IO_PRIORITY = 33
+_IO_PRIORITY_NORMAL = 2
+
+
+def normalize_priority() -> None:
+    """Make this process -- and so everything it starts -- Normal CPU and Normal
+    I/O priority. Raising Low to Normal needs no privilege. Best effort and
+    silent: a refusal leaves the inherited priority, which is slow, not wrong,
+    and must never cost the command it was about to run. No-op off Windows."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    with contextlib.suppress(OSError, AttributeError):
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        handle = kernel32.GetCurrentProcess()
+        kernel32.SetPriorityClass(handle, _NORMAL_PRIORITY_CLASS)
+        ntdll = ctypes.WinDLL("ntdll")
+        ntdll.NtSetInformationProcess.argtypes = [
+            wintypes.HANDLE,
+            wintypes.ULONG,
+            ctypes.c_void_p,
+            wintypes.ULONG,
+        ]
+        level = wintypes.ULONG(_IO_PRIORITY_NORMAL)
+        ntdll.NtSetInformationProcess(
+            handle, _PROCESS_IO_PRIORITY, ctypes.byref(level), ctypes.sizeof(level)
+        )
 
 
 def write_spec(work: Path, argv: list[str], cwd: str) -> None:
@@ -130,6 +175,7 @@ def spawn(
 def run(work: Path) -> int:
     """Run the command staged in ``work`` and record its pid and exit code.
     Returns the exit code recorded."""
+    normalize_priority()
     try:
         argv, cwd = read_spec(work)
         with (work / OUT).open("wb") as out, (work / ERR).open("wb") as err:

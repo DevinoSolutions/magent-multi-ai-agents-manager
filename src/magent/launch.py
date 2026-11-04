@@ -238,6 +238,38 @@ def report_bring_up_casualties(
         click.echo(f"  {style(note, dim=True)}")
 
 
+def session0_gate(plat: Platform) -> Literal["run", "handoff", "refuse"]:
+    """``session0_disposition`` for a command shell, with the refusal said aloud.
+
+    What every command that CREATES sessions asks before it does any work: the
+    answer is the policy's, and on "refuse" the reason has already been
+    printed (stderr), so the caller only has to choose how to stop -- exit 1,
+    or back to the menu it was called from. "handoff" is the caller's to carry
+    out with ``relay_handoff`` and ``handoff_argv``.
+    """
+    disposition = session0_disposition(plat)
+    if disposition == "refuse":
+        click.echo(f"  {style('x', fg='red')} {session0_refusal(plat)}", err=True)
+    return disposition
+
+
+def handoff_argv(config_path: str | None, *args: str) -> list[str]:
+    """The magent command line the desktop copy must run.
+
+    ``sys.executable -m magent``, not a bare ``magent``: the desktop copy must
+    be THIS install, not whatever a differently-ordered desktop PATH resolves --
+    and a console-script shim may not even be on a scheduled task's PATH. The
+    group-level ``--config`` goes first when the user gave one: ``find_config``
+    walks up from the working directory, so a hand-off that dropped it could
+    bring up a different config's projects than the one the user pointed at.
+    """
+    argv = [sys.executable, "-m", "magent"]
+    if config_path:
+        argv.extend(["--config", str(config_path)])
+    argv.extend(args)
+    return argv
+
+
 def relay_handoff(plat: Platform, argv: list[str], *, timeout_s: float) -> int:
     """Run ``argv`` on the desktop, relay its output verbatim, return its code.
 
