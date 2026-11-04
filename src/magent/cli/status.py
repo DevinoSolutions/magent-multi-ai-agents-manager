@@ -1274,9 +1274,13 @@ def _menu_status(config_file: Path) -> None:
 
 def _menu_up(config_file: Path) -> None:
     from magent.launch import (  # heavy subsystem: in-body per policy
+        SESSION0_UP_TIMEOUT_S,
         bring_up_psmux,
+        handoff_argv,
         psmux_status,
+        relay_handoff,
         report_bring_up_casualties,
+        session0_gate,
     )
 
     cfg = _load_config_or_exit(config_file)
@@ -1314,16 +1318,40 @@ def _menu_up(config_file: Path) -> None:
         )
         if choice in ("n", "no", "cancel", "q"):
             return
+        group_sel: str | None = None
         if choice in ("a", "all", "y", ""):
             only = [_as_str(d.get("session")) or _as_str(d.get("name")) for d in down]
         elif choice.isdigit() and 1 <= int(choice) <= len(pickable):
-            only = dn_buckets[pickable[int(choice) - 1]]
+            group_sel = pickable[int(choice) - 1]
+            only = dn_buckets[group_sel]
         else:
-            sel = next((g for g in pickable if g.lower() == choice), None)
-            if not sel:
+            group_sel = next((g for g in pickable if g.lower() == choice), None)
+            if not group_sel:
                 click.echo(f"  {style('?', fg='yellow')} cancelled.")
                 return
-            only = dn_buckets[sel]
+            only = dn_buckets[group_sel]
+        # The choice above is a group or "everything that is down", both of
+        # which `magent up` says natively -- so in Session 0 the menu hands THAT
+        # to the desktop (the hand-off `up` itself makes) instead of tripping
+        # the psmux choke point's refusal on every session.
+        from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+        plat = get_platform()
+        disposition = session0_gate(plat)
+        if disposition != "run":
+            if disposition == "handoff":
+                relay_handoff(
+                    plat,
+                    handoff_argv(
+                        str(config_file),
+                        "up",
+                        *(["-g", group_sel] if group_sel else []),
+                    ),
+                    timeout_s=SESSION0_UP_TIMEOUT_S,
+                )
+            click.echo()
+            click.pause(info=f"  {style('press any key to return', dim=True)}")
+            return
         created, failed = bring_up_psmux(cfg, only=only)
         click.echo(
             f"  {style('+', fg='green')} Brought up {style(str(len(created)), fg='green', bold=True)} "
@@ -1331,9 +1359,9 @@ def _menu_up(config_file: Path) -> None:
         )
         # The casualties `launch_verified` already logged, said out loud. This
         # menu used to report every attempted session as brought up, so a wave
-        # that half-failed looked identical to one that worked. The menu is a
-        # local, interactive surface and never hands off, so a Session-0
-        # refusal from the choke point is the one cause its note can name.
+        # that half-failed looked identical to one that worked. A Session-0 launch
+        # was handed off (or refused) above, so what reaches here ran on a
+        # desktop (or under `allow`) and the note names any other cause.
         report_bring_up_casualties(failed)
         if cfg.settings.upload_server:
             _maybe_start_upload_server(cfg.settings.upload_port, str(config_file))

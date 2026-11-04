@@ -2152,11 +2152,20 @@ Windows must never be able to stop an ordinary desktop launch.
 **One policy function, two enforcement altitudes.** `launch.session0_disposition`
 is the only place the question is answered (`run` / `handoff` / `refuse`,
 per `MAGENT_SESSION0_POLICY`). The COMMAND shells hand off: `up` and
-`serve --ensure`, the two things `magent attach` fires on a host. The CHOKE
+`serve --ensure`, the two things `magent attach` fires on a host, and the launch
+a person types by hand over ssh (`--go`, `-a`, `-g`, the menu, the menu's `u`).
+That last one is asked BEFORE the project checklist, so a refused launch never
+makes the user answer a prompt; the menu and checklist then run in the ssh
+terminal (they are only UI) and what is handed off is the concrete answer --
+`--go`/`--retile-all`/`-g`/`--all`/`--allow-dirty` plus a hidden, repeatable
+`--only NAME` carrying the checklist's selection, because the desktop copy's
+stdin is NUL and it shows neither. Tiling therefore only ever runs in the
+desktop copy. A `--dry-run` creates and moves nothing and is left to run in
+place. The CHOKE
 POINT -- `psmux.launch_verified`, which every session magent creates passes
 through -- only ever REFUSES, and that asymmetry is deliberate. Reaching the
-choke point in Session 0 means a path that did not hand off (`--go`, the menu's
-`u`, `revive`), and the honest outcome there is a loud failure naming the cause
+choke point in Session 0 means a path that did not hand off (`revive`, or a
+future caller that skipped `launch.session0_gate`), and the honest outcome there is a loud failure naming the cause
 rather than a subsystem quietly writing scheduled tasks. The three "N session(s)
 failed to come up" printers add `launch.session0_note()` so the casualty list
 never arrives without its reason -- last time a user read 40 failed names and

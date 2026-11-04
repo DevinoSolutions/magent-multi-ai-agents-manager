@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`magent`, `magent --go`, `-a` and `-g` now work over ssh on Windows.** They
+  fell through to the psmux choke point, which could only refuse ("refusing to
+  start psmux sessions from a non-interactive logon session ... would have
+  created: MASTER_CHAT", then "tiling: window not found"). The top-level launch
+  path now asks the same `session0_disposition` as `magent up`: `refuse` prints
+  the reason and exits 1, `handoff` re-runs the launch on the desktop (the menu
+  and project checklist still run in the ssh terminal; the concrete selection
+  travels as a hidden `--only`) and exits with its code. The menu's `u` hands
+  off as `magent up [-g GROUP]`; status and the other read-only actions are
+  untouched.
+- **Hand-off children no longer run at background priority.** A Task Scheduler
+  task defaults to priority 7 (BelowNormal CPU, Low I/O) and everything the
+  hand-off started inherited it: a `claude --continue` read a 424 MB transcript
+  at 0.4 MB/s and looked hung. The staged launcher now resets itself to Normal
+  CPU and I/O priority before starting the command.
 - **A phone or Alt+V listener hanging up mid-upload is no longer logged as a
   server crash.** A reset or aborted connection while reading the body or
   writing the reply is now one warning with the path and byte count, instead of

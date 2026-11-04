@@ -397,3 +397,101 @@ class TestItRunsAsALooseScript:
         ]
 
         assert touched == []
+
+
+class TestTheCommandRunsAtNormalPriority:
+    """A task registered without an explicit priority is Task Scheduler's
+    default 7: BelowNormal CPU and Low I/O, both inherited by every child. The
+    hand-off's psmux server, pane shells and agents all ran that way -- a
+    `claude --continue` read a 424 MB transcript at 0.4 MB/s and looked hung.
+    The launcher is the one process every hand-off passes through, so it puts
+    itself back at Normal before it starts the command."""
+
+    def test_priority_is_normalised_before_the_command_starts(
+        self, tmp_path, monkeypatch
+    ):
+        events: list[str] = []
+        real_spawn = launcher.spawn
+
+        monkeypatch.setattr(
+            launcher, "normalize_priority", lambda: events.append("normalize")
+        )
+
+        def spawn(*args, **kwargs):
+            events.append("spawn")
+            return real_spawn(*args, **kwargs)
+
+        monkeypatch.setattr(launcher, "spawn", spawn)
+        work = _stage(tmp_path / "w", [sys.executable, "-c", "pass"], tmp_path)
+
+        assert launcher.run(work) == 0
+
+        assert events == ["normalize", "spawn"]
+
+    def test_a_launcher_that_cannot_normalise_still_runs_the_command(
+        self, tmp_path, monkeypatch
+    ):
+        # Slow is better than not at all: the best-effort call swallows its own
+        # failures, so a refusal can never cost the command it precedes.
+        if sys.platform == "win32":
+            import ctypes
+
+            def refuse(*_a, **_k):
+                raise OSError("denied")
+
+            monkeypatch.setattr(ctypes, "WinDLL", refuse)
+        work = _stage(
+            tmp_path / "w", [sys.executable, "-c", "raise SystemExit(3)"], tmp_path
+        )
+
+        assert launcher.run(work) == 3
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows priority classes")
+    def test_a_background_priority_launcher_starts_a_normal_priority_command(
+        self, tmp_path
+    ):
+        # The real thing, on real processes: a launcher started the way Task
+        # Scheduler starts a default-priority task (BelowNormal CPU, Low I/O)
+        # must hand its child Normal CPU (0x20) and Normal I/O (2).
+        work = tmp_path / "w"
+        report = (
+            "import ctypes\n"
+            "from ctypes import wintypes\n"
+            "k = ctypes.WinDLL('kernel32')\n"
+            "k.GetCurrentProcess.restype = wintypes.HANDLE\n"
+            "k.GetPriorityClass.argtypes = [wintypes.HANDLE]\n"
+            "h = k.GetCurrentProcess()\n"
+            "io = wintypes.ULONG(99)\n"
+            "n = ctypes.WinDLL('ntdll')\n"
+            "n.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, wintypes.ULONG,"
+            " ctypes.c_void_p, wintypes.ULONG, ctypes.c_void_p]\n"
+            "n.NtQueryInformationProcess(h, 33, ctypes.byref(io), 4, None)\n"
+            "print(hex(k.GetPriorityClass(h)), io.value)\n"
+        )
+        _stage(work, [sys.executable, "-c", report], tmp_path)
+        (work / launcher.LAUNCHER).write_bytes(Path(launcher.__file__).read_bytes())
+        # Lower this process like a priority-7 task would (CPU and I/O), then
+        # run the staged launcher exactly as run.ps1 does.
+        lower = (
+            "import ctypes, runpy, sys\n"
+            "from ctypes import wintypes\n"
+            "k = ctypes.WinDLL('kernel32')\n"
+            "k.GetCurrentProcess.restype = wintypes.HANDLE\n"
+            "k.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]\n"
+            "h = k.GetCurrentProcess()\n"
+            "k.SetPriorityClass(h, 0x4000)\n"
+            "n = ctypes.WinDLL('ntdll')\n"
+            "n.NtSetInformationProcess.argtypes = [wintypes.HANDLE, wintypes.ULONG,"
+            " ctypes.c_void_p, wintypes.ULONG]\n"
+            "n.NtSetInformationProcess(h, 33, ctypes.byref(wintypes.ULONG(1)), 4)\n"
+            "runpy.run_path(sys.argv[1], run_name='__main__')\n"
+        )
+        done = subprocess.run(
+            [sys.executable, "-I", "-c", lower, str(work / launcher.LAUNCHER)],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+
+        assert done.returncode == 0, done.stderr
+        assert _text(work / launcher.OUT).split() == ["0x20", "2"]
