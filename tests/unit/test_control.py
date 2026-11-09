@@ -775,7 +775,7 @@ class TestStartStop:
         )
 
     def test_start_and_stop_share_one_lock(self):
-        assert isinstance(control._FLEET_LOCK, type(threading.Lock()))
+        assert isinstance(control.FLEET_LOCK, type(threading.Lock()))
 
     def test_start_reports_live_sessions_and_brings_up_the_rest(
         self, typed, monkeypatch

@@ -48,8 +48,13 @@ _MODEL_RE = re.compile(r"^[A-Za-z0-9][\w.\-\[\]]*$")
 # overlapping calls (two API requests) would bring up or kill the same session
 # twice. One lock across both bodies is enough for P1, and it deliberately
 # serialises ``start`` against ``stop`` as well as against itself: the API
-# layer must not add a second lock of its own around these verbs.
-_FLEET_LOCK = threading.Lock()
+# layer must not add a second lock of its own around these verbs. Each loads
+# the config INSIDE the lock, because ``projects.remove(stop=True)`` holds it
+# too, from its first read through the config write: a start queued behind a
+# stop-and-remove must see the project gone, not a snapshot from before.
+# In-process only, like ``_KEYS_LOCKS``: a ``magent config remove`` or
+# ``magent up`` in another process is not serialised against these.
+FLEET_LOCK = threading.Lock()
 
 # Keystrokes into one pane, one verb at a time. A send is two psmux calls
 # (the literal paste, then Enter); two overlapping sends to one session landed
@@ -487,8 +492,8 @@ def start(
 
     if sessions is None and group is None:
         raise ControlError("invalid_request", "name sessions or a group")
-    cfg = _typed(config_path)
-    with _FLEET_LOCK:
+    with FLEET_LOCK:
+        cfg = _typed(config_path)
         up, down, projects = psmux.psmux_status(cfg, group)
         local = [psmux.socket_id(p) for p in projects]
         remote = launch.node_session_ids(cfg, group)
@@ -547,8 +552,8 @@ def stop(config_path: str | None, sessions: list[str]) -> StopResult:
 
     if not sessions:
         raise ControlError("invalid_request", "name at least one session")
-    cfg = _typed(config_path)
-    with _FLEET_LOCK:
+    with FLEET_LOCK:
+        cfg = _typed(config_path)
         local = {psmux.socket_id(p) for p in psmux.eligible_projects(cfg)}
         remote = set(launch.node_session_ids(cfg))
         unknown = [s for s in sessions if s not in local and s not in remote]

@@ -4,18 +4,19 @@ always written through ``config_io.save`` (lock, validate, backup, atomic).
 The one implementation behind ``/api/v1/projects`` and ``magent config
 add/remove/enable/disable``. Refusals raise ``ProjectError`` with a wire
 code; nothing here prints, prompts or exits. A leaf over ``config_io``,
-``config``, ``psmux`` and ``launch``; never imports the cli package.
+``config``, ``control``, ``psmux`` and ``launch``; never imports the cli
+package.
 """
 
 from __future__ import annotations
 
 import subprocess
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from magent import config_io, psmux
+from magent import config_io, control, psmux
 from magent.lockfile import LockHeld
 from magent.paths import find_config
 from magent.wire import WireError
@@ -218,22 +219,29 @@ def remove(config_path: str | None, query: str, *, stop: bool = False) -> Remove
     read, so a project that another writer removed meanwhile is not removed
     twice. ``not_found`` when nothing matches on either read; a session the
     verified shutdown names as still running refuses the removal
-    (``unavailable``, reason ``still_running``)."""
+    (``unavailable``, reason ``still_running``).
+
+    With ``stop``, all of it -- first read, shutdown, config write -- runs
+    under ``control.FLEET_LOCK``, the lock ``control.start``/``stop`` load
+    their config under: a start that came first left a session this stop
+    takes down, and one queued behind reads a config without the project, so
+    no start can bring a session back between the stop and the write."""
     config_file = _config_file(config_path)
-    doomed = [p for p in _entries(_load(config_file)) if _matches(p, query)]
-    if not doomed:
-        raise ProjectError("not_found", f"no project matching {query!r}")
-    stopped: list[str] = []
-    if stop:
-        stopped = _stop([_project(p) for p in doomed], str(config_file))
-    with _locked():
-        data = _load(config_file)
-        entries = _entries(data)
-        doomed = [p for p in entries if _matches(p, query)]
+    with control.FLEET_LOCK if stop else nullcontext():
+        doomed = [p for p in _entries(_load(config_file)) if _matches(p, query)]
         if not doomed:
             raise ProjectError("not_found", f"no project matching {query!r}")
-        data["projects"] = [p for p in entries if p not in doomed]
-        _save(config_file, data)
+        stopped: list[str] = []
+        if stop:
+            stopped = _stop([_project(p) for p in doomed], str(config_file))
+        with _locked():
+            data = _load(config_file)
+            entries = _entries(data)
+            doomed = [p for p in entries if _matches(p, query)]
+            if not doomed:
+                raise ProjectError("not_found", f"no project matching {query!r}")
+            data["projects"] = [p for p in entries if p not in doomed]
+            _save(config_file, data)
     return RemoveResult([_project(p).name for p in doomed], stopped)
 
 

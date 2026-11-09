@@ -10,8 +10,9 @@ from datetime import datetime
 
 import pytest
 
-from magent import config_io, projects, psmux
+from magent import config_io, control, launch, projects, psmux
 from magent.lockfile import LockHeld, persistent_lock
+from tests.unit._fake_psmux import make_fake_psmux
 
 
 class _OneInstant(datetime):
@@ -369,6 +370,65 @@ class TestRemove:
         )
         assert "api" in err.value.message
         assert cfg.read_bytes() == before
+
+    def test_a_start_during_a_stop_and_remove_never_leaves_an_orphan(
+        self, tmp_path, monkeypatch
+    ):
+        """A removal paused between its verified stop and its config write,
+        and an API start for the same project meanwhile: the start must not
+        bring the session back up, or the removal deletes a project whose
+        session runs on, out of reach of every config-driven verb. The stop
+        waits (bounded) for the start's bring-up: unserialised they meet and
+        the orphan is made; serialised the wait runs out, and the start reads
+        the config only once the project is gone."""
+        (tmp_path / "api").mkdir()
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr(psmux, "find_psmux", lambda: fake.path)
+        path = tmp_path / "magent.config.json"
+        path.write_text(
+            json.dumps({"version": 4, "projects": [{"path": str(tmp_path / "api")}]}),
+            encoding="utf-8",
+        )
+        paused = threading.Event()
+        brought_up = threading.Event()
+        live: set[str] = set()
+
+        def _stop(names, psmux=None):
+            live.difference_update(names)
+            paused.set()
+            brought_up.wait(timeout=1.0)
+            return list(names), []
+
+        def _bring_up(_cfg, only=None, **_kw):
+            live.update(only or [])
+            brought_up.set()
+            return launch.BringUp(
+                created=list(only or []), local_failed={}, node_outcomes=[]
+            )
+
+        monkeypatch.setattr(psmux, "stop_sessions", _stop)
+        monkeypatch.setattr(launch, "bring_up_psmux_quiet", _bring_up)
+        removed: list[projects.RemoveResult] = []
+        started: list[control.StartResult] = []
+        remover = threading.Thread(
+            target=lambda: removed.append(projects.remove(str(path), "api", stop=True))
+        )
+        remover.start()
+        assert paused.wait(timeout=30)
+        starter = threading.Thread(
+            target=lambda: started.append(control.start(str(path), ["api"]))
+        )
+        starter.start()
+        remover.join(timeout=30)
+        starter.join(timeout=30)
+        assert removed == [projects.RemoveResult(removed=["api"], stopped=["api"])]
+        assert projects.list_projects(str(path)) == []
+        assert live == set()
+        assert started == [
+            control.StartResult(
+                failed=[control.StartFailure("api", "not a configured session")]
+            )
+        ]
 
 
 class TestSetEnabled:
