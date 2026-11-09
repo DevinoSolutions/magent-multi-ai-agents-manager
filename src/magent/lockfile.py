@@ -205,8 +205,17 @@ def persistent_lock(
     The lock is per open file, not per process: a second acquisition in the
     same process waits like any other contender. Callers serialize their own
     threads first (a ``threading.Lock``) so they do not poll each other."""
+    with persistent_lock_at(lock_path(name), wait_s=wait_s, poll_s=poll_s):
+        yield
+
+
+@contextlib.contextmanager
+def persistent_lock_at(
+    path: Path, *, wait_s: float, poll_s: float = 0.02
+) -> Generator[None]:
+    """``persistent_lock`` on the sidecar ``path`` itself, for a lock that
+    sits beside the file it guards rather than under ``~/.magent``."""
     deadline = time.monotonic() + wait_s
-    path = lock_path(name)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:

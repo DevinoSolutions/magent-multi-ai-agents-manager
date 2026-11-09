@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
-from magent import linkcrypto, linkfiles
+from magent import linkcrypto, linkfiles, lockfile
 from magent.link import EVENT_THREAD, UPLOAD_THREAD, LinkRunner, _default_client
 from magent.linkcrypto import AAD_CMD, AAD_RES, AAD_UKEY, AAD_UMETA, KeyPairs, PairKeys
 from magent.linkfiles import LinkFile, TrustedDevice
@@ -24,6 +24,8 @@ from magent.linkfiles import LinkFile, TrustedDevice
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
+
+    import pytest
 
     from magent.link import ClientFactory
     from tests._fake_relay import FakeRelay
@@ -482,3 +484,44 @@ def stray_forwarders(timeout: float = 5.0) -> list[threading.Thread]:
             if thread.is_alive():
                 stuck.append(thread)
     return stuck
+
+
+def unlink_racing_the_next_save(
+    monkeypatch: pytest.MonkeyPatch, link_path: Path, state_path: Path
+) -> threading.Thread:
+    """`magent unlink` (linkfiles.delete_link, as another process would run
+    it) started inside the next save_link, before it replaces link.json:
+    right after whatever checks that save's caller made. The save goes on
+    once the unlink has either finished (nothing serialized the two) or is
+    waiting on link.json's mutation lock. The unlink's thread, to join."""
+    real_save, real_try = linkfiles.save_link, lockfile._try_lock
+    contended, done = threading.Event(), threading.Event()
+    armed = [True]
+
+    def unlink() -> None:
+        try:
+            linkfiles.delete_link(link_path, state_path)
+        finally:
+            done.set()
+
+    racer = threading.Thread(target=unlink, daemon=True)
+
+    def try_lock(fd: int) -> bool:
+        got = real_try(fd)
+        if not got and threading.current_thread() is racer:
+            contended.set()
+        return got
+
+    def save(link: LinkFile, path: Path | None = None) -> None:
+        if armed[0]:
+            armed[0] = False
+            racer.start()
+            deadline = time.monotonic() + 5
+            while not (done.is_set() or contended.is_set()):
+                assert time.monotonic() < deadline, "the unlink neither ran nor waited"
+                done.wait(0.01)
+        real_save(link, path)
+
+    monkeypatch.setattr(lockfile, "_try_lock", try_lock)
+    monkeypatch.setattr(linkfiles, "save_link", save)
+    return racer

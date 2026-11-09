@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, NoReturn
 import click
 
 from magent.cli.app import main
+from magent.lockfile import LockHeld
 from magent.paths import find_config
 from magent.style import style
 
@@ -312,17 +313,18 @@ def _save_new_host(client: RelayClient, keys: KeyPairs, outcome: ClaimOutcome) -
         linkfiles.save_state(
             linkfiles.LinkState(state="connecting", host_id=outcome.host_id)
         )
-        saving_link = True
-        linkfiles.save_link(
-            linkfiles.LinkFile(
-                relay_url=client.base_url,
-                host_id=outcome.host_id,
-                host_token=token,
-                host_kex_priv=linkcrypto.b64u_encode(keys.kex_priv),
-                host_sign_priv=linkcrypto.b64u_encode(keys.sign_priv),
-                devices=outcome.devices,
+        with linkfiles.link_lock():
+            saving_link = True  # only once held: never remove another's file
+            linkfiles.save_link(
+                linkfiles.LinkFile(
+                    relay_url=client.base_url,
+                    host_id=outcome.host_id,
+                    host_token=token,
+                    host_kex_priv=linkcrypto.b64u_encode(keys.kex_priv),
+                    host_sign_priv=linkcrypto.b64u_encode(keys.sign_priv),
+                    devices=outcome.devices,
+                )
             )
-        )
     except BaseException as exc:
         if saving_link:  # first, so no serve starts a runner on it
             with contextlib.suppress(OSError):
@@ -354,7 +356,10 @@ def _save_new_host(client: RelayClient, keys: KeyPairs, outcome: ClaimOutcome) -
 def _save_added_device(existing: LinkFile, outcome: ClaimOutcome) -> None:
     """Merge the new device into link.json as it is now (the runner keeps
     the device list current): same host and token or nothing is saved, one
-    entry per device id, at most DEVICES_MAX (the oldest go)."""
+    entry per device id, at most DEVICES_MAX (the oldest go). The re-read and
+    the replace are one step under linkfiles.link_lock; a link.json that is
+    gone (`magent unlink` meanwhile) or cannot be read saves nothing, never
+    the copy read before the pairing."""
     from magent import linkfiles  # heavy subsystem: in-body per policy
 
     if outcome.host_id != existing.host_id:
@@ -364,28 +369,38 @@ def _save_added_device(existing: LinkFile, outcome: ClaimOutcome) -> None:
             f"{_shown(existing.host_id)}; nothing was saved. Remove the device "
             "in the app."
         )
-    try:
-        current = linkfiles.load_link() or existing
-    except linkfiles.LinkFileError:
-        current = existing
-    if (current.host_id, current.host_token) != (existing.host_id, existing.host_token):
-        _fail(
-            "magent link: link.json changed while the device was pairing; "
-            "nothing was saved. Run `magent link --add-device` again."
-        )
-    added = {d.device_id for d in outcome.devices}
-    merged = (
-        *(d for d in current.devices if d.device_id not in added),
-        *outcome.devices,
+    changed = (
+        "magent link: link.json changed while the device was pairing; "
+        "nothing was saved. Run `magent link --add-device` again."
     )
-    dropped, kept = merged[:-DEVICES_MAX], merged[-DEVICES_MAX:]
+    unsaved = (
+        "the device is paired on the relay but not trusted here. Remove it in "
+        "the app, then pair it again."
+    )
     try:
-        linkfiles.save_link(replace(current, devices=kept))
+        with linkfiles.link_lock():
+            try:
+                current = linkfiles.load_link()
+            except linkfiles.LinkFileError:
+                current = None
+            if current is None or (current.host_id, current.host_token) != (
+                existing.host_id,
+                existing.host_token,
+            ):
+                _fail(changed)
+            added = {d.device_id for d in outcome.devices}
+            merged = (
+                *(d for d in current.devices if d.device_id not in added),
+                *outcome.devices,
+            )
+            dropped, kept = merged[:-DEVICES_MAX], merged[-DEVICES_MAX:]
+            linkfiles.save_link(replace(current, devices=kept))
+    except LockHeld:
+        _fail(f"magent link: {linkfiles.LINK_PATH} is being changed; {unsaved}")
     except OSError as exc:
         _fail(
             f"magent link: could not save {linkfiles.LINK_PATH} "
-            f"({type(exc).__name__}); the device is paired on the relay but not "
-            "trusted here. Remove it in the app, then pair it again."
+            f"({type(exc).__name__}); {unsaved}"
         )
     for device in dropped:
         click.echo(
@@ -499,6 +514,20 @@ def link_cmd(
     _pair(config_file, existing if add_device else None, remote_control, no_qr)
 
 
+def _delete_link() -> None:
+    """linkfiles.delete_link, or a failure that says to try again when
+    another change to link.json keeps its lock."""
+    from magent import linkfiles  # heavy subsystem: in-body per policy
+
+    try:
+        linkfiles.delete_link()
+    except LockHeld:
+        _fail(
+            f"magent unlink: {linkfiles.LINK_PATH} is being changed; nothing was "
+            "removed here. Run `magent unlink` again."
+        )
+
+
 @main.command("unlink")
 def unlink_cmd() -> None:
     """Forget this machine's link and ask the relay to revoke it."""
@@ -507,7 +536,7 @@ def unlink_cmd() -> None:
     try:
         existing = linkfiles.load_link()
     except linkfiles.LinkFileError as exc:
-        linkfiles.delete_link()
+        _delete_link()
         link.sweep_incoming_if_free()
         click.echo(
             f"Removed an unreadable link file ({exc}). If the app still lists "
@@ -528,7 +557,7 @@ def unlink_cmd() -> None:
         problem = _shown(str(exc), 300)
     except ValueError:
         problem = "link.json's relay URL or host token cannot be used"
-    linkfiles.delete_link()
+    _delete_link()
     # Left-over pulls hold decrypted files; a serve still running the link
     # may own one, so they wait for the next serve that takes the link.
     link.sweep_incoming_if_free()

@@ -33,6 +33,7 @@ from tests.unit._link_fakes import (
     stop_all,
     stray_forwarders,
     stream_opens,
+    unlink_racing_the_next_save,
     write_link,
 )
 
@@ -994,6 +995,51 @@ class TestDevices:
         assert run.wait_done() == "unlinked"
         assert armed == [False]
         assert not linked.link_path.exists()
+
+    def test_an_unlink_between_the_stamp_check_and_the_replace_is_not_undone(
+        self, monkeypatch, tmp_path, phone
+    ):
+        # The stamp check has passed and the save is about to replace
+        # link.json when `magent unlink` deletes it. The check and the
+        # replace are one step under link.json's mutation lock, so the unlink
+        # waits for the replace and the file stays deleted.
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, "http://127.0.0.1:9", (phone, tablet), host_token="mlh_DECOY_t"
+        )
+        runner = link.LinkRunner(
+            FakeHost(), link_path=linked.link_path, state_path=linked.state_path
+        )
+        current = linkfiles.load_link(linked.link_path)
+        stamp = link._link_stamp(linked.link_path)
+        racer = unlink_racing_the_next_save(
+            monkeypatch, linked.link_path, linked.state_path
+        )
+
+        kept = runner._forget(current, {tablet.device_id}, stamp)
+
+        racer.join(10)
+        assert not racer.is_alive()
+        assert [d.device_id for d in kept.devices] == [phone.device_id]
+        assert not linked.link_path.exists()
+
+    def test_a_lock_that_stays_taken_saves_nothing(self, monkeypatch, tmp_path, phone):
+        # Another process is changing link.json: the revocation applies in
+        # memory, and the file is left to the next look.
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, "http://127.0.0.1:9", (phone, tablet), host_token="mlh_DECOY_t"
+        )
+        runner = link.LinkRunner(
+            FakeHost(), link_path=linked.link_path, state_path=linked.state_path
+        )
+        current = linkfiles.load_link(linked.link_path)
+        stamp = link._link_stamp(linked.link_path)
+        monkeypatch.setattr(linkfiles, "LINK_LOCK_WAIT_S", 0.05)
+        with linkfiles.link_lock(linked.link_path, wait_s=0):
+            kept = runner._forget(current, {tablet.device_id}, stamp)
+        assert [d.device_id for d in kept.devices] == [phone.device_id]
+        assert linked.device_ids() == [phone.device_id, tablet.device_id]
 
     def test_a_link_json_read_that_fails_once_is_retried(
         self, monkeypatch, tmp_path, relay, phone

@@ -14,7 +14,13 @@ from magent import cli, config, fsutil, link, linkcrypto, linkfiles, linkpair, l
 from magent.cli import link_cmd
 from magent.config import load_config
 from magent.link import LINK_LOCK, UPGRADE_HINT
-from tests.unit._link_fakes import OTHER_ID, PHONE_ID, TABLET_ID, new_device
+from tests.unit._link_fakes import (
+    OTHER_ID,
+    PHONE_ID,
+    TABLET_ID,
+    new_device,
+    unlink_racing_the_next_save,
+)
 
 SECRET = b"\x07" * 16  # the QR secret, pinned so the test can play the app
 ANSWER_HELP = (
@@ -504,6 +510,59 @@ class TestLinked:
         assert [d.device_id for d in saved.devices] == [phone.device_id]
         assert not relay.deleted
 
+    def test_an_unlink_during_add_device_is_not_undone(
+        self, runner, relay, cfg, monkeypatch
+    ):
+        # `magent unlink` while the device was pairing: the link read before
+        # the pairing must never be saved back.
+        _pair(runner, relay, cfg)
+        relay.stage_pairing(
+            claimed_devices=[_claimed(new_device(TABLET_ID), qr=True)], new_host=False
+        )
+        real_wait = linkpair.wait_for_claim
+
+        def wait_for_claim(*args, **kwargs):
+            linkfiles.delete_link()
+            return real_wait(*args, **kwargs)
+
+        monkeypatch.setattr(linkpair, "wait_for_claim", wait_for_claim)
+        result = _link(runner, cfg, "--add-device", "--no-qr")
+        assert result.exit_code == 1
+        assert "nothing was saved" in result.output
+        assert not linkfiles.LINK_PATH.exists()
+
+    def test_an_unlink_racing_the_add_device_save_is_not_undone(
+        self, runner, relay, cfg, monkeypatch
+    ):
+        # The re-read and its checks have passed when `magent unlink` deletes
+        # link.json: the unlink waits for the replace, and wins.
+        _pair(runner, relay, cfg)
+        relay.stage_pairing(
+            claimed_devices=[_claimed(new_device(TABLET_ID), qr=True)], new_host=False
+        )
+        racer = unlink_racing_the_next_save(
+            monkeypatch, linkfiles.LINK_PATH, linkfiles.LINK_STATE_PATH
+        )
+        result = _link(runner, cfg, "--add-device", "--no-qr")
+        racer.join(10)
+        assert not racer.is_alive()
+        assert result.exit_code == 0, result.output
+        assert not linkfiles.LINK_PATH.exists()
+
+    def test_add_device_saves_nothing_while_link_json_is_being_changed(
+        self, runner, relay, cfg, monkeypatch
+    ):
+        phone = _pair(runner, relay, cfg)
+        relay.stage_pairing(
+            claimed_devices=[_claimed(new_device(TABLET_ID), qr=True)], new_host=False
+        )
+        monkeypatch.setattr(linkfiles, "LINK_LOCK_WAIT_S", 0.05)
+        with linkfiles.link_lock(wait_s=0):
+            result = _link(runner, cfg, "--add-device", "--no-qr")
+        assert result.exit_code == 1
+        assert "is being changed" in result.output
+        assert [d.device_id for d in linkfiles.load_link().devices] == [phone.device_id]
+
     def test_add_device_keeps_at_most_ten_devices(self, runner, relay, cfg):
         _pair(runner, relay, cfg)
         saved = linkfiles.load_link()
@@ -627,6 +686,19 @@ class TestUnlink:
         assert "Unlinked here, but the relay could not be told" in result.output
         assert "Revoke this machine from the app's Hosts page." in result.output
         assert linkfiles.load_link() is None
+
+    def test_unlink_while_link_json_is_being_changed_removes_nothing(
+        self, runner, relay, cfg, monkeypatch
+    ):
+        # Another change to link.json keeps its lock: nothing is removed
+        # here, and the message says to run it again.
+        _pair(runner, relay, cfg)
+        monkeypatch.setattr(linkfiles, "LINK_LOCK_WAIT_S", 0.05)
+        with linkfiles.link_lock(wait_s=0):
+            result = runner.invoke(cli.main, ["--config", str(cfg), "unlink"])
+        assert result.exit_code == 1
+        assert "Run `magent unlink` again." in result.output
+        assert linkfiles.LINK_PATH.exists()
 
     def test_unlink_when_not_linked(self, runner, cfg):
         result = runner.invoke(cli.main, ["--config", str(cfg), "unlink"])

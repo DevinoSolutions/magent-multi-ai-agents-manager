@@ -4,7 +4,9 @@
 private keys and the devices it trusts. It is written owner-only
 (fsutil.write_private) and refused on read unless it is still owner-only and
 exactly the expected shape -- the repair is always `magent unlink` then
-`magent link`. ``link-state.json`` is not secret: the stream cursor, the ring
+`magent link`. Every change to it is made under one cross-process mutation
+lock (link_lock, the ``link.json.lock`` sidecar), held by a read-modify-write
+from its read to its replace. ``link-state.json`` is not secret: the stream cursor, the ring
 of command and upload ids already handled, the host they belong to, and the
 state `magent status` shows. A bad state file degrades to a fresh one.
 ``link-serve.json`` is not secret either: the serve that runs the link (it
@@ -17,13 +19,18 @@ tests/conftest.py's tripwire redirects them.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from magent import fsutil
+from magent import fsutil, lockfile
 from magent.log import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 LINK_PATH = Path.home() / ".magent" / "link.json"
 LINK_STATE_PATH = Path.home() / ".magent" / "link-state.json"
@@ -37,6 +44,9 @@ SEEN_MAX = 1024
 # times, this far apart, as LinkRunner retries its own reads and writes.
 READ_ATTEMPTS = 5
 READ_RETRY_S = 0.02
+# How long a change to link.json waits for another holder of its mutation
+# lock (each holder keeps it for one read and one atomic replace).
+LINK_LOCK_WAIT_S = 5.0
 
 _LINK_KEYS = ("relay_url", "host_id", "host_token", "host_kex_priv", "host_sign_priv")
 _DEVICE_KEYS = ("device_id", "name", "kex_pub", "sign_pub", "paired_at")
@@ -151,17 +161,43 @@ def load_link(path: Path | None = None) -> LinkFile | None:
     return LinkFile(devices=tuple(devices), **fields)
 
 
+def link_lock_path(path: Path | None = None) -> Path:
+    """The mutation lock's sidecar beside link.json: ``link.json.lock``."""
+    p = _link_path(path)
+    return p.with_name(p.name + ".lock")
+
+
+@contextlib.contextmanager
+def link_lock(
+    path: Path | None = None, *, wait_s: float | None = None
+) -> Generator[None]:
+    """Hold link.json's mutation lock, across processes: every change to the
+    file (a save, the delete) is made under it, and a read-modify-write
+    holds it from its read to its replace, so `magent unlink`, `magent link
+    --add-device` and a runner forgetting a revoked device can never undo
+    each other. ``lockfile.LockHeld`` when another holder keeps it past
+    ``wait_s`` (None: LINK_LOCK_WAIT_S). The sidecar is never deleted (see
+    lockfile.persistent_lock), and the lock is per open file: a thread
+    already holding it must not take it again."""
+    wait = LINK_LOCK_WAIT_S if wait_s is None else wait_s
+    with lockfile.persistent_lock_at(link_lock_path(path), wait_s=wait):
+        yield
+
+
 def save_link(link: LinkFile, path: Path | None = None) -> None:
-    """Write link.json owner-only and atomically."""
+    """Write link.json owner-only and atomically. The caller holds
+    link_lock: from its read of the file when ``link`` was made from one."""
     body = {"version": FILE_VERSION, **asdict(link)}
     body["devices"] = [asdict(d) for d in link.devices]
     fsutil.write_private(_link_path(path), json.dumps(body, indent=2).encode("utf-8"))
 
 
 def delete_link(path: Path | None = None, state_path: Path | None = None) -> None:
-    """Forget the link: both files, missing ones included."""
-    _link_path(path).unlink(missing_ok=True)
-    _state_path(state_path).unlink(missing_ok=True)
+    """Forget the link: both files, missing ones included, under link_lock
+    (``lockfile.LockHeld`` when it stays taken: nothing is deleted)."""
+    with link_lock(path):
+        _link_path(path).unlink(missing_ok=True)
+        _state_path(state_path).unlink(missing_ok=True)
 
 
 def load_state(path: Path | None = None) -> LinkState:

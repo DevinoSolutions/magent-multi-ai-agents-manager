@@ -1809,20 +1809,33 @@ class LinkRunner:
         ``stamp`` is link.json's as it was before ``link`` was read: when the
         file has moved since (`magent unlink` deleted it, `magent link`
         saved a device), the save is skipped, as it would bring back the
-        deleted file or drop the new device. The revocation still applies in
-        memory, and the next look at link.json (it changed) applies it to
-        the new file."""
+        deleted file or drop the new device. The check and the replace are
+        one step under linkfiles.link_lock, which those writers hold too, and
+        each retry checks again. The revocation still applies in memory, and
+        the next look at link.json (it changed) applies it to the new file;
+        so does a lock that stays taken."""
         kept = tuple(d for d in link.devices if d.device_id not in revoked)
         if len(kept) == len(link.devices):
             return link
         link = replace(link, devices=kept)
         self._log.info("link: the relay revoked a paired device; forgetting it")
-        if _link_stamp(self._link_path) != stamp:
-            self._log.info("link: link.json changed meanwhile; not rewriting it")
-            return link
-        # Retried like _save: on Windows a reader holding link.json open makes
-        # the atomic replace fail for a moment.
+        try:
+            with linkfiles.link_lock(self._link_path):
+                self._save_unless_changed(link, stamp)
+        except lockfile.LockHeld:
+            self._log.info("link: link.json is being changed; not rewriting it")
+        return link
+
+    def _save_unless_changed(
+        self, link: LinkFile, stamp: tuple[int, int, int] | None
+    ) -> None:
+        """Save ``link`` while link.json is still as stamped (the caller
+        holds link_lock). Retried like _save: on Windows a reader holding
+        link.json open makes the atomic replace fail for a moment."""
         for attempt in range(SAVE_ATTEMPTS):
+            if _link_stamp(self._link_path) != stamp:
+                self._log.info("link: link.json changed meanwhile; not rewriting it")
+                return
             try:
                 linkfiles.save_link(link, self._link_path)
             except OSError as exc:
@@ -1831,8 +1844,7 @@ class LinkRunner:
                 else:
                     time.sleep(SAVE_RETRY_S)
             else:
-                break
-        return link
+                return
 
     def _read_link(self) -> LinkFile | None:
         """link.json. On Windows a writer's atomic replace (`magent link`, or
