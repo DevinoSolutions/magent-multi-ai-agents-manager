@@ -4,7 +4,10 @@
 private keys and the devices it trusts. It is written owner-only
 (fsutil.write_private) and refused on read unless it is still owner-only and
 exactly the expected shape -- the repair is always `magent unlink` then
-`magent link`. Every change to it is made under one cross-process mutation
+`magent link`. Beside the trusted devices it keeps tombstones of the ones the
+relay revoked (``revoked``, written only when there are any, so a file
+without them reads as before), which no later save may bring back. Every
+change to it is made under one cross-process mutation
 lock (link_lock, the ``link.json.lock`` sidecar), held by a read-modify-write
 from its read to its replace. ``link-state.json`` is not secret: the stream cursor, the ring
 of command and upload ids already handled, the host they belong to, and the
@@ -47,10 +50,13 @@ READ_RETRY_S = 0.02
 # How long a change to link.json waits for another holder of its mutation
 # lock (each holder keeps it for one read and one atomic replace).
 LINK_LOCK_WAIT_S = 5.0
+# Revocation tombstones kept in link.json, the newest; the oldest go first.
+REVOKED_MAX = 100
 
 _LINK_KEYS = ("relay_url", "host_id", "host_token", "host_kex_priv", "host_sign_priv")
 _DEVICE_KEYS = ("device_id", "name", "kex_pub", "sign_pub", "paired_at")
-_TOP_KEYS = frozenset(("version", "devices", *_LINK_KEYS))
+_REVOKED_KEYS = ("device_id", "sign_pub", "revoked_at")
+_TOP_KEYS = frozenset(("version", "devices", "revoked", *_LINK_KEYS))
 
 # What _read_json returns for a file that is not JSON. The decode error itself
 # is dropped, never chained: it carries the file's text, and link.json's text
@@ -72,6 +78,16 @@ class TrustedDevice:
 
 
 @dataclass(frozen=True)
+class RevokedDevice:
+    """A device the relay revoked: never trusted again under this id, nor
+    under this signing key (``sign_pub``; "" when it was never known)."""
+
+    device_id: str
+    sign_pub: str
+    revoked_at: str
+
+
+@dataclass(frozen=True)
 class LinkFile:
     relay_url: str
     host_id: str
@@ -81,6 +97,15 @@ class LinkFile:
     host_kex_priv: str = field(repr=False)
     host_sign_priv: str = field(repr=False)
     devices: tuple[TrustedDevice, ...]
+    revoked: tuple[RevokedDevice, ...] = ()
+
+    def is_revoked(self, device: TrustedDevice) -> bool:
+        """``device`` matches a tombstone, by id or by signing key."""
+        return any(
+            t.device_id == device.device_id
+            or (t.sign_pub and t.sign_pub == device.sign_pub)
+            for t in self.revoked
+        )
 
 
 @dataclass(frozen=True)
@@ -158,7 +183,25 @@ def load_link(path: Path | None = None) -> LinkFile | None:
         if not isinstance(item, dict) or not set(item) <= set(_DEVICE_KEYS):
             raise LinkFileError(f"{p} is not a magent link file (devices)")
         devices.append(TrustedDevice(**_strings(item, _DEVICE_KEYS, p)))
-    return LinkFile(devices=tuple(devices), **fields)
+    return LinkFile(devices=tuple(devices), revoked=_revoked(raw, p), **fields)
+
+
+def _revoked(raw: dict[str, object], where: Path) -> tuple[RevokedDevice, ...]:
+    """The tombstones; none when the file has no ``revoked`` (one written
+    before them, or with none to keep)."""
+    items = raw.get("revoked", [])
+    if not isinstance(items, list):
+        raise LinkFileError(f"{where} is not a magent link file (revoked)")
+    out: list[RevokedDevice] = []
+    for item in items:
+        if not isinstance(item, dict) or set(item) != set(_REVOKED_KEYS):
+            raise LinkFileError(f"{where} is not a magent link file (revoked)")
+        sign_pub = item.get("sign_pub")
+        if not isinstance(sign_pub, str):
+            raise LinkFileError(f"{where} is not a magent link file (revoked)")
+        named = _strings(item, ("device_id", "revoked_at"), where)
+        out.append(RevokedDevice(sign_pub=sign_pub, **named))
+    return tuple(out)
 
 
 def link_stamp(path: Path | None = None) -> tuple[int, int, int] | None:
@@ -199,6 +242,10 @@ def save_link(link: LinkFile, path: Path | None = None) -> None:
     link_lock: from its read of the file when ``link`` was made from one."""
     body = {"version": FILE_VERSION, **asdict(link)}
     body["devices"] = [asdict(d) for d in link.devices]
+    # Left out when empty: a build from before tombstones refuses the key.
+    body.pop("revoked")
+    if link.revoked:
+        body["revoked"] = [asdict(t) for t in link.revoked[-REVOKED_MAX:]]
     fsutil.write_private(_link_path(path), json.dumps(body, indent=2).encode("utf-8"))
 
 

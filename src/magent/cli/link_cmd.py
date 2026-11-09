@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
     from magent.link import RelayClient
     from magent.linkcrypto import KeyPairs
-    from magent.linkfiles import LinkFile, LinkState
+    from magent.linkfiles import LinkFile, LinkState, TrustedDevice
     from magent.linkpair import ClaimOutcome
 
 PAIR_WAIT_S = 600.0  # the code lives 10 minutes on the relay...
@@ -360,13 +360,19 @@ def _save_new_host(client: RelayClient, keys: KeyPairs, outcome: ClaimOutcome) -
         )
 
 
-def _save_added_device(existing: LinkFile, outcome: ClaimOutcome) -> None:
+def _save_added_device(
+    existing: LinkFile, outcome: ClaimOutcome
+) -> tuple[TrustedDevice, ...]:
     """Merge the new device into link.json as it is now (the runner keeps
     the device list current): same host and token or nothing is saved, one
-    entry per device id, at most DEVICES_MAX (the oldest go). The re-read and
-    the replace are one step under linkfiles.link_lock; a link.json that is
-    gone (`magent unlink` meanwhile) or cannot be read saves nothing, never
-    the copy read before the pairing."""
+    entry per device id, at most DEVICES_MAX (the oldest go); the devices it
+    added. The re-read and the replace are one step under
+    linkfiles.link_lock; a link.json that is gone (`magent unlink`
+    meanwhile) or cannot be read saves nothing, never the copy read before
+    the pairing. A claimed device this machine already trusted before the
+    pairing is refused (a claim is for a new device), and one the file
+    holds a tombstone for (the relay revoked it meanwhile, by id or signing
+    key) is not trusted: a claim made before a revocation must not undo it."""
     from magent import linkfiles  # heavy subsystem: in-body per policy
 
     if outcome.host_id != existing.host_id:
@@ -376,6 +382,13 @@ def _save_added_device(existing: LinkFile, outcome: ClaimOutcome) -> None:
             f"{_shown(existing.host_id)}; nothing was saved. Remove the device "
             "in the app."
         )
+    trusted = {d.device_id for d in existing.devices}
+    for device in outcome.devices:
+        if device.device_id in trusted:
+            _fail(
+                f"magent link: {_shown(device.name)} is already paired with this "
+                "machine; nothing was saved."
+            )
     changed = (
         "magent link: link.json changed while the device was pairing; "
         "nothing was saved. Run `magent link --add-device` again."
@@ -395,10 +408,19 @@ def _save_added_device(existing: LinkFile, outcome: ClaimOutcome) -> None:
                 existing.host_token,
             ):
                 _fail(changed)
-            added = {d.device_id for d in outcome.devices}
+            fresh = tuple(d for d in outcome.devices if not current.is_revoked(d))
+            for device in outcome.devices:
+                if device not in fresh:
+                    click.echo(
+                        f"Not trusting {_shown(device.name)}: it was revoked "
+                        "while it was pairing."
+                    )
+            if not fresh:
+                _fail("magent link: nothing was saved.")
+            added = {d.device_id for d in fresh}
             merged = (
                 *(d for d in current.devices if d.device_id not in added),
-                *outcome.devices,
+                *fresh,
             )
             dropped, kept = merged[:-DEVICES_MAX], merged[-DEVICES_MAX:]
             linkfiles.save_link(replace(current, devices=kept))
@@ -414,6 +436,7 @@ def _save_added_device(existing: LinkFile, outcome: ClaimOutcome) -> None:
             f"Forgot {_shown(device.name)}: this machine trusts at most "
             f"{DEVICES_MAX} devices."
         )
+    return fresh
 
 
 def _pair(
@@ -437,10 +460,11 @@ def _pair(
     outcome = _claim(client, keys, existing, no_qr)
     if existing is None:
         _save_new_host(client, keys, outcome)
+        paired = outcome.devices
     else:
-        _save_added_device(existing, outcome)
+        paired = _save_added_device(existing, outcome)
     how = "QR verified" if outcome.via_qr else "safety number confirmed"
-    for device in outcome.devices:
+    for device in paired:
         click.echo(f"Paired {_shown(device.name)} ({how}).")
     if remote_control is None and existing is None:
         try:

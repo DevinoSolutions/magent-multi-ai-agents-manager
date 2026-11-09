@@ -71,6 +71,22 @@ def _claimed(device, *, qr: bool) -> dict[str, object]:
     return raw
 
 
+class _NoHost:
+    """A LinkHost the runner is never asked anything of here."""
+
+
+def _wire(device, *, revoked_at: str | None = None) -> dict[str, object]:
+    """``device`` as the relay lists it."""
+    return {
+        "deviceId": device.device_id,
+        "name": device.name,
+        "kexPub": linkcrypto.b64u_encode(device.keys.kex_pub),
+        "signPub": linkcrypto.b64u_encode(device.keys.sign_pub),
+        "pairedAt": "2026-10-08T12:00:00+00:00",
+        "revokedAt": revoked_at,
+    }
+
+
 def _link(runner, cfg, *args: str, input: str | None = None):  # noqa: A002  # reason: click's CliRunner keyword
     return runner.invoke(cli.main, ["--config", str(cfg), "link", *args], input=input)
 
@@ -628,6 +644,46 @@ class TestLinked:
         assert result.exit_code == 1
         assert "is being changed" in result.output
         assert [d.device_id for d in linkfiles.load_link().devices] == [phone.device_id]
+
+    def test_a_device_revoked_while_it_was_pairing_stays_untrusted(
+        self, runner, relay, cfg, monkeypatch
+    ):
+        # The claim is in; before it is saved the relay revokes that device
+        # and the runner tombstones it. The save must not trust it, and a
+        # runner started afterwards must not either.
+        phone = _pair(runner, relay, cfg)
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        relay.stage_pairing(claimed_devices=[_claimed(tablet, qr=True)], new_host=False)
+        real_accept = linkpair.accept_claim
+
+        def accept_then_revoked(*args, **kwargs):
+            outcome = real_accept(*args, **kwargs)
+            revoked = _wire(tablet, revoked_at="2026-10-09T00:00:00Z")
+            link.LinkRunner(_NoHost())._on_devices(None, {"devices": [revoked]})
+            return outcome
+
+        monkeypatch.setattr(linkpair, "accept_claim", accept_then_revoked)
+        result = _link(runner, cfg, "--add-device", "--no-qr")
+        assert result.exit_code == 1, result.output
+        assert (
+            "Not trusting Tablet DECOY: it was revoked while it was pairing."
+            in result.output
+        )
+        saved = linkfiles.load_link()
+        assert [d.device_id for d in saved.devices] == [phone.device_id]
+        assert [t.device_id for t in saved.revoked] == [TABLET_ID]
+        fresh = link.LinkRunner(_NoHost())
+        fresh._load(saved)
+        assert fresh.peer(TABLET_ID) is None
+        assert fresh.peer(phone.device_id) is not None
+
+    def test_a_claim_for_a_device_already_trusted_is_refused(self, runner, relay, cfg):
+        phone = _pair(runner, relay, cfg)
+        relay.stage_pairing(claimed_devices=[_claimed(phone, qr=True)], new_host=False)
+        result = _link(runner, cfg, "--add-device", "--no-qr")
+        assert result.exit_code == 1
+        assert f"{phone.name} is already paired with this machine" in result.output
+        assert [d.device_id for d in linkfiles.load_link().devices] == [PHONE_ID]
 
     def test_add_device_keeps_at_most_ten_devices(self, runner, relay, cfg):
         _pair(runner, relay, cfg)

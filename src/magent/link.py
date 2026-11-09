@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import datetime
 import http.client
 import importlib.metadata
 import ipaddress
@@ -1172,6 +1173,8 @@ class LinkRunner:
         # again must revisit this set: it would keep refusing that device
         # until the run ends.
         self._revoked: set[str] = set()
+        # The signing keys the relay listed revoked devices with: tombstones.
+        self._revoked_keys: dict[str, str] = {}
         self._trust_lock = threading.Lock()
         # A trust change whose snapshot PUT was deferred (see _refresh_trust).
         self._snapshot_due = False
@@ -1676,12 +1679,16 @@ class LinkRunner:
         ever added locally (`magent link`); link.json is re-read, so a device
         paired while this runs is picked up here too. When link.json cannot
         be read, the revocations still apply, in memory."""
-        revoked = {
-            str(d.get("deviceId"))
-            for d in _objects(data.get("devices"))
-            if d.get("revokedAt") is not None
+        listed = [
+            d for d in _objects(data.get("devices")) if d.get("revokedAt") is not None
+        ]
+        revoked = {str(d.get("deviceId")) for d in listed}
+        sign_pubs = {
+            str(d.get("deviceId")): key
+            for d in listed
+            if isinstance(key := d.get("signPub"), str)
         }
-        self._refresh_trust(client, revoked)
+        self._refresh_trust(client, revoked, sign_pubs=sign_pubs)
 
     def _refresh_trust(
         self,
@@ -1689,6 +1696,7 @@ class LinkRunner:
         revoked: set[str] | None = None,
         *,
         defer_snapshot: bool = False,
+        sign_pubs: dict[str, str] | None = None,
     ) -> None:
         """Trust what link.json lists now, less every device the relay has
         listed revoked during this run (``revoked``: the device list just
@@ -1699,13 +1707,17 @@ class LinkRunner:
         next), so a device just paired gets its sessions at once;
         ``defer_snapshot`` PUTs none here and leaves it to the event
         forwarder's next look (take_snapshot_due), for a caller that must
-        not wait on the relay. When link.json cannot be read, the
-        revocations apply in memory only."""
+        not wait on the relay. Every device revoked this run is tombstoned
+        in link.json (see _forget; ``sign_pubs``: the signing keys the relay
+        listed them with). When link.json cannot be read, the revocations
+        apply in memory only."""
         self._check_end()
         with self._trust_lock:
             with self._lock:
                 self._revoked |= revoked or set()
+                self._revoked_keys.update(sign_pubs or {})
                 gone = set(self._revoked)
+                keys = dict(self._revoked_keys)
             # Taken before the read: a change after it is seen next time.
             stamp = _link_stamp(self._link_path)
             try:
@@ -1714,7 +1726,7 @@ class LinkRunner:
                     self._end_run("unlinked")
                     raise _Unlinked
                 self._check_same_link(current)
-                current = self._forget(current, gone, stamp)
+                current = self._forget(current, gone, stamp, keys)
                 peers = self._peers_for(current)
             except linkfiles.LinkFileError as exc:
                 if revoked is not None:
@@ -1819,8 +1831,13 @@ class LinkRunner:
         link: LinkFile,
         revoked: set[str],
         stamp: tuple[int, int, int] | None,
+        sign_pubs: dict[str, str] | None = None,
     ) -> LinkFile:
-        """``link`` without the revoked devices, saved when that changed it.
+        """``link`` without the revoked devices and with a tombstone for each
+        (linkfiles.RevokedDevice: the id, and the signing key the file or
+        the relay knew it by), saved when that changed it. A device a
+        tombstone already names goes too, by id or by key: no save from
+        before the revocation can bring it back, nor a restart forget it.
         ``stamp`` is link.json's as it was before ``link`` was read: when the
         file has moved since (`magent unlink` deleted it, `magent link`
         saved a device), the save is skipped, as it would bring back the
@@ -1829,11 +1846,28 @@ class LinkRunner:
         each retry checks again. The revocation still applies in memory, and
         the next look at link.json (it changed) applies it to the new file;
         so does a lock that stays taken."""
-        kept = tuple(d for d in link.devices if d.device_id not in revoked)
-        if len(kept) == len(link.devices):
+        keys = {d.device_id: d.sign_pub for d in link.devices}
+        known = {t.device_id for t in link.revoked}
+        at = datetime.datetime.fromtimestamp(
+            self._clock(), datetime.timezone.utc
+        ).isoformat()
+        tombs = tuple(
+            linkfiles.RevokedDevice(
+                device_id=device_id,
+                sign_pub=keys.get(device_id) or (sign_pubs or {}).get(device_id, ""),
+                revoked_at=at,
+            )
+            for device_id in sorted(revoked - known)
+        )
+        marked = replace(
+            link, revoked=(*link.revoked, *tombs)[-linkfiles.REVOKED_MAX :]
+        )
+        kept = tuple(d for d in link.devices if not marked.is_revoked(d))
+        if not tombs and len(kept) == len(link.devices):
             return link
-        link = replace(link, devices=kept)
-        self._log.info("link: the relay revoked a paired device; forgetting it")
+        link = replace(marked, devices=kept)
+        if len(kept) < len(keys):
+            self._log.info("link: the relay revoked a paired device; forgetting it")
         try:
             with linkfiles.link_lock(self._link_path):
                 self._save_unless_changed(link, stamp)
@@ -2045,6 +2079,8 @@ class LinkRunner:
             raise linkfiles.LinkFileError("link.json holds an unusable host key")
         peers: dict[str, _Peer] = {}
         for device in link.devices:
+            if link.is_revoked(device):
+                continue  # a tombstone outranks a listing (an older save)
             try:
                 sign_pub = linkcrypto.b64u_decode(device.sign_pub)
                 keys = linkcrypto.pair_keys(
@@ -2079,6 +2115,11 @@ class LinkRunner:
         with self._lock:
             self._link = link
             self._peers = peers
+            # The tombstones are this run's revocations from its start.
+            self._revoked |= {t.device_id for t in link.revoked}
+            self._revoked_keys.update(
+                {t.device_id: t.sign_pub for t in link.revoked if t.sign_pub}
+            )
             self._cursor = state.cursor
             self._seen = SeenRing(state.seen_ids, size=SEEN_MAX)
             self._last_connected = state.last_connected

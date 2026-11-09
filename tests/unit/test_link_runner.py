@@ -10,6 +10,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -1022,6 +1023,59 @@ class TestDevices:
         assert not racer.is_alive()
         assert [d.device_id for d in kept.devices] == [phone.device_id]
         assert not linked.link_path.exists()
+
+    def test_a_revocation_outlives_the_run_and_any_save_from_before_it(
+        self, tmp_path, phone
+    ):
+        # The relay revoked the tablet: link.json keeps a tombstone. A save
+        # made from a copy read before that (an add-device claim) lists the
+        # tablet again; a fresh runner, before any word from the relay,
+        # still never trusts it, nor seals a snapshot to it.
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, "http://127.0.0.1:9", (phone, tablet), host_token="mlh_DECOY_t"
+        )
+        first = link.LinkRunner(
+            FakeHost(), link_path=linked.link_path, state_path=linked.state_path
+        )
+        revoked = tablet.wire(revoked_at="2026-10-09T00:00:00Z")
+        first._on_devices(None, {"devices": [phone.wire(), revoked]})
+        marked = linkfiles.load_link(linked.link_path)
+        assert [d.device_id for d in marked.devices] == [phone.device_id]
+        assert [(t.device_id, t.sign_pub) for t in marked.revoked] == [
+            (TABLET_ID, tablet.trusted().sign_pub)
+        ]
+        stale = replace(marked, devices=(phone.trusted(), tablet.trusted()))
+        linkfiles.save_link(stale, linked.link_path)
+
+        fresh = link.LinkRunner(
+            FakeHost(), link_path=linked.link_path, state_path=linked.state_path
+        )
+        fresh._load(linkfiles.load_link(linked.link_path))
+        assert fresh.peer(TABLET_ID) is None
+        assert set(fresh.seal_for_devices(b"rows", "snap:x")) == {phone.device_id}
+        fresh._refresh_trust(None)
+        assert fresh.peer(TABLET_ID) is None
+        assert linked.device_ids() == [phone.device_id]  # written out again
+
+    def test_a_device_revoked_before_it_was_saved_is_tombstoned_too(
+        self, tmp_path, phone
+    ):
+        # Not in link.json yet (its claim is still being saved): the
+        # revocation is kept by id and by the key the relay listed it with.
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, "http://127.0.0.1:9", (phone,), host_token="mlh_DECOY_t"
+        )
+        runner = link.LinkRunner(
+            FakeHost(), link_path=linked.link_path, state_path=linked.state_path
+        )
+        revoked = tablet.wire(revoked_at="2026-10-09T00:00:00Z")
+        runner._on_devices(None, {"devices": [phone.wire(), revoked]})
+        marked = linkfiles.load_link(linked.link_path)
+        assert marked.is_revoked(tablet.trusted())
+        renamed = replace(tablet.trusted(), device_id=OTHER_ID)
+        assert marked.is_revoked(renamed)  # the same key under another id
 
     def test_a_lock_that_stays_taken_saves_nothing(self, monkeypatch, tmp_path, phone):
         # Another process is changing link.json: the revocation applies in

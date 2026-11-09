@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from magent import linkfiles
-from magent.linkfiles import LinkFile, LinkState, TrustedDevice
+from magent.linkfiles import LinkFile, LinkState, RevokedDevice, TrustedDevice
 
 POSIX = pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
 
@@ -133,6 +133,25 @@ class TestLinkFile:
             pytest.param(
                 lambda d: d["devices"][0].update(extra="x"), id="unknown-device-key"
             ),
+            pytest.param(lambda d: d.update(revoked="x"), id="revoked-str"),
+            pytest.param(lambda d: d.update(revoked=["x"]), id="tombstone-str"),
+            pytest.param(
+                lambda d: d.update(revoked=[{"device_id": "a"}]), id="tombstone-short"
+            ),
+            pytest.param(
+                lambda d: d.update(
+                    revoked=[{"device_id": "a", "sign_pub": 7, "revoked_at": "t"}]
+                ),
+                id="tombstone-key-int",
+            ),
+            pytest.param(
+                lambda d: d.update(
+                    revoked=[
+                        {"device_id": "a", "sign_pub": "", "revoked_at": "t", "x": 1}
+                    ]
+                ),
+                id="tombstone-extra-key",
+            ),
         ],
     )
     def test_a_wrong_shape_is_refused(self, tmp_path, mutate):
@@ -146,6 +165,61 @@ class TestLinkFile:
         with pytest.raises(linkfiles.LinkFileError) as caught:
             linkfiles.load_link(path)
         _no_secret_in(caught.value)
+
+    def test_tombstones_round_trip_in_their_own_key(self, tmp_path):
+        path = tmp_path / "link.json"
+        gone = RevokedDevice(
+            device_id="0190f3a2-7b1c-7d4e-8a5b-3c2d1e0f9a8c",
+            sign_pub="e" * 43,
+            revoked_at="2026-10-09T00:00:00+00:00",
+        )
+        unknown = RevokedDevice(
+            device_id="0190f3a2-7b1c-7d4e-8a5b-3c2d1e0f9a8d",
+            sign_pub="",
+            revoked_at="2026-10-09T00:00:00+00:00",
+        )
+        marked = LinkFile(**{**LINK.__dict__, "revoked": (gone, unknown)})
+        linkfiles.save_link(marked, path)
+        assert linkfiles.load_link(path) == marked
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["revoked"] == [
+            {
+                "device_id": gone.device_id,
+                "sign_pub": gone.sign_pub,
+                "revoked_at": gone.revoked_at,
+            },
+            {
+                "device_id": unknown.device_id,
+                "sign_pub": "",
+                "revoked_at": unknown.revoked_at,
+            },
+        ]
+
+    def test_a_file_without_tombstones_reads_as_none(self, tmp_path):
+        # A link.json from before tombstones (and one with none to keep: the
+        # key is left out, so an older build still reads it).
+        path = tmp_path / "link.json"
+        linkfiles.save_link(LINK, path)
+        assert "revoked" not in json.loads(path.read_text(encoding="utf-8"))
+        assert linkfiles.load_link(path).revoked == ()
+
+    def test_a_tombstone_matches_by_id_or_by_signing_key(self):
+        stranger = "0190f3a2-7b1c-7d4e-8a5b-3c2d1e0f9aff"
+        by_id = RevokedDevice(DEVICE.device_id, "", "t")
+        by_key = RevokedDevice(stranger, DEVICE.sign_pub, "t")
+        other = RevokedDevice(stranger, "", "t")
+        assert LinkFile(**{**LINK.__dict__, "revoked": (by_id,)}).is_revoked(DEVICE)
+        assert LinkFile(**{**LINK.__dict__, "revoked": (by_key,)}).is_revoked(DEVICE)
+        assert not LinkFile(**{**LINK.__dict__, "revoked": (other,)}).is_revoked(DEVICE)
+
+    def test_only_the_newest_tombstones_are_kept(self, tmp_path):
+        path = tmp_path / "link.json"
+        many = tuple(
+            RevokedDevice(f"0190f3a2-7b1c-7d4e-8a5b-{n:012d}", "", "t")
+            for n in range(linkfiles.REVOKED_MAX + 3)
+        )
+        linkfiles.save_link(LinkFile(**{**LINK.__dict__, "revoked": many}), path)
+        assert linkfiles.load_link(path).revoked == many[3:]
 
     def test_not_json_is_refused(self, tmp_path):
         from magent import fsutil
