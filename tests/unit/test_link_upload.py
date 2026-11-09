@@ -951,6 +951,29 @@ class TestRefusals:
         assert puller_puts == []
         assert linked_when_staged == [True]
 
+    def test_an_ended_run_reports_nothing_more_even_when_stopping(
+        self, relay, phone, linked
+    ):
+        # Unlinked and stopped inside the "pulled" report: the ended run
+        # outranks the stop, so no inject_failed goes under its token.
+        uid = up_id(127)
+        host = FakeHost()
+        box: list[Running] = []
+
+        def unlink_and_stop():
+            linked.link_path.unlink()
+            box[0].runner._end_run("unlinked")
+            box[0].runner._uploads._stop.set()
+
+        run = Running(host, linked, client_factory=_on_pulled(unlink_and_stop))
+        box.append(run)
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        )
+        assert run.wait_done() == "unlinked"
+        assert host.staged == []
+        assert _states(relay, uid) == ["pulled"]
+
 
 class TestReplays:
     def test_a_replayed_upload_is_reported_again_not_pasted_again(

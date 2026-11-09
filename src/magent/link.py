@@ -1745,6 +1745,11 @@ class LinkRunner:
             due, self._snapshot_due = self._snapshot_due, False
             return due
 
+    def has_ended(self) -> bool:
+        """Was this run ended from link.json (unlinked, paired again)?"""
+        with self._lock:
+            return self._end is not None
+
     def _check_same_link(self, current: LinkFile) -> None:
         """_Relinked when ``current`` names another host or token than the
         one this run connected with: its keys belong to the new pairing, and
@@ -3021,7 +3026,8 @@ class UploadPuller:
         """Why ``ready`` may not be staged now (``stopping``, ``ended``,
         ``revoked``: see LinkRunner.upload_blocker), or None."""
         if self._stop.is_set():
-            return "stopping"
+            # An ended run outranks the stop: nothing more is reported.
+            return "ended" if self._runner.has_ended() else "stopping"
         blocker = self._runner.upload_blocker(ready.peer)
         if blocker is None and self._stop.is_set():
             return "stopping"  # set while trust was being read
@@ -3070,7 +3076,14 @@ class UploadPuller:
         return error is None
 
     def _post(self, upload_id: str, state: str) -> RelayError | None:
-        """POST one upload result; the error when the relay did not take it."""
+        """POST one upload result; the error when the relay did not take it.
+        Nothing once the run has ended (unlinked, paired again): its token
+        is abandoned, and the result is dropped as if delivered."""
+        if self._runner.has_ended():
+            self._log.info(
+                "link: upload %s result %s dropped: the link ended", upload_id, state
+            )
+            return None
         result = {"type": "upload", "uploadId": upload_id, "state": state}
         try:
             self._client.call("POST", "/v1/host/results", {"results": [result]})
