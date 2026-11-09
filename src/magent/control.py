@@ -447,9 +447,15 @@ def _tail(text: str, lines: int) -> str:
 
 
 def _node_pane(config_path: str | None, row: fleetview.SessionRow) -> str:
+    return node_pane(_typed(config_path), row)
+
+
+def node_pane(cfg: MagentConfig, row: fleetview.SessionRow) -> str:
+    """``row``'s pane read on its node (one bounded ssh capture), with the
+    typed config a caller already holds -- the event poller's, which must
+    not load one per tick."""
     from magent import env, nodes, remote_mux  # in-body: nodes pulls in ssh
 
-    cfg = _typed(config_path)
     if row.node is None:
         raise ControlError("not_found", f"{row.session} is placed on no node")
     try:

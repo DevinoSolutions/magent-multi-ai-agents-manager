@@ -150,6 +150,7 @@ class _Fleet:
         self.rows = rows
         self.fired: list[tuple[str, str]] = []
         self.pane = PaneCapture(text="hello\n", timed_out=False)
+        self.read: list[SessionRow] = []
 
     def rows_fn(self, _include_pane: bool) -> list[SessionRow]:
         return list(self.rows)
@@ -158,7 +159,8 @@ class _Fleet:
         self.fired.append((session, state))
         return True
 
-    def pane_fn(self, _session: str) -> PaneCapture:
+    def pane_fn(self, row: SessionRow) -> PaneCapture:
+        self.read.append(row)
         return self.pane
 
 
@@ -284,6 +286,48 @@ class TestEventPoller:
         fleet.pane = PaneCapture(text="", timed_out=True)
         with bus.subscription(("a",)):
             _poller(fleet, bus).tick()
+        assert not [e for e in bus.since("e:0").events if e.type == "session.pane"]
+
+    def test_a_pane_is_read_through_its_configured_row(self):
+        bus = events.EventBus("e")
+        fleet = _Fleet([_row("a")])
+        with bus.subscription(("a",)):
+            _poller(fleet, bus).tick()
+        assert fleet.read == [_row("a")]
+
+    def test_a_name_outside_the_config_is_never_read(self):
+        # The API refuses such a subscription up front; the poller must not
+        # rely on that, or a raw name reaches psmux and its pane is published.
+        bus = events.EventBus("e")
+        fleet = _Fleet([_row("a")])
+        with bus.subscription(("not-in-config",)):
+            _poller(fleet, bus).tick()
+        assert fleet.read == []
+        assert not [e for e in bus.since("e:0").events if e.type == "session.pane"]
+
+    def test_a_session_dropped_from_the_config_stops_being_read(self):
+        bus = events.EventBus("e")
+        fleet = _Fleet([_row("a")])
+        poller = _poller(fleet, bus)
+        with bus.subscription(("a",)):
+            poller.tick()
+            fleet.rows = []
+            fleet.pane = PaneCapture(text="private\n", timed_out=False)
+            poller.tick()
+        assert len(fleet.read) == 1
+        panes = [e.data for e in bus.since("e:0").events if e.type == "session.pane"]
+        assert [p["text"] for p in panes] == ["hello\n"]
+
+    def test_a_row_the_reader_declines_publishes_nothing(self):
+        bus = events.EventBus("e")
+        poller = events.EventPoller(
+            bus=bus,
+            rows_fn=lambda _p: [_row("a")],
+            fire_fn=lambda *_: False,
+            pane_fn=lambda _row: None,
+        )
+        with bus.subscription(("a",)):
+            poller.tick()
         assert not [e for e in bus.since("e:0").events if e.type == "session.pane"]
 
     def test_an_unsubscribed_pane_is_forgotten(self):
@@ -520,6 +564,55 @@ class TestForConfig:
         assert rows_calls[0]["engine"] is None
         assert rows_calls[0]["cfg"] is None
         assert rows_calls[0]["probe_timeout_s"] == events.PROBE_TIMEOUT_S
+
+    def test_a_live_local_row_is_read_through_psmux(self, seams, monkeypatch):
+        from magent import psmux
+
+        reads: list[str] = []
+        capture = PaneCapture(text="x\n", timed_out=False)
+        monkeypatch.setattr(
+            psmux, "read_pane", lambda session: reads.append(session) or capture
+        )
+        poller = events.EventPoller.for_config(events.EventBus("e"), None)
+        assert poller.pane_fn(_row("a")) is capture
+        assert poller.pane_fn(_row("b", live=False)) is None
+        assert reads == ["a"]
+
+    def test_a_live_node_row_is_read_on_its_node_with_the_kept_config(
+        self, seams, monkeypatch
+    ):
+        from magent import control, psmux
+
+        _loads, _rows_calls, cfg, _engine = seams
+        dialled: list[tuple[object, str]] = []
+
+        def _node_pane(got_cfg, row):
+            dialled.append((got_cfg, row.session))
+            return "remote\n"
+
+        def _no_local(_session):
+            raise AssertionError("a node session was read through local psmux")
+
+        monkeypatch.setattr(control, "node_pane", _node_pane)
+        monkeypatch.setattr(psmux, "read_pane", _no_local)
+        poller = events.EventPoller.for_config(events.EventBus("e"), "/c.json")
+        node = {"node": "box", "pane_state": None}
+        live = poller.pane_fn(_row("r1", node_state="live", **node))
+        stale = poller.pane_fn(_row("r2", node_state="stale", live=False, **node))
+        assert live == PaneCapture(text="remote\n", timed_out=False)
+        assert stale is None
+        assert dialled == [(cfg, "r1")]
+
+    def test_a_node_read_that_fails_is_declined(self, seams, monkeypatch):
+        from magent import control
+
+        def _refuse(_cfg, row):
+            raise control.ControlError("unavailable", f"could not read {row.session}")
+
+        monkeypatch.setattr(control, "node_pane", _refuse)
+        poller = events.EventPoller.for_config(events.EventBus("e"), "/c.json")
+        row = _row("r1", node="box", node_state="live", pane_state=None)
+        assert poller.pane_fn(row) is None
 
     def test_the_probe_bound_is_a_few_seconds(self):
         assert 1.0 <= events.PROBE_TIMEOUT_S <= 10.0
