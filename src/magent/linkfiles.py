@@ -161,6 +161,16 @@ def load_link(path: Path | None = None) -> LinkFile | None:
     return LinkFile(devices=tuple(devices), **fields)
 
 
+def link_stamp(path: Path | None = None) -> tuple[int, int, int] | None:
+    """link.json's mtime, size and file index, None when it is absent: a
+    re-pair (an atomic replace, so a new file) or an unlink changes it."""
+    try:
+        info = _link_path(path).stat()
+    except OSError:
+        return None
+    return info.st_mtime_ns, info.st_size, info.st_ino
+
+
 def link_lock_path(path: Path | None = None) -> Path:
     """The mutation lock's sidecar beside link.json: ``link.json.lock``."""
     p = _link_path(path)

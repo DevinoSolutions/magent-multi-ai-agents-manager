@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -344,6 +346,70 @@ class TestPairing:
         assert not linkfiles.LINK_STATE_PATH.exists()
         assert relay.host_token not in result.output
         assert "PrivateFileError" in result.output
+
+    def test_the_rollback_of_a_failed_host_never_removes_a_successor(
+        self, runner, relay, cfg, monkeypatch
+    ):
+        # The save fails after its rename and its file is removed again. A
+        # successor `magent link` saving its own host as that removal starts
+        # must find the lock still held, save after it, and keep its file.
+        relay.stage_pairing(claimed_devices=[_claimed(new_device(), qr=True)])
+        real_check, real_save, real_try = (
+            fsutil.check_private,
+            linkfiles.save_link,
+            lockfile._try_lock,
+        )
+        real_unlink = Path.unlink
+        armed = {"check": True, "unlink": True}
+        contended, done = threading.Event(), threading.Event()
+        successor: list[linkfiles.LinkFile] = []
+
+        def not_private_once(path):
+            if armed["check"]:
+                armed["check"] = False
+                raise fsutil.PrivateFileError(f"DECOY: {path} is readable by others")
+            return real_check(path)
+
+        def save_successor() -> None:
+            try:
+                with linkfiles.link_lock():
+                    real_save(successor[0])
+            finally:
+                done.set()
+
+        racer = threading.Thread(target=save_successor, daemon=True)
+
+        def try_lock(fd):
+            got = real_try(fd)
+            if not got and threading.current_thread() is racer:
+                contended.set()
+            return got
+
+        def unlink(self, *args, **kwargs):
+            if self == linkfiles.LINK_PATH and armed["unlink"]:
+                armed["unlink"] = False
+                failed = linkfiles.load_link()  # the failed host, still there
+                successor.append(replace(failed, host_id="hst_DECOY_successor"))
+                racer.start()
+                deadline = time.monotonic() + 5
+                while not (done.is_set() or contended.is_set()):
+                    assert time.monotonic() < deadline, (
+                        "the successor neither ran nor waited"
+                    )
+                    done.wait(0.01)
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(fsutil, "check_private", not_private_once)
+        monkeypatch.setattr(lockfile, "_try_lock", try_lock)
+        monkeypatch.setattr(Path, "unlink", unlink)
+        result = _link(runner, cfg, "--no-qr", "--no-remote-control")
+        racer.join(10)
+        assert not racer.is_alive()
+        assert result.exit_code == 1
+        assert armed == {"check": False, "unlink": False}
+        saved = linkfiles.load_link()  # None: the rollback removed it
+        assert saved is not None
+        assert saved.host_id == "hst_DECOY_successor"
 
     @pytest.mark.parametrize("fault", [OSError("disk full"), KeyboardInterrupt()])
     def test_a_relay_that_cannot_be_told_is_not_said_to_be_told(

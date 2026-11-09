@@ -297,8 +297,11 @@ def _save_new_host(client: RelayClient, keys: KeyPairs, outcome: ClaimOutcome) -
     failure, or Ctrl+C, frees the host on the relay and puts the old state
     back. A link.json the failed save left behind goes too: the write can
     fail after its rename (the file then holds the new token and keys, but
-    did not prove private), and only no link or a revoked one is ever
-    replaced here."""
+    did not prove private). It goes inside the same hold of
+    linkfiles.link_lock that wrote it, and only when the file moved since
+    the save began (so it is this save's): released first, another `magent
+    link` could save its host in between and lose it, or a runner could
+    pass its stamp check on the failed one and write it back."""
     from magent import linkcrypto, linkfiles  # heavy subsystem: in-body per policy
 
     token = outcome.host_token
@@ -306,7 +309,6 @@ def _save_new_host(client: RelayClient, keys: KeyPairs, outcome: ClaimOutcome) -
         _fail("The relay did not issue a host token; nothing was saved.")
     had_state = False
     previous: LinkState | None = None  # None: stopped before any write
-    saving_link = False
     try:
         had_state = linkfiles.LINK_STATE_PATH.exists()
         previous = linkfiles.load_state()
@@ -314,21 +316,26 @@ def _save_new_host(client: RelayClient, keys: KeyPairs, outcome: ClaimOutcome) -
             linkfiles.LinkState(state="connecting", host_id=outcome.host_id)
         )
         with linkfiles.link_lock():
-            saving_link = True  # only once held: never remove another's file
-            linkfiles.save_link(
-                linkfiles.LinkFile(
-                    relay_url=client.base_url,
-                    host_id=outcome.host_id,
-                    host_token=token,
-                    host_kex_priv=linkcrypto.b64u_encode(keys.kex_priv),
-                    host_sign_priv=linkcrypto.b64u_encode(keys.sign_priv),
-                    devices=outcome.devices,
+            before = linkfiles.link_stamp()
+            try:
+                linkfiles.save_link(
+                    linkfiles.LinkFile(
+                        relay_url=client.base_url,
+                        host_id=outcome.host_id,
+                        host_token=token,
+                        host_kex_priv=linkcrypto.b64u_encode(keys.kex_priv),
+                        host_sign_priv=linkcrypto.b64u_encode(keys.sign_priv),
+                        devices=outcome.devices,
+                    )
                 )
-            )
+            except BaseException:
+                # Every writer holds this lock: a file that moved since
+                # `before` is this save's. First, so no serve starts on it.
+                if linkfiles.link_stamp() != before:
+                    with contextlib.suppress(OSError):
+                        linkfiles.LINK_PATH.unlink(missing_ok=True)
+                raise
     except BaseException as exc:
-        if saving_link:  # first, so no serve starts a runner on it
-            with contextlib.suppress(OSError):
-                linkfiles.LINK_PATH.unlink(missing_ok=True)
         released = _release(client, token)
         # Best effort: the runner reads a state of another pairing as fresh.
         if previous is not None:

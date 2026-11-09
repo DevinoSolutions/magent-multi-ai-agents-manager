@@ -3104,13 +3104,8 @@ SUPERVISE_BACKOFF_CAP_S = 300.0
 
 
 def _link_stamp(path: Path | None) -> tuple[int, int, int] | None:
-    """link.json's mtime, size and file index, None when it is absent: a
-    re-pair (an atomic replace, so a new file) or an unlink changes it."""
-    try:
-        info = (path or linkfiles.LINK_PATH).stat()
-    except OSError:
-        return None
-    return info.st_mtime_ns, info.st_size, info.st_ino
+    """linkfiles.link_stamp: the one stamp the runner and the CLI compare."""
+    return linkfiles.link_stamp(path)
 
 
 def supervise(
