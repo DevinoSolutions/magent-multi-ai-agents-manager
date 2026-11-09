@@ -407,6 +407,53 @@ class TestChoose:
         fake.set_pane(DIALOG)
         assert control.choose(cfg, "caramel", 1).confirmed is False
 
+    def test_two_chooses_on_one_dialog_press_one_digit(self, fleet, monkeypatch):
+        """Two overlapping chooses (two API requests) on ONE dialog: exactly
+        one digit goes in, and the other choose sees the dialog gone and
+        refuses -- it never types into the prompt, never reports confirmed.
+        After its dialog check, each choose waits (bounded) for the other to
+        check too: unserialised that rendezvous meets, both see the dialog and
+        both press; serialised it times out, because the other check cannot
+        run until this choose's digit and read-back are done."""
+        fake, cfg = fleet
+        fake.set_pane(DIALOG)
+        fake.set_pane_after_send(IDLE)
+        real = control._pane_state
+        checked = threading.Condition()
+        checks = [0]
+
+        def _rendezvous(session, binary, *, delivered=False):
+            state = real(session, binary, delivered=delivered)
+            if not delivered:
+                with checked:
+                    checks[0] += 1
+                    checked.notify_all()
+                    checked.wait_for(lambda: checks[0] >= 2, timeout=1.0)
+            return state
+
+        monkeypatch.setattr(control, "_pane_state", _rendezvous)
+        results: list[control.ChooseResult | control.ControlError] = []
+
+        def _choose(option: int) -> None:
+            try:
+                results.append(control.choose(cfg, "caramel", option))
+            except control.ControlError as exc:
+                results.append(exc)
+
+        threads = [threading.Thread(target=_choose, args=(n,)) for n in (1, 2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert len(results) == 2
+        chosen = [r for r in results if isinstance(r, control.ChooseResult)]
+        refused = [r for r in results if isinstance(r, control.ControlError)]
+        assert [r.confirmed for r in chosen] == [True]
+        assert [(r.code, r.details) for r in refused] == [
+            ("conflict", {"reason": "not_in_dialog", "pane_state": "idle"})
+        ]
+        assert [c[-1] for c in fake.send_key_calls()] == [str(chosen[0].option)]
+
     @pytest.mark.parametrize("option", [0, 10, -1])
     def test_option_out_of_range_is_invalid(self, fleet, option):
         _fake, cfg = fleet
@@ -546,6 +593,47 @@ class TestSetModel:
         with pytest.raises(control.ControlError) as err:
             control.set_model(cfg, "caramel", "opus")
         assert err.value.details == {"reason": "busy", "pane_state": "busy"}
+
+    def test_the_idle_check_runs_after_waiting_on_the_session_lock(
+        self, fleet, monkeypatch
+    ):
+        """Another verb holds the session's lock and turns the pane busy
+        before letting go: the switch, queued behind it, must check the pane
+        THEN -- not before it queued -- and refuse without typing."""
+        fake, cfg = fleet
+        lock = control._keys_lock("caramel")
+        asked = threading.Event()
+
+        class _Watched:
+            def __enter__(self) -> None:
+                asked.set()
+                lock.acquire()
+
+            def __exit__(self, *_exc: object) -> None:
+                lock.release()
+
+        monkeypatch.setattr(control, "_keys_lock", lambda _session: _Watched())
+        errors: list[control.ControlError] = []
+
+        def _switch() -> None:
+            try:
+                control.set_model(cfg, "caramel", "opus")
+            except control.ControlError as exc:
+                errors.append(exc)
+
+        lock.acquire()
+        try:
+            worker = threading.Thread(target=_switch)
+            worker.start()
+            assert asked.wait(timeout=30)
+            fake.set_pane(BUSY)
+        finally:
+            lock.release()
+        worker.join(timeout=30)
+        assert [(e.code, e.details) for e in errors] == [
+            ("conflict", {"reason": "busy", "pane_state": "busy"})
+        ]
+        assert fake.send_key_calls() == []
 
     def test_an_unknown_effort_is_invalid(self, fleet):
         _fake, cfg = fleet

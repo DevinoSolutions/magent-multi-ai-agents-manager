@@ -54,16 +54,23 @@ _FLEET_LOCK = threading.Lock()
 # Keystrokes into one pane, one verb at a time. A send is two psmux calls
 # (the literal paste, then Enter); two overlapping sends to one session landed
 # as paste, paste, Enter, Enter and submitted ONE merged prompt while both
-# reported confirmed. Every control verb holds its session's lock for exactly
-# its keystrokes -- never across a wait or a read-back -- so different
-# sessions still run in parallel. The one exception is ``set_model``: it holds
-# the lock across ``switch_model``'s settle between ``/model`` and ``/effort``,
-# so no prompt lands between the two commands.
+# reported confirmed. ``send`` and ``interrupt`` hold their session's lock for
+# exactly their keystrokes -- never across a wait or a read-back -- so
+# different sessions still run in parallel. ``choose`` and ``set_model`` hold
+# it from their pane check through the read-back that follows their keys: a
+# digit is safe only in the dialog it was checked against and ``/model`` only
+# at the idle prompt, so a check made before waiting on the lock is stale by
+# the time the keys go in (two chooses on one dialog both saw it, and the
+# second digit landed in the prompt reporting confirmed), and the read-back
+# keeps the next verb from checking a pane that has not reacted yet.
+# ``set_model``'s hold also spans ``switch_model``'s settle between
+# ``/model`` and ``/effort``, so no prompt lands between the two commands.
 #
-# A stalled psmux holds a session's lock for as long as its own send-keys
-# budgets: about 50s for a send (the literal paste's 30s, then Enter's 20s)
-# and about twice that for a model switch with an effort. That is acceptable,
-# because a concurrent send would stall on the same pane anyway.
+# A stalled psmux holds a session's lock for as long as its own budgets:
+# about 50s for a send (the literal paste's 30s, then Enter's 20s), and for a
+# choose or a model switch (twice the send-keys budget with an effort) its
+# keys plus two pane captures. That is acceptable, because a concurrent verb
+# would stall on the same pane anyway.
 #
 # Only these verbs take the lock. The ``/upload`` paste (``uploads.py``) and
 # the idle reaper's post-kill reset (``reap.py``) type into panes without it,
@@ -326,25 +333,27 @@ def choose(config_path: str | None, session: str, option: int) -> ChooseResult:
     """Pick numbered option ``option`` (1-9) of the dialog on screen: the
     digit is pressed alone (no Enter -- Claude Code's menus act on the digit),
     and ONLY when the pane classifies as ``dialog``, so a digit is never typed
-    into a prompt. ``confirmed`` = the dialog is gone a moment later."""
+    into a prompt. ``confirmed`` = the dialog is gone a moment later. The
+    check, the digit and that read-back are one hold of the session's lock
+    (see ``_KEYS_LOCKS``)."""
     if not 1 <= option <= CHOOSE_MAX:
         raise ControlError("invalid_request", f"option must be 1-{CHOOSE_MAX}")
     binary = _writable(config_path, session)
-    before = _pane_state(session, binary)
-    if before != "dialog":
-        raise ControlError(
-            "conflict",
-            f"{session} is not showing a dialog (pane is {before})",
-            {"reason": "not_in_dialog", "pane_state": before},
-        )
     with _keys_lock(session):
+        before = _pane_state(session, binary)
+        if before != "dialog":
+            raise ControlError(
+                "conflict",
+                f"{session} is not showing a dialog (pane is {before})",
+                {"reason": "not_in_dialog", "pane_state": before},
+            )
         pressed = psmux.send_keys(
             session, str(option), target=session, literal=True, psmux=binary
         )
-    if not pressed:
-        raise _send_failed(session, binary)
-    time.sleep(REACT_S)
-    after = _pane_state(session, binary, delivered=True)
+        if not pressed:
+            raise _send_failed(session, binary)
+        time.sleep(REACT_S)
+        after = _pane_state(session, binary, delivered=True)
     return ChooseResult(session, option, after != "dialog", after)
 
 
@@ -366,7 +375,9 @@ def set_model(
     config_path: str | None, session: str, model: str, effort: str | None = None
 ) -> ModelResult:
     """One switch attempt: refused with ``conflict`` (reason ``busy``) unless
-    the pane is idle; ``verified`` = the footer shows the new model/effort."""
+    the pane is idle; ``verified`` = the footer shows the new model/effort.
+    The idle check, the switch and the footer read are one hold of the
+    session's lock (see ``_KEYS_LOCKS``)."""
     if not model.strip():
         raise ControlError("invalid_request", "model is required")
     if not _MODEL_RE.fullmatch(model):
@@ -379,20 +390,20 @@ def set_model(
             "invalid_request", f"effort must be one of {', '.join(fleet.EFFORTS)}"
         )
     binary = _writable(config_path, session)
-    state = _pane_state(session, binary)
-    if state != "idle":
-        raise ControlError(
-            "conflict",
-            f"{session} is not idle (pane is {state})",
-            {"reason": "busy", "pane_state": state},
-        )
     # Held across switch_model's settles on purpose: see _KEYS_LOCKS.
     with _keys_lock(session):
+        state = _pane_state(session, binary)
+        if state != "idle":
+            raise ControlError(
+                "conflict",
+                f"{session} is not idle (pane is {state})",
+                {"reason": "busy", "pane_state": state},
+            )
         switched = fleet.switch_model(session, model, effort, psmux_bin=binary)
-    if not switched:
-        raise _send_failed(session, binary)
-    time.sleep(MODEL_SETTLE_S)
-    pane = psmux.capture_pane(session, psmux=binary)
+        if not switched:
+            raise _send_failed(session, binary)
+        time.sleep(MODEL_SETTLE_S)
+        pane = psmux.capture_pane(session, psmux=binary)
     footer_model, footer_effort = fleet.parse_footer(pane)
     return ModelResult(
         session, footer_model, footer_effort, fleet.verify_switch(pane, model, effort)
