@@ -62,6 +62,10 @@ def _child_env(home: Path) -> dict[str, str]:
     env["MAGENT_PSMUX_BOOST"] = "0"
     env["MAGENT_NODE_SYNC"] = "0"
     env["MAGENT_IDLE_REAP"] = "0"
+    # ...and the relay link, whose reach is the internet.
+    env["MAGENT_LINK"] = "0"
+    env["MAGENT_EVENTS"] = "0"
+    env["MAGENT_LINK_URL"] = "http://127.0.0.1:9"
     env["MAGENT_SESSION0_POLICY"] = "allow"
     env["APPDATA"] = home_s
     env["LOCALAPPDATA"] = home_s

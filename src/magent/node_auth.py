@@ -28,7 +28,8 @@ minted_at}``. On POSIX it is 0600 and this user's; on Windows it is created
 with a protected DACL granting this user alone (no inherited ACEs), set at
 CreateFile time so there is no moment it is readable by anyone else. A file
 that is not that exact shape is refused (``TokenFileError``) rather than
-trusted: the repair is always the same command.
+trusted: the repair is always the same command. The write and the check
+live in fsutil, shared with link.json.
 """
 
 from __future__ import annotations
@@ -40,16 +41,14 @@ import os
 import queue
 import re
 import shutil
-import stat
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from magent import env
+from magent import env, fsutil
 from magent.log import get_logger
 
 if TYPE_CHECKING:
@@ -187,22 +186,9 @@ def find_claude() -> str | None:
 def _check_private(path: Path) -> None:
     """TokenFileError unless ``path`` is a plain file only this user can read."""
     try:
-        st = os.lstat(path)
-    except OSError as exc:
-        raise TokenFileError(f"{path} cannot be read ({type(exc).__name__})") from exc
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-        raise TokenFileError(f"{path} is not a plain file")
-    if sys.platform == "win32":
-        attrs = getattr(st, "st_file_attributes", 0)
-        if attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-            raise TokenFileError(f"{path} is not a plain file")
-        if not _win_dacl_is_private(path):
-            raise TokenFileError(f"{path} is readable by more than this user")
-        return
-    if st.st_mode & 0o077:
-        raise TokenFileError(f"{path} is mode {stat.S_IMODE(st.st_mode):o}, not 600")
-    if st.st_uid != os.getuid():
-        raise TokenFileError(f"{path} is not owned by this user")
+        fsutil.check_private(path)
+    except fsutil.PrivateFileError as exc:
+        raise TokenFileError(str(exc)) from exc
 
 
 def read_token(home: Path | None = None) -> StoredToken | None:
@@ -237,300 +223,21 @@ def read_token(home: Path | None = None) -> StoredToken | None:
 def write_token(
     token: str, *, home: Path | None = None, now: float | None = None
 ) -> StoredToken:
-    """Store ``token`` owner-only and atomically (a temp file created private,
-    fsync'd, then renamed over the old one -- a link there is replaced, never
-    followed). ValueError for anything that is not a subscription token; its
-    words never quote the value."""
+    """Store ``token`` owner-only and atomically (fsutil.write_private: a temp
+    file created private, fsync'd, then renamed over the old one -- a link
+    there is replaced, never followed). ValueError for anything that is not a
+    subscription token; its words never quote the value."""
     if not TOKEN_RE.fullmatch(token):
         raise ValueError("not a Claude subscription token (sk-ant-oat...)")
     stored = StoredToken(token=token, minted_at=time.time() if now is None else now)
-    path = token_path(home)
-    path.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(
         {"version": FILE_VERSION, "token": token, "minted_at": stored.minted_at}
     ).encode("utf-8")
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with contextlib.suppress(FileNotFoundError):
-        tmp.unlink()
     try:
-        if sys.platform == "win32":
-            _win_write_private(tmp, body)
-        else:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-            fd = os.open(tmp, flags, 0o600)
-            with os.fdopen(fd, "wb") as fh:
-                os.fchmod(fh.fileno(), 0o600)
-                fh.write(body)
-                fh.flush()
-                os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
-    _check_private(path)
+        fsutil.write_private(token_path(home), body)
+    except fsutil.PrivateFileError as exc:
+        raise TokenFileError(str(exc)) from exc
     return stored
-
-
-# -- Windows: a DACL that names this user alone --------------------------------
-
-_SE_FILE_OBJECT = 1
-_DACL_SECURITY_INFORMATION = 0x4
-_SDDL_REVISION_1 = 1
-_GENERIC_WRITE = 0x40000000
-_CREATE_NEW = 1
-_FILE_ATTRIBUTE_NORMAL = 0x80
-_TOKEN_QUERY = 0x0008
-_TOKEN_USER = 1
-
-
-def _win_user_sid() -> str:
-    """This process's user SID, as a string (``S-1-5-21-...``)."""
-    if sys.platform != "win32":
-        raise OSError("not Windows")
-    import ctypes  # win-only: ctypes.WinDLL/windll exist only on Windows
-    from ctypes import wintypes
-
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    advapi32.OpenProcessToken.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.HANDLE),
-    ]
-    advapi32.GetTokenInformation.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    advapi32.ConvertSidToStringSidW.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    handle = wintypes.HANDLE()
-    if not advapi32.OpenProcessToken(
-        kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(handle)
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        size = wintypes.DWORD()
-        advapi32.GetTokenInformation(handle, _TOKEN_USER, None, 0, ctypes.byref(size))
-        buf = ctypes.create_string_buffer(size.value)
-        if not advapi32.GetTokenInformation(
-            handle, _TOKEN_USER, buf, size, ctypes.byref(size)
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        # TOKEN_USER opens with SID_AND_ATTRIBUTES, which opens with the PSID.
-        psid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
-        text = ctypes.c_void_p()
-        if not advapi32.ConvertSidToStringSidW(psid, ctypes.byref(text)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            return ctypes.wstring_at(text)
-        finally:
-            kernel32.LocalFree(text)
-    finally:
-        kernel32.CloseHandle(handle)
-
-
-def _private_sddl() -> str:
-    """Protected (nothing inherited), one ACE: full access for this user."""
-    return f"D:P(A;;FA;;;{_win_user_sid()})"
-
-
-def _win_write_private(path: Path, body: bytes) -> None:
-    """Create ``path`` (it must not exist) with ``_private_sddl`` as its DACL
-    from the first instant, then write ``body`` and fsync it."""
-    if sys.platform != "win32":
-        raise OSError("not Windows")
-    import ctypes  # win-only: ctypes.WinDLL/windll exist only on Windows
-    import msvcrt
-    from ctypes import wintypes
-
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    class _SecurityAttributes(ctypes.Structure):
-        _fields_ = (
-            ("nLength", wintypes.DWORD),
-            ("lpSecurityDescriptor", ctypes.c_void_p),
-            ("bInheritHandle", wintypes.BOOL),
-        )
-
-    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_void_p,
-    ]
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.POINTER(_SecurityAttributes),
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    ]
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    descriptor = ctypes.c_void_p()
-    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        _private_sddl(), _SDDL_REVISION_1, ctypes.byref(descriptor), None
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        attrs = _SecurityAttributes(
-            ctypes.sizeof(_SecurityAttributes), descriptor, False
-        )
-        handle = kernel32.CreateFileW(
-            str(path),
-            _GENERIC_WRITE,
-            0,
-            ctypes.byref(attrs),
-            _CREATE_NEW,
-            _FILE_ATTRIBUTE_NORMAL,
-            None,
-        )
-        if handle is None or handle == ctypes.c_void_p(-1).value:
-            raise ctypes.WinError(ctypes.get_last_error())
-    finally:
-        kernel32.LocalFree(descriptor)
-    try:
-        fd = msvcrt.open_osfhandle(handle, os.O_WRONLY)
-    except OSError:
-        kernel32.CloseHandle(handle)
-        raise
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(body)
-        fh.flush()
-        os.fsync(fh.fileno())
-
-
-def _win_dacl(path: Path) -> str:
-    """``path``'s DACL as SDDL (``D:P(A;;FA;;;S-...)``)."""
-    if sys.platform != "win32":
-        raise OSError("not Windows")
-    import ctypes  # win-only: ctypes.WinDLL/windll exist only on Windows
-    from ctypes import wintypes
-
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
-    advapi32.GetNamedSecurityInfoW.argtypes = [
-        wintypes.LPCWSTR,
-        ctypes.c_int,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_void_p,
-    ]
-    dacl = ctypes.c_void_p()
-    descriptor = ctypes.c_void_p()
-    err = advapi32.GetNamedSecurityInfoW(
-        str(path),
-        _SE_FILE_OBJECT,
-        _DACL_SECURITY_INFORMATION,
-        None,
-        None,
-        ctypes.byref(dacl),
-        None,
-        ctypes.byref(descriptor),
-    )
-    if err:
-        raise ctypes.WinError(err)
-    try:
-        text = ctypes.c_void_p()
-        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            descriptor,
-            _SDDL_REVISION_1,
-            _DACL_SECURITY_INFORMATION,
-            ctypes.byref(text),
-            None,
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            return ctypes.wstring_at(text)
-        finally:
-            kernel32.LocalFree(text)
-    finally:
-        kernel32.LocalFree(descriptor)
-
-
-def _win_canonical_sddl(sddl: str) -> str:
-    """``sddl`` after a round trip through the security descriptor, which is
-    how Windows itself spells it back. SDDL aliases some SIDs (the machine's
-    RID-500 account reads back as ``LA``), so a text compare against the SID
-    string we wrote would refuse a file magent just made for that user."""
-    if sys.platform != "win32":
-        raise OSError("not Windows")
-    import ctypes  # win-only: ctypes.WinDLL/windll exist only on Windows
-    from ctypes import wintypes
-
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_void_p,
-    ]
-    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_void_p,
-    ]
-    descriptor = ctypes.c_void_p()
-    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        sddl, _SDDL_REVISION_1, ctypes.byref(descriptor), None
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        text = ctypes.c_void_p()
-        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            descriptor,
-            _SDDL_REVISION_1,
-            _DACL_SECURITY_INFORMATION,
-            ctypes.byref(text),
-            None,
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            return ctypes.wstring_at(text)
-        finally:
-            kernel32.LocalFree(text)
-    finally:
-        kernel32.LocalFree(descriptor)
-
-
-def _win_dacl_is_private(path: Path) -> bool:
-    """True when ``path``'s DACL is protected and holds exactly one ACE:
-    this user's full access. Unknown (a probe that failed) is not private."""
-    try:
-        sddl = _win_dacl(path)
-        expected = _win_canonical_sddl(_private_sddl())
-    except OSError:
-        return False
-    return sddl == expected
 
 
 # -- minting -------------------------------------------------------------------

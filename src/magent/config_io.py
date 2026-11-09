@@ -14,8 +14,8 @@ the modules allowed to make one.
 taken with a bounded wait, so two API requests (or a cli and the daemon)
 racing over the config serialise instead of one being refused.
 
-Stdlib + ``config`` + ``lockfile`` only; never prints or exits (the cli
-module of the same name wraps these for the editor's exit-on-error style).
+Stdlib + ``config`` + ``fsutil`` + ``lockfile`` only; never prints or exits (the
+cli module of the same name wraps these for the editor's exit-on-error style).
 """
 
 from __future__ import annotations
@@ -32,6 +32,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from magent.config import load_config
+from magent.fsutil import REPLACE_RETRIES as REPLACE_RETRIES
+from magent.fsutil import REPLACE_SLEEP_S as REPLACE_SLEEP_S
+from magent.fsutil import replace_retrying
 from magent.lockfile import LockHeld, persistent_lock
 
 if TYPE_CHECKING:
@@ -51,13 +54,6 @@ LOCK_WAIT_S = 2.0
 # concurrent API writes wait on a cheap lock instead of polling the file lock
 # against each other -- the same shape as ``nodes.map_lock``.
 _WRITE_LOCK = threading.Lock()
-
-# A reader holding the config on Windows makes the writer's ``os.replace``
-# fail with ``PermissionError`` for as long as it reads (every ``load_config``
-# is such a reader). Bounded: ~0.5 s outlasts any one ``read_text``; a file
-# held for good still surfaces as the error.
-REPLACE_RETRIES = 20
-REPLACE_SLEEP_S = 0.025
 
 
 class ConfigWriteError(ValueError):
@@ -151,27 +147,6 @@ def backup(path: Path, *, keep: int = BACKUP_KEEP) -> Path | None:
         with contextlib.suppress(OSError):
             old.unlink()
     return dest
-
-
-def replace_retrying(
-    src: Path,
-    dst: Path,
-    *,
-    retries: int = REPLACE_RETRIES,
-    sleep_s: float = REPLACE_SLEEP_S,
-) -> None:
-    """``os.replace(src, dst)``, retried ``retries`` times ``sleep_s`` apart
-    while a reader holds ``dst`` (``PermissionError``, Windows); any other
-    error, and a refusal that outlasts every retry, propagate."""
-    for attempt in range(retries + 1):
-        try:
-            os.replace(src, dst)
-        except PermissionError:
-            if attempt == retries:
-                raise
-            time.sleep(sleep_s)
-        else:
-            return
 
 
 def write_atomic(path: Path, data: dict[str, object]) -> None:

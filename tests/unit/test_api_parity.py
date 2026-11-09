@@ -6,6 +6,7 @@ test_upload_server_api.py); the CLI half is the real Click entry point."""
 
 from __future__ import annotations
 
+import functools
 import json
 import time
 
@@ -45,6 +46,16 @@ def _no_sleep(monkeypatch):
 @pytest.fixture(autouse=True)
 def _patient_capture(monkeypatch):
     monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 60.0)
+
+
+@pytest.fixture(autouse=True)
+def _patient_send(monkeypatch):
+    # The fake psmux is a real child process: on a loaded machine its start
+    # alone can pass send-keys' 20 s bound, which is a default argument, so
+    # the call is wrapped rather than the constant patched.
+    monkeypatch.setattr(
+        psmux, "send_keys", functools.partial(psmux.send_keys, timeout=60.0)
+    )
 
 
 def make_ctx(cfg: str, tmp_path) -> api.ApiContext:

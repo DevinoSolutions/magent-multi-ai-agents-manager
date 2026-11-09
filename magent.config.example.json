@@ -39,6 +39,9 @@
       "enabled": true,
       "afterMinutes": 120
     },
+    "link": {
+      "remoteControl": false
+    },
     "tools": {
       "claude": "claude --continue",
       "codex": "codex",

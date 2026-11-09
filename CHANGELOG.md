@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`magent link` pairs this machine with the magent app over the relay.**
+  It prints a QR code and an 8-character code, waits for the app to claim it
+  (a typed code is confirmed with a 6-digit safety number on both screens),
+  and asks whether paired devices may drive sessions: remote control, off
+  unless you say yes (`--remote-control` / `--no-remote-control` change it
+  later, stored as `settings.link.remoteControl` in the config file the CLI
+  resolves; off whenever that file cannot be read). `--add-device` pairs
+  another device, `--status [--json]` shows the link, and `magent unlink`
+  revokes it. Needs the new `[link]` extra.
+- **`magent serve` keeps the link open.** One outbound connection to
+  `api.magent.now`, nothing listening: session rows, events, command results
+  and uploaded files are end-to-end encrypted for the paired devices, and a
+  device's command runs only if its signature verifies, it is under two
+  minutes old and it comes from a paired device. A command the relay replays
+  never runs twice, and an upload is pasted once. An answer too large to send
+  comes back as `502 result_too_large`, and an upload state the relay missed
+  is sent again. One serve per machine runs the link and any other stands by;
+  `magent link --status`, `status` and `doctor` name it, and warn when it
+  reads remote control from another config file than the CLI. Decrypted
+  files a serve left behind mid-pull are removed when the next serve takes
+  the link, or by `magent unlink`. `MAGENT_LINK=0` keeps a linked machine
+  offline; `MAGENT_LINK_URL` points at another relay.
+- **`magent status`, `magent doctor` and `status --json` report the link:**
+  `unlinked`, `connecting`, `online`, `offline (retry in Ns)`, `revoked` or
+  `disabled`. Error reports sent to Sentry have the link's token and keys
+  stripped.
 - **A versioned local API: `/api/v1`.** `magent serve` now answers
   `/api/v1/meta`, `health`, `status`, `sessions` (each row carries the hook
   state and, with `?fresh=1`, the pane state, side by side), a session's pane, `projects`, an

@@ -252,6 +252,18 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "below 30 are raised to 30 (the floor)."
         ),
     ),
+    (
+        "link.remoteControl",
+        "boolean",
+        "`false`",
+        (
+            "Let devices paired with `magent link` send text, choose, interrupt, "
+            "change model, start/stop sessions and edit projects. Off, they can "
+            "only watch and upload. Set by `magent link --remote-control` / "
+            "`--no-remote-control`; any non-boolean is a config error, never "
+            "read as on."
+        ),
+    ),
 ]
 
 
@@ -433,6 +445,35 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         (
             "Deliberately bind LAN-wide instead. The escape hatch, not a default -- "
             "see the bind note above before using it."
+        ),
+    ),
+    (
+        "magent link",
+        (
+            "Pair this machine with the magent app through the relay "
+            "(api.magent.now): prints a QR code and an 8-character code, waits "
+            "for the app to claim it, then asks whether paired devices may "
+            "drive sessions (remote control, off by default). `--add-device` "
+            "pairs one more device; `--no-qr` prints the link instead; "
+            "`--remote-control` / `--no-remote-control` on a linked machine "
+            "only flips that setting. Needs the `[link]` extra. Everything the "
+            "relay carries is end-to-end encrypted; `magent serve` holds the "
+            "connection (one serve per machine runs it)."
+        ),
+    ),
+    (
+        "magent link --status",
+        (
+            "Show the link's state, relay, host id, paired devices and remote "
+            "control, which serve runs the link, and a warning when that serve "
+            "reads remote control from another config file (`--json` for scripts)."
+        ),
+    ),
+    (
+        "magent unlink",
+        (
+            "Forget the link: asks the relay to revoke this machine (best "
+            "effort) and deletes `~/.magent/link.json`."
         ),
     ),
     (

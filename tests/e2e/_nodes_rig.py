@@ -100,6 +100,9 @@ PIN_VALUES: dict[str, str] = {
     "MAGENT_PSMUX_BOOST": "0",
     "MAGENT_NODE_SYNC": "0",
     "MAGENT_IDLE_REAP": "0",
+    "MAGENT_LINK": "0",
+    "MAGENT_EVENTS": "0",
+    "MAGENT_LINK_URL": "http://127.0.0.1:9",
     "MAGENT_SESSION0_POLICY": "allow",
     "MAGENT_MCP_RELAY": "0",
     "MAGENT_ACCOUNT_ROUTING": "0",
@@ -114,6 +117,8 @@ REQUIRED_PINS = (
     "MAGENT_SESSION0_POLICY",
     "MAGENT_NODE_SYNC",
     "MAGENT_IDLE_REAP",
+    "MAGENT_LINK",
+    "MAGENT_LINK_URL",
 )
 # Set in every PC-side child, and never allowed to reach a node pane
 # (remote_mux forwards no environment). MAGENT_* canaries are impossible:

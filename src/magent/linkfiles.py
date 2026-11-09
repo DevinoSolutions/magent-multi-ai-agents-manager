@@ -1,0 +1,375 @@
+"""The link's two files under ~/.magent (contract C8).
+
+``link.json`` is a secret: the relay URL, this host's id and token, both
+private keys and the devices it trusts. It is written owner-only
+(fsutil.write_private) and refused on read unless it is still owner-only and
+exactly the expected shape -- the repair is always `magent unlink` then
+`magent link`. Beside the trusted devices it keeps tombstones of the ones the
+relay revoked (``revoked``, written only when there are any, so a file
+without them reads as before), which no later save may bring back. They are
+kept in the order they were written and capped at REVOKED_MAX: a new one is
+appended and only the oldest are evicted, never one out of the middle, and
+the runner does not write back one the cap evicted (see tombstones_lost for
+why that is still safe). Every
+change to it is made under one cross-process mutation
+lock (link_lock, the ``link.json.lock`` sidecar), held by a read-modify-write
+from its read to its replace. ``link-state.json`` is not secret: the stream cursor, the ring
+of command and upload ids already handled, the host they belong to, and the
+state `magent status` shows. A bad state file degrades to a fresh one.
+``link-serve.json`` is not secret either: the serve that runs the link (it
+holds ``link.LINK_LOCK``) names itself there -- pid, port, and the config
+file it reads remote control from -- for as long as it holds the lock.
+
+The paths are bound at import, like every other ~/.magent path, so
+tests/conftest.py's tripwire redirects them.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from magent import fsutil, lockfile
+from magent.log import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+LINK_PATH = Path.home() / ".magent" / "link.json"
+LINK_STATE_PATH = Path.home() / ".magent" / "link-state.json"
+INCOMING_DIR = Path.home() / ".magent" / "uploads" / ".incoming"
+LINK_SERVE_PATH = Path.home() / ".magent" / "link-serve.json"
+
+FILE_VERSION = 1
+SEEN_MAX = 1024
+# On Windows a read racing a writer's atomic replace is refused for a moment
+# (the runner rewrites link-state.json on every change): retried this many
+# times, this far apart, as LinkRunner retries its own reads and writes.
+READ_ATTEMPTS = 5
+READ_RETRY_S = 0.02
+# How long a change to link.json waits for another holder of its mutation
+# lock (each holder keeps it for one read and one atomic replace).
+LINK_LOCK_WAIT_S = 5.0
+# Revocation tombstones kept in link.json, the newest; the oldest go first.
+# A running link never trusts a device it saw revoked, whatever the cap kept.
+REVOKED_MAX = 100
+
+_LINK_KEYS = ("relay_url", "host_id", "host_token", "host_kex_priv", "host_sign_priv")
+_DEVICE_KEYS = ("device_id", "name", "kex_pub", "sign_pub", "paired_at")
+_REVOKED_KEYS = ("device_id", "sign_pub", "revoked_at")
+_TOP_KEYS = frozenset(("version", "devices", "revoked", *_LINK_KEYS))
+
+# What _read_json returns for a file that is not JSON. The decode error itself
+# is dropped, never chained: it carries the file's text, and link.json's text
+# is the host token and both private keys.
+_NOT_JSON = object()
+
+
+class LinkFileError(ValueError):
+    """link.json exists but is unsafe or not a magent link file."""
+
+
+@dataclass(frozen=True)
+class TrustedDevice:
+    device_id: str
+    name: str
+    kex_pub: str
+    sign_pub: str
+    paired_at: str
+
+
+@dataclass(frozen=True)
+class RevokedDevice:
+    """A device the relay revoked: never trusted again under this id, nor
+    under this signing key (``sign_pub``; "" when it was never known)."""
+
+    device_id: str
+    sign_pub: str
+    revoked_at: str
+
+
+@dataclass(frozen=True)
+class LinkFile:
+    relay_url: str
+    host_id: str
+    # The secrets stay out of repr(), so a log line or a traceback that
+    # formats a LinkFile never prints the token or a key.
+    host_token: str = field(repr=False)
+    host_kex_priv: str = field(repr=False)
+    host_sign_priv: str = field(repr=False)
+    devices: tuple[TrustedDevice, ...]
+    revoked: tuple[RevokedDevice, ...] = ()
+
+    def is_revoked(self, device: TrustedDevice) -> bool:
+        """``device`` matches a tombstone, by id or by signing key."""
+        return any(
+            t.device_id == device.device_id
+            or (t.sign_pub and t.sign_pub == device.sign_pub)
+            for t in self.revoked
+        )
+
+
+@dataclass(frozen=True)
+class LinkState:
+    cursor: int = 0
+    seen_ids: tuple[str, ...] = ()
+    last_connected: float | None = None
+    state: str = "unlinked"
+    retry_at: float | None = None
+    # The pairing whose cursor and seen ring these are; None in a file from
+    # before the field (kept as it is). A runner on another host starts fresh.
+    host_id: str | None = None
+
+
+def _link_path(path: Path | None) -> Path:
+    return LINK_PATH if path is None else path
+
+
+def _state_path(path: Path | None) -> Path:
+    return LINK_STATE_PATH if path is None else path
+
+
+def _is_current(raw: dict[str, object]) -> bool:
+    """True when ``raw`` is FILE_VERSION exactly: an int, not True or 1.0."""
+    version = raw.get("version")
+    return type(version) is int and version == FILE_VERSION
+
+
+def _read_json(p: Path) -> object:
+    """``p`` parsed, or _NOT_JSON when it is not JSON. OSError propagates."""
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except ValueError:
+        # Returned, not raised from in here: see _NOT_JSON.
+        return _NOT_JSON
+
+
+def _strings(
+    raw: dict[str, object], keys: tuple[str, ...], where: Path
+) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key in keys:
+        value = raw.get(key)
+        if not isinstance(value, str) or not value:
+            raise LinkFileError(f"{where} is not a magent link file ({key})")
+        out[key] = value
+    return out
+
+
+def load_link(path: Path | None = None) -> LinkFile | None:
+    """The saved link, or None when this host is not linked."""
+    p = _link_path(path)
+    if not p.exists() and not p.is_symlink():
+        return None
+    try:
+        fsutil.check_private(p)
+    except fsutil.PrivateFileError as exc:
+        raise LinkFileError(str(exc)) from exc
+    try:
+        raw = _read_json(p)
+    except OSError as exc:
+        raise LinkFileError(f"{p} is not a magent link file") from exc
+    if raw is _NOT_JSON:
+        raise LinkFileError(f"{p} is not a magent link file")
+    if not isinstance(raw, dict) or not _is_current(raw):
+        raise LinkFileError(f"{p} is not a magent link file (version)")
+    if not set(raw) <= _TOP_KEYS:
+        raise LinkFileError(f"{p} is not a magent link file (unexpected keys)")
+    fields = _strings(raw, _LINK_KEYS, p)
+    devices_raw = raw.get("devices")
+    if not isinstance(devices_raw, list):
+        raise LinkFileError(f"{p} is not a magent link file (devices)")
+    devices: list[TrustedDevice] = []
+    for item in devices_raw:
+        if not isinstance(item, dict) or not set(item) <= set(_DEVICE_KEYS):
+            raise LinkFileError(f"{p} is not a magent link file (devices)")
+        devices.append(TrustedDevice(**_strings(item, _DEVICE_KEYS, p)))
+    return LinkFile(devices=tuple(devices), revoked=_revoked(raw, p), **fields)
+
+
+def _revoked(raw: dict[str, object], where: Path) -> tuple[RevokedDevice, ...]:
+    """The tombstones; none when the file has no ``revoked`` (one written
+    before them, or with none to keep)."""
+    items = raw.get("revoked", [])
+    if not isinstance(items, list):
+        raise LinkFileError(f"{where} is not a magent link file (revoked)")
+    out: list[RevokedDevice] = []
+    for item in items:
+        if not isinstance(item, dict) or set(item) != set(_REVOKED_KEYS):
+            raise LinkFileError(f"{where} is not a magent link file (revoked)")
+        sign_pub = item.get("sign_pub")
+        if not isinstance(sign_pub, str):
+            raise LinkFileError(f"{where} is not a magent link file (revoked)")
+        named = _strings(item, ("device_id", "revoked_at"), where)
+        out.append(RevokedDevice(sign_pub=sign_pub, **named))
+    return tuple(out)
+
+
+def tombstones_lost(before: LinkFile, after: LinkFile) -> bool:
+    """Whether a tombstone written after ``before`` was read may have been
+    evicted from ``after`` (the same link, read again): then a claim made
+    since ``before`` cannot be told from a device revoked meanwhile, and
+    must not be saved. Tombstones are only appended and only the oldest are
+    evicted, so none written since was while ``before``'s oldest is still
+    there; with none in ``before``, a full list may hide one. Fails closed."""
+    if before.revoked:
+        return before.revoked[0] not in after.revoked
+    return len(after.revoked) >= REVOKED_MAX
+
+
+def link_stamp(path: Path | None = None) -> tuple[int, int, int] | None:
+    """link.json's mtime, size and file index, None when it is absent: a
+    re-pair (an atomic replace, so a new file) or an unlink changes it."""
+    try:
+        info = _link_path(path).stat()
+    except OSError:
+        return None
+    return info.st_mtime_ns, info.st_size, info.st_ino
+
+
+def link_lock_path(path: Path | None = None) -> Path:
+    """The mutation lock's sidecar beside link.json: ``link.json.lock``."""
+    p = _link_path(path)
+    return p.with_name(p.name + ".lock")
+
+
+@contextlib.contextmanager
+def link_lock(
+    path: Path | None = None, *, wait_s: float | None = None
+) -> Generator[None]:
+    """Hold link.json's mutation lock, across processes: every change to the
+    file (a save, the delete) is made under it, and a read-modify-write
+    holds it from its read to its replace, so `magent unlink`, `magent link
+    --add-device` and a runner forgetting a revoked device can never undo
+    each other. ``lockfile.LockHeld`` when another holder keeps it past
+    ``wait_s`` (None: LINK_LOCK_WAIT_S). The sidecar is never deleted (see
+    lockfile.persistent_lock), and the lock is per open file: a thread
+    already holding it must not take it again."""
+    wait = LINK_LOCK_WAIT_S if wait_s is None else wait_s
+    with lockfile.persistent_lock_at(link_lock_path(path), wait_s=wait):
+        yield
+
+
+def save_link(link: LinkFile, path: Path | None = None) -> None:
+    """Write link.json owner-only and atomically. The caller holds
+    link_lock: from its read of the file when ``link`` was made from one."""
+    body = {"version": FILE_VERSION, **asdict(link)}
+    body["devices"] = [asdict(d) for d in link.devices]
+    # Left out when empty: a build from before tombstones refuses the key.
+    body.pop("revoked")
+    if link.revoked:
+        body["revoked"] = [asdict(t) for t in link.revoked[-REVOKED_MAX:]]
+    fsutil.write_private(_link_path(path), json.dumps(body, indent=2).encode("utf-8"))
+
+
+def delete_link(path: Path | None = None, state_path: Path | None = None) -> None:
+    """Forget the link: both files, missing ones included, under link_lock
+    (``lockfile.LockHeld`` when it stays taken: nothing is deleted)."""
+    with link_lock(path):
+        _link_path(path).unlink(missing_ok=True)
+        _state_path(state_path).unlink(missing_ok=True)
+
+
+def load_state(path: Path | None = None) -> LinkState:
+    """The saved state; a fresh LinkState when it is missing or unreadable."""
+    p = _state_path(path)
+    raw: object = _NOT_JSON
+    for attempt in range(READ_ATTEMPTS):
+        try:
+            raw = _read_json(p)
+        except FileNotFoundError:
+            return LinkState()
+        except OSError:
+            # A read racing the writer: never a phantom fresh state at once.
+            if attempt < READ_ATTEMPTS - 1:
+                time.sleep(READ_RETRY_S)
+        else:
+            break
+    if not isinstance(raw, dict) or not _is_current(raw):
+        get_logger("link").warning(
+            "link: %s is unreadable; starting from a fresh state", p
+        )
+        return LinkState()
+    cursor = raw.get("cursor")
+    seen = raw.get("seen_ids")
+    last = raw.get("last_connected")
+    state = raw.get("state")
+    retry = raw.get("retry_at")
+    host_id = raw.get("host_id")
+    return LinkState(
+        cursor=cursor
+        if isinstance(cursor, int) and not isinstance(cursor, bool)
+        else 0,
+        seen_ids=tuple(s for s in seen if isinstance(s, str))[-SEEN_MAX:]
+        if isinstance(seen, list)
+        else (),
+        last_connected=float(last)
+        if isinstance(last, (int, float)) and not isinstance(last, bool)
+        else None,
+        state=state if isinstance(state, str) else "unlinked",
+        retry_at=float(retry)
+        if isinstance(retry, (int, float)) and not isinstance(retry, bool)
+        else None,
+        host_id=host_id if isinstance(host_id, str) and host_id else None,
+    )
+
+
+def save_state(state: LinkState, path: Path | None = None) -> None:
+    """Write link-state.json atomically, keeping only the newest SEEN_MAX ids."""
+    body = {
+        "version": FILE_VERSION,
+        "cursor": state.cursor,
+        "seen_ids": list(state.seen_ids[-SEEN_MAX:]),
+        "last_connected": state.last_connected,
+        "state": state.state,
+        "retry_at": state.retry_at,
+        "host_id": state.host_id,
+    }
+    fsutil.write_atomic(_state_path(path), json.dumps(body).encode("utf-8"))
+
+
+def _serve_path(path: Path | None) -> Path:
+    return LINK_SERVE_PATH if path is None else path
+
+
+def save_serve(record: dict[str, object], path: Path | None = None) -> None:
+    """Write link-serve.json atomically: what the serve running the link says
+    about itself (``pid``, ``port``, ``config``)."""
+    body = {"version": FILE_VERSION, **record}
+    fsutil.write_atomic(_serve_path(path), json.dumps(body).encode("utf-8"))
+
+
+def load_serve(path: Path | None = None) -> dict[str, object] | None:
+    """The record, without its version; None when it is missing or not a
+    current record. It only means something while the link lock is held:
+    a serve that died leaves its record behind."""
+    p = _serve_path(path)
+    for attempt in range(READ_ATTEMPTS):
+        try:
+            raw = _read_json(p)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            # A read racing the writer's atomic replace (Windows).
+            if attempt < READ_ATTEMPTS - 1:
+                time.sleep(READ_RETRY_S)
+            continue
+        if not isinstance(raw, dict) or not _is_current(raw):
+            return None
+        return {str(k): v for k, v in raw.items() if k != "version"}
+    return None
+
+
+def clear_serve(pid: int | None = None, path: Path | None = None) -> None:
+    """Delete link-serve.json; with ``pid``, only while it still names that
+    process (a serve that took the link over keeps its own record)."""
+    p = _serve_path(path)
+    if pid is not None:
+        record = load_serve(p)
+        if record is None or record.get("pid") != pid:
+            return
+    p.unlink(missing_ok=True)

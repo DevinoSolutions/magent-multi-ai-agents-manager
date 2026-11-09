@@ -192,6 +192,10 @@ class _Run:
         # The MAGENT_* strip drops conftest's pin: a child born with the idle
         # reaper on could reach this box's live fleet.
         env["MAGENT_IDLE_REAP"] = "0"
+        # ...and the relay link, whose reach is the internet.
+        env["MAGENT_LINK"] = "0"
+        env["MAGENT_EVENTS"] = "0"
+        env["MAGENT_LINK_URL"] = "http://127.0.0.1:9"
         # Our fake must win the PATH lookup find_psmux does -- verified after
         # the run by the recorded invocations, never assumed.
         env["PATH"] = str(self.bin_dir) + os.pathsep + env.get("PATH", "")

@@ -177,7 +177,8 @@ class TestNoEagerImport:
             [sys.executable, "-c", probe],
             capture_output=True,
             text=True,
-            timeout=10,
+            # A bare interpreter start has taken 14 s on a loaded machine.
+            timeout=60,
             check=True,
         )
         assert result.stdout.strip() == "False"

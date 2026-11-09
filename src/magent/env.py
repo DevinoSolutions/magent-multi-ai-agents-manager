@@ -188,6 +188,31 @@ class MagentEnv(BaseSettings):
     # must not have it capturing the developer's live panes -- so
     # tests/conftest.py pins it to 0 for every tier.
     events: bool = True
+    # Should `magent serve` run the magent link thread? (default: 1 / on.) The
+    # thread is idle until `magent link` has paired this machine with the relay
+    # (~/.magent/link.json exists); then it holds one outbound SSE stream to the
+    # relay and runs the encrypted, device-signed commands it receives through
+    # the same api.handle the local /api/v1 uses. Set to 0 to keep a linked
+    # machine offline without unlinking it.
+    #
+    # Another member of the test-isolation law (hotkey_supervisor /
+    # upload_supervisor / attention_supervisor / psmux_boost / node_sync /
+    # idle_reap / events): on a developer box that is linked, a test that
+    # starts a real serve would otherwise dial the real relay with the
+    # developer's own host token. tests/conftest.py pins it to 0 for every
+    # tier; the link tests drive the runner in process against a fake relay.
+    link: bool = True
+    # Where `magent link` pairs (default: https://api.magent.now). The relay URL
+    # is saved into ~/.magent/link.json at pairing time, so changing this later
+    # does not move an already-linked machine; unlink and link again for that.
+    # tests/conftest.py pins it to a dead loopback (http://127.0.0.1:9) so no
+    # test can reach the real relay by omission.
+    link_url: HttpUrl = HttpUrl("https://api.magent.now")
+    # The app the pairing QR opens (default: https://app.magent.now). The QR's
+    # fragment carries the pairing secret, so `magent link` refuses a relay
+    # reply whose appUrl is not this origin: a relay cannot aim the QR at a
+    # page of its own choosing.
+    link_app_url: HttpUrl = HttpUrl("https://app.magent.now")
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:
