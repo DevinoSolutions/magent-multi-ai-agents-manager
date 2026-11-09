@@ -1966,6 +1966,32 @@ class LinkRunner:
         with self._lock:
             return self._peers.get(device_id)
 
+    def upload_blocker(self, peer: _Peer, client: RelayClient | None) -> str | None:
+        """Why an upload ``peer`` sent may not be staged now, or None. Trust
+        is re-read from link.json first (_refresh_trust, its snapshot PUT
+        through ``client``): ``ended`` once the run was unlinked or paired
+        again, ``revoked`` once the device is no longer trusted with the same
+        keys. A snapshot that cannot go out does not change the answer: the
+        trust in memory is refreshed before it is PUT."""
+        try:
+            self._refresh_trust(client)
+        except (_Unlinked, _Relinked):
+            return "ended"
+        except Exception:  # noqa: BLE001  # reason: a snapshot for a changed trust that fails (relay or LinkHost) must not decide the upload; the check below still reads the refreshed trust
+            self._log.warning(
+                "link: could not send the snapshot for a changed link.json"
+            )
+        with self._lock:
+            if self._end is not None:
+                return "ended"
+            current = self._peers.get(peer.device.device_id)
+        if current is None or (current.sign_pub, current.keys) != (
+            peer.sign_pub,
+            peer.keys,
+        ):
+            return "revoked"
+        return None
+
     def has_seen(self, item_id: str) -> bool:
         with self._lock:
             return item_id in self._seen
@@ -2590,6 +2616,7 @@ class _Verified:
     cap: int
     content_key: bytes
     name: str
+    peer: _Peer  # as trusted when verified: checked again before staging
 
 
 @dataclass(frozen=True)
@@ -2629,8 +2656,10 @@ class UploadPuller:
     (one folder per pull) under the same cap and decrypted chunk by chunk (a
     tampered or cut-short object fails whole). Only then, unless the link
     has stopped meanwhile, does the id enter the seen ring, in one step
-    with the seen check; it is reported ``pulled``, handed to
-    ``LinkHost.stage_upload``, and its outcome reported: ``injected``,
+    with the seen check; it is reported ``pulled``, checked again (link.json
+    re-read: the run still live and not stopping, the device still trusted
+    under the same keys), handed to ``LinkHost.stage_upload``, and its
+    outcome reported: ``injected``,
     ``inject_pending``, ``inject_failed`` (a paste was asked for and did not
     happen) or nothing more (none was asked for). Reported states only move
     forward. A state the relay could not take for now (no reply, a 5xx or a
@@ -2865,6 +2894,7 @@ class UploadPuller:
             cap=cap,
             content_key=content_key,
             name=safe_name(meta.get("name")),
+            peer=peer,
         )
 
     def _fetch(self, ready: _Verified, folder: Path) -> Path | None:
@@ -2926,7 +2956,13 @@ class UploadPuller:
     def _stage(self, ready: _Verified, target: Path) -> tuple[str, bool] | None:
         """Remember, report ``pulled``, stage: the final state (see _take).
         None, and nothing remembered, when the link stopped meanwhile: the
-        relay sends it again on the next run."""
+        relay sends it again on the next run.
+
+        The download and the ``pulled`` report can take minutes, so right
+        before the file is handed over the puller checks again (_cleared):
+        a stop, a revoked device or a device trusted under other keys stages
+        nothing and reports ``inject_failed``; an unlinked or re-paired run
+        stages and reports nothing (its token is abandoned)."""
         upload_id = ready.upload_id
         if self._stop.is_set():
             return None
@@ -2943,6 +2979,10 @@ class UploadPuller:
             )
             return "inject_failed", True
         self._advance(upload_id, "pulled")
+        blocker = self._cleared(ready)
+        if blocker is not None:
+            self._log.warning("link: upload %s not staged: %s", upload_id, blocker)
+            return None if blocker == "ended" else ("inject_failed", True)
         try:
             envelope = self._host.stage_upload(
                 ready.device_id, ready.session, target, ready.inject
@@ -2953,6 +2993,17 @@ class UploadPuller:
         else:
             state = upload_state(envelope, ready.inject)
         return state, True
+
+    def _cleared(self, ready: _Verified) -> str | None:
+        """Why ``ready`` may not be staged now (``stopping``, ``ended``,
+        ``revoked``: see LinkRunner.upload_blocker), or None."""
+        if self._stop.is_set():
+            return "stopping"
+        client = self._client if self._runner.online() else None
+        blocker = self._runner.upload_blocker(ready.peer, client)
+        if blocker is None and self._stop.is_set():
+            return "stopping"  # set while trust was being read
+        return blocker
 
     def _advance(self, upload_id: str, state: str) -> None:
         if self._record(upload_id, state):

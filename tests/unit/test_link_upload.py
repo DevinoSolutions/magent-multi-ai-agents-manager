@@ -31,6 +31,7 @@ from tests.unit._link_fakes import (
     cut_stream_and_wait,
     make_upload,
     new_device,
+    save_linked,
     stop_all,
     stray_forwarders,
     stream_opens,
@@ -140,6 +141,29 @@ def _missed(fails, state="injected", error=None):
             state=state,
             error=error or RelayError(503, "unavailable", "DECOY relay hiccup"),
         )
+
+    return factory
+
+
+class _OnPulled(RelayClient):
+    """Runs ``hook`` inside the ``pulled`` result POST, before it reaches the
+    relay: whatever a relay holding that reply back lets happen meanwhile."""
+
+    def __init__(self, url, *, token, sleep, hook):
+        super().__init__(url, token=token, sleep=sleep)
+        self._hook = hook
+
+    def call(self, method, path, body=None, **kwargs):
+        results = body.get("results") if isinstance(body, dict) else None
+        states = [r.get("state") for r in results or [] if r.get("type") == "upload"]
+        if path == "/v1/host/results" and "pulled" in states:
+            self._hook()
+        return super().call(method, path, body, **kwargs)
+
+
+def _on_pulled(hook):
+    def factory(url, token, *, sleep):
+        return _OnPulled(url, token=token, sleep=sleep, hook=hook)
 
     return factory
 
@@ -574,7 +598,8 @@ class TestRefusals:
                 inject=False,
             )
         )
-        relay.wait_for(lambda: _states(relay, uid) == ["pulled"])
+        relay.wait_for(lambda: host.staged)  # "pulled" is reported first
+        assert _states(relay, uid) == ["pulled"]
         assert host.staged == [
             (phone.device_id, "magent-beta", "photo.png", b"PNG", False)
         ]
@@ -801,6 +826,70 @@ class TestRefusals:
         assert host.staged == []
         assert _states(relay, uid) == []
         assert uid not in linked.state().seen_ids
+        assert _pulls(uid) == []
+
+    @pytest.mark.parametrize("how", ["relay", "link.json", "new keys"])
+    def test_a_device_revoked_during_the_pull_is_never_staged(
+        self, relay, phone, linked, how
+    ):
+        # Trusted when the offer was verified, not by the time the file is
+        # ready: a download can take minutes, and trust is read again last.
+        uid = up_id(123)
+        gate, entered = threading.Event(), threading.Event()
+        host = FakeHost()
+        run = Running(
+            host, linked, client_factory=_downloads(gate=gate, entered=entered)
+        )
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        )
+        assert entered.wait(5)
+        if how == "relay":
+            relay.set_devices([phone.wire(revoked_at="2026-10-09T00:00:00Z")])
+            relay.wait_for(lambda: run.runner.peer(phone.device_id) is None)
+        elif how == "link.json":
+            save_linked(linked, host_token=relay.host_token, devices=())
+        else:  # the same device id, paired again under other keys
+            again = new_device(phone.device_id, phone.name)
+            save_linked(linked, host_token=relay.host_token, devices=(again.trusted(),))
+        gate.set()
+        relay.wait_for(lambda: _states(relay, uid) == ["pulled", "inject_failed"])
+        run.finish(relay)
+        assert host.staged == []
+        assert _pulls(uid) == []
+
+    def test_an_unlink_during_the_pulled_report_stages_nothing(
+        self, relay, phone, linked
+    ):
+        # `magent unlink` lands while the relay holds the "pulled" reply back:
+        # the reply that follows must not paste under the abandoned link.
+        uid = up_id(124)
+        host = FakeHost()
+        run = Running(host, linked, client_factory=_on_pulled(linked.link_path.unlink))
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        )
+        assert run.wait_done() == "unlinked"
+        assert host.staged == []
+        assert _states(relay, uid) == ["pulled"]  # nothing more under its token
+        assert _pulls(uid) == []
+
+    def test_a_stop_during_the_pulled_report_stages_nothing(self, relay, phone, linked):
+        uid = up_id(125)
+        host = FakeHost()
+        box: list[Running] = []
+
+        def stop_the_puller():
+            box[0].runner._uploads._stop.set()  # what stop() does first
+
+        run = Running(host, linked, client_factory=_on_pulled(stop_the_puller))
+        box.append(run)
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        )
+        relay.wait_for(lambda: _states(relay, uid) == ["pulled", "inject_failed"])
+        run.finish(relay)
+        assert host.staged == []
         assert _pulls(uid) == []
 
 
