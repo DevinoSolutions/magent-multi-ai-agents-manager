@@ -24,6 +24,7 @@ from tests.unit._link_fakes import (
     SESSION_ROW,
     STRANGER_ID,
     TABLET_ID,
+    Device,
     FakeHost,
     Running,
     cmd_id,
@@ -1117,6 +1118,52 @@ class TestDevices:
         assert runner.peer(TABLET_ID) is None
         assert set(runner.seal_for_devices(b"rows", "snap:x")) == {phone.device_id}
         assert linked.device_ids() == [phone.device_id]
+
+    def test_a_revoked_key_outlives_its_evicted_tombstone(self, tmp_path, phone):
+        # The tablet and an alias share one signing key under two ids. The
+        # relay revokes the tablet, listing it with another key, and
+        # REVOKED_MAX more devices: the cap evicts the tablet's tombstone.
+        # The key this host trusted the tablet with is still revoked, so
+        # the alias goes too: off disk, out of the live and a fresh run's
+        # peers and the snapshot, and refused by the upload guard.
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        alias = Device(OTHER_ID, "Alias DECOY", tablet.keys)
+        linked = write_link(
+            tmp_path,
+            "http://127.0.0.1:9",
+            (phone, tablet, alias),
+            host_token="mlh_DECOY_t",
+        )
+        runner = link.LinkRunner(
+            FakeHost(), link_path=linked.link_path, state_path=linked.state_path
+        )
+        runner._load(linkfiles.load_link(linked.link_path))
+        alias_peer = runner.peer(OTHER_ID)
+        assert alias_peer is not None
+        listed = tablet.wire(revoked_at="2026-10-09T00:00:00Z")
+        listed["signPub"] = new_device(STRANGER_ID).wire()["signPub"]
+        frame = {
+            "devices": [
+                phone.wire(),
+                listed,
+                *revoked_wires(linkfiles.REVOKED_MAX),
+            ]
+        }
+        runner._on_devices(None, frame)
+        marked = linkfiles.load_link(linked.link_path)
+        assert TABLET_ID not in {t.device_id for t in marked.revoked}  # evicted
+        assert [d.device_id for d in marked.devices] == [phone.device_id]
+        assert runner.peer(TABLET_ID) is None
+        assert runner.peer(OTHER_ID) is None
+        assert set(runner.seal_for_devices(b"rows", "snap:x")) == {phone.device_id}
+        assert runner.upload_blocker(alias_peer) == "revoked"
+
+        fresh = link.LinkRunner(
+            FakeHost(), link_path=linked.link_path, state_path=linked.state_path
+        )
+        fresh._load(linkfiles.load_link(linked.link_path))
+        assert fresh.peer(OTHER_ID) is None
+        assert set(fresh.seal_for_devices(b"rows", "snap:x")) == {phone.device_id}
 
     def test_a_lock_that_stays_taken_saves_nothing(self, monkeypatch, tmp_path, phone):
         # Another process is changing link.json: the revocation applies in

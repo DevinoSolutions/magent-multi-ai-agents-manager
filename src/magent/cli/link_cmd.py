@@ -370,7 +370,9 @@ def _save_added_device(
     linkfiles.link_lock; a link.json that is gone (`magent unlink`
     meanwhile) or cannot be read saves nothing, never the copy read before
     the pairing. A claimed device this machine already trusted before the
-    pairing is refused (a claim is for a new device), and one the file
+    pairing is refused (a claim is for a new device), so is one signing
+    with a trusted device's key under another id (revoking either must
+    distrust both, one installation under two ids), and one the file
     holds a tombstone for (the relay revoked it meanwhile, by id or signing
     key) is not trusted: a claim made before a revocation must not undo it.
     Nothing is saved when a tombstone written since the pairing began may
@@ -416,6 +418,15 @@ def _save_added_device(
                     "pairing, more than this machine keeps a record of; nothing "
                     "was saved. Run `magent link --add-device` again."
                 )
+            by_key = {d.sign_pub: d for d in current.devices}
+            for device in outcome.devices:
+                twin = by_key.get(device.sign_pub)
+                if twin is not None and twin.device_id != device.device_id:
+                    _fail(
+                        f"magent link: {_shown(device.name)} signs with the key "
+                        f"of {_shown(twin.name)}, already paired with this "
+                        "machine; nothing was saved."
+                    )
             fresh = tuple(d for d in outcome.devices if not current.is_revoked(d))
             for device in outcome.devices:
                 if device not in fresh:

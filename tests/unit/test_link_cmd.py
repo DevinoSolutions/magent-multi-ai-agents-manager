@@ -20,6 +20,7 @@ from tests.unit._link_fakes import (
     OTHER_ID,
     PHONE_ID,
     TABLET_ID,
+    Device,
     new_device,
     revoked_wires,
     unlink_racing_the_next_save,
@@ -710,6 +711,19 @@ class TestLinked:
         fresh._load(saved)
         assert fresh.peer(TABLET_ID) is None
         assert set(fresh.seal_for_devices(b"rows", "snap:x")) == {phone.device_id}
+
+    def test_a_claim_signing_with_a_trusted_devices_key_is_refused(
+        self, runner, relay, cfg
+    ):
+        # Another id with the phone's keys: one installation under two ids,
+        # which a revocation of one would leave trusted under the other.
+        phone = _pair(runner, relay, cfg)
+        alias = Device(OTHER_ID, "Alias DECOY", phone.keys)
+        relay.stage_pairing(claimed_devices=[_claimed(alias, qr=True)], new_host=False)
+        result = _link(runner, cfg, "--add-device", "--no-qr")
+        assert result.exit_code == 1, result.output
+        assert "signs with the key of Phone DECOY" in result.output
+        assert [d.device_id for d in linkfiles.load_link().devices] == [PHONE_ID]
 
     def test_a_claim_for_a_device_already_trusted_is_refused(self, runner, relay, cfg):
         phone = _pair(runner, relay, cfg)

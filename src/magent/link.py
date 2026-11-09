@@ -1175,6 +1175,11 @@ class LinkRunner:
         self._revoked: set[str] = set()
         # The signing keys the relay listed revoked devices with: tombstones.
         self._revoked_keys: dict[str, str] = {}
+        # Every signing key revoked during this run: the relay's, a
+        # tombstone's, and the key this host trusted a revoked device with
+        # (taken before it is forgotten, whatever the cap keeps). Only ever
+        # added to: a later listing with another key cannot take one back.
+        self._gone_keys: set[str] = set()
         # Ids link.json has held a tombstone for during this run: one the cap
         # evicted is not written again (each look would evict another), and
         # is still never trusted (_revoked).
@@ -1720,6 +1725,7 @@ class LinkRunner:
             with self._lock:
                 self._revoked |= revoked or set()
                 self._revoked_keys.update(sign_pubs or {})
+                self._gone_keys |= {key for key in (sign_pubs or {}).values() if key}
                 gone = set(self._revoked)
                 keys = dict(self._revoked_keys)
             # Taken before the read: a change after it is seen next time.
@@ -1742,7 +1748,17 @@ class LinkRunner:
                 changed = False
                 if self._end is None:  # not ended on another thread meanwhile
                     if current is None:
-                        peers = {k: p for k, p in self._peers.items() if k not in gone}
+                        self._gone_keys |= {
+                            p.device.sign_pub
+                            for k, p in self._peers.items()
+                            if k in gone and p.device.sign_pub
+                        }
+                        peers = {
+                            k: p
+                            for k, p in self._peers.items()
+                            if k not in gone
+                            and p.device.sign_pub not in self._gone_keys
+                        }
                     else:
                         self._link = current
                         self._stamp = stamp
@@ -1845,7 +1861,9 @@ class LinkRunner:
         the relay knew it by), saved when that changed it. A device a
         tombstone already names goes too, by id or by key: no save from
         before the revocation can bring it back, nor a restart forget it.
-        The devices go by every revocation in ``revoked`` and ``sign_pubs``,
+        The devices go by every revocation of this run, ids (``revoked``)
+        and signing keys (the relay's, the tombstones', and the key a revoked
+        device was trusted with here, so another id sharing it goes too),
         not only those the capped tombstones still hold; an id this run
         already tombstoned is not tombstoned again once the cap evicted it.
         ``stamp`` is link.json's as it was before ``link`` was read: when the
@@ -1861,6 +1879,11 @@ class LinkRunner:
         with self._lock:
             self._tombstoned |= known
             written = set(self._tombstoned)
+            # The key this host trusted a revoked device with is revoked too,
+            # whatever key the relay listed it with: before it is forgotten.
+            self._gone_keys |= {keys[i] for i in revoked if keys.get(i)}
+            self._gone_keys |= {t.sign_pub for t in link.revoked if t.sign_pub}
+            gone_keys = set(self._gone_keys)
         at = datetime.datetime.fromtimestamp(
             self._clock(), datetime.timezone.utc
         ).isoformat()
@@ -1875,7 +1898,6 @@ class LinkRunner:
         marked = replace(
             link, revoked=(*link.revoked, *tombs)[-linkfiles.REVOKED_MAX :]
         )
-        gone_keys = {key for key in (sign_pubs or {}).values() if key}
         kept = tuple(
             d for d in link.devices if not _is_revoked(d, link, revoked, gone_keys)
         )
@@ -2102,7 +2124,7 @@ class LinkRunner:
             raise linkfiles.LinkFileError("link.json holds an unusable host key")
         with self._lock:
             gone = set(self._revoked)
-            gone_keys = {key for key in self._revoked_keys.values() if key}
+            gone_keys = set(self._gone_keys)
         peers: dict[str, _Peer] = {}
         for device in link.devices:
             if _is_revoked(device, link, gone, gone_keys):
@@ -2146,6 +2168,7 @@ class LinkRunner:
             self._revoked_keys.update(
                 {t.device_id: t.sign_pub for t in link.revoked if t.sign_pub}
             )
+            self._gone_keys |= {t.sign_pub for t in link.revoked if t.sign_pub}
             self._cursor = state.cursor
             self._seen = SeenRing(state.seen_ids, size=SEEN_MAX)
             self._last_connected = state.last_connected
