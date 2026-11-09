@@ -290,3 +290,19 @@ class TestAConfigThatDoesNotParse:
         assert body["error"]["code"] == "unavailable"
         assert body["error"]["message"].startswith("config: ")
         assert fake.send_key_calls() == []
+
+    @pytest.mark.parametrize("content", ['{"projects": {}}', '{"projects": "bad"}'])
+    def test_text_mode_reads_a_non_list_as_no_projects(
+        self, runner, tmp_path, monkeypatch, content
+    ):
+        # Text mode's answer for these shapes predates the --json envelope:
+        # no project, so the ordinary "no live session matches" and exit 2,
+        # never a traceback.
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        bad = tmp_path / "magent.config.json"
+        bad.write_text(content, encoding="utf-8")
+        result = runner.invoke(cli.main, ["--config", str(bad), "peek", "api"])
+        assert result.exit_code == 2, result.output
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "no live session matches 'api'" in result.output

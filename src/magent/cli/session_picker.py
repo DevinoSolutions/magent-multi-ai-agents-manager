@@ -412,7 +412,7 @@ def _node_session_targets(
     envelope. With ``as_json`` the raw read itself refuses the same way (a
     file that cannot be read, is not JSON, or is not an object with a
     ``projects`` list), before any node is looked for: a local-only config
-    reaches it too."""
+    reaches it too. Text mode reads the wrong shape as no node projects."""
     from magent import env, nodes  # heavy subsystem: in-body per policy
     from magent.wire import WireError
 
@@ -424,6 +424,11 @@ def _node_session_targets(
     except (OSError, ValueError, TypeError) as exc:
         if as_json:
             raise WireError("unavailable", f"config: {exc}") from exc
+        if isinstance(exc, TypeError):
+            # Text mode: a shape that is not an object with a projects list
+            # names no node project, as it always has -- the local reader
+            # ignores it too, so the command answers with its own diagnostic.
+            return []
         raise
     # Raw dict: same rule as config_sessions' node skip (DECISION-15). A
     # deliberate SUPERSET of nodes.node_projects (it ignores enabled, IDE tools
