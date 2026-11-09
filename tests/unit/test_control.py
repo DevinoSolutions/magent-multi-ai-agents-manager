@@ -774,8 +774,63 @@ class TestStartStop:
             ],
         )
 
-    def test_start_and_stop_share_one_lock(self):
-        assert isinstance(control.FLEET_LOCK, type(threading.Lock()))
+    def test_start_and_stop_never_overlap(self, typed, monkeypatch):
+        """A start and a stop released together: their lifecycle side
+        effects (the bring-up, the verified shutdown) must never run at the
+        same time. Each, once inside, waits (bounded) for the other to be
+        inside too: unserialised they meet and both are in at once;
+        serialised each wait runs out alone, because the other is still
+        queued on the lock."""
+        _fake, cfg = typed
+        inside = [0]
+        peak = [0]
+        guard = threading.Condition()
+
+        def _inside() -> None:
+            with guard:
+                inside[0] += 1
+                peak[0] = max(peak[0], inside[0])
+                guard.notify_all()
+                guard.wait_for(lambda: inside[0] >= 2, timeout=1.0)
+                inside[0] -= 1
+
+        def _quiet(config, only=None, group=None, **_kw):
+            _inside()
+            return launch.BringUp(
+                created=list(only or []), local_failed={}, node_outcomes=[]
+            )
+
+        def _stop(names, psmux=None):
+            _inside()
+            return list(names), []
+
+        monkeypatch.setattr(launch, "bring_up_psmux_quiet", _quiet)
+        monkeypatch.setattr(psmux, "stop_sessions", _stop)
+        go = threading.Barrier(2)
+        results: list[object] = []
+
+        def _run(verb) -> None:
+            go.wait(timeout=30)
+            results.append(verb())
+
+        threads = [
+            threading.Thread(target=_run, args=(lambda: control.start(cfg, ["upup"]),)),
+            threading.Thread(
+                target=_run, args=(lambda: control.stop(cfg, ["caramel"]),)
+            ),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert peak[0] == 1
+        assert sorted(results, key=repr) == sorted(
+            [
+                control.StartResult(started=["upup"]),
+                control.StopResult(stopped=["caramel"]),
+            ],
+            key=repr,
+        )
 
     def test_start_reports_live_sessions_and_brings_up_the_rest(
         self, typed, monkeypatch
