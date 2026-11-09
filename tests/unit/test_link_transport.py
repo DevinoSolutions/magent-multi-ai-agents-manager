@@ -198,6 +198,26 @@ def server():
     httpd.server_close()
 
 
+STORAGE = "https://storage.test"  # what a presigned getUrl names
+
+
+@pytest.fixture
+def storage(server, monkeypatch):
+    """``server`` as the storage host: get_bytes's one connection seam dials
+    STORAGE's URLs there, over plain http, after the real URL policy passed
+    them. Yields STORAGE."""
+    port = int(server.rsplit(":", 1)[1])
+
+    def dial(client, url, budget):
+        parts = link.urlsplit(url)
+        assert parts.hostname == "storage.test", "dialled a host it was not given"
+        target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        return http.client.HTTPConnection("127.0.0.1", port, timeout=5), target
+
+    monkeypatch.setattr(RelayClient, "_public_connection", dial)
+    return STORAGE
+
+
 class TestCall:
     def test_ok_returns_data_and_sends_the_protocol_and_bearer(self, server):
         data = RelayClient(server, token="mlh_DECOY_t").call("POST", "/ok", {"a": 1})
@@ -383,7 +403,7 @@ class TestSecurity:
             list(RelayClient(server).stream("/redirect"))
         assert (exc.value.status, exc.value.code) == (302, "invalid_response")
 
-    def test_the_token_never_reaches_an_error(self, server):
+    def test_the_token_never_reaches_an_error(self, server, storage):
         dead = RelayClient("http://127.0.0.1:9", token="mlh_DECOY_t", timeout=2)
         with pytest.raises(RelayError) as exc:
             dead.call("GET", "/ok")
@@ -395,7 +415,7 @@ class TestSecurity:
             _assert_no_decoy(exc.value)
         with pytest.raises(RelayError) as exc:
             live.get_bytes(
-                f"{server}/missing?sig=DECOY_s", lambda b: None, max_bytes=10
+                f"{storage}/missing?sig=DECOY_s", lambda b: None, max_bytes=10
             )
         _assert_no_decoy(exc.value)
         with pytest.raises(RelayError) as exc:
@@ -429,7 +449,7 @@ class TestSecurity:
         assert _Handler.seen == []
 
     @pytest.mark.parametrize("url", ["ftp://relay/x", "file:///etc/passwd", "/blob"])
-    def test_get_bytes_fetches_http_and_https_only(self, server, url):
+    def test_get_bytes_fetches_https_only(self, server, url):
         with pytest.raises(RelayError) as exc:
             RelayClient(server).get_bytes(url, lambda b: None, max_bytes=10)
         assert (exc.value.status, exc.value.code) == (0, "invalid_response")
@@ -449,36 +469,38 @@ class TestStreamAndDownload:
         with pytest.raises(Revoked):
             list(RelayClient(server).stream("/revoked"))
 
-    def test_get_bytes_streams_to_the_sink_without_relay_headers(self, server):
+    def test_get_bytes_streams_to_the_sink_without_relay_headers(self, server, storage):
         got = bytearray()
         n = RelayClient(server, token="mlh_DECOY_t").get_bytes(
-            f"{server}/blob?sig=1", got.extend, max_bytes=1_000_000
+            f"{storage}/blob?sig=1", got.extend, max_bytes=1_000_000
         )
         assert n == 300_000 and bytes(got) == b"x" * 300_000
         headers = _Handler.seen[-1][2]
         assert "Authorization" not in headers and "X-Magent-Link" not in headers
 
-    def test_get_bytes_enforces_the_cap(self, server):
+    def test_get_bytes_enforces_the_cap(self, server, storage):
         got = bytearray()
         with pytest.raises(RelayError) as exc:
-            RelayClient(server).get_bytes(f"{server}/blob", got.extend, max_bytes=1000)
+            RelayClient(server).get_bytes(f"{storage}/blob", got.extend, max_bytes=1000)
         assert (exc.value.status, exc.value.code) == (413, "payload_too_large")
         assert got == b""  # nothing past the cap ever reaches the sink
 
     @pytest.mark.parametrize("path", ["/drip", "/drip-open"])
-    def test_a_dripping_download_is_cut_at_its_deadline(self, server, path):
+    def test_a_dripping_download_is_cut_at_its_deadline(self, server, storage, path):
         # The deadline bounds the whole download, not each read. -open has no
         # Content-Length, so on Windows the cut reads as an early end of the
         # body: only the expired check tells it from a finished download.
         started = time.monotonic()
         with pytest.raises(RelayError) as exc:
             RelayClient(server, timeout=5).get_bytes(
-                f"{server}{path}", lambda b: None, max_bytes=1000, deadline=0.5
+                f"{storage}{path}", lambda b: None, max_bytes=1000, deadline=0.5
             )
         assert (exc.value.status, exc.value.code) == (0, "timeout")
         assert time.monotonic() - started < 2.5
 
-    def test_a_download_that_ends_once_cut_is_a_timeout(self, server, monkeypatch):
+    def test_a_download_that_ends_once_cut_is_a_timeout(
+        self, server, storage, monkeypatch
+    ):
         # Where a cut reads as a clean end of an open-ended body (Linux), the
         # loop ends as if the download were whole: the expired check after it
         # is all that stands between a truncated file and a "complete" one.
@@ -506,15 +528,15 @@ class TestStreamAndDownload:
         monkeypatch.setattr(link, "_Deadline", _Expired)
         with pytest.raises(RelayError) as exc:
             RelayClient(server).get_bytes(
-                f"{server}/blob", lambda b: None, max_bytes=1_000_000
+                f"{storage}/blob", lambda b: None, max_bytes=1_000_000
             )
         assert (exc.value.status, exc.value.code) == (0, "timeout")
 
 
 class TestDownloadTargets:
-    """A relay on https hands out presigned https URLs on a public storage
-    host, on port 443; the download refuses anything else, before it
-    connects."""
+    """A relay hands out presigned https URLs on a public storage host, on
+    port 443; the download refuses anything else, before it connects --
+    whatever the relay's own scheme."""
 
     @pytest.fixture
     def no_connect(self, monkeypatch):
@@ -569,13 +591,14 @@ class TestDownloadTargets:
             "https://[::ffff:127.0.0.1]/o?sig=DECOY_s",
         ],
     )
-    def test_an_https_relay_refuses_plain_http_other_ports_and_private_hosts(
-        self, no_connect, url
+    @pytest.mark.parametrize(
+        "relay", ["https://relay.example.com", "http://relay.example.com"]
+    )
+    def test_a_relay_refuses_plain_http_other_ports_and_private_hosts(
+        self, no_connect, relay, url
     ):
         with pytest.raises(RelayError) as exc:
-            RelayClient("https://relay.example.com").get_bytes(
-                url, lambda b: None, max_bytes=10
-            )
+            RelayClient(relay).get_bytes(url, lambda b: None, max_bytes=10)
         assert (exc.value.status, exc.value.code) == (0, "invalid_response")
         _assert_no_decoy(exc.value)
 
@@ -660,12 +683,32 @@ class TestDownloadTargets:
         assert dialled == [(address, 443)]
         _assert_no_decoy(exc.value)
 
-    def test_an_http_relay_may_download_from_loopback(self, server):
-        got = bytearray()
-        assert (
-            RelayClient(server).get_bytes(f"{server}/blob", got.extend, max_bytes=10**6)
-            == 300_000
-        )
+    def test_an_http_relay_may_not_download_from_loopback(self, server):
+        # A relay on plain http, even on loopback, vouches for no URL: its
+        # loopback getUrl is refused, and nothing reaches the server.
+        with pytest.raises(RelayError) as exc:
+            RelayClient(server).get_bytes(
+                f"{server}/blob", lambda b: None, max_bytes=10**6
+            )
+        assert (exc.value.status, exc.value.code) == (0, "invalid_response")
+        assert _Handler.seen == []
+
+    def test_an_http_relay_resolves_and_pins_like_an_https_one(self, monkeypatch):
+        # A public-looking name that resolves to a private address is
+        # refused undialled; a public one is dialled at the checked address.
+        self._resolve_to(monkeypatch, "10.0.0.5")
+        dialled = self._dial_log(monkeypatch)
+        client = RelayClient("http://relay.example.com")
+        url = "https://storage.example.com/o"
+        with pytest.raises(RelayError) as exc:
+            client.get_bytes(url, lambda b: None, max_bytes=10)
+        assert (exc.value.status, exc.value.code) == (0, "invalid_response")
+        assert dialled == []
+        self._resolve_to(monkeypatch, "93.184.216.34")
+        with pytest.raises(RelayError) as exc:
+            client.get_bytes(url, lambda b: None, max_bytes=10)
+        assert (exc.value.status, exc.value.code) == (0, "network")
+        assert dialled == [("93.184.216.34", 443)]
 
     @pytest.mark.parametrize(
         "url", ["http://127.0.0.1:99999/o?sig=DECOY_s", "http://127.0.0.1:x/o"]

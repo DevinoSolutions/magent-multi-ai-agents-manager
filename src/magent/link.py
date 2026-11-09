@@ -544,37 +544,29 @@ class RelayClient:
 
         No relay headers: a presigned GET carries its own authority, and an
         extra Authorization header would make the storage service refuse it.
-        A relay on https hands out https URLs on a public storage host, so
-        then only https on port 443 is fetched, and never from a loopback,
-        private or otherwise non-public address: the name is resolved once,
-        every address it has must be public, and the connection goes to the
-        one that was checked. A relay on plain http (a local one) may name
-        any http(s) URL. A URL refused here is a RelayError
-        ``invalid_response``. ``deadline`` bounds the whole download, the TLS
-        handshake included, however slowly it trickles in (the name lookup
-        and the TCP connect only by the client's timeout). The URL never
-        appears in an error.
+        Whatever the relay's own scheme, only https on port 443 is fetched,
+        and never from a loopback, private or otherwise non-public address:
+        the name is resolved once, every address it has must be public, and
+        the connection goes to the one that was checked (_public_connection,
+        the one seam a test replaces to serve a local object). A relay on
+        plain http is no reason to trust the URLs it names. A URL refused
+        here is a RelayError ``invalid_response``. ``deadline`` bounds the
+        whole download, the TLS handshake included, however slowly it
+        trickles in (the name lookup and the TCP connect only by the client's
+        timeout). The URL never appears in an error.
         """
         parts = urlsplit(url)
-        secure = urlsplit(self.base_url).scheme == "https"
         try:
             port = parts.port  # read now: a bad port is a bad URL
         except ValueError:
             port = -1
-        if secure:
-            allowed = parts.scheme == "https" and port in (None, 443)
-        else:
-            allowed = parts.scheme in ("https", "http") and port != -1
-        if not allowed or not parts.hostname:
+        if parts.scheme != "https" or port not in (None, 443) or not parts.hostname:
             raise RelayError(0, "invalid_response", "download URL is not allowed")
         with _Deadline(None, deadline) as cut:
             conn: http.client.HTTPConnection | None = None
             try:
                 try:
-                    if secure:
-                        conn, target = self._public_connection(url, cut.left)
-                    else:
-                        conn, target = self._connection(url, self._timeout)
+                    conn, target = self._public_connection(url, cut.left)
                 except ssl.SSLError as exc:
                     # No TLS context here (a broken certificate store): a
                     # retry would fail the same way, so the URL is refused.

@@ -1180,7 +1180,7 @@ class TestReplays:
         run = Running(host, linked)
         ready = make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
         # A URL the relay answers 404: the download fails and is logged.
-        ready["getUrl"] = f"{relay.url}/blob/missing?X-Sig=DECOY_presigned"
+        ready["getUrl"] = relay.blob_url("missing?X-Sig=DECOY_presigned")
         relay.queue_upload_ready(ready)
         relay.wait_for(lambda: _blob_gets(relay, "missing") >= 1)
         relay.wait_for(lambda: uid not in run.runner._uploads._inflight)

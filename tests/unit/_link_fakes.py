@@ -230,7 +230,7 @@ def make_upload(
     sealed: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """An UploadReady (C4) for ``data``, its encrypted object served by the
-    fake relay at ``/blob/<upload_id>`` -- as magent-app stages one, with
+    fake relay at ``relay.blob_url(upload_id)`` -- as magent-app stages one, with
     ``session`` and ``inject`` sealed in its meta. ``sealed`` overrides meta
     keys (a None value drops the key)."""
     keys = linked.device_keys(device)
@@ -256,7 +256,7 @@ def make_upload(
         "deviceId": device.device_id,
         "session": session,
         "sizeBytes": len(blob) if size is None else size,
-        "getUrl": f"{relay.url}/blob/{upload_id}",
+        "getUrl": relay.blob_url(upload_id),
         "wrappedKey": linkcrypto.seal(keys.d2h, content_key, AAD_UKEY + upload_id),
         "sealedMeta": linkcrypto.seal(
             keys.d2h, json.dumps(meta).encode(), AAD_UMETA + upload_id

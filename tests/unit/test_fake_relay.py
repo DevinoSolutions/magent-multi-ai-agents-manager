@@ -554,7 +554,7 @@ def test_long_poll_and_blob(relay):
     polled = client.call("GET", "/v1/host/commands?since=0&wait=25")
     assert [c["id"] for c in polled["commands"]] == [COMMAND["id"]]
     got = bytearray()
-    assert client.get_bytes(f"{relay.url}/blob/u1", got.extend, max_bytes=100) == 6
+    assert client.get_bytes(relay.blob_url("u1"), got.extend, max_bytes=100) == 6
     assert bytes(got) == b"cipher"
 
 

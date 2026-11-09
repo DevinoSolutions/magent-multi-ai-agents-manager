@@ -20,6 +20,13 @@ it:
   stays claimed; pair/start with a host token checks it (401) and the keys
   (409 ``key_mismatch``).
 
+Upload objects are served at ``blob_url(key)``: an https URL on a storage
+host of this relay's own, as the relay's presigned URLs are, so the daemon's
+download policy (https on 443 only) applies to them unchanged. While the
+relay runs, the one connection seam that policy leaves --
+``RelayClient._public_connection`` -- dials that host here, over plain http
+on loopback; every other host still goes through the real one.
+
 Tests script it: queue commands and uploads, change the devices, revoke the
 host, cut every open stream, fail the next stream opens, rate-limit the next
 calls to a rate-limited route, or play a relay too new for this daemon.
@@ -30,6 +37,7 @@ Every token here carries DECOY (gitleaks allowlists it under tests/).
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import select
@@ -238,9 +246,44 @@ class FakeRelay:
         host, port = self._server.server_address[:2]
         self.address = (str(host), int(port))
         self.url = f"http://{host}:{port}"
+        self.blob_host = f"p{port}.blobs.relay.test"
+        self._real_dial: Callable[..., object] | None = None
         self._thread: threading.Thread | None = None
 
+    def blob_url(self, key: str) -> str:
+        """Where the object ``key`` (in ``objects``) is downloaded from."""
+        return f"https://{self.blob_host}/blob/{key}"
+
+    def _serve_blobs(self) -> None:
+        """Dial ``blob_host`` here while the relay runs (see the module)."""
+        from magent import link
+
+        real = link.RelayClient._public_connection
+        (host, port), blob_host = self.address, self.blob_host
+
+        def dial(
+            client: link.RelayClient, url: str, budget: Callable[[], float]
+        ) -> tuple[http.client.HTTPConnection, str]:
+            parts = urlsplit(url)
+            if parts.hostname != blob_host:
+                return real(client, url, budget)
+            target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+            return http.client.HTTPConnection(
+                host, port, timeout=client._timeout
+            ), target
+
+        self._real_dial = real
+        link.RelayClient._public_connection = dial
+
+    def _stop_serving_blobs(self) -> None:
+        from magent import link
+
+        if self._real_dial is not None:
+            link.RelayClient._public_connection = self._real_dial
+            self._real_dial = None
+
     def __enter__(self) -> FakeRelay:
+        self._serve_blobs()
         self._thread = threading.Thread(
             target=self._server.serve_forever,
             kwargs={"poll_interval": _WAIT_S},
@@ -250,6 +293,8 @@ class FakeRelay:
         return self
 
     def __exit__(self, exc_type: object, *_: object) -> None:
+        # Relays nest as with-blocks do: the last one in is the first out.
+        self._stop_serving_blobs()
         # The teardown checks stay quiet while another failure propagates, so
         # they never mask it.
         loud = exc_type is None
