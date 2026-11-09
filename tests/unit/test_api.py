@@ -955,8 +955,25 @@ class TestEventsPoll:
         )
         assert_refused(resp, 400, "invalid_request")
 
+    def test_a_pane_outside_the_config_is_refused_and_never_subscribed(
+        self, ctx, bus, fixed_rows, monkeypatch
+    ):
+        waits: list[object] = []
+        monkeypatch.setattr(bus, "wait", lambda *a: waits.append(a))
+        resp = api.handle(
+            make_req(
+                path="/api/v1/events/poll",
+                query={"panes": ["api,not-in-config"], "wait": ["0"]},
+            ),
+            ctx,
+        )
+        error = assert_refused(resp, 404, "not_found")
+        assert error["details"] == {"unknown": ["not-in-config"]}
+        assert waits == []
+        assert bus.pane_interest() == []
+
     def test_the_wait_counts_as_a_subscriber_with_its_panes(
-        self, ctx, bus, monkeypatch
+        self, ctx, bus, fixed_rows, monkeypatch
     ):
         """``bus.wait`` alone registers nobody, and the poller sleeps through
         an unsubscribed wait: the route must hold a subscription (with the
@@ -992,7 +1009,9 @@ def frame(raw: bytes) -> dict[str, str]:
 class TestSse:
     @pytest.fixture(autouse=True)
     def _rows(self, monkeypatch):
-        monkeypatch.setattr(fleetview, "rows", lambda *_a, **_kw: [row("api")])
+        monkeypatch.setattr(
+            fleetview, "rows", lambda *_a, **_kw: [row("api"), row("Site")]
+        )
 
     def _open(self, ctx, **kw):
         stream = api.handle(make_req(path="/api/v1/events", **kw), ctx)
@@ -1076,3 +1095,26 @@ class TestSse:
         frames.close()
         assert bus.subscribers == 0
         assert bus.pane_interest() == []
+
+    def test_a_pane_outside_the_config_never_reaches_the_reader(self, ctx, bus):
+        """``panes=`` naming a session this server does not configure is
+        refused before the stream opens, and the poller -- had the name got
+        in -- would not read it either: no ``session.pane`` frame, ever."""
+        resp = api.handle(
+            make_req(path="/api/v1/events", query={"panes": ["not-in-config"]}), ctx
+        )
+        error = assert_refused(resp, 404, "not_found")
+        assert error["details"] == {"unknown": ["not-in-config"]}
+        assert (bus.subscribers, bus.pane_interest()) == (0, [])
+        read: list[str] = []
+
+        def _reader(r: fleetview.SessionRow) -> None:
+            read.append(r.session)
+
+        poller = events.EventPoller(
+            bus=bus, rows_fn=lambda _p: [], fire_fn=lambda *_: False, pane_fn=_reader
+        )
+        with bus.subscription(("not-in-config",)):
+            poller.tick()
+        assert read == []
+        assert [e.type for e in bus.since("deadbeef:0").events] == []

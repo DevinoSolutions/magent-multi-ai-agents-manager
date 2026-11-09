@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
 import threading
 import time
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from magent import env, events, log
 from magent.fleetview import SessionRow
 from magent.psmux import PaneCapture
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def _row(session: str, **changes: object) -> SessionRow:
@@ -150,6 +156,7 @@ class _Fleet:
         self.rows = rows
         self.fired: list[tuple[str, str]] = []
         self.pane = PaneCapture(text="hello\n", timed_out=False)
+        self.read: list[SessionRow] = []
 
     def rows_fn(self, _include_pane: bool) -> list[SessionRow]:
         return list(self.rows)
@@ -158,7 +165,8 @@ class _Fleet:
         self.fired.append((session, state))
         return True
 
-    def pane_fn(self, _session: str) -> PaneCapture:
+    def pane_fn(self, row: SessionRow) -> PaneCapture:
+        self.read.append(row)
         return self.pane
 
 
@@ -284,6 +292,48 @@ class TestEventPoller:
         fleet.pane = PaneCapture(text="", timed_out=True)
         with bus.subscription(("a",)):
             _poller(fleet, bus).tick()
+        assert not [e for e in bus.since("e:0").events if e.type == "session.pane"]
+
+    def test_a_pane_is_read_through_its_configured_row(self):
+        bus = events.EventBus("e")
+        fleet = _Fleet([_row("a")])
+        with bus.subscription(("a",)):
+            _poller(fleet, bus).tick()
+        assert fleet.read == [_row("a")]
+
+    def test_a_name_outside_the_config_is_never_read(self):
+        # The API refuses such a subscription up front; the poller must not
+        # rely on that, or a raw name reaches psmux and its pane is published.
+        bus = events.EventBus("e")
+        fleet = _Fleet([_row("a")])
+        with bus.subscription(("not-in-config",)):
+            _poller(fleet, bus).tick()
+        assert fleet.read == []
+        assert not [e for e in bus.since("e:0").events if e.type == "session.pane"]
+
+    def test_a_session_dropped_from_the_config_stops_being_read(self):
+        bus = events.EventBus("e")
+        fleet = _Fleet([_row("a")])
+        poller = _poller(fleet, bus)
+        with bus.subscription(("a",)):
+            poller.tick()
+            fleet.rows = []
+            fleet.pane = PaneCapture(text="private\n", timed_out=False)
+            poller.tick()
+        assert len(fleet.read) == 1
+        panes = [e.data for e in bus.since("e:0").events if e.type == "session.pane"]
+        assert [p["text"] for p in panes] == ["hello\n"]
+
+    def test_a_row_the_reader_declines_publishes_nothing(self):
+        bus = events.EventBus("e")
+        poller = events.EventPoller(
+            bus=bus,
+            rows_fn=lambda _p: [_row("a")],
+            fire_fn=lambda *_: False,
+            pane_fn=lambda _row: None,
+        )
+        with bus.subscription(("a",)):
+            poller.tick()
         assert not [e for e in bus.since("e:0").events if e.type == "session.pane"]
 
     def test_an_unsubscribed_pane_is_forgotten(self):
@@ -514,15 +564,297 @@ class TestForConfig:
 
         poller.rows_fn(False)
         fired = poller.fire_fn("a", "done")
+        poller.rows_fn(False)
 
         assert fired is False
-        assert loads == [None, None]  # retried each time: a config may appear
+        # Retried by every row build (a config may appear); fire never loads.
+        assert loads == [None, None]
         assert rows_calls[0]["engine"] is None
         assert rows_calls[0]["cfg"] is None
         assert rows_calls[0]["probe_timeout_s"] == events.PROBE_TIMEOUT_S
 
+    def test_a_live_local_row_is_read_through_psmux(self, seams, monkeypatch):
+        from magent import psmux
+
+        reads: list[str] = []
+        capture = PaneCapture(text="x\n", timed_out=False)
+        monkeypatch.setattr(
+            psmux, "read_pane", lambda session: reads.append(session) or capture
+        )
+        poller = events.EventPoller.for_config(events.EventBus("e"), None)
+        assert poller.pane_fn(_row("a")) is capture
+        assert poller.pane_fn(_row("b", live=False)) is None
+        assert reads == ["a"]
+
+    def test_a_live_node_row_is_read_on_its_node_with_the_kept_config(
+        self, seams, monkeypatch
+    ):
+        from magent import control, psmux
+
+        _loads, _rows_calls, cfg, _engine = seams
+        dialled: list[tuple[object, str]] = []
+
+        def _node_pane(got_cfg, row):
+            dialled.append((got_cfg, row.session))
+            return "remote\n"
+
+        def _no_local(_session):
+            raise AssertionError("a node session was read through local psmux")
+
+        monkeypatch.setattr(control, "node_pane", _node_pane)
+        monkeypatch.setattr(psmux, "read_pane", _no_local)
+        poller = events.EventPoller.for_config(events.EventBus("e"), "/c.json")
+        poller.rows_fn(False)  # the tick's row build loads the config the read uses
+        node = {"node": "box", "pane_state": None}
+        live = poller.pane_fn(_row("r1", node_state="live", **node))
+        stale = poller.pane_fn(_row("r2", node_state="stale", live=False, **node))
+        assert live == PaneCapture(text="remote\n", timed_out=False)
+        assert stale is None
+        assert dialled == [(cfg, "r1")]
+
+    def test_a_node_read_that_fails_is_declined(self, seams, monkeypatch):
+        from magent import control
+
+        def _refuse(_cfg, row):
+            raise control.ControlError("unavailable", f"could not read {row.session}")
+
+        monkeypatch.setattr(control, "node_pane", _refuse)
+        poller = events.EventPoller.for_config(events.EventBus("e"), "/c.json")
+        poller.rows_fn(False)
+        row = _row("r1", node="box", node_state="live", pane_state=None)
+        assert poller.pane_fn(row) is None
+
+    def test_fire_and_pane_never_load_the_config_themselves(self, seams, monkeypatch):
+        from magent import control, fleetview
+
+        loads, _rows_calls, cfg, engine = seams
+        monkeypatch.setattr(control, "node_pane", lambda got, _row: "x\n")
+        poller = events.EventPoller.for_config(events.EventBus("e"), "/c.json")
+        poller.rows_fn(False)
+
+        def _no_load(_path):
+            raise AssertionError("a callback reloaded the config")
+
+        monkeypatch.setattr(fleetview, "load_typed", _no_load)
+        monkeypatch.setattr(events, "config_stamp", _no_load)
+        assert poller.fire_fn("a", "done") is True
+        row = _row("r1", node="box", node_state="live", pane_state=None)
+        assert poller.pane_fn(row) == PaneCapture(text="x\n", timed_out=False)
+        assert loads == ["/c.json"]
+        assert engine.fired == [("a", "done")]
+        assert cfg is not None
+
     def test_the_probe_bound_is_a_few_seconds(self):
         assert 1.0 <= events.PROBE_TIMEOUT_S <= 10.0
+
+
+class TestForConfigFollowsTheConfig:
+    """The real wiring end to end -- ``for_config``, ``fleetview.rows``, the
+    node rows from the sync daemon's files, ``control.node_pane`` -- with only
+    the ssh capture (``remote_mux.capture_pane``) substituted."""
+
+    @pytest.fixture
+    def two_nodes(self, tmp_path, monkeypatch):
+        from magent import nodes, psmux, remote_mux
+        from magent.nodes import NodeMapEntry
+
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"),
+            {"ts": time.time(), "sessions": ["a", "b"]},
+        )
+        for name in ("a", "b"):
+            nodes.update_node_map(
+                name,
+                NodeMapEntry(
+                    nick="second",
+                    sid=name,
+                    placed_ts=1.0,
+                    attached_existing=False,
+                    remote_root=f"~/magent/{name}",
+                    target="demo@box-second",
+                    cwd=f"/home/demo/magent/{name}",
+                ),
+            )
+        path = tmp_path / "magent.config.json"
+
+        def write(names: list[str]) -> None:
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 4,
+                        "projects": [
+                            {"path": str(tmp_path / n), "title": n, "node": "second"}
+                            for n in names
+                        ],
+                        "settings": {
+                            "nodes": {"second": {"host": "box-second", "user": "demo"}}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        write(["a", "b"])
+        captured: list[str] = []
+        texts: dict[str, str] = {"a": "a before\n", "b": "b before\n"}
+        hooks: list[Callable[[str], None]] = []
+
+        def _capture(_node, session):
+            captured.append(session)
+            for hook in hooks:
+                hook(session)
+            return texts[session]
+
+        monkeypatch.setattr(remote_mux, "capture_pane", _capture)
+        return str(path), write, captured, texts, hooks
+
+    @staticmethod
+    def _panes(bus: events.EventBus) -> list[tuple[object, object]]:
+        return [
+            (e.data["session"], e.data["text"])
+            for e in bus.since(f"{bus.epoch}:0").events
+            if e.type == "session.pane"
+        ]
+
+    def test_a_removed_node_project_stops_being_read_while_another_stays(
+        self, two_nodes
+    ):
+        path, write, captured, texts, _hooks = two_nodes
+        bus = events.EventBus("e")
+        poller = events.EventPoller.for_config(bus, path)
+        with bus.subscription(("a", "b")):
+            poller.tick()
+            assert sorted(captured) == ["a", "b"]
+            write(["b"])
+            texts.update(a="a private AFTER removal\n", b="b after\n")
+            captured.clear()
+            poller.tick()
+            poller.tick()
+        assert captured == ["b", "b"]
+        assert sorted(self._panes(bus)) == [
+            ("a", "a before\n"),
+            ("b", "b after\n"),
+            ("b", "b before\n"),
+        ]
+        removed = [
+            e.data for e in bus.since("e:0").events if e.type == "session.removed"
+        ]
+        assert removed == [{"session": "a"}]
+
+    def test_an_unchanged_config_is_loaded_once(self, two_nodes, monkeypatch):
+        from magent import fleetview
+
+        path, _write, _captured, _texts, _hooks = two_nodes
+        loads: list[object] = []
+        real = fleetview.load_typed
+        monkeypatch.setattr(
+            fleetview, "load_typed", lambda p: loads.append(p) or real(p)
+        )
+        bus = events.EventBus("e")
+        poller = events.EventPoller.for_config(bus, path)
+        with bus.subscription(("a",)):
+            for _ in range(3):
+                poller.tick()
+        assert loads == [path]
+
+    def test_an_unreadable_config_mid_tick_never_loses_an_attention_event(
+        self, two_nodes, tmp_path, monkeypatch
+    ):
+        """Both node sessions go idle -> needs-input on the tick where an
+        external truncate-and-write leaves the config empty right after the
+        engine's poll (the rows are built by then). Each transition still
+        owes its ``attention`` event: emitted on that tick, or, the tick
+        failing, on the one after the file is whole again -- never lost
+        because ``_diff`` already committed the new hook state."""
+        from magent import fleetview, nodes
+
+        path, _write, _captured, _texts, _hooks = two_nodes
+        whole = Path(path).read_bytes()
+
+        def _record(name: str, state: str) -> None:
+            store = nodes.state_dir("second", name)
+            store.mkdir(parents=True, exist_ok=True)
+            (store / f"{name}.json").write_text(
+                json.dumps(
+                    {
+                        "state": state,
+                        "ts": time.time(),
+                        "cwd": f"/home/demo/magent/{name}",
+                        "session_id": f"s-{name}",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        truncate_after_poll = [False]
+        real_engine = fleetview.engine_from_config
+
+        def _engine(cfg):
+            engine = real_engine(cfg)
+            real_poll = engine.poll
+
+            def _poll():
+                views = real_poll()
+                if truncate_after_poll[0]:
+                    truncate_after_poll[0] = False
+                    Path(path).write_bytes(b"")
+                return views
+
+            monkeypatch.setattr(engine, "poll", _poll)
+            return engine
+
+        monkeypatch.setattr(fleetview, "engine_from_config", _engine)
+        for name in ("a", "b"):
+            _record(name, "idle")
+        bus = events.EventBus("e")
+        poller = events.EventPoller.for_config(bus, path)
+        with bus.subscription():
+            poller.tick()
+            assert [
+                (e.data["session"], e.data["hook_state"])
+                for e in bus.since("e:0").events
+                if e.type == "session.added"
+            ] == [("a", "idle"), ("b", "idle")]
+            for name in ("a", "b"):
+                _record(name, "needs-input")
+            truncate_after_poll[0] = True
+            with contextlib.suppress(Exception):
+                poller.tick()  # a failing tick is run_poller's to log
+            Path(path).write_bytes(whole)
+            poller.tick()
+            poller.tick()
+        attention = [
+            (e.data["session"], e.data["hook_state"], e.data["fire"])
+            for e in bus.since("e:0").events
+            if e.type == "attention"
+        ]
+        assert sorted(attention) == [
+            ("a", "needs-input", True),
+            ("b", "needs-input", True),
+        ]
+
+    def test_a_capture_taken_across_a_config_edit_is_not_published(self, two_nodes):
+        # The rows were built, then the edit removed `a` while its pane was
+        # being read: that capture must be dropped, not published once.
+        path, write, captured, texts, hooks = two_nodes
+        bus = events.EventBus("e")
+        poller = events.EventPoller.for_config(bus, path)
+        texts["a"] = "a private AFTER removal\n"
+
+        def _remove_a(session: str) -> None:
+            if session == "a":
+                write(["b"])
+
+        hooks.append(_remove_a)
+        with bus.subscription(("a",)):
+            poller.tick()
+            hooks.clear()
+            poller.tick()
+        assert captured == ["a"]
+        assert self._panes(bus) == []
 
 
 class _Engine:

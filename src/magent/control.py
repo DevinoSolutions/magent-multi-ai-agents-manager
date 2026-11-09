@@ -48,22 +48,39 @@ _MODEL_RE = re.compile(r"^[A-Za-z0-9][\w.\-\[\]]*$")
 # overlapping calls (two API requests) would bring up or kill the same session
 # twice. One lock across both bodies is enough for P1, and it deliberately
 # serialises ``start`` against ``stop`` as well as against itself: the API
-# layer must not add a second lock of its own around these verbs.
-_FLEET_LOCK = threading.Lock()
+# layer must not add a second lock of its own around these verbs. Each loads
+# the config INSIDE the lock, because ``projects.remove(stop=True)`` holds it
+# too, from its first read through the config write: a start queued behind a
+# stop-and-remove must see the project gone, not a snapshot from before.
+# In-process only, like ``_KEYS_LOCKS``: a ``magent config remove`` or
+# ``magent up`` in another process is not serialised against these.
+FLEET_LOCK = threading.Lock()
 
 # Keystrokes into one pane, one verb at a time. A send is two psmux calls
 # (the literal paste, then Enter); two overlapping sends to one session landed
 # as paste, paste, Enter, Enter and submitted ONE merged prompt while both
-# reported confirmed. Every control verb holds its session's lock for exactly
-# its keystrokes -- never across a wait or a read-back -- so different
-# sessions still run in parallel. The one exception is ``set_model``: it holds
-# the lock across ``switch_model``'s settle between ``/model`` and ``/effort``,
-# so no prompt lands between the two commands.
+# reported confirmed. ``interrupt`` holds its session's lock for exactly its
+# keystroke, and nothing holds it across a long wait (``send``'s idle wait
+# runs outside it), so different sessions still run in parallel and an
+# interrupt is never stuck behind a turn. ``send`` holds it from its paste
+# through its read-back, and with ``wait_idle``/``compact`` re-checks idle
+# under it before pasting (``_paste_and_read_back``). ``choose`` and
+# ``set_model`` hold it from their pane check through the read-back that
+# follows their keys: a
+# digit is safe only in the dialog it was checked against and ``/model`` only
+# at the idle prompt, so a check made before waiting on the lock is stale by
+# the time the keys go in (two chooses on one dialog both saw it, and the
+# second digit landed in the prompt reporting confirmed), and the read-back
+# keeps the next verb from checking a pane that has not reacted yet.
+# ``set_model``'s hold also spans ``switch_model``'s settle between
+# ``/model`` and ``/effort``, so no prompt lands between the two commands.
 #
-# A stalled psmux holds a session's lock for as long as its own send-keys
-# budgets: about 50s for a send (the literal paste's 30s, then Enter's 20s)
-# and about twice that for a model switch with an effort. That is acceptable,
-# because a concurrent send would stall on the same pane anyway.
+# A stalled psmux holds a session's lock for as long as its own budgets:
+# about 50s for a send (the literal paste's 30s, then Enter's 20s, plus its
+# settle and one pane capture, and an idle-gated send's check), and for a
+# choose or a model switch (twice the send-keys budget with an effort) its
+# keys plus two pane captures. That is acceptable, because a concurrent verb
+# would stall on the same pane anyway.
 #
 # Only these verbs take the lock. The ``/upload`` paste (``uploads.py``) and
 # the idle reaper's post-kill reset (``reap.py``) type into panes without it,
@@ -278,6 +295,12 @@ def send(
         raise ControlError("invalid_request", "no prompt text")
     timeout_s = _valid_timeout(timeout_s)
     binary = _writable(config_path, session)
+    deadline = time.monotonic() + timeout_s
+    not_idle = (
+        f"{session} still busy after /compact; prompt not sent"
+        if compact
+        else f"{session} did not go idle within {timeout_s:g}s"
+    )
     if compact:
         with _keys_lock(session):
             compacted = fleet.paste_and_enter(session, "/compact", psmux_bin=binary)
@@ -286,7 +309,7 @@ def send(
         idle = fleet.wait_for_idle(
             session,
             psmux_bin=binary,
-            deadline=time.monotonic() + timeout_s,
+            deadline=deadline,
             settle=fleet.COMMAND_SETTLE_S,
         )
         if not text.strip():
@@ -294,25 +317,18 @@ def send(
                 session, idle, _pane_state(session, binary, delivered=True)
             )
         if not idle:
-            raise ControlError(
-                "timeout",
-                f"{session} still busy after /compact; prompt not sent",
-                {"reason": "not_idle"},
-            )
+            raise ControlError("timeout", not_idle, {"reason": "not_idle"})
     elif wait_idle and not fleet.wait_for_idle(
-        session, psmux_bin=binary, deadline=time.monotonic() + timeout_s
+        session, psmux_bin=binary, deadline=deadline
     ):
-        raise ControlError(
-            "timeout",
-            f"{session} did not go idle within {timeout_s:g}s",
-            {"reason": "not_idle"},
-        )
-    with _keys_lock(session):
-        sent = fleet.paste_and_enter(session, text, psmux_bin=binary)
-    if not sent:
-        raise _send_failed(session, binary)
-    time.sleep(SEND_SETTLE_S)
-    capture = psmux.read_pane(session, psmux=binary)
+        raise ControlError("timeout", not_idle, {"reason": "not_idle"})
+    capture = _paste_and_read_back(
+        session,
+        text,
+        binary,
+        deadline=deadline if compact or wait_idle else None,
+        not_idle=not_idle,
+    )
     if capture.timed_out:
         return SendResult(session, False, fleet.TIMEOUT_STATE)
     return SendResult(
@@ -322,29 +338,62 @@ def send(
     )
 
 
+def _paste_and_read_back(
+    session: str,
+    text: str,
+    binary: str,
+    *,
+    deadline: float | None,
+    not_idle: str,
+) -> psmux.PaneCapture:
+    """``send``'s paste, Enter, settle and read-back, as one hold of the
+    session's lock. With a ``deadline`` (``wait_idle``/``compact``) the pane
+    must classify as idle UNDER that lock first: the caller's idle wait ran
+    outside it, so interrupt and choose stay usable through a long turn, and
+    what it saw may be stale by the time the lock is ours (two waiting sends
+    both saw idle, and the second landed in the turn the first started). A
+    pane found busy lets go of the lock and is waited out again, against the
+    same deadline. The read-back stays inside the hold because a pane that
+    was just sent to still looks idle for a moment (``fleet.wait_for_idle``'s
+    ``settle``): released before it, the next queued send would believe it."""
+    while True:
+        with _keys_lock(session):
+            if deadline is None or _pane_state(session, binary) == "idle":
+                if not fleet.paste_and_enter(session, text, psmux_bin=binary):
+                    raise _send_failed(session, binary)
+                time.sleep(SEND_SETTLE_S)
+                return psmux.read_pane(session, psmux=binary)
+        if time.monotonic() >= deadline or not fleet.wait_for_idle(
+            session, psmux_bin=binary, deadline=deadline
+        ):
+            raise ControlError("timeout", not_idle, {"reason": "not_idle"})
+
+
 def choose(config_path: str | None, session: str, option: int) -> ChooseResult:
     """Pick numbered option ``option`` (1-9) of the dialog on screen: the
     digit is pressed alone (no Enter -- Claude Code's menus act on the digit),
     and ONLY when the pane classifies as ``dialog``, so a digit is never typed
-    into a prompt. ``confirmed`` = the dialog is gone a moment later."""
+    into a prompt. ``confirmed`` = the dialog is gone a moment later. The
+    check, the digit and that read-back are one hold of the session's lock
+    (see ``_KEYS_LOCKS``)."""
     if not 1 <= option <= CHOOSE_MAX:
         raise ControlError("invalid_request", f"option must be 1-{CHOOSE_MAX}")
     binary = _writable(config_path, session)
-    before = _pane_state(session, binary)
-    if before != "dialog":
-        raise ControlError(
-            "conflict",
-            f"{session} is not showing a dialog (pane is {before})",
-            {"reason": "not_in_dialog", "pane_state": before},
-        )
     with _keys_lock(session):
+        before = _pane_state(session, binary)
+        if before != "dialog":
+            raise ControlError(
+                "conflict",
+                f"{session} is not showing a dialog (pane is {before})",
+                {"reason": "not_in_dialog", "pane_state": before},
+            )
         pressed = psmux.send_keys(
             session, str(option), target=session, literal=True, psmux=binary
         )
-    if not pressed:
-        raise _send_failed(session, binary)
-    time.sleep(REACT_S)
-    after = _pane_state(session, binary, delivered=True)
+        if not pressed:
+            raise _send_failed(session, binary)
+        time.sleep(REACT_S)
+        after = _pane_state(session, binary, delivered=True)
     return ChooseResult(session, option, after != "dialog", after)
 
 
@@ -366,7 +415,9 @@ def set_model(
     config_path: str | None, session: str, model: str, effort: str | None = None
 ) -> ModelResult:
     """One switch attempt: refused with ``conflict`` (reason ``busy``) unless
-    the pane is idle; ``verified`` = the footer shows the new model/effort."""
+    the pane is idle; ``verified`` = the footer shows the new model/effort.
+    The idle check, the switch and the footer read are one hold of the
+    session's lock (see ``_KEYS_LOCKS``)."""
     if not model.strip():
         raise ControlError("invalid_request", "model is required")
     if not _MODEL_RE.fullmatch(model):
@@ -379,20 +430,20 @@ def set_model(
             "invalid_request", f"effort must be one of {', '.join(fleet.EFFORTS)}"
         )
     binary = _writable(config_path, session)
-    state = _pane_state(session, binary)
-    if state != "idle":
-        raise ControlError(
-            "conflict",
-            f"{session} is not idle (pane is {state})",
-            {"reason": "busy", "pane_state": state},
-        )
     # Held across switch_model's settles on purpose: see _KEYS_LOCKS.
     with _keys_lock(session):
+        state = _pane_state(session, binary)
+        if state != "idle":
+            raise ControlError(
+                "conflict",
+                f"{session} is not idle (pane is {state})",
+                {"reason": "busy", "pane_state": state},
+            )
         switched = fleet.switch_model(session, model, effort, psmux_bin=binary)
-    if not switched:
-        raise _send_failed(session, binary)
-    time.sleep(MODEL_SETTLE_S)
-    pane = psmux.capture_pane(session, psmux=binary)
+        if not switched:
+            raise _send_failed(session, binary)
+        time.sleep(MODEL_SETTLE_S)
+        pane = psmux.capture_pane(session, psmux=binary)
     footer_model, footer_effort = fleet.parse_footer(pane)
     return ModelResult(
         session, footer_model, footer_effort, fleet.verify_switch(pane, model, effort)
@@ -431,9 +482,15 @@ def _tail(text: str, lines: int) -> str:
 
 
 def _node_pane(config_path: str | None, row: fleetview.SessionRow) -> str:
+    return node_pane(_typed(config_path), row)
+
+
+def node_pane(cfg: MagentConfig, row: fleetview.SessionRow) -> str:
+    """``row``'s pane read on its node (one bounded ssh capture), with the
+    typed config a caller already holds -- the event poller's, which must
+    not load one per tick."""
     from magent import env, nodes, remote_mux  # in-body: nodes pulls in ssh
 
-    cfg = _typed(config_path)
     if row.node is None:
         raise ControlError("not_found", f"{row.session} is placed on no node")
     try:
@@ -476,8 +533,8 @@ def start(
 
     if sessions is None and group is None:
         raise ControlError("invalid_request", "name sessions or a group")
-    cfg = _typed(config_path)
-    with _FLEET_LOCK:
+    with FLEET_LOCK:
+        cfg = _typed(config_path)
         up, down, projects = psmux.psmux_status(cfg, group)
         local = [psmux.socket_id(p) for p in projects]
         remote = launch.node_session_ids(cfg, group)
@@ -536,8 +593,8 @@ def stop(config_path: str | None, sessions: list[str]) -> StopResult:
 
     if not sessions:
         raise ControlError("invalid_request", "name at least one session")
-    cfg = _typed(config_path)
-    with _FLEET_LOCK:
+    with FLEET_LOCK:
+        cfg = _typed(config_path)
         local = {psmux.socket_id(p) for p in psmux.eligible_projects(cfg)}
         remote = set(launch.node_session_ids(cfg))
         unknown = [s for s in sessions if s not in local and s not in remote]

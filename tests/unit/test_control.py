@@ -8,6 +8,7 @@ import time
 import pytest
 
 from magent import control, fleetview, launch, psmux
+from magent import fleet as fleet_mod
 from tests.unit._fake_psmux import make_fake_psmux
 
 MID = "·"
@@ -257,6 +258,85 @@ class TestSend:
         assert order == ["paste", "Enter", "paste", "Enter"]
         assert len(fake.send_key_calls()) == 4
 
+    def test_two_waiting_sends_never_both_land_in_one_turn(self, fleet, monkeypatch):
+        """Two ``wait_idle`` sends to one idle session (two API requests):
+        the first prompt starts a turn, so the second must NOT be pasted into
+        it -- it waits again and, the turn outlasting its deadline, refuses
+        with nothing typed. Each send's idle wait, once it says idle, waits
+        (bounded) for the other's to say so too: both have then seen idle
+        before either pasted, which is exactly when a check made only outside
+        the session lock lets both through."""
+        fake, cfg = fleet
+        fake.set_pane_after_send(BUSY)
+        real = fleet_mod.wait_for_idle
+        both_idle = threading.Condition()
+        saw_idle = [0]
+
+        def _rendezvous(*args, **kwargs):
+            idle = real(*args, **kwargs)
+            with both_idle:
+                if idle and saw_idle[0] < 2:
+                    saw_idle[0] += 1
+                    both_idle.notify_all()
+                    both_idle.wait_for(lambda: saw_idle[0] >= 2, timeout=1.0)
+            return idle
+
+        monkeypatch.setattr(fleet_mod, "wait_for_idle", _rendezvous)
+        results: list[control.SendResult | control.ControlError] = []
+
+        def _send(text: str) -> None:
+            try:
+                results.append(
+                    control.send(cfg, "caramel", text, wait_idle=True, timeout_s=1.0)
+                )
+            except control.ControlError as exc:
+                results.append(exc)
+
+        threads = [
+            threading.Thread(target=_send, args=(t,))
+            for t in ("first prompt here", "second prompt here")
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        assert saw_idle[0] == 2  # both waits really did see idle first
+        sent = [r for r in results if isinstance(r, control.SendResult)]
+        refused = [r for r in results if isinstance(r, control.ControlError)]
+        assert [(r.confirmed, r.pane_state_after) for r in sent] == [(True, "busy")]
+        assert [(r.code, r.details) for r in refused] == [
+            ("timeout", {"reason": "not_idle"})
+        ]
+        assert [c[-1] for c in fake.send_key_calls()][1:] == ["Enter"]
+        assert len(fake.send_key_calls()) == 2
+
+    def test_compact_then_prompt_rechecks_idle_before_the_prompt(
+        self, fleet, monkeypatch
+    ):
+        """The post-compact idle wait said idle, then the pane went busy
+        (another sender's turn) before the prompt's paste: the prompt waits
+        again under the same deadline instead of landing in that turn."""
+        fake, cfg = fleet
+        real = fleet_mod.wait_for_idle
+        calls = [0]
+
+        def _then_busy(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                fake.set_pane(BUSY)
+                return True
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(fleet_mod, "wait_for_idle", _then_busy)
+        with pytest.raises(control.ControlError) as err:
+            control.send(cfg, "caramel", "next prompt", compact=True, timeout_s=0.5)
+        assert (err.value.code, err.value.details) == (
+            "timeout",
+            {"reason": "not_idle"},
+        )
+        assert "after /compact" in err.value.message
+        assert [s[-1] for s in fake.send_key_calls()] == ["/compact", "Enter"]
+
     def test_a_prompt_still_on_the_input_line_is_not_confirmed(self, fleet):
         fake, cfg = fleet
         fake.set_pane(
@@ -407,6 +487,53 @@ class TestChoose:
         fake.set_pane(DIALOG)
         assert control.choose(cfg, "caramel", 1).confirmed is False
 
+    def test_two_chooses_on_one_dialog_press_one_digit(self, fleet, monkeypatch):
+        """Two overlapping chooses (two API requests) on ONE dialog: exactly
+        one digit goes in, and the other choose sees the dialog gone and
+        refuses -- it never types into the prompt, never reports confirmed.
+        After its dialog check, each choose waits (bounded) for the other to
+        check too: unserialised that rendezvous meets, both see the dialog and
+        both press; serialised it times out, because the other check cannot
+        run until this choose's digit and read-back are done."""
+        fake, cfg = fleet
+        fake.set_pane(DIALOG)
+        fake.set_pane_after_send(IDLE)
+        real = control._pane_state
+        checked = threading.Condition()
+        checks = [0]
+
+        def _rendezvous(session, binary, *, delivered=False):
+            state = real(session, binary, delivered=delivered)
+            if not delivered:
+                with checked:
+                    checks[0] += 1
+                    checked.notify_all()
+                    checked.wait_for(lambda: checks[0] >= 2, timeout=1.0)
+            return state
+
+        monkeypatch.setattr(control, "_pane_state", _rendezvous)
+        results: list[control.ChooseResult | control.ControlError] = []
+
+        def _choose(option: int) -> None:
+            try:
+                results.append(control.choose(cfg, "caramel", option))
+            except control.ControlError as exc:
+                results.append(exc)
+
+        threads = [threading.Thread(target=_choose, args=(n,)) for n in (1, 2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert len(results) == 2
+        chosen = [r for r in results if isinstance(r, control.ChooseResult)]
+        refused = [r for r in results if isinstance(r, control.ControlError)]
+        assert [r.confirmed for r in chosen] == [True]
+        assert [(r.code, r.details) for r in refused] == [
+            ("conflict", {"reason": "not_in_dialog", "pane_state": "idle"})
+        ]
+        assert [c[-1] for c in fake.send_key_calls()] == [str(chosen[0].option)]
+
     @pytest.mark.parametrize("option", [0, 10, -1])
     def test_option_out_of_range_is_invalid(self, fleet, option):
         _fake, cfg = fleet
@@ -547,6 +674,47 @@ class TestSetModel:
             control.set_model(cfg, "caramel", "opus")
         assert err.value.details == {"reason": "busy", "pane_state": "busy"}
 
+    def test_the_idle_check_runs_after_waiting_on_the_session_lock(
+        self, fleet, monkeypatch
+    ):
+        """Another verb holds the session's lock and turns the pane busy
+        before letting go: the switch, queued behind it, must check the pane
+        THEN -- not before it queued -- and refuse without typing."""
+        fake, cfg = fleet
+        lock = control._keys_lock("caramel")
+        asked = threading.Event()
+
+        class _Watched:
+            def __enter__(self) -> None:
+                asked.set()
+                lock.acquire()
+
+            def __exit__(self, *_exc: object) -> None:
+                lock.release()
+
+        monkeypatch.setattr(control, "_keys_lock", lambda _session: _Watched())
+        errors: list[control.ControlError] = []
+
+        def _switch() -> None:
+            try:
+                control.set_model(cfg, "caramel", "opus")
+            except control.ControlError as exc:
+                errors.append(exc)
+
+        lock.acquire()
+        try:
+            worker = threading.Thread(target=_switch)
+            worker.start()
+            assert asked.wait(timeout=30)
+            fake.set_pane(BUSY)
+        finally:
+            lock.release()
+        worker.join(timeout=30)
+        assert [(e.code, e.details) for e in errors] == [
+            ("conflict", {"reason": "busy", "pane_state": "busy"})
+        ]
+        assert fake.send_key_calls() == []
+
     def test_an_unknown_effort_is_invalid(self, fleet):
         _fake, cfg = fleet
         with pytest.raises(control.ControlError) as err:
@@ -686,8 +854,63 @@ class TestStartStop:
             ],
         )
 
-    def test_start_and_stop_share_one_lock(self):
-        assert isinstance(control._FLEET_LOCK, type(threading.Lock()))
+    def test_start_and_stop_never_overlap(self, typed, monkeypatch):
+        """A start and a stop released together: their lifecycle side
+        effects (the bring-up, the verified shutdown) must never run at the
+        same time. Each, once inside, waits (bounded) for the other to be
+        inside too: unserialised they meet and both are in at once;
+        serialised each wait runs out alone, because the other is still
+        queued on the lock."""
+        _fake, cfg = typed
+        inside = [0]
+        peak = [0]
+        guard = threading.Condition()
+
+        def _inside() -> None:
+            with guard:
+                inside[0] += 1
+                peak[0] = max(peak[0], inside[0])
+                guard.notify_all()
+                guard.wait_for(lambda: inside[0] >= 2, timeout=1.0)
+                inside[0] -= 1
+
+        def _quiet(config, only=None, group=None, **_kw):
+            _inside()
+            return launch.BringUp(
+                created=list(only or []), local_failed={}, node_outcomes=[]
+            )
+
+        def _stop(names, psmux=None):
+            _inside()
+            return list(names), []
+
+        monkeypatch.setattr(launch, "bring_up_psmux_quiet", _quiet)
+        monkeypatch.setattr(psmux, "stop_sessions", _stop)
+        go = threading.Barrier(2)
+        results: list[object] = []
+
+        def _run(verb) -> None:
+            go.wait(timeout=30)
+            results.append(verb())
+
+        threads = [
+            threading.Thread(target=_run, args=(lambda: control.start(cfg, ["upup"]),)),
+            threading.Thread(
+                target=_run, args=(lambda: control.stop(cfg, ["caramel"]),)
+            ),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert peak[0] == 1
+        assert sorted(results, key=repr) == sorted(
+            [
+                control.StartResult(started=["upup"]),
+                control.StopResult(stopped=["caramel"]),
+            ],
+            key=repr,
+        )
 
     def test_start_reports_live_sessions_and_brings_up_the_rest(
         self, typed, monkeypatch

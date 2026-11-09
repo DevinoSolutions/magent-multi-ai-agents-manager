@@ -626,9 +626,27 @@ def _float_query(req: ApiRequest, key: str, default: float) -> float:
         raise _bad(f"{key} must be a number") from None
 
 
-def _panes(req: ApiRequest) -> tuple[str, ...]:
-    raw = _query(req, "panes") or ""
-    return tuple(p.strip() for p in raw.split(",") if p.strip())
+def _panes(call: Call) -> tuple[str, ...]:
+    """The panes a client asks to tail, each one a configured session's exact
+    socket id -- the boundary ``control._row`` holds for every other pane
+    read. Any other name is ``not_found`` before anything subscribes (the
+    poller checks again before every capture)."""
+    raw = _query(call.req, "panes") or ""
+    panes = tuple(p.strip() for p in raw.split(",") if p.strip())
+    if not panes:
+        return panes
+    configured = {
+        r.session
+        for r in _rows(call.ctx.config_path, include_pane=False, fleet=call.ctx.fleet)
+    }
+    unknown = [p for p in panes if p not in configured]
+    if unknown:
+        raise WireError(
+            "not_found",
+            f"no configured session named {', '.join(map(repr, unknown))}",
+            {"unknown": unknown},
+        )
+    return panes
 
 
 def _json(req: ApiRequest) -> dict[str, object]:
@@ -905,13 +923,13 @@ def sse_frames(
 
 def _events(call: Call) -> ApiStream:
     last = call.req.header("last-event-id") or _query(call.req, "since")
-    return ApiStream(sse_frames(call.ctx, last, _panes(call.req)))
+    return ApiStream(sse_frames(call.ctx, last, _panes(call)))
 
 
 def _poll(call: Call) -> ApiResponse:
     wait = _float_query(call.req, "wait", POLL_WAIT_MAX_S)
     wait = min(max(wait, 0.0), POLL_WAIT_MAX_S)
-    with call.ctx.bus.subscription(_panes(call.req)):
+    with call.ctx.bus.subscription(_panes(call)):
         got = call.ctx.bus.wait(_query(call.req, "since"), wait)
     return ApiResponse.ok(got)
 
