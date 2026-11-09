@@ -1173,6 +1173,8 @@ class LinkRunner:
         # until the run ends.
         self._revoked: set[str] = set()
         self._trust_lock = threading.Lock()
+        # A trust change whose snapshot PUT was deferred (see _refresh_trust).
+        self._snapshot_due = False
 
     # -- the loop ------------------------------------------------------------
 
@@ -1682,7 +1684,11 @@ class LinkRunner:
         self._refresh_trust(client, revoked)
 
     def _refresh_trust(
-        self, client: RelayClient | None, revoked: set[str] | None = None
+        self,
+        client: RelayClient | None,
+        revoked: set[str] | None = None,
+        *,
+        defer_snapshot: bool = False,
     ) -> None:
         """Trust what link.json lists now, less every device the relay has
         listed revoked during this run (``revoked``: the device list just
@@ -1690,8 +1696,11 @@ class LinkRunner:
         the file cannot be read). A file that is gone, or names another
         pairing, ends the run (see _end_run). A change in who is trusted
         re-PUTs the snapshot through ``client`` (None: the caller PUTs one
-        next), so a device just paired gets its sessions at once. When
-        link.json cannot be read, the revocations apply in memory only."""
+        next), so a device just paired gets its sessions at once;
+        ``defer_snapshot`` PUTs none here and leaves it to the event
+        forwarder's next look (take_snapshot_due), for a caller that must
+        not wait on the relay. When link.json cannot be read, the
+        revocations apply in memory only."""
         self._check_end()
         with self._trust_lock:
             with self._lock:
@@ -1723,9 +1732,18 @@ class LinkRunner:
                         self._stamp = stamp
                     changed = set(peers) != set(self._peers)
                     self._peers = peers
+                    if changed and defer_snapshot:
+                        self._snapshot_due = True
         self._check_end()
-        if changed and client is not None:
+        if changed and client is not None and not defer_snapshot:
             self.put_snapshot(client)
+
+    def take_snapshot_due(self) -> bool:
+        """Whether a trust change was left unsent (see _refresh_trust's
+        ``defer_snapshot``); asking clears it."""
+        with self._lock:
+            due, self._snapshot_due = self._snapshot_due, False
+            return due
 
     def _check_same_link(self, current: LinkFile) -> None:
         """_Relinked when ``current`` names another host or token than the
@@ -1970,21 +1988,19 @@ class LinkRunner:
         with self._lock:
             return self._peers.get(device_id)
 
-    def upload_blocker(self, peer: _Peer, client: RelayClient | None) -> str | None:
-        """Why an upload ``peer`` sent may not be staged now, or None. Trust
-        is re-read from link.json first (_refresh_trust, its snapshot PUT
-        through ``client``): ``ended`` once the run was unlinked or paired
-        again, ``revoked`` once the device is no longer trusted with the same
-        keys. A snapshot that cannot go out does not change the answer: the
-        trust in memory is refreshed before it is PUT."""
+    def upload_blocker(self, peer: _Peer) -> str | None:
+        """Why an upload ``peer`` sent may not be staged now, or None, from
+        local state only: link.json is re-read (_refresh_trust) and nothing
+        here waits on the relay, so the answer is as fresh as that read when
+        the stage follows it. A trust change found here is left for the
+        event forwarder to PUT (a relay holding that PUT back could
+        otherwise hold the answer back past an unlink).
+        ``ended`` once the run was unlinked or paired again, ``revoked``
+        once the device is no longer trusted with the same keys."""
         try:
-            self._refresh_trust(client)
+            self._refresh_trust(None, defer_snapshot=True)
         except (_Unlinked, _Relinked):
             return "ended"
-        except Exception:  # noqa: BLE001  # reason: a snapshot for a changed trust that fails (relay or LinkHost) must not decide the upload; the check below still reads the refreshed trust
-            self._log.warning(
-                "link: could not send the snapshot for a changed link.json"
-            )
         with self._lock:
             if self._end is not None:
                 return "ended"
@@ -2368,8 +2384,11 @@ class EventForwarder:
         except Exception:  # noqa: BLE001  # reason: a snapshot for a changed trust that fails (relay or LinkHost) is repaired like a dropped batch; the forwarder goes on
             self._failed("link: could not send the snapshot for a changed link.json")
             self._dropped(failed=True)
+        # A trust change the upload puller found and left unsent; offline,
+        # the reconnect PUTs the snapshot anyway.
+        due = self._runner.take_snapshot_due()
         if not self._resync and self._runner.online():
-            self._resync = self._runner.remote_control_changed()
+            self._resync = due or self._runner.remote_control_changed()
 
     def _send_logged(self, batch: list[dict[str, object]]) -> None:
         try:
@@ -3003,8 +3022,7 @@ class UploadPuller:
         ``revoked``: see LinkRunner.upload_blocker), or None."""
         if self._stop.is_set():
             return "stopping"
-        client = self._client if self._runner.online() else None
-        blocker = self._runner.upload_blocker(ready.peer, client)
+        blocker = self._runner.upload_blocker(ready.peer)
         if blocker is None and self._stop.is_set():
             return "stopping"  # set while trust was being read
         return blocker

@@ -575,6 +575,9 @@ class _Stub:
     def remote_control_changed(self) -> bool:
         return False
 
+    def take_snapshot_due(self) -> bool:
+        return False
+
     def watch_link(self, client: RelayClient | None) -> None:
         pass
 

@@ -892,6 +892,65 @@ class TestRefusals:
         assert host.staged == []
         assert _pulls(uid) == []
 
+    def test_the_last_check_before_staging_waits_on_no_relay(
+        self, relay, phone, linked
+    ):
+        # A device added during the pull changes who is trusted, so the
+        # last check finds a snapshot to send. Sent from there, a relay
+        # holding that PUT back would let `magent unlink` land behind the
+        # check's answer. The check is local: no PUT from the puller, the
+        # file is staged only while link.json is there, and the snapshot for
+        # the new device still goes out, from the event forwarder.
+        uid = up_id(126)
+        gate, entered = threading.Event(), threading.Event()
+        puller_puts: list[str] = []
+        downloads = _downloads(gate=gate, entered=entered)
+
+        def factory(url, token, *, sleep):
+            client = downloads(url, token, sleep=sleep)
+            real_call = client.call
+
+            def call(method, path, body=None, **kwargs):
+                if (
+                    path == "/v1/host/snapshot"
+                    and threading.current_thread().name == link.UPLOAD_THREAD
+                ):
+                    puller_puts.append(path)
+                    linked.link_path.unlink()  # unlinked while the PUT is held
+                return real_call(method, path, body, **kwargs)
+
+            client.call = call
+            return client
+
+        host = FakeHost()
+        linked_when_staged: list[bool] = []
+        real_stage = host.stage_upload
+
+        def stage(*args):
+            linked_when_staged.append(linked.link_path.exists())
+            return real_stage(*args)
+
+        host.stage_upload = stage
+        run = Running(host, linked, client_factory=factory)
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        )
+        assert entered.wait(5)
+        other = new_device(OTHER_ID, "Laptop DECOY")
+        save_linked(
+            linked,
+            host_token=relay.host_token,
+            devices=(phone.trusted(), other.trusted()),
+        )
+        gate.set()
+        relay.wait_for(lambda: _states(relay, uid) == ["pulled", "injected"])
+        relay.wait_for(
+            lambda: bool(relay.snapshots) and OTHER_ID in relay.snapshots[-1]["sealed"]
+        )
+        run.finish(relay)
+        assert puller_puts == []
+        assert linked_when_staged == [True]
+
 
 class TestReplays:
     def test_a_replayed_upload_is_reported_again_not_pasted_again(
