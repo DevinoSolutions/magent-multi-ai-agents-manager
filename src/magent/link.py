@@ -2612,7 +2612,19 @@ class UploadPuller:
     again. Otherwise the device must be trusted, ``sizeBytes`` at most the
     daemon's upload cap plus 64 KiB of framing (or nothing is fetched), and
     the content key (AAD ``ukey:<id>``) and meta (AAD ``umeta:<id>``) must
-    open under that device's d2h key. The object is streamed from its
+    open under that device's d2h key.
+
+    The sealed meta is the only authority for where the file goes and
+    whether it is pasted: besides ``name`` (and ``type``/``size``) it must
+    carry ``session`` (a non-empty string) and ``inject`` (a boolean), and
+    both must equal the relay's plaintext ``session`` and ``inject``, which
+    only route the offer. Either missing (``meta_missing``) or different
+    (``meta_mismatch``) is a refusal: a relay that swapped them would
+    otherwise paste a genuine upload into a session the device never chose.
+    The device must therefore seal ``session`` and ``inject`` into
+    ``sealedMeta``; an app that seals the name alone is refused.
+
+    The object is streamed from its
     presigned URL into ``~/.magent/uploads/.incoming/<uploadId>.<token>/``
     (one folder per pull) under the same cap and decrypted chunk by chunk (a
     tampered or cut-short object fails whole). Only then, unless the link
@@ -2833,11 +2845,22 @@ class UploadPuller:
             raise _UploadRefused("its key or name did not decrypt") from exc
         if len(content_key) != 32 or meta is None:
             raise _UploadRefused("its key or name is malformed")
+        # Where the file goes and whether it is pasted are the device's word,
+        # sealed with the name: the relay's plaintext copies only route it.
+        sealed_session, sealed_inject = meta.get("session"), meta.get("inject")
+        if not (
+            isinstance(sealed_session, str)
+            and sealed_session
+            and isinstance(sealed_inject, bool)
+        ):
+            raise _UploadRefused("meta_missing: its session or paste is not sealed")
+        if sealed_session != session or ready.get("inject") is not sealed_inject:
+            raise _UploadRefused("meta_mismatch: its session or paste is not as sealed")
         return _Verified(
             upload_id=upload_id,
             device_id=device_id,
-            session=session,
-            inject=ready.get("inject") is True,
+            session=sealed_session,
+            inject=sealed_inject,
             url=url,
             cap=cap,
             content_key=content_key,

@@ -501,6 +501,85 @@ class TestRefusals:
         assert uid not in linked.state().seen_ids
         run.finish(relay)
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("session", "magent-beta"),
+            ("inject", False),
+            ("inject", None),
+            ("inject", 1),
+        ],
+    )
+    def test_a_relay_cannot_reroute_or_repaste_a_genuine_upload(
+        self, relay, phone, linked, field, value
+    ):
+        # The same valid ciphertext, key and sealed meta; only the relay's
+        # plaintext routing field changed. The device sealed where the file
+        # goes and whether it is pasted, so the swap is refused, unfetched.
+        uid = up_id(22)
+        host = FakeHost()
+        run = Running(host, linked)
+        ready = make_upload(relay, linked, phone, upload_id=uid, data=b"PNG")
+        if value is None:
+            del ready[field]
+        else:
+            ready[field] = value
+        relay.queue_upload_ready(ready)
+        relay.wait_for(lambda: _states(relay, uid) == ["inject_failed"])
+        assert host.staged == []
+        assert _blob_gets(relay, uid) == 0
+        assert uid not in linked.state().seen_ids
+        run.finish(relay)
+
+    @pytest.mark.parametrize(
+        "sealed",
+        [
+            {"session": None},
+            {"inject": None},
+            {"session": ""},
+            {"session": 7},
+            {"inject": "true"},
+            {"session": None, "inject": None},  # an app that seals the name only
+        ],
+    )
+    def test_a_meta_that_does_not_seal_session_and_paste_is_refused(
+        self, relay, phone, linked, sealed
+    ):
+        uid = up_id(23)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.queue_upload_ready(
+            make_upload(relay, linked, phone, upload_id=uid, data=b"PNG", sealed=sealed)
+        )
+        relay.wait_for(lambda: _states(relay, uid) == ["inject_failed"])
+        assert host.staged == []
+        assert _blob_gets(relay, uid) == 0
+        assert uid not in linked.state().seen_ids
+        run.finish(relay)
+
+    def test_the_sealed_session_and_paste_are_what_reach_the_host(
+        self, relay, phone, linked
+    ):
+        uid = up_id(24)
+        host = FakeHost()
+        run = Running(host, linked)
+        relay.queue_upload_ready(
+            make_upload(
+                relay,
+                linked,
+                phone,
+                upload_id=uid,
+                data=b"PNG",
+                session="magent-beta",
+                inject=False,
+            )
+        )
+        relay.wait_for(lambda: _states(relay, uid) == ["pulled"])
+        assert host.staged == [
+            (phone.device_id, "magent-beta", "photo.png", b"PNG", False)
+        ]
+        run.finish(relay)
+
     def test_refusals_are_logged_once_a_minute(self, relay, phone, linked, caplog):
         stranger = new_device(STRANGER_ID, "Stranger DECOY")
         uids = [up_id(n) for n in (41, 42, 43)]
@@ -672,17 +751,18 @@ class TestRefusals:
         assert _blob_gets(relay, uid) == 0
         run.finish(relay)
 
-    def test_only_inject_true_asks_for_a_paste(self, relay, phone, linked):
+    def test_only_a_boolean_inject_is_taken(self, relay, phone, linked):
+        # A truthy string is no paste request, and no sealed boolean's equal:
+        # refused, never staged with a guessed paste.
         uid = up_id(26)
         host = FakeHost()
         run = Running(host, linked)
         ready = make_upload(relay, linked, phone, upload_id=uid, data=b"x")
         relay.queue_upload_ready({**ready, "inject": "false"})
-        relay.wait_for(lambda: host.staged)
+        relay.wait_for(lambda: _states(relay, uid) == ["inject_failed"])
         relay.wait_for(lambda: uid not in run.runner._uploads._inflight)
         run.finish(relay)
-        assert host.staged[0][4] is False
-        assert _states(relay, uid) == ["pulled"]
+        assert host.staged == []
 
     def test_an_unsaved_ring_reports_failed_and_never_pastes(
         self, relay, phone, linked, monkeypatch

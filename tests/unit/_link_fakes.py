@@ -225,16 +225,30 @@ def make_upload(
     inject: bool = True,
     size: int | None = None,
     tamper: bool = False,
+    sealed: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """An UploadReady (C4) for ``data``, its encrypted object served by the
-    fake relay at ``/blob/<upload_id>`` -- as magent-app stages one."""
+    fake relay at ``/blob/<upload_id>`` -- as magent-app stages one, with
+    ``session`` and ``inject`` sealed in its meta. ``sealed`` overrides meta
+    keys (a None value drops the key)."""
     keys = linked.device_keys(device)
     content_key = os.urandom(32)
     blob = bytearray(linkcrypto.encrypt_upload(content_key, upload_id, data))
     if tamper:
         blob[20] ^= 0x01
     relay.objects[upload_id] = bytes(blob)
-    meta = {"name": name, "type": "image/png", "size": len(data)}
+    meta: dict[str, object] = {
+        "name": name,
+        "type": "image/png",
+        "size": len(data),
+        "session": session,
+        "inject": inject,
+    }
+    for key, value in (sealed or {}).items():
+        if value is None:
+            meta.pop(key, None)
+        else:
+            meta[key] = value
     return {
         "uploadId": upload_id,
         "deviceId": device.device_id,
