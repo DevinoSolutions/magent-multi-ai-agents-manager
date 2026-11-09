@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from magent import link, linkcrypto
+from magent import link, linkcrypto, linkfiles
 from magent.link import EventForwarder, LinkRunner, RelayClient, event_meta
 from magent.linkcrypto import AAD_EVT
 from tests._fake_relay import FakeRelay
@@ -578,7 +578,9 @@ class _Stub:
     def take_snapshot_due(self) -> bool:
         return False
 
-    def watch_link(self, client: RelayClient | None) -> None:
+    def watch_link(
+        self, client: RelayClient | None, *, defer_snapshot: bool = False
+    ) -> None:
         pass
 
     def seal_for_devices(self, plain: bytes, aad: str) -> dict[str, str]:
@@ -661,6 +663,59 @@ class TestResync:
         finally:
             forwarder.stop()
         assert relay.requests == []
+
+    @pytest.mark.parametrize("found_by", ["upload guard", "forwarder"])
+    def test_a_trust_change_left_while_connecting_is_sent_once_online(
+        self, tmp_path, relay, phone, found_by
+    ):
+        # The reconnect's snapshot PUT is in flight, its body sealed to the
+        # phone alone. Meanwhile a device is saved, and trusted by the upload
+        # guard (which leaves its snapshot to the forwarder) or by the
+        # forwarder's own look, both while the runner is still connecting.
+        # That PUT then lands, the runner is online, and nothing else
+        # changes: the forwarder must still PUT a snapshot that includes the
+        # new device.
+        linked = write_link(tmp_path, relay.url, (phone,), host_token=relay.host_token)
+        runner = LinkRunner(
+            FakeHost(), link_path=linked.link_path, state_path=linked.state_path
+        )
+        runner._load(linkfiles.load_link(linked.link_path))
+        runner._set_state("connecting")
+        feed = _Feed()
+        box: list[EventForwarder] = []
+        other = new_device(OTHER_ID, "Laptop DECOY")
+
+        class Held(RelayClient):
+            def call(self, method, path, body=None, **kwargs):
+                if path == "/v1/host/snapshot" and not relay.snapshots:
+                    save_linked(
+                        linked,
+                        host_token=relay.host_token,
+                        devices=(phone.trusted(), other.trusted()),
+                    )
+                    if found_by == "upload guard":
+                        peer = runner.peer(phone.device_id)
+                        assert runner.upload_blocker(peer) is None
+                    box[0]._check_link()  # the forwarder looks, still connecting
+                    assert runner.peer(OTHER_ID) is not None
+                return super().call(method, path, body, **kwargs)
+
+        client = Held(relay.url, token=relay.host_token)
+        box.append(EventForwarder(runner, client, lambda: feed))
+        runner.put_snapshot(client)  # the reconnect's PUT
+        assert OTHER_ID not in relay.snapshots[0]["sealed"]
+        runner._set_state("online")
+        box[0].start()
+        try:
+            relay.wait_for(
+                lambda: (
+                    len(relay.snapshots) == 2
+                    and OTHER_ID in relay.snapshots[-1]["sealed"]
+                ),
+                timeout=link.LINK_CHECK_S + 5,
+            )
+        finally:
+            box[0].stop()
 
     def test_a_remote_control_switch_reaches_the_relay_without_a_reconnect(
         self, tmp_path, relay, phone

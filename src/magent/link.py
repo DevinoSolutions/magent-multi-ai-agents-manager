@@ -1779,19 +1779,22 @@ class LinkRunner:
             self._end_run("relinked")
             raise _Relinked
 
-    def watch_link(self, client: RelayClient | None) -> None:
+    def watch_link(
+        self, client: RelayClient | None, *, defer_snapshot: bool = False
+    ) -> None:
         """Refresh trust from link.json if it changed since this run read it
-        (a stat when it did not): see _refresh_trust. Called on every
-        command, and by the event forwarder every LINK_CHECK_S, so a device
-        `magent link --add-device` saved is trusted, and sent a snapshot,
-        without a reconnect (the relay announces it before it is saved), and
-        a quiet stream is closed once link.json is gone. A file that cannot
-        be read now is looked at again next time."""
+        (a stat when it did not): see _refresh_trust, and its
+        ``defer_snapshot``. Called on every command, and by the event
+        forwarder every LINK_CHECK_S, so a device `magent link --add-device`
+        saved is trusted, and sent a snapshot, without a reconnect (the
+        relay announces it before it is saved), and a quiet stream is
+        closed once link.json is gone. A file that cannot be read now is
+        looked at again next time."""
         self._check_end()
         with self._lock:
             stamp = self._stamp
         if _link_stamp(self._link_path) != stamp:
-            self._refresh_trust(client)
+            self._refresh_trust(client, defer_snapshot=defer_snapshot)
 
     def _end_run(self, outcome: str) -> None:
         """End this run from link.json (``unlinked``, ``relinked``): drop the
@@ -2445,19 +2448,25 @@ class EventForwarder:
             return
         self._check_after = now + LINK_CHECK_S
         try:
-            # Offline, the reconnect PUTs the snapshot for the new trust.
+            # Not online, a trust change is owed to the next PUT from here
+            # (below): a reconnect's PUT in flight may predate it.
             online = self._runner.online()
-            self._runner.watch_link(self._client if online else None)
+            self._runner.watch_link(
+                self._client if online else None, defer_snapshot=not online
+            )
         except (_Unlinked, _Relinked):
             pass
         except Exception:  # noqa: BLE001  # reason: a snapshot for a changed trust that fails (relay or LinkHost) is repaired like a dropped batch; the forwarder goes on
             self._failed("link: could not send the snapshot for a changed link.json")
             self._dropped(failed=True)
-        # A trust change the upload puller found and left unsent; offline,
-        # the reconnect PUTs the snapshot anyway.
-        due = self._runner.take_snapshot_due()
-        if not self._resync and self._runner.online():
-            self._resync = due or self._runner.remote_control_changed()
+        # A trust change the upload puller found and left unsent: owed until
+        # a snapshot PUT that starts after this succeeds (send clears it),
+        # online or not. A reconnect's PUT in flight now may have sealed its
+        # body before the change, so it does not count.
+        if self._runner.take_snapshot_due():
+            self._resync = True
+        elif not self._resync and self._runner.online():
+            self._resync = self._runner.remote_control_changed()
 
     def _send_logged(self, batch: list[dict[str, object]]) -> None:
         try:
