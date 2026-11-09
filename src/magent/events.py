@@ -237,14 +237,29 @@ SSE_PING = b": ping\n\n"
 # --- The poller ---------------------------------------------------------------
 
 
+def config_stamp(config_path: str | None) -> str | None:
+    """A digest of the config file's bytes, None when it cannot be read: two
+    equal stamps mean the same config, so the poller reloads only on change.
+    Content, not mtime, because an edit inside one timestamp tick must count."""
+    from magent.paths import find_config
+
+    try:
+        data = find_config(config_path).read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha1(data, usedforsecurity=False).hexdigest()
+
+
 @dataclass
 class EventPoller:
     """Diffs successive fleet snapshots into events on ``bus``.
 
-    The three callables are the seams: ``rows_fn(include_pane)`` returns the
+    The callables are the seams: ``rows_fn(include_pane)`` returns the
     current rows, ``fire_fn(session, hook_state)`` is the attention
     debounce, ``pane_fn(row)`` captures one configured session's pane (None:
-    not readable now). ``for_config`` wires the real ones.
+    not readable now), and ``generation_fn()`` names the config the rows
+    came from (a capture taken across a change is dropped). ``for_config``
+    wires the real ones.
 
     A session first seen on a hook tick is announced (``session.added``)
     with its pane fields (``PANE_FIELDS``) as None, because a hook tick reads
@@ -255,6 +270,7 @@ class EventPoller:
     rows_fn: Callable[[bool], list[SessionRow]]
     fire_fn: Callable[[str, str], bool]
     pane_fn: Callable[[SessionRow], PaneCapture | None]
+    generation_fn: Callable[[], str | None] = lambda: None
     pane_every: int = PANE_EVERY_N_TICKS
     _snapshot: dict[str, dict[str, object]] = field(
         default_factory=dict, init=False, repr=False
@@ -272,15 +288,22 @@ class EventPoller:
         live node session, ``psmux.read_pane`` for a live local one, nothing
         for a session that is not live.
 
-        The config is loaded once per serve, on the first tick that has one,
-        and the engine built from it; both are kept until the server
-        restarts. So the staleness windows, debounce and node extra-stores
-        are frozen at that point (a ``settings.attention`` edit reaches the
-        stream only after a restart), and so is the node-project list the
-        node rows are built from -- the LOCAL rows read the raw file every
-        tick, so a project added later is announced as usual. Loading per
-        tick instead would echo ``load_config``'s stderr warning once a
-        second. ``fire_fn`` keys the engine's debounce map (``_last_fired``)
+        The typed config is loaded on the first tick that has one and again
+        whenever the file's bytes change (``config_stamp``, a digest read
+        each time it is asked for), never on a tick that finds it unchanged:
+        loading per tick would echo ``load_config``'s stderr warning once a
+        second. The node rows are built from it, so a node project removed
+        while another stays configured stops being listed -- and tailed --
+        on the next tick. A changed config that does not load fails the tick
+        (logged by ``run_poller``) rather than leaving the old one in force.
+        The engine is built from the FIRST config and kept until the server
+        restarts, so the staleness windows, debounce and node extra-stores
+        are frozen there (a ``settings.attention`` edit reaches the stream
+        only after a restart). ``generation_fn`` is ``config_stamp`` too: a
+        capture is published only if the stamp still matches the one taken
+        before the tick's rows were built, so a config edit that lands
+        mid-tick drops that tick's captures instead of publishing a pane the
+        edit just removed. ``fire_fn`` keys the engine's debounce map (``_last_fired``)
         by SESSION NAME, and nothing on this path ever prunes it (only
         ``AttentionEngine.transitions`` does, which ``fleetview.rows`` never
         calls): one entry per (session, state) ever paged, for the life of
@@ -293,23 +316,34 @@ class EventPoller:
         ``fleetview.rows``."""
         from magent import control, fleetview, psmux
 
-        loaded: list[tuple[MagentConfig, AttentionEngine]] = []
+        def _stamp() -> str | None:
+            return config_stamp(config_path)
+
+        cfg: MagentConfig | None = None
+        engine: AttentionEngine | None = None
+        seen: str | None = None
 
         def _config() -> tuple[MagentConfig, AttentionEngine] | None:
-            if not loaded:
+            nonlocal cfg, engine, seen
+            stamp = _stamp()
+            if cfg is None or stamp != seen:
+                # Stamped BEFORE the read: an edit landing in between makes
+                # the next call load again, never keeps a stale config.
                 cfg = fleetview.load_typed(config_path)
-                if cfg is None:
-                    return None
-                loaded.append((cfg, fleetview.engine_from_config(cfg)))
-            return loaded[0]
+                seen = stamp
+            if cfg is None:
+                return None
+            if engine is None:
+                engine = fleetview.engine_from_config(cfg)
+            return cfg, engine
 
         def _rows(include_pane: bool) -> list[SessionRow]:
-            cfg, engine = _config() or (None, None)
+            now_cfg, now_engine = _config() or (None, None)
             return fleetview.rows(
                 config_path,
                 include_pane=include_pane,
-                engine=engine,
-                cfg=cfg,
+                engine=now_engine,
+                cfg=now_cfg,
                 probe_timeout_s=PROBE_TIMEOUT_S,
             )
 
@@ -317,8 +351,7 @@ class EventPoller:
             got = _config()
             if got is None:
                 return False
-            _cfg, engine = got
-            return engine.should_fire(session, state)
+            return got[1].should_fire(session, state)
 
         def _pane(row: SessionRow) -> PaneCapture | None:
             if row.node_state is not None:
@@ -334,18 +367,26 @@ class EventPoller:
                 return None
             return psmux.read_pane(row.session)
 
-        return cls(bus=bus, rows_fn=_rows, fire_fn=_fire, pane_fn=_pane)
+        return cls(
+            bus=bus,
+            rows_fn=_rows,
+            fire_fn=_fire,
+            pane_fn=_pane,
+            generation_fn=_stamp,
+        )
 
     def tick(self) -> None:
         """One poll: hooks every tick, panes every ``pane_every`` ticks,
         subscribed pane tails every tick. A subscribed name is tailed only
         while this tick's rows hold it -- the configured fleet, read afresh
         -- and through its own row, so no raw subscriber string ever reaches
-        a reader. The pane-hash memory is pruned to the panes somebody still
-        asks for, so an unsubscribed pane is tailed afresh when interest
-        returns."""
+        a reader; and a capture is published only while ``generation_fn``
+        still answers what it did before those rows were built. The
+        pane-hash memory is pruned to the panes somebody still asks for, so
+        an unsubscribed pane is tailed afresh when interest returns."""
         with_pane = self._ticks % self.pane_every == 0
         self._ticks += 1
+        generation = self.generation_fn()
         rows = self.rows_fn(with_pane)
         self._diff(rows, with_pane=with_pane)
         configured = {r.session: r for r in rows}
@@ -353,7 +394,7 @@ class EventPoller:
         for session in interest:
             row = configured.get(session)
             if row is not None:
-                self._tail(row)
+                self._tail(row, generation)
         self._pane_hash = {s: h for s, h in self._pane_hash.items() if s in interest}
 
     def _diff(self, rows: list[SessionRow], *, with_pane: bool) -> None:
@@ -387,11 +428,13 @@ class EventPoller:
             self._pane_hash.pop(session, None)
             self.bus.publish("session.removed", {"session": session})
 
-    def _tail(self, row: SessionRow) -> None:
+    def _tail(self, row: SessionRow, generation: str | None) -> None:
         session = row.session
         capture = self.pane_fn(row)
         if capture is None or capture.timed_out:
             return
+        if self.generation_fn() != generation:
+            return  # the config changed under this tick: its rows are stale
         digest = hashlib.sha1(
             capture.text.encode("utf-8"), usedforsecurity=False
         ).hexdigest()[:16]

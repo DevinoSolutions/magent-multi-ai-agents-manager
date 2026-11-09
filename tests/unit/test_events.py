@@ -7,12 +7,16 @@ import json
 import logging
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import pytest
 
 from magent import env, events, log
 from magent.fleetview import SessionRow
 from magent.psmux import PaneCapture
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def _row(session: str, **changes: object) -> SessionRow:
@@ -616,6 +620,139 @@ class TestForConfig:
 
     def test_the_probe_bound_is_a_few_seconds(self):
         assert 1.0 <= events.PROBE_TIMEOUT_S <= 10.0
+
+
+class TestForConfigFollowsTheConfig:
+    """The real wiring end to end -- ``for_config``, ``fleetview.rows``, the
+    node rows from the sync daemon's files, ``control.node_pane`` -- with only
+    the ssh capture (``remote_mux.capture_pane``) substituted."""
+
+    @pytest.fixture
+    def two_nodes(self, tmp_path, monkeypatch):
+        from magent import nodes, psmux, remote_mux
+        from magent.nodes import NodeMapEntry
+
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"),
+            {"ts": time.time(), "sessions": ["a", "b"]},
+        )
+        for name in ("a", "b"):
+            nodes.update_node_map(
+                name,
+                NodeMapEntry(
+                    nick="second",
+                    sid=name,
+                    placed_ts=1.0,
+                    attached_existing=False,
+                    remote_root=f"~/magent/{name}",
+                    target="demo@box-second",
+                    cwd=f"/home/demo/magent/{name}",
+                ),
+            )
+        path = tmp_path / "magent.config.json"
+
+        def write(names: list[str]) -> None:
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 4,
+                        "projects": [
+                            {"path": str(tmp_path / n), "title": n, "node": "second"}
+                            for n in names
+                        ],
+                        "settings": {
+                            "nodes": {"second": {"host": "box-second", "user": "demo"}}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        write(["a", "b"])
+        captured: list[str] = []
+        texts: dict[str, str] = {"a": "a before\n", "b": "b before\n"}
+        hooks: list[Callable[[str], None]] = []
+
+        def _capture(_node, session):
+            captured.append(session)
+            for hook in hooks:
+                hook(session)
+            return texts[session]
+
+        monkeypatch.setattr(remote_mux, "capture_pane", _capture)
+        return str(path), write, captured, texts, hooks
+
+    @staticmethod
+    def _panes(bus: events.EventBus) -> list[tuple[object, object]]:
+        return [
+            (e.data["session"], e.data["text"])
+            for e in bus.since(f"{bus.epoch}:0").events
+            if e.type == "session.pane"
+        ]
+
+    def test_a_removed_node_project_stops_being_read_while_another_stays(
+        self, two_nodes
+    ):
+        path, write, captured, texts, _hooks = two_nodes
+        bus = events.EventBus("e")
+        poller = events.EventPoller.for_config(bus, path)
+        with bus.subscription(("a", "b")):
+            poller.tick()
+            assert sorted(captured) == ["a", "b"]
+            write(["b"])
+            texts.update(a="a private AFTER removal\n", b="b after\n")
+            captured.clear()
+            poller.tick()
+            poller.tick()
+        assert captured == ["b", "b"]
+        assert sorted(self._panes(bus)) == [
+            ("a", "a before\n"),
+            ("b", "b after\n"),
+            ("b", "b before\n"),
+        ]
+        removed = [
+            e.data for e in bus.since("e:0").events if e.type == "session.removed"
+        ]
+        assert removed == [{"session": "a"}]
+
+    def test_an_unchanged_config_is_loaded_once(self, two_nodes, monkeypatch):
+        from magent import fleetview
+
+        path, _write, _captured, _texts, _hooks = two_nodes
+        loads: list[object] = []
+        real = fleetview.load_typed
+        monkeypatch.setattr(
+            fleetview, "load_typed", lambda p: loads.append(p) or real(p)
+        )
+        bus = events.EventBus("e")
+        poller = events.EventPoller.for_config(bus, path)
+        with bus.subscription(("a",)):
+            for _ in range(3):
+                poller.tick()
+        assert loads == [path]
+
+    def test_a_capture_taken_across_a_config_edit_is_not_published(self, two_nodes):
+        # The rows were built, then the edit removed `a` while its pane was
+        # being read: that capture must be dropped, not published once.
+        path, write, captured, texts, hooks = two_nodes
+        bus = events.EventBus("e")
+        poller = events.EventPoller.for_config(bus, path)
+        texts["a"] = "a private AFTER removal\n"
+
+        def _remove_a(session: str) -> None:
+            if session == "a":
+                write(["b"])
+
+        hooks.append(_remove_a)
+        with bus.subscription(("a",)):
+            poller.tick()
+            hooks.clear()
+            poller.tick()
+        assert captured == ["a"]
+        assert self._panes(bus) == []
 
 
 class _Engine:
