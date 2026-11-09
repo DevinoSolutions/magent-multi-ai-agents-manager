@@ -8,6 +8,7 @@ import time
 import pytest
 
 from magent import control, fleetview, launch, psmux
+from magent import fleet as fleet_mod
 from tests.unit._fake_psmux import make_fake_psmux
 
 MID = "·"
@@ -256,6 +257,85 @@ class TestSend:
         assert len(results) == 2
         assert order == ["paste", "Enter", "paste", "Enter"]
         assert len(fake.send_key_calls()) == 4
+
+    def test_two_waiting_sends_never_both_land_in_one_turn(self, fleet, monkeypatch):
+        """Two ``wait_idle`` sends to one idle session (two API requests):
+        the first prompt starts a turn, so the second must NOT be pasted into
+        it -- it waits again and, the turn outlasting its deadline, refuses
+        with nothing typed. Each send's idle wait, once it says idle, waits
+        (bounded) for the other's to say so too: both have then seen idle
+        before either pasted, which is exactly when a check made only outside
+        the session lock lets both through."""
+        fake, cfg = fleet
+        fake.set_pane_after_send(BUSY)
+        real = fleet_mod.wait_for_idle
+        both_idle = threading.Condition()
+        saw_idle = [0]
+
+        def _rendezvous(*args, **kwargs):
+            idle = real(*args, **kwargs)
+            with both_idle:
+                if idle and saw_idle[0] < 2:
+                    saw_idle[0] += 1
+                    both_idle.notify_all()
+                    both_idle.wait_for(lambda: saw_idle[0] >= 2, timeout=1.0)
+            return idle
+
+        monkeypatch.setattr(fleet_mod, "wait_for_idle", _rendezvous)
+        results: list[control.SendResult | control.ControlError] = []
+
+        def _send(text: str) -> None:
+            try:
+                results.append(
+                    control.send(cfg, "caramel", text, wait_idle=True, timeout_s=1.0)
+                )
+            except control.ControlError as exc:
+                results.append(exc)
+
+        threads = [
+            threading.Thread(target=_send, args=(t,))
+            for t in ("first prompt here", "second prompt here")
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        assert saw_idle[0] == 2  # both waits really did see idle first
+        sent = [r for r in results if isinstance(r, control.SendResult)]
+        refused = [r for r in results if isinstance(r, control.ControlError)]
+        assert [(r.confirmed, r.pane_state_after) for r in sent] == [(True, "busy")]
+        assert [(r.code, r.details) for r in refused] == [
+            ("timeout", {"reason": "not_idle"})
+        ]
+        assert [c[-1] for c in fake.send_key_calls()][1:] == ["Enter"]
+        assert len(fake.send_key_calls()) == 2
+
+    def test_compact_then_prompt_rechecks_idle_before_the_prompt(
+        self, fleet, monkeypatch
+    ):
+        """The post-compact idle wait said idle, then the pane went busy
+        (another sender's turn) before the prompt's paste: the prompt waits
+        again under the same deadline instead of landing in that turn."""
+        fake, cfg = fleet
+        real = fleet_mod.wait_for_idle
+        calls = [0]
+
+        def _then_busy(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                fake.set_pane(BUSY)
+                return True
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(fleet_mod, "wait_for_idle", _then_busy)
+        with pytest.raises(control.ControlError) as err:
+            control.send(cfg, "caramel", "next prompt", compact=True, timeout_s=0.5)
+        assert (err.value.code, err.value.details) == (
+            "timeout",
+            {"reason": "not_idle"},
+        )
+        assert "after /compact" in err.value.message
+        assert [s[-1] for s in fake.send_key_calls()] == ["/compact", "Enter"]
 
     def test_a_prompt_still_on_the_input_line_is_not_confirmed(self, fleet):
         fake, cfg = fleet
