@@ -10,8 +10,12 @@ RECEIVES -- including that no shell splits or rewrites ``/model`` on the way.
 elsewhere) that shells to a Python recorder. Every invocation appends its argv
 to ``calls.jsonl``; ``capture-pane`` prints ``pane.txt`` (after sleeping
 ``capture_delay.txt`` seconds, if set); ``has-session`` exits 0 unless
-``live.txt`` exists and omits the queried session. The base directory
-is baked into the recorder as a literal, so no environment plumbing is needed.
+``live.txt`` exists and omits the queried session (after sleeping
+``has_session_delay.txt`` seconds, if set); ``send-keys`` swaps in
+``after_send.txt`` as the pane when one is staged, and exits 1 while
+``fail_send.txt`` is staged (a staged ``gone`` also empties ``live.txt``: the
+session died, which is why the send failed). The base directory is baked into
+the recorder as a literal, so no environment plumbing is needed.
 """
 
 from __future__ import annotations
@@ -51,7 +55,29 @@ def _target():
     return ""
 
 
+if "send-keys" in args:
+    # A send that fails: what a psmux whose server went away (or that refused
+    # the key) answers. With "gone" staged the liveness probe fails from here
+    # on too, the way a dead session's does.
+    fail = BASE / "fail_send.txt"
+    if fail.exists():
+        if fail.read_text(encoding="utf-8").strip() == "gone":
+            (BASE / "live.txt").write_text("", encoding="utf-8")
+        sys.exit(1)
+    # A pane that reacts: when after_send.txt is staged, the first send-keys
+    # swaps it in as the pane (a dialog that closes on a keypress, a turn
+    # that stops on Escape) -- what a capture right after the key shows.
+    after = BASE / "after_send.txt"
+    if after.exists():
+        os.replace(after, BASE / "pane.txt")
+    sys.exit(0)
+
 if "has-session" in args:
+    # A liveness probe that answers late: a loaded or frozen psmux server,
+    # made deterministic. Only has-session is slowed.
+    delay = BASE / "has_session_delay.txt"
+    if delay.exists():
+        time.sleep(float(delay.read_text(encoding="utf-8")))
     live = BASE / "live.txt"
     if live.exists():
         names = set(live.read_text(encoding="utf-8").split())
@@ -92,6 +118,21 @@ class FakePsmux:
     def set_capture_delay(self, seconds: float) -> None:
         """Make every later ``capture-pane`` sleep ``seconds`` before answering."""
         (self.base / "capture_delay.txt").write_text(str(seconds), encoding="utf-8")
+
+    def set_pane_after_send(self, text: str) -> None:
+        """Make the NEXT ``send-keys`` replace the pane with ``text``."""
+        (self.base / "after_send.txt").write_text(text, encoding="utf-8")
+
+    def set_has_session_delay(self, seconds: float) -> None:
+        """Make every later ``has-session`` sleep ``seconds`` before answering."""
+        (self.base / "has_session_delay.txt").write_text(str(seconds), encoding="utf-8")
+
+    def set_send_failure(self, *, gone: bool = False) -> None:
+        """Make every later ``send-keys`` exit 1. With ``gone`` the session
+        also stops answering ``has-session`` from that send on."""
+        (self.base / "fail_send.txt").write_text(
+            "gone" if gone else "", encoding="utf-8"
+        )
 
     def set_live(self, names: list[str] | None) -> None:
         live = self.base / "live.txt"

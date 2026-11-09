@@ -65,6 +65,8 @@ class SessionView:
     state: str  # effective state (staleness applied)
     ts: float  # when the record was written
     age_s: float  # seconds since ts, at poll time
+    raw_state: str  # the record's own state: differs from ``state`` when stale
+    session_id: str | None  # the record's agent session id, when it has one
 
 
 @dataclass
@@ -196,7 +198,9 @@ class AttentionEngine:
         """One record as a view, or None when it is unusable. A node record
         (``key`` set, ``@<nick>``) is named by its project (``label``) and its
         cwd becomes ``<key>:<cwd>``: two nodes can hold the same directory, and
-        transitions and debounce are keyed by cwd. Its ts is the node's clock."""
+        transitions and debounce are keyed by cwd. Its ts is the node's clock.
+        The view is the ONE read of the record: it also carries the raw state
+        and the session id, so no row builder re-reads the store."""
         raw_state = rec.get("state")
         raw_cwd = rec.get("cwd")
         if not isinstance(raw_state, str) or not isinstance(raw_cwd, str):
@@ -212,15 +216,22 @@ class AttentionEngine:
         stale_after = self._staleness.get(state)
         if stale_after is not None and age > stale_after:
             state = agent_state.IDLE
+        sid = rec.get("session_id")
+        session_id = sid if isinstance(sid, str) and sid else None
         if key is None:
             name = self._name_by_cwd.get(raw_cwd, _leaf(raw_cwd))
-            return SessionView(name=name, cwd=raw_cwd, state=state, ts=ts, age_s=age)
+            cwd = raw_cwd
+        else:
+            name = label if label is not None else _leaf(raw_cwd)
+            cwd = f"{key}:{raw_cwd}"
         return SessionView(
-            name=label if label is not None else _leaf(raw_cwd),
-            cwd=f"{key}:{raw_cwd}",
+            name=name,
+            cwd=cwd,
             state=state,
             ts=ts,
             age_s=age,
+            raw_state=raw_state,
+            session_id=session_id,
         )
 
     def transitions(self, views: list[SessionView]) -> list[Transition]:

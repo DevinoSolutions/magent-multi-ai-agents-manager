@@ -42,6 +42,7 @@ from magent.config import (
     is_cloud,
     runs_on_node,
 )
+from magent.config_io import replace_retrying
 from magent.json_depth import MAX_JSON_DEPTH, TOO_DEEP, nests_too_deep
 from magent.lockfile import LockHeld, persistent_lock
 from magent.log import get_logger
@@ -1753,15 +1754,7 @@ _REPLACE_SLEEP_S = 0.025
 
 
 def _replace_retrying(src: Path, dst: Path) -> None:
-    for attempt in range(_REPLACE_RETRIES + 1):
-        try:
-            os.replace(src, dst)
-        except PermissionError:
-            if attempt == _REPLACE_RETRIES:
-                raise
-            time.sleep(_REPLACE_SLEEP_S)
-        else:
-            return
+    replace_retrying(src, dst, retries=_REPLACE_RETRIES, sleep_s=_REPLACE_SLEEP_S)
 
 
 # The sidecar every map writer holds (DECISION-13): ~/.magent/node-map.lock,

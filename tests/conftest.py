@@ -247,6 +247,12 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # box's live fleet. Off for every tier; reaper tests turn it on IN PROCESS
     # only (monkeypatch.setenv + resetting env._cached_env).
     monkeypatch.setenv("MAGENT_IDLE_REAP", "0")
+    # ...and a sixth: `magent serve`'s event poller (events.run_poller)
+    # captures every live pane on this machine while a client listens. A test
+    # that starts a real serve and opens /api/v1/events would otherwise read
+    # the developer's own fleet. Off for every tier; tests that are ABOUT the
+    # poller drive EventPoller.tick directly with fake seams.
+    monkeypatch.setenv("MAGENT_EVENTS", "0")
     log.reset_logging()
     yield
     log.reset_logging()
@@ -300,6 +306,24 @@ def _no_real_gh(monkeypatch):
     and ``node setup`` registers an ssh key to their account with it. Same
     device as ``_no_real_ssh``; the ``fake_gh`` fixture wins over it."""
     monkeypatch.setattr("magent.remote_mux.find_gh", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_tailnet_names(request, monkeypatch):
+    """No in-process ``run_server`` learns the developer's REAL tailnet
+    names. ``upload_server._learn_hosts`` runs on a daemon thread that
+    ``run_server`` starts: it shells out to ``tailscale`` and writes
+    ``UploadHandler.allowed_hosts``, a class attribute, so a thread that
+    outlives its test's monkeypatch teardown would land the real MagicDNS
+    name and tailnet IP in the class state every later test reads. Stubbed
+    on the module attribute (the thread target is looked up at start time),
+    so the one test that drives ``_learn_hosts`` directly opts out with
+    ``@pytest.mark.learn_hosts`` and patches ``tailnet`` itself. A real
+    serve in a child process keeps the real function: its class state dies
+    with the process."""
+    if request.node.get_closest_marker("learn_hosts") is not None:
+        return
+    monkeypatch.setattr("magent.upload_server._learn_hosts", lambda _host: None)
 
 
 @pytest.fixture(autouse=True)

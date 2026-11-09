@@ -271,7 +271,11 @@ def _probe_live(names: list[str], binary: str, timeout: float | None) -> set[str
     Every probe is spawned before any is waited on, so n sessions cost roughly
     one psmux round-trip instead of n sequential ones. A probe that could not
     be spawned, or that outran ``timeout``, counts as NOT live -- the caller
-    decides whether to retry it.
+    decides whether to retry it. A bounded pass waits under ONE deadline
+    (``await_clients``): the clients run concurrently, so W wedged sockets
+    cost one ``timeout``, not W of them, and each one is killed AND reaped.
+    An unbounded pass (``timeout`` None) waits each client out in turn, as
+    the status/down/picker surfaces want.
     """
     procs: list[tuple[str, subprocess.Popen[bytes] | None]] = []
     for name in names:
@@ -291,16 +295,12 @@ def _probe_live(names: list[str], binary: str, timeout: float | None) -> set[str
         except OSError:
             procs.append((name, None))
 
+    if timeout is not None:
+        codes = await_clients([proc for _name, proc in procs], timeout)
+        return {name for (name, _proc), rc in zip(procs, codes, strict=True) if rc == 0}
     live: set[str] = set()
     for name, proc in procs:
-        if proc is None:
-            continue
-        try:
-            rc = proc.wait() if timeout is None else proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            continue
-        if rc == 0:
+        if proc is not None and proc.wait() == 0:
             live.add(name)
     return live
 
@@ -801,6 +801,29 @@ def send_keys(
         return False
     else:
         return result.returncode == 0
+
+
+# The key NAMES magent presses as keys (not pasted as text). A closed set:
+# ``send_key`` refuses anything else, so a caller can never smuggle text in
+# through a key name.
+NAMED_KEYS = frozenset({"Escape", "Enter"})
+
+
+def send_key(
+    name: str,
+    key: str,
+    *,
+    psmux: str | None = None,
+    timeout: float = SEND_KEYS_TIMEOUT_S,
+) -> bool:
+    """Press ONE named key in session ``name``'s pane (``send-keys -t name
+    <key>``, no ``-l``). ``Escape`` is the interrupt Claude Code honours
+    mid-turn. Same bound and non-raising contract as ``send_keys``; an
+    unknown key name raises ``ValueError`` (a programming error, not a
+    runtime condition)."""
+    if key not in NAMED_KEYS:
+        raise ValueError(f"not a key magent presses: {key!r}")
+    return send_keys(name, key, target=name, psmux=psmux, timeout=timeout)
 
 
 def pane_cwd(name: str, psmux: str | None = None) -> str:
@@ -2251,9 +2274,19 @@ def revive_sessions(
     return revived
 
 
-def config_sessions(config_path: str | None) -> list[dict[str, object]]:
+def config_sessions(
+    config_path: str | None,
+    *,
+    detail: bool = False,
+    raw: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
     """Eligible psmux sessions from config — no psmux binary calls, fast path
-    for the upload server's session list."""
+    for the upload server's session list.
+
+    ``detail=True`` adds ``group``, ``tool``, ``enabled`` and ``node`` to each row for
+    ``fleetview``; the default rows keep the exact shape ``/api/sessions``
+    has always served. ``raw`` is the config file already parsed (fleetview
+    reads it once per row build); without it the file is read here."""
     import json
     from pathlib import Path
 
@@ -2265,19 +2298,26 @@ def config_sessions(config_path: str | None) -> list[dict[str, object]]:
     from magent.paths import find_config
     from magent.sessions import is_ide_tool
 
-    config_file = find_config(config_path)
-    if not config_file.exists():
-        return []
-
-    data = json.loads(config_file.read_text(encoding="utf-8"))
-    default_tool = data.get("settings", {}).get("defaultTool", "claude")
+    if raw is None:
+        config_file = find_config(config_path)
+        if not config_file.exists():
+            return []
+        raw = json.loads(config_file.read_text(encoding="utf-8"))
+    data = raw
+    settings = data.get("settings")
+    default_tool = (
+        settings.get("defaultTool", "claude")
+        if isinstance(settings, dict)
+        else "claude"
+    )
     raw_base = data.get("baseDir")
+    projects = data.get("projects", [])
     base_dir = (
         _expand_base_dir(raw_base) if isinstance(raw_base, str) and raw_base else None
     )
     out: list[dict[str, object]] = []
-    for p in data.get("projects", []):
-        if not p.get("enabled", True):
+    for p in projects if isinstance(projects, list) else []:
+        if not isinstance(p, dict) or not p.get("enabled", True):
             continue
         tool = p.get("tool", default_tool)
         if isinstance(tool, str) and is_ide_tool(tool):
@@ -2286,16 +2326,23 @@ def config_sessions(config_path: str | None) -> list[dict[str, object]]:
         if p.get("node") not in (None, "cloud"):
             continue
         proj_name = p.get("title") or Path(p["path"]).name
-        out.append(
-            {
-                "name": proj_name,
-                "session": session_name(proj_name),
-                "path": p["path"],
-                # "" (never None) when the folder can't be resolved, so a JSON
-                # consumer can treat it as a plain string field.
-                "resolved": _resolve_path(p["path"], base_dir) or "",
-            }
-        )
+        row: dict[str, object] = {
+            "name": proj_name,
+            "session": session_name(proj_name),
+            "path": p["path"],
+            # "" (never None) when the folder can't be resolved, so a JSON
+            # consumer can treat it as a plain string field.
+            "resolved": _resolve_path(p["path"], base_dir) or "",
+        }
+        if detail:
+            group = p.get("group")
+            row["group"] = group if isinstance(group, str) else None
+            row["tool"] = tool if isinstance(tool, str) else None
+            row["enabled"] = True
+            # None for a local project, "cloud" for a cloud pane: the pool
+            # node rows were skipped above.
+            row["node"] = "cloud" if p.get("node") == "cloud" else None
+        out.append(row)
     return out
 
 

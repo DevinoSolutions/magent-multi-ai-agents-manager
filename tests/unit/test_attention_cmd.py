@@ -413,8 +413,8 @@ class TestStalenessFromConfig:
     per-session state reads in session_picker/status go through it, because a
     second copy is exactly the drift that left `magent sessions` (and `status`'s
     psmux-session table) reading the module defaults while the daemon honored
-    config. The cli module owns the config translation, the consumer takes
-    plain values."""
+    config. ``fleetview`` owns the translation (so src modules can build the
+    engine); this module re-exports it, and the consumer takes plain values."""
 
     def test_config_values_become_the_window_map(self, tmp_config):
         cfg = config.load_config(
@@ -451,17 +451,35 @@ class TestStalenessFromConfig:
 
     def test_the_engine_builder_reads_through_it(self, monkeypatch, tmp_config):
         # The engine must not keep its own inline copy of the translation:
-        # whatever this seam answers is what the engine ages with.
+        # whatever the one seam (fleetview's) answers is what the engine ages
+        # with, whichever spelling built it.
+        from magent import fleetview
+
         cfg = config.load_config(
             tmp_config({"version": config.SCHEMA_VERSION, "projects": []})
         )
         monkeypatch.setattr(
-            attention_cmd, "staleness_from_config", lambda _cfg: {"working": 7.0}
+            fleetview, "staleness_from_config", lambda _cfg: {"working": 7.0}
         )
 
         engine = attention_cmd.engine_from_config(cfg)
 
         assert engine._staleness == {"working": 7.0}
+
+    def test_the_cli_spellings_are_the_fleetview_ones(self, tmp_config):
+        from magent import fleetview
+
+        cfg = config.load_config(
+            tmp_config({"version": config.SCHEMA_VERSION, "projects": []})
+        )
+
+        assert attention_cmd.staleness_from_config(
+            cfg
+        ) == fleetview.staleness_from_config(cfg)
+        assert (
+            attention_cmd.engine_from_config(cfg)._staleness
+            == fleetview.engine_from_config(cfg)._staleness
+        )
 
 
 class TestIntervalConfigResolution:

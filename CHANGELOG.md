@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A versioned local API: `/api/v1`.** `magent serve` now answers
+  `/api/v1/meta`, `health`, `status`, `sessions` (each row carries the hook
+  state and, with `?fresh=1`, the pane state, side by side), a session's pane, `projects`, an
+  SSE event stream (`/api/v1/events`, resumable with `Last-Event-ID`) and its
+  long-poll twin, and uploads -- every reply one `{ok, data}` /
+  `{ok, error: {code, message}}` envelope, described by
+  `docs/api/v1.schema.json`. From this machine only, it also drives the
+  fleet: send, choose, interrupt, model, start, stop, and project
+  add / enable / disable / remove. `MAGENT_EVENTS=0` turns the event poller off.
+- **`magent choose <session> <n>` and `magent interrupt <session>`.** Answer a
+  numbered dialog (only while one is on screen) or press Escape mid-turn.
+- **`--json` on `send`, `model`, `peek`, `choose` and `interrupt`, and `--v1` on
+  `status` and `sessions`,** printing exactly what the matching `/api/v1` route
+  returns. The existing `status --json` and `sessions --json` shapes are
+  unchanged.
+
 - **Where to get help is now one link away.** `magent --help` ends with the
   mAgent Discord invite, a failing `magent doctor` points there under its
   summary, the PyPI page lists it under Project links, and the README has a
@@ -16,6 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The upload server refuses cross-site and rebound requests.** A browser
+  request whose Host, Origin or `Sec-Fetch-Site` does not belong to this
+  server gets 403, on the legacy routes too -- a web page can no longer flash
+  your status bar through `<img src=.../api/flash>` or switch the picker through
+  `/focus`.
+  Scripts and the Alt+V listener are unaffected, and so is the phone page when
+  it uses the tailnet name or IP, this machine's hostname, or the address
+  `magent serve` binds. A `magent mobile --host` name outside that list, such
+  as another mDNS `.local` name, now gets 403.
+- **Config edits are backed up and written atomically; add/remove/enable/disable/migrate are validated first.**
+  `config add`, `remove`, `enable`, `disable` and `migrate` (and the API)
+  refuse a change that would not load. Every config write keeps the previous
+  file in `~/.magent/backups` (newest 20 per config file) and swaps the new one
+  in with one rename.
 - **Every psmux argv is now built in `psmux.py`.** The attach, new-session and
   agent-command send argvs that `platform/windows.py` and the session picker
   hand-built are named builders there, and custom lint rule MD007 fails the gate

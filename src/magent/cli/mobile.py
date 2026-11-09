@@ -8,6 +8,7 @@ import getpass
 import re
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
@@ -22,6 +23,10 @@ from magent.cli.ui import _banner, _divider, _force_utf8_console, _print_qr
 from magent.config import load_config
 from magent.paths import find_config
 from magent.style import style
+from magent.wire import WireError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # The port the upload server bound before it read the config at all -- and
 # therefore the only honest answer when there is no config to read. Same
@@ -152,6 +157,30 @@ Host magent
         click.echo(f"  {style('Add --install to write to ~/.ssh/config', dim=True)}")
 
 
+def _status_provider(config_path: str | None) -> Callable[[], dict[str, object]]:
+    """``GET /api/v1/status``'s payload, built per request by the same
+    function as ``status --json``. Handed down like the attention watchdog:
+    it is cli code, and upload_server must not import the cli package.
+
+    Only the config load is a refusal (``unavailable``, the same ``config:``
+    text ``status --v1`` and ``/api/v1/sessions`` answer); anything the
+    probes raise past it is a crash for ``api.handle`` to log as a 500,
+    never mislabelled a config problem."""
+
+    def _provide() -> dict[str, object]:
+        # heavy subsystem: in-body per policy (a sibling command module)
+        from magent.cli.status import _status_payload
+
+        try:
+            cfg = load_config(str(find_config(config_path)))
+        except (ValueError, OSError) as e:
+            raise WireError("unavailable", f"config: {e}") from e
+        payload, _degraded = _status_payload(cfg)
+        return payload
+
+    return _provide
+
+
 @main.command("serve")
 @click.option(
     "--port",
@@ -244,7 +273,13 @@ def serve_cmd(
     watchdogs = [attention_hook] if attention_hook is not None else []
 
     try:
-        run_server(port=port, config_path=config_path, host=host, watchdogs=watchdogs)
+        run_server(
+            port=port,
+            config_path=config_path,
+            host=host,
+            watchdogs=watchdogs,
+            status_provider=_status_provider(config_path),
+        )
     except KeyboardInterrupt:
         click.echo(f"\n  {style('Server stopped.', dim=True)}")
     except BindFailed as e:
