@@ -847,6 +847,39 @@ class TestPinnedTls:
         assert (exc.value.status, exc.value.code) == (0, "timeout")
         assert time.monotonic() - started < 2.5
 
+    def test_a_handshake_timed_out_by_the_deadline_is_a_timeout_however_early(
+        self, monkeypatch
+    ):
+        # The handshake's socket timeout is the deadline's budget, and on
+        # Windows it can wake a moment before the clock says the deadline is
+        # due (CI saw "network"). Here the budget it is given runs out well
+        # ahead of the deadline: still a timeout, the deadline's doing.
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        real_dial = socket.create_connection
+        real_connection = RelayClient._public_connection
+        monkeypatch.setattr(link, "_public_address", lambda host, p: "127.0.0.1")
+        monkeypatch.setattr(
+            link.socket,
+            "create_connection",
+            lambda address, *a, **k: real_dial(("127.0.0.1", port), *a, **k),
+        )
+
+        def early(self, url, budget):
+            return real_connection(self, url, lambda: budget() - 1.5)
+
+        monkeypatch.setattr(RelayClient, "_public_connection", early)
+        try:
+            with pytest.raises(RelayError) as exc:
+                RelayClient("https://relay.example.com", timeout=5).get_bytes(
+                    "https://storage.test/o", lambda b: None, max_bytes=10, deadline=2.0
+                )
+        finally:
+            listener.close()
+        assert (exc.value.status, exc.value.code) == (0, "timeout")
+
     def test_a_deadline_already_spent_is_a_timeout_not_a_crash(self, tls_server):
         # Nothing left for the handshake: its timeout is floored, never a
         # negative one (a ValueError that would crash the pull unreported).

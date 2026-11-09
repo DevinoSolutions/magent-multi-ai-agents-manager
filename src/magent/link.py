@@ -577,8 +577,8 @@ class RelayClient:
                 _connect(conn)
                 cut.watch(conn.sock)
                 total = self._download(conn, target, sink, max_bytes)
-            except RelayError:
-                if cut.passed:
+            except RelayError as exc:
+                if cut.passed or isinstance(exc.__cause__, _DeadlineSpent):
                     raise _too_slow() from None
                 raise
             finally:
@@ -667,6 +667,12 @@ def _public_address(host: str, port: int) -> str:
     return addresses[0]
 
 
+class _DeadlineSpent(TimeoutError):
+    """A TLS handshake timed out on the deadline's budget, not on the
+    socket timeout: the deadline's doing even when the socket wakes a
+    moment before the clock says the deadline is due (Windows)."""
+
+
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     """HTTPS to one address checked beforehand, so a second name lookup can
     never swap in another; the certificate is still verified for the URL's
@@ -698,8 +704,14 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             tls = self._tls.wrap_socket(
                 sock, server_hostname=self.host, do_handshake_on_connect=False
             )
-            tls.settimeout(max(0.001, min(self._read_timeout, self._budget())))
-            tls.do_handshake()
+            left = self._budget()
+            tls.settimeout(max(0.001, min(self._read_timeout, left)))
+            try:
+                tls.do_handshake()
+            except TimeoutError as exc:
+                if left < self._read_timeout:
+                    raise _DeadlineSpent from exc
+                raise
             tls.settimeout(self._read_timeout)
         except BaseException:
             (tls or sock).close()
