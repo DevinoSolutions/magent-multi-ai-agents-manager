@@ -290,7 +290,8 @@ class EventPoller:
 
         The typed config is loaded on the first tick that has one and again
         whenever the file's bytes change (``config_stamp``, a digest read
-        each time it is asked for), never on a tick that finds it unchanged:
+        once per ``rows_fn`` call; ``fire_fn`` and ``pane_fn`` use what that
+        call loaded), never on a tick that finds it unchanged:
         loading per tick would echo ``load_config``'s stderr warning once a
         second. The node rows are built from it, so a node project removed
         while another stays configured stops being listed -- and tailed --
@@ -347,19 +348,23 @@ class EventPoller:
                 probe_timeout_s=PROBE_TIMEOUT_S,
             )
 
+        # ``_fire`` and ``_pane`` run after ``_rows`` in a tick and use what it
+        # loaded, never a reload of their own: a reload failing there (a
+        # truncate-and-write edit, a transient read error) would raise after
+        # ``_diff`` committed the new hook state, and the attention event that
+        # state owed would never come -- next tick it is no longer a change.
+        # Staleness is the post-capture stamp check's job (``generation_fn``).
         def _fire(session: str, state: str) -> bool:
-            got = _config()
-            if got is None:
+            if engine is None:
                 return False
-            return got[1].should_fire(session, state)
+            return engine.should_fire(session, state)
 
         def _pane(row: SessionRow) -> PaneCapture | None:
             if row.node_state is not None:
-                got = _config()
-                if row.node_state != "live" or got is None:
+                if row.node_state != "live" or cfg is None:
                     return None
                 try:
-                    text = control.node_pane(got[0], row)
+                    text = control.node_pane(cfg, row)
                 except control.ControlError:
                     return None
                 return psmux.PaneCapture(text=text, timed_out=False)
