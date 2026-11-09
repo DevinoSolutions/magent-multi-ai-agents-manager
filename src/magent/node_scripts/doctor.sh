@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # magent node doctor: health rows for this node user. Read-only: it writes
-# nothing, and the two secrets it reads (the Claude token, git's github.com
-# credential) reach curl on stdin only, never an argv or a row.
+# nothing but its probes' captured output, in a private temp directory it
+# removes on exit (see bounded). The two secrets it reads (the Claude token,
+# git's github.com credential) reach curl on stdin only, never an argv or a
+# row; the credential crosses one owner-only capture on its way.
 # Fed over stdin by remote_mux.doctor
 # (`bash -s -- <socket> --root R --target T`); reads no payload. lib.sh takes
 # the socket (required, no default) into MAGENT_SOCKET.
@@ -28,11 +30,30 @@ PROBE_KILL_S=2  # a probe that ignores TERM gets KILL this much later
 
 say() { printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}"; }
 
-# bounded <seconds> <argv...>: argv under its own time limit.
+# Where bounded captures probe output: made by main, removed by the EXIT trap.
+# Global, not local: the trap runs after main has returned.
+PROBE_DIR=''
+
+# bounded <seconds> <argv...>: argv under its own time limit. Prints what argv
+# wrote to stdout, and returns its status, once timeout has returned.
+# The output goes to a file, never the caller's $(...) pipe: timeout(1) only
+# promises to end argv itself, and a child of argv that outlives the KILL
+# would hold that pipe open -- the read, and the doctor, waiting as long as it
+# lives. uutils' timeout (Ubuntu 26.04's default coreutils) is one such: its
+# -k KILL reaches argv but not argv's process group.
+# argv's stderr goes where the caller's does. PROBE_STDERR=capture puts it in
+# the same file instead, interleaved as written: a caller's 2>&1 would hand
+# that child the pipe again.
 bounded() {
-  local seconds=$1
+  local seconds=$1 out=$PROBE_DIR/out errfd=2 rc=0
   shift
-  timeout -k "$PROBE_KILL_S" "$seconds" "$@"
+  [ "${PROBE_STDERR:-}" = capture ] && errfd=1
+  {
+    timeout -k "$PROBE_KILL_S" "$seconds" "$@"
+  } >"$out" 2>&"$errfd" || rc=$?
+  printf '%s' "$(<"$out")"
+  rm -f -- "$out"
+  return "$rc"
 }
 
 # timed_out <rc>: did a bounded probe run out of time (TERM 124, KILL 137)?
@@ -48,7 +69,8 @@ check_tool() {
     say "$missing" "$name" "$name is not on PATH -- run: magent node setup"
     return
   fi
-  out=$(bounded "$VERSION_PROBE_S" "$@" 2>&1)
+  # Some tools print their version on stderr: it is the detail too.
+  out=$(PROBE_STDERR=capture bounded "$VERSION_PROBE_S" "$@")
   rc=$?
   if timed_out "$rc"; then
     say "$missing" "$name" "$* timed out after ${VERSION_PROBE_S}s"
@@ -330,6 +352,13 @@ main() {
   # read as its own wrong finding, so the one real cause is the only row.
   if ! command -v timeout >/dev/null 2>&1; then
     say fail doctor "timeout is not on PATH -- every probe runs under it; install coreutils on this node"
+    return 0
+  fi
+  # The trap before the dir: a signal between the two would strand it.
+  trap '[ -z "$PROBE_DIR" ] || rm -rf -- "$PROBE_DIR"' EXIT
+  # Without it no probe's read is bounded, so none runs: one row says why.
+  if ! PROBE_DIR=$(mktemp -d 2>/dev/null); then
+    say fail doctor "mktemp -d failed: nowhere to capture probe output -- check this node's temp directory"
     return 0
   fi
   check_tmux
