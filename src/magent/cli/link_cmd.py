@@ -372,7 +372,9 @@ def _save_added_device(
     the pairing. A claimed device this machine already trusted before the
     pairing is refused (a claim is for a new device), and one the file
     holds a tombstone for (the relay revoked it meanwhile, by id or signing
-    key) is not trusted: a claim made before a revocation must not undo it."""
+    key) is not trusted: a claim made before a revocation must not undo it.
+    Nothing is saved when a tombstone written since the pairing began may
+    have been evicted (linkfiles.tombstones_lost): that device could be it."""
     from magent import linkfiles  # heavy subsystem: in-body per policy
 
     if outcome.host_id != existing.host_id:
@@ -408,6 +410,12 @@ def _save_added_device(
                 existing.host_token,
             ):
                 _fail(changed)
+            if linkfiles.tombstones_lost(existing, current):
+                _fail(
+                    "magent link: devices were revoked while this one was "
+                    "pairing, more than this machine keeps a record of; nothing "
+                    "was saved. Run `magent link --add-device` again."
+                )
             fresh = tuple(d for d in outcome.devices if not current.is_revoked(d))
             for device in outcome.devices:
                 if device not in fresh:

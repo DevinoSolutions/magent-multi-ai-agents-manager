@@ -221,6 +221,25 @@ class TestLinkFile:
         linkfiles.save_link(LinkFile(**{**LINK.__dict__, "revoked": many}), path)
         assert linkfiles.load_link(path).revoked == many[3:]
 
+    def test_a_tombstone_the_cap_may_have_evicted_is_known(self):
+        # Since `before` was read tombstones were only appended and the
+        # oldest evicted: lost exactly when before's oldest is gone, or, with
+        # none before, when the list is full (it may hide one: fail closed).
+        many = tuple(
+            RevokedDevice(f"0190f3a2-7b1c-7d4e-8a5b-{n:012d}", "", "t")
+            for n in range(linkfiles.REVOKED_MAX + 1)
+        )
+
+        def with_tombs(tombs):
+            return LinkFile(**{**LINK.__dict__, "revoked": tombs})
+
+        lost = linkfiles.tombstones_lost
+        assert not lost(with_tombs(many[:5]), with_tombs(many[:5]))
+        assert not lost(with_tombs(many[:5]), with_tombs(many[:-1]))  # full, kept
+        assert lost(with_tombs(many[:5]), with_tombs(many[1:]))
+        assert not lost(with_tombs(()), with_tombs(many[: linkfiles.REVOKED_MAX - 1]))
+        assert lost(with_tombs(()), with_tombs(many[: linkfiles.REVOKED_MAX]))
+
     def test_not_json_is_refused(self, tmp_path):
         from magent import fsutil
 

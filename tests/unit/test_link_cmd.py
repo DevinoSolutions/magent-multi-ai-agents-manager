@@ -21,6 +21,7 @@ from tests.unit._link_fakes import (
     PHONE_ID,
     TABLET_ID,
     new_device,
+    revoked_wires,
     unlink_racing_the_next_save,
 )
 
@@ -676,6 +677,39 @@ class TestLinked:
         fresh._load(saved)
         assert fresh.peer(TABLET_ID) is None
         assert fresh.peer(phone.device_id) is not None
+
+    def test_a_revocation_the_tombstone_cap_dropped_still_refuses_the_claim(
+        self, runner, relay, cfg, monkeypatch
+    ):
+        # The claim is in; before it is saved the relay revokes that device,
+        # then REVOKED_MAX more, and the cap evicts its tombstone. The save
+        # cannot tell it was among them: it saves nothing, and a runner
+        # started afterwards does not trust it.
+        phone = _pair(runner, relay, cfg)
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        relay.stage_pairing(claimed_devices=[_claimed(tablet, qr=True)], new_host=False)
+        real_accept = linkpair.accept_claim
+
+        def accept_then_revoked(*args, **kwargs):
+            outcome = real_accept(*args, **kwargs)
+            revoker = link.LinkRunner(_NoHost())
+            revoked = _wire(tablet, revoked_at="2026-10-09T00:00:00Z")
+            revoker._on_devices(None, {"devices": [revoked]})
+            many = revoked_wires(linkfiles.REVOKED_MAX)
+            revoker._on_devices(None, {"devices": many})
+            return outcome
+
+        monkeypatch.setattr(linkpair, "accept_claim", accept_then_revoked)
+        result = _link(runner, cfg, "--add-device", "--no-qr")
+        assert result.exit_code == 1, result.output
+        assert "more than this machine keeps a record of" in result.output
+        saved = linkfiles.load_link()
+        assert [d.device_id for d in saved.devices] == [phone.device_id]
+        assert TABLET_ID not in {t.device_id for t in saved.revoked}  # evicted
+        fresh = link.LinkRunner(_NoHost())
+        fresh._load(saved)
+        assert fresh.peer(TABLET_ID) is None
+        assert set(fresh.seal_for_devices(b"rows", "snap:x")) == {phone.device_id}
 
     def test_a_claim_for_a_device_already_trusted_is_refused(self, runner, relay, cfg):
         phone = _pair(runner, relay, cfg)

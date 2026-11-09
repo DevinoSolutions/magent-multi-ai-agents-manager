@@ -1175,6 +1175,10 @@ class LinkRunner:
         self._revoked: set[str] = set()
         # The signing keys the relay listed revoked devices with: tombstones.
         self._revoked_keys: dict[str, str] = {}
+        # Ids link.json has held a tombstone for during this run: one the cap
+        # evicted is not written again (each look would evict another), and
+        # is still never trusted (_revoked).
+        self._tombstoned: set[str] = set()
         self._trust_lock = threading.Lock()
         # A trust change whose snapshot PUT was deferred (see _refresh_trust).
         self._snapshot_due = False
@@ -1838,6 +1842,9 @@ class LinkRunner:
         the relay knew it by), saved when that changed it. A device a
         tombstone already names goes too, by id or by key: no save from
         before the revocation can bring it back, nor a restart forget it.
+        The devices go by every revocation in ``revoked`` and ``sign_pubs``,
+        not only those the capped tombstones still hold; an id this run
+        already tombstoned is not tombstoned again once the cap evicted it.
         ``stamp`` is link.json's as it was before ``link`` was read: when the
         file has moved since (`magent unlink` deleted it, `magent link`
         saved a device), the save is skipped, as it would bring back the
@@ -1848,6 +1855,9 @@ class LinkRunner:
         so does a lock that stays taken."""
         keys = {d.device_id: d.sign_pub for d in link.devices}
         known = {t.device_id for t in link.revoked}
+        with self._lock:
+            self._tombstoned |= known
+            written = set(self._tombstoned)
         at = datetime.datetime.fromtimestamp(
             self._clock(), datetime.timezone.utc
         ).isoformat()
@@ -1857,12 +1867,15 @@ class LinkRunner:
                 sign_pub=keys.get(device_id) or (sign_pubs or {}).get(device_id, ""),
                 revoked_at=at,
             )
-            for device_id in sorted(revoked - known)
+            for device_id in sorted(revoked - written)
         )
         marked = replace(
             link, revoked=(*link.revoked, *tombs)[-linkfiles.REVOKED_MAX :]
         )
-        kept = tuple(d for d in link.devices if not marked.is_revoked(d))
+        gone_keys = {key for key in (sign_pubs or {}).values() if key}
+        kept = tuple(
+            d for d in link.devices if not _is_revoked(d, link, revoked, gone_keys)
+        )
         if not tombs and len(kept) == len(link.devices):
             return link
         link = replace(marked, devices=kept)
@@ -1870,21 +1883,26 @@ class LinkRunner:
             self._log.info("link: the relay revoked a paired device; forgetting it")
         try:
             with linkfiles.link_lock(self._link_path):
-                self._save_unless_changed(link, stamp)
+                saved = self._save_unless_changed(link, stamp)
         except lockfile.LockHeld:
             self._log.info("link: link.json is being changed; not rewriting it")
+        else:
+            if saved:
+                with self._lock:
+                    self._tombstoned |= {t.device_id for t in tombs}
         return link
 
     def _save_unless_changed(
         self, link: LinkFile, stamp: tuple[int, int, int] | None
-    ) -> None:
+    ) -> bool:
         """Save ``link`` while link.json is still as stamped (the caller
-        holds link_lock). Retried like _save: on Windows a reader holding
-        link.json open makes the atomic replace fail for a moment."""
+        holds link_lock); whether it was saved. Retried like _save: on
+        Windows a reader holding link.json open makes the atomic replace
+        fail for a moment."""
         for attempt in range(SAVE_ATTEMPTS):
             if _link_stamp(self._link_path) != stamp:
                 self._log.info("link: link.json changed meanwhile; not rewriting it")
-                return
+                return False
             try:
                 linkfiles.save_link(link, self._link_path)
             except OSError as exc:
@@ -1893,7 +1911,8 @@ class LinkRunner:
                 else:
                     time.sleep(SAVE_RETRY_S)
             else:
-                return
+                return True
+        return False
 
     def _read_link(self) -> LinkFile | None:
         """link.json. On Windows a writer's atomic replace (`magent link`, or
@@ -2070,17 +2089,21 @@ class LinkRunner:
     def _peers_for(self, link: LinkFile) -> dict[str, _Peer]:
         """The pair keys for every trusted device. A device whose saved keys
         are unusable (a link.json from before pairing refused weak keys) is
-        left out and named in the log; a bad host key is a LinkFileError."""
+        left out and named in the log; a bad host key is a LinkFileError.
+        So is every device revoked: by a tombstone, or during this run."""
         try:
             own = linkcrypto.b64u_decode(link.host_kex_priv)
         except ValueError:
             own = b""
         if len(own) != 32:
             raise linkfiles.LinkFileError("link.json holds an unusable host key")
+        with self._lock:
+            gone = set(self._revoked)
+            gone_keys = {key for key in self._revoked_keys.values() if key}
         peers: dict[str, _Peer] = {}
         for device in link.devices:
-            if link.is_revoked(device):
-                continue  # a tombstone outranks a listing (an older save)
+            if _is_revoked(device, link, gone, gone_keys):
+                continue  # a revocation outranks a listing (an older save)
             try:
                 sign_pub = linkcrypto.b64u_decode(device.sign_pub)
                 keys = linkcrypto.pair_keys(
@@ -3147,6 +3170,19 @@ SUPERVISE_BACKOFF_CAP_S = 300.0
 def _link_stamp(path: Path | None) -> tuple[int, int, int] | None:
     """linkfiles.link_stamp: the one stamp the runner and the CLI compare."""
     return linkfiles.link_stamp(path)
+
+
+def _is_revoked(
+    device: TrustedDevice, link: LinkFile, gone: set[str], gone_keys: set[str]
+) -> bool:
+    """``device`` was revoked: by one of ``link``'s tombstones, or during
+    this run (``gone``: the ids; ``gone_keys``: the signing keys). The
+    tombstones are capped (linkfiles.REVOKED_MAX), a run's revocations not."""
+    return (
+        device.device_id in gone
+        or device.sign_pub in gone_keys
+        or link.is_revoked(device)
+    )
 
 
 def supervise(

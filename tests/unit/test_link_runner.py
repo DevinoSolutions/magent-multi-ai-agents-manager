@@ -30,6 +30,7 @@ from tests.unit._link_fakes import (
     make_command,
     new_device,
     open_result,
+    revoked_wires,
     save_linked,
     stop_all,
     stray_forwarders,
@@ -1076,6 +1077,46 @@ class TestDevices:
         assert marked.is_revoked(tablet.trusted())
         renamed = replace(tablet.trusted(), device_id=OTHER_ID)
         assert marked.is_revoked(renamed)  # the same key under another id
+
+    def test_a_revocation_the_tombstone_cap_dropped_still_holds(self, tmp_path, phone):
+        # One device list revokes the trusted tablet and REVOKED_MAX more; the
+        # tablet sorts first, so its tombstone is the one the cap evicts. The
+        # run still never trusts it, seals to it nor keeps it on disk, even
+        # once a save lists it again; and the same list again rewrites
+        # nothing (an evicted tombstone is not written back in a churn).
+        tablet = new_device(TABLET_ID, "Tablet DECOY")
+        linked = write_link(
+            tmp_path, "http://127.0.0.1:9", (phone, tablet), host_token="mlh_DECOY_t"
+        )
+        runner = link.LinkRunner(
+            FakeHost(), link_path=linked.link_path, state_path=linked.state_path
+        )
+        frame = {
+            "devices": [
+                phone.wire(),
+                tablet.wire(revoked_at="2026-10-09T00:00:00Z"),
+                *revoked_wires(linkfiles.REVOKED_MAX),
+            ]
+        }
+        runner._on_devices(None, frame)
+        marked = linkfiles.load_link(linked.link_path)
+        assert len(marked.revoked) == linkfiles.REVOKED_MAX
+        assert TABLET_ID not in {t.device_id for t in marked.revoked}  # evicted
+        assert [d.device_id for d in marked.devices] == [phone.device_id]
+        assert runner.peer(TABLET_ID) is None
+        assert set(runner.seal_for_devices(b"rows", "snap:x")) == {phone.device_id}
+
+        stamp = linkfiles.link_stamp(linked.link_path)
+        runner._on_devices(None, frame)
+        assert linkfiles.link_stamp(linked.link_path) == stamp
+        assert linkfiles.load_link(linked.link_path) == marked
+
+        stale = replace(marked, devices=(phone.trusted(), tablet.trusted()))
+        linkfiles.save_link(stale, linked.link_path)
+        runner._refresh_trust(None)
+        assert runner.peer(TABLET_ID) is None
+        assert set(runner.seal_for_devices(b"rows", "snap:x")) == {phone.device_id}
+        assert linked.device_ids() == [phone.device_id]
 
     def test_a_lock_that_stays_taken_saves_nothing(self, monkeypatch, tmp_path, phone):
         # Another process is changing link.json: the revocation applies in

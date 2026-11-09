@@ -6,7 +6,11 @@ private keys and the devices it trusts. It is written owner-only
 exactly the expected shape -- the repair is always `magent unlink` then
 `magent link`. Beside the trusted devices it keeps tombstones of the ones the
 relay revoked (``revoked``, written only when there are any, so a file
-without them reads as before), which no later save may bring back. Every
+without them reads as before), which no later save may bring back. They are
+kept in the order they were written and capped at REVOKED_MAX: a new one is
+appended and only the oldest are evicted, never one out of the middle, and
+the runner does not write back one the cap evicted (see tombstones_lost for
+why that is still safe). Every
 change to it is made under one cross-process mutation
 lock (link_lock, the ``link.json.lock`` sidecar), held by a read-modify-write
 from its read to its replace. ``link-state.json`` is not secret: the stream cursor, the ring
@@ -51,6 +55,7 @@ READ_RETRY_S = 0.02
 # lock (each holder keeps it for one read and one atomic replace).
 LINK_LOCK_WAIT_S = 5.0
 # Revocation tombstones kept in link.json, the newest; the oldest go first.
+# A running link never trusts a device it saw revoked, whatever the cap kept.
 REVOKED_MAX = 100
 
 _LINK_KEYS = ("relay_url", "host_id", "host_token", "host_kex_priv", "host_sign_priv")
@@ -202,6 +207,18 @@ def _revoked(raw: dict[str, object], where: Path) -> tuple[RevokedDevice, ...]:
         named = _strings(item, ("device_id", "revoked_at"), where)
         out.append(RevokedDevice(sign_pub=sign_pub, **named))
     return tuple(out)
+
+
+def tombstones_lost(before: LinkFile, after: LinkFile) -> bool:
+    """Whether a tombstone written after ``before`` was read may have been
+    evicted from ``after`` (the same link, read again): then a claim made
+    since ``before`` cannot be told from a device revoked meanwhile, and
+    must not be saved. Tombstones are only appended and only the oldest are
+    evicted, so none written since was while ``before``'s oldest is still
+    there; with none in ``before``, a full list may hide one. Fails closed."""
+    if before.revoked:
+        return before.revoked[0] not in after.revoked
+    return len(after.revoked) >= REVOKED_MAX
 
 
 def link_stamp(path: Path | None = None) -> tuple[int, int, int] | None:

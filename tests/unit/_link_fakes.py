@@ -84,6 +84,22 @@ def new_device(device_id: str = PHONE_ID, name: str = "Phone DECOY") -> Device:
     return Device(device_id, name, linkcrypto.generate_key_pairs())
 
 
+def revoked_wires(n: int) -> list[dict[str, object]]:
+    """``n`` devices as the relay lists them revoked, each with a signing key
+    of its own; every id sorts after the ids above."""
+    return [
+        {
+            "deviceId": f"0190f3a2-7b1c-7d4e-8a5b-ff{i:010d}",
+            "name": f"Gone DECOY {i}",
+            "kexPub": linkcrypto.b64u_encode((i + 1).to_bytes(32, "big")),
+            "signPub": linkcrypto.b64u_encode((i + 1).to_bytes(32, "little")),
+            "pairedAt": PAIRED_AT,
+            "revokedAt": "2026-10-09T00:00:00Z",
+        }
+        for i in range(n)
+    ]
+
+
 @dataclass(frozen=True)
 class Linked:
     """A host paired on disk: link.json + link-state.json under tmp_path."""
