@@ -257,3 +257,36 @@ class TestAConfigThatFailsValidation:
         assert result.exit_code == 1
         assert result.stdout == ""
         assert "Error:" in result.stderr
+
+
+class TestAConfigThatDoesNotParse:
+    """The raw read that looks for node projects runs before any typed load,
+    for a local-only config too: a file that is not JSON, or not an object
+    with a ``projects`` list, must still answer ``--json`` with the one
+    ``unavailable`` envelope and exit 3 -- never a traceback on empty
+    stdout."""
+
+    VERBS = (
+        ["peek", "api"],
+        ["send", "api", "hi"],
+        ["interrupt", "api"],
+        ["choose", "api", "1"],
+        ["model", "api", "opus"],
+    )
+
+    @pytest.mark.parametrize("content", ["{", "[]", '{"projects": 5}'])
+    @pytest.mark.parametrize("verb", VERBS, ids=lambda v: v[0])
+    def test_json_answers_the_error_envelope(
+        self, runner, tmp_path, monkeypatch, content, verb
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        bad = tmp_path / "magent.config.json"
+        bad.write_text(content, encoding="utf-8")
+        result = runner.invoke(cli.main, ["--config", str(bad), *verb, "--json"])
+        assert result.exit_code == 3, result.output
+        body = json.loads(result.stdout)
+        assert body["ok"] is False
+        assert body["error"]["code"] == "unavailable"
+        assert body["error"]["message"].startswith("config: ")
+        assert fake.send_key_calls() == []

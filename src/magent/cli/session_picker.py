@@ -381,6 +381,20 @@ def _emit_sessions_v1(config_path: str | None) -> None:
     click.echo(json.dumps(wire.ok(listing)))
 
 
+def _raw_projects(config_file: Path) -> list[object]:
+    """The raw config's ``projects`` list (``[]`` when the key is absent).
+    ``OSError`` for a file that cannot be read, ``ValueError`` for one that
+    is not JSON, ``TypeError`` for one that is not an object with a
+    ``projects`` list."""
+    import json
+
+    raw = json.loads(config_file.read_text(encoding="utf-8"))
+    projects = raw.get("projects", []) if isinstance(raw, dict) else None
+    if not isinstance(projects, list):
+        raise TypeError("expected a JSON object with a projects list")
+    return projects
+
+
 def _node_session_targets(
     config_path: str | None, *, as_json: bool = False
 ) -> list[tuple[dict[str, object], Node | None]]:
@@ -395,28 +409,33 @@ def _node_session_targets(
     a failed validation exits through ``_load_config_or_exit`` -- or, with
     ``as_json``, raises the ``unavailable`` ``WireError`` that ``control``
     gives for the same config, for the ``--json`` shell to emit as its
-    envelope."""
-    import json
-
+    envelope. With ``as_json`` the raw read itself refuses the same way (a
+    file that cannot be read, is not JSON, or is not an object with a
+    ``projects`` list), before any node is looked for: a local-only config
+    reaches it too."""
     from magent import env, nodes  # heavy subsystem: in-body per policy
+    from magent.wire import WireError
 
     config_file = find_config(config_path)
     if not config_file.exists():
         return []
-    raw = json.loads(config_file.read_text(encoding="utf-8"))
+    try:
+        projects = _raw_projects(config_file)
+    except (OSError, ValueError, TypeError) as exc:
+        if as_json:
+            raise WireError("unavailable", f"config: {exc}") from exc
+        raise
     # Raw dict: same rule as config_sessions' node skip (DECISION-15). A
     # deliberate SUPERSET of nodes.node_projects (it ignores enabled, IDE tools
     # and duplicate sids): it may trigger a typed load that lists nothing, but
     # it can never drop a node row. Mirroring those skips here would be a third
     # spelling of node_projects' predicate to keep in step.
     if not any(
-        isinstance(p, dict) and p.get("node") not in (None, "cloud")
-        for p in raw.get("projects", [])
+        isinstance(p, dict) and p.get("node") not in (None, "cloud") for p in projects
     ):
         return []
     if as_json:
         from magent.config import load_config
-        from magent.wire import WireError
 
         try:
             cfg = load_config(str(config_file))
