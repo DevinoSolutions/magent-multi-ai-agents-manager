@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A fresh install no longer pulls in a sentry-sdk that breaks error
-  reporting.** sentry-sdk 3.0 removed options `init_sentry` relies on, so with
-  `MAGENT_SENTRY_DSN` set a fresh `pip install` raised `TypeError` at startup.
-  The dependency is now capped at `sentry-sdk>=2,<3`.
+- **Error reporting starts on sentry-sdk 3.x.** sentry-sdk 3.0 removed options
+  `init_sentry` passed (`ThreadingIntegration(propagate_hub=)`,
+  `send_default_pii`, `include_local_variables`), so with `MAGENT_SENTRY_DSN` set
+  a fresh `pip install` raised `TypeError` at startup. `init_sentry` now uses
+  `propagate_scope` and picks the SDK's own spelling of the no-PII and
+  no-frame-locals settings, so 2.x and 3.x both keep those guarantees.
 
 ## [3.21.0] - 2026-11-09
 
