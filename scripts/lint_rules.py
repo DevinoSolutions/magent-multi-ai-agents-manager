@@ -51,7 +51,53 @@ MD008  No bare process termination outside ``src/magent/procs.py``: no
        recorded process. Killing a ``Popen`` you hold (``proc.kill()``) is not
        the hazard and is not flagged.
 
-Scopes: MD001/002/003/006/007 apply to ``src/magent/`` only; MD005 to
+MD009  No string literal starting ``"/api/v1"`` outside ``src/magent/api.py``.
+       The route prefix is ``api.PREFIX``: ``upload_server`` (and ``link.py``
+       in P2) branch on it, so a second spelling can never drift from the
+       route table. The match is a string that STARTS with the prefix: a
+       full-URL literal (``"http://host:8765/api/v1/meta"``) is not seen, and
+       a docstring that starts with ``/api/v1`` is flagged like any literal.
+
+MD010  The keystroke seam: ``psmux.send_keys`` / ``psmux.send_key`` /
+       ``fleet.paste_and_enter`` / ``fleet.switch_model`` are called only from
+       the files on the reasoned MD010_ALLOW list. Typing into an agent's pane
+       goes through ``control`` (the API and the fleet shells), ``uploads``
+       (the one paste of an upload) or a pipeline that owns its own press.
+       The match is syntactic and names the bare module: ``psmux.send_keys``
+       as written after ``from magent import psmux``. An alias
+       (``import magent.psmux as p``, ``from magent import psmux as px``), a
+       dotted ``magent.psmux.send_keys(`` or a relative ``from .psmux import``
+       is not seen; review covers those.
+
+MD011  The config write seam: ``config_io.save`` / ``config_io.write_atomic``
+       (lock + validate + backup + atomic replace) and the cli wrappers over
+       them (``_save_raw_config`` / ``_save_raw_config_atomic``) are called
+       only from the files on the reasoned MD011_ALLOW list. A config written
+       anywhere else skips the validation, the backup or the atomic swap.
+       The match is syntactic and names the bare module: ``config_io.save``
+       as written after ``from magent import config_io``. An alias
+       (``import magent.config_io as cio``), a dotted ``magent.config_io.save``
+       or a bare ``path.write_text`` is not seen; review covers those.
+
+MD012  ``AttentionEngine(`` is constructed only in ``src/magent/fleetview.py``
+       (``engine_from_config``): one place decides the staleness and the name
+       pairs every reader of the agent-state store uses.
+
+MD013  No outbound HTTP client outside the files on ``MD013_ALLOW``: no import
+       of an HTTP client module (``urllib.request``, ``http.client``,
+       ``xmlrpc.client``, ``requests``, ``httpx``, ``aiohttp``, ``urllib3``,
+       a submodule of one, or ``from urllib import request`` and the like) and
+       no ``HTTPSConnection`` / ``HTTPConnection`` / ``urlopen`` /
+       ``urlretrieve`` / ``build_opener`` / ``OpenerDirector`` name or
+       attribute. The import is what catches an alias
+       (``from urllib.request import urlopen as fetch``). ``link.py`` is the
+       one module that dials a non-local service on its own (the relay);
+       every other entry is a loopback, tailnet or user-configured target with
+       its reason recorded. Out of scope: raw ``socket`` use and subprocesses
+       (``tailscale``, ``ssh``), which the product uses for local probes and
+       its own transports; review covers those.
+
+Scopes: MD001/002/003/006/007/008/009/010/011/012/013 apply to ``src/magent/`` only; MD005 to
 ``src/magent/cli/`` only; MD004 applies to ``src`` + ``scripts`` + ``tests``.
 """
 
@@ -86,7 +132,7 @@ MD002_ALLOW = {
     "src/magent/sessions/codex.py": "FS case-insensitivity for session-path matching",
     "src/magent/cli/ui.py": "OS-specific editor command + Windows console UTF-8 fix",
     "src/magent/procs.py": "OpenProcess vs os.kill pid-liveness primitive",
-    "src/magent/node_auth.py": "an owner-only token file is a protected DACL at CreateFileW (ctypes, Windows) vs O_EXCL 0600 + owner check (POSIX)",
+    "src/magent/fsutil.py": "an owner-only file is a protected DACL at CreateFileW (ctypes, Windows) vs O_EXCL 0600 + owner check (POSIX)",
     "src/magent/cli/session_picker.py": "terminal reset (cls vs stty/tput) is per-OS",
     "src/magent/console.py": "whether stdin is a person's console: GetConsoleMode (ctypes, Windows; NUL is a 'tty' there) vs isatty (POSIX)",
     "src/magent/cli/picker.py": "raw single-key console reads are per-OS (msvcrt vs termios/tty), same split as cli/watch.py",
@@ -102,6 +148,36 @@ MD002_ALLOW = {
 MD008_ALLOW = {"src/magent/procs.py"}
 _MD008_ARGV0 = frozenset({"taskkill", "taskkill.exe"})
 _MD008_OS_KILLS = frozenset({"kill", "killpg"})
+
+# MD013: the files that may open an outbound HTTP connection, and why.
+MD013_ALLOW = {
+    "src/magent/link.py": "the relay link (P2): the one module that dials a non-local service on its own",
+    "src/magent/altv.py": "Alt+V uploads to a serve URL: loopback, or a tailnet peer for a remote-wired listener",
+    "src/magent/attention.py": "ntfy push to the user's own MAGENT_NTFY_TOPIC",
+    "src/magent/hotkey.py": "the Alt+V listener reads /api/sessions from the loopback serve",
+    "src/magent/cli/status.py": "the loopback /health probe behind `magent status`",
+}
+_MD013_NAMES = frozenset(
+    {
+        "HTTPSConnection",
+        "HTTPConnection",
+        "urlopen",
+        "urlretrieve",
+        "build_opener",
+        "OpenerDirector",
+    }
+)
+_MD013_MODULES = frozenset(
+    {
+        "urllib.request",
+        "http.client",
+        "xmlrpc.client",
+        "requests",
+        "httpx",
+        "aiohttp",
+        "urllib3",
+    }
+)
 
 # MD003: the only two src files allowed to hold a literal "magent:".
 MD003_ALLOW = {"src/magent/titles.py", "src/magent/cli/attach.py"}
@@ -147,6 +223,38 @@ WT_EXEC_NAMES = ("wt", "wt.exe")
 PSMUX_OWNER = "src/magent/psmux.py"
 PSMUX_EXEC_STRINGS = ("psmux", "psmux.exe", "pmux", "pmux.exe")
 PSMUX_EXEC_NAMES = ("psmux", "psmux_bin", "psmux_exe", "psmux_path")
+
+
+# MD009: the one module that may spell the /api/v1 route prefix.
+MD009_OWNER = "src/magent/api.py"
+_MD009_PREFIX = "/api/v1"
+
+# MD010: the files allowed to type into a pane, each with why.
+MD010_ALLOW = {
+    "src/magent/psmux.py": "defines send_keys / send_key",
+    "src/magent/fleet.py": "defines paste_and_enter / switch_model over send_keys",
+    "src/magent/control.py": "send, choose, interrupt, set_model: the API and the fleet shells",
+    "src/magent/uploads.py": "the one paste of an upload's saved paths",
+    "src/magent/altv.py": "the Alt+V press pastes C-v or the copied paths itself",
+    "src/magent/reap.py": "types the reset + resume notice into a parked pane",
+}
+_MD010_CALLS = frozenset({"send_keys", "send_key", "paste_and_enter", "switch_model"})
+_MD010_OWNERS = frozenset({"psmux", "fleet"})
+
+# MD012: the one module that builds an AttentionEngine.
+MD012_OWNER = "src/magent/fleetview.py"
+
+# MD011: the files allowed to write the config, each with why.
+MD011_ALLOW = {
+    "src/magent/config_io.py": "defines the one safe write",
+    "src/magent/projects.py": "project add / remove / enable (the API and the cli shells)",
+    "src/magent/cli/config_io.py": "the editor's exit-on-error wrappers over config_io.save",
+    "src/magent/cli/config_editor.py": "the interactive editor and config set/put/migrate, for keys projects.py does not own",
+    "src/magent/cli/node_onboard.py": "node onboarding writes settings.nodes",
+    "src/magent/link.py": "settings.link.remoteControl, which `magent link` sets (P2)",
+}
+_MD011_ATTRS = frozenset({"save", "write_atomic"})
+_MD011_NAMES = frozenset({"_save_raw_config", "_save_raw_config_atomic"})
 
 
 class Finding(NamedTuple):
@@ -398,8 +506,90 @@ def _is_bare_kill(node: ast.AST) -> bool:
     return isinstance(node, ast.Name) and node.id == "TerminateProcess"
 
 
+def _is_http_module(name: str) -> bool:
+    """MD013 -- ``name`` is an HTTP client module or one of its submodules."""
+    return any(name == m or name.startswith(f"{m}.") for m in _MD013_MODULES)
+
+
+def _is_outbound_http(node: ast.AST) -> bool:
+    """MD013 -- an import of an HTTP client module, or one of its connection /
+    opener names as a bare name or an attribute (so
+    ``http.client.HTTPSConnection`` counts)."""
+    if isinstance(node, ast.Import):
+        return any(_is_http_module(alias.name) for alias in node.names)
+    if isinstance(node, ast.ImportFrom):
+        if node.level or not node.module:
+            return False
+        return _is_http_module(node.module) or any(
+            _is_http_module(f"{node.module}.{alias.name}") for alias in node.names
+        )
+    if isinstance(node, ast.Name):
+        return node.id in _MD013_NAMES
+    if isinstance(node, ast.Attribute):
+        return node.attr in _MD013_NAMES
+    return False
+
+
+def _is_config_write(node: ast.AST) -> bool:
+    """MD011 -- ``config_io.save(...)`` / ``config_io.write_atomic(...)``, a
+    call to a cli save wrapper, or a ``from magent.config_io import save``."""
+    if isinstance(node, ast.ImportFrom):
+        return node.module == "magent.config_io" and any(
+            alias.name in _MD011_ATTRS for alias in node.names
+        )
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    if isinstance(f, ast.Attribute):
+        return (
+            f.attr in _MD011_ATTRS
+            and isinstance(f.value, ast.Name)
+            and f.value.id == "config_io"
+        )
+    return isinstance(f, ast.Name) and f.id in _MD011_NAMES
+
+
+def _is_api_prefix(node: ast.AST) -> bool:
+    """MD009 -- a string constant (an f-string piece included) that starts
+    with the /api/v1 route prefix."""
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.startswith(_MD009_PREFIX)
+    )
+
+
+def _is_keystroke(node: ast.AST) -> bool:
+    """MD010 -- ``psmux.send_keys(...)`` / ``psmux.send_key(...)`` /
+    ``fleet.paste_and_enter(...)`` / ``fleet.switch_model(...)``, or one of
+    those names imported from ``magent.psmux`` / ``magent.fleet``."""
+    if isinstance(node, ast.ImportFrom):
+        return node.module in {"magent.psmux", "magent.fleet"} and any(
+            alias.name in _MD010_CALLS for alias in node.names
+        )
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    return (
+        isinstance(f, ast.Attribute)
+        and f.attr in _MD010_CALLS
+        and isinstance(f.value, ast.Name)
+        and f.value.id in _MD010_OWNERS
+    )
+
+
+def _is_engine_build(node: ast.AST) -> bool:
+    """MD012 -- ``AttentionEngine(...)`` or ``attention.AttentionEngine(...)``."""
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    if isinstance(f, ast.Attribute):
+        return f.attr == "AttentionEngine"
+    return isinstance(f, ast.Name) and f.id == "AttentionEngine"
+
+
 def _ast_rules(rel: str, source: str) -> list[Finding]:
-    """MD001/002/003/006/007 (src/magent/) + MD005 (src/magent/cli/)."""
+    """MD001/002/003/006/007/008/009/010/011/012/013 (src/magent/) + MD005 (src/magent/cli/)."""
     out: list[Finding] = []
     try:
         tree = ast.parse(source, filename=rel)
@@ -419,6 +609,11 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
     md002_allowed = in_platform or rel in MD002_ALLOW
     md003_allowed = rel in MD003_ALLOW
     md008_allowed = rel in MD008_ALLOW
+    md013_allowed = rel in MD013_ALLOW
+    md011_allowed = rel in MD011_ALLOW
+    md009_applies = rel != MD009_OWNER
+    md010_applies = rel not in MD010_ALLOW
+    md012_applies = rel != MD012_OWNER
 
     # Constants that are pieces of an f-string are counted via their JoinedStr
     # parent (below), never again as standalone literals — so f"magent:{x}" flags once.
@@ -461,6 +656,56 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
                     col,
                     "MD008",
                     "bare process termination (os.kill / taskkill / TerminateProcess) outside procs.py — a pid from a file can name a stranger; use pidfile.terminate / procs.terminate_pid",
+                )
+            )
+        if not md013_allowed and _is_outbound_http(node):
+            out.append(
+                Finding(
+                    rel,
+                    line,
+                    col,
+                    "MD013",
+                    "outbound HTTP client outside the MD013 allowlist -- the relay link is link.py's job; a new loopback/tailnet caller needs a reasoned MD013_ALLOW entry",
+                )
+            )
+        if md009_applies and _is_api_prefix(node):
+            out.append(
+                Finding(
+                    rel,
+                    line,
+                    col,
+                    "MD009",
+                    'string literal starting "/api/v1" outside api.py -- use api.PREFIX, so the prefix cannot drift from the route table',
+                )
+            )
+        if md010_applies and _is_keystroke(node):
+            out.append(
+                Finding(
+                    rel,
+                    line,
+                    col,
+                    "MD010",
+                    "keystroke into a pane outside the control seam -- call magent.control (or add a reasoned MD010_ALLOW entry)",
+                )
+            )
+        if md012_applies and _is_engine_build(node):
+            out.append(
+                Finding(
+                    rel,
+                    line,
+                    col,
+                    "MD012",
+                    "AttentionEngine built outside fleetview.py -- call fleetview.engine_from_config, so every reader shares one staleness and one name map",
+                )
+            )
+        if not md011_allowed and _is_config_write(node):
+            out.append(
+                Finding(
+                    rel,
+                    line,
+                    col,
+                    "MD011",
+                    "config write outside the config_io seam -- call projects.* (or add a reasoned MD011_ALLOW entry); a config written anywhere else skips validation, the backup and the atomic swap",
                 )
             )
         if (
