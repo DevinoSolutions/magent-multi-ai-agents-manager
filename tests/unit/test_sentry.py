@@ -55,7 +55,18 @@ def _install_fake_sentry_sdk(
     fake_sdk.flush = _flush
 
     class FakeLoggingIntegration:
-        def __init__(self, level: int | None, event_level: int) -> None:
+        """The real signature per major: 3.0 added `breadcrumb_level` (default
+        INFO -- so leaving it out means log breadcrumbs ARE on), and 2.x
+        raises TypeError on it."""
+
+        def __init__(
+            self, level: int | None, event_level: int, **extra: object
+        ) -> None:
+            if version.startswith("3."):
+                assert extra.keys() <= {"breadcrumb_level"}, extra
+                self.breadcrumb_level = extra.get("breadcrumb_level", logging.INFO)
+            elif extra:
+                raise TypeError(f"unexpected keyword argument(s) {sorted(extra)}")
             self.level = level
             self.event_level = event_level
 
@@ -159,6 +170,122 @@ class TestCapturabilityContract:
         integrations = fake_sdk.init_calls[0]["integrations"]
         logging_integration = next(i for i in integrations if hasattr(i, "event_level"))
         assert logging_integration.event_level == logging.ERROR
+
+    def test_neither_major_gets_log_breadcrumbs_or_sentry_logs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """2.x: `level` IS the breadcrumb level, so None switches them off.
+        3.x: `level` is the Sentry-Logs level and `breadcrumb_level` defaults
+        to INFO, so it has to be None too -- the real-SDK proof is
+        test_sentry_real_sdk.py; this pins the spelling on both majors."""
+        for version in ("2.71.0", "3.0.1"):
+            fake_sdk = _install_fake_sentry_sdk(monkeypatch, version=version)
+            monkeypatch.setattr(atexit, "register", lambda _callback: None)
+
+            init_sentry(_FAKE_DSN)
+
+            (call,) = fake_sdk.init_calls
+            (integration,) = (i for i in call["integrations"] if hasattr(i, "level"))
+            assert integration.level is None, version
+            if version.startswith("3."):
+                assert integration.breadcrumb_level is None
+            assert call["max_breadcrumbs"] == 0, version
+
+    def test_a_sentry_sdk_3_closes_every_data_collection_category(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """3.x's `data_collection` has no off switch: a category left out of
+        the options keeps its collecting default. Every category the 3.0 SDK
+        defines is named, and off."""
+        fake_sdk = _install_fake_sentry_sdk(monkeypatch, version="3.0.1")
+        monkeypatch.setattr(atexit, "register", lambda _callback: None)
+
+        init_sentry(_FAKE_DSN)
+
+        (call,) = fake_sdk.init_calls
+        closed = call["data_collection"]
+        assert set(closed) == {
+            "user_info",
+            "cookies",
+            "http_headers",
+            "http_bodies",
+            "url_query_params",
+            "graphql",
+            "gen_ai",
+            "mcp",
+            "database_query_data",
+            "queues",
+            "stack_frame_variables",
+        }
+        assert closed["user_info"] is False
+        assert closed["stack_frame_variables"] is False
+        assert closed["http_bodies"] == []
+        assert closed["database_query_data"] is False
+        assert closed["queues"] is False
+        for key in ("cookies", "url_query_params"):
+            assert closed[key] == {"mode": "off"}, key
+        assert closed["http_headers"] == {"request": {"mode": "off"}}
+        for key in ("graphql", "gen_ai", "mcp"):
+            assert not any(closed[key].values()), key
+
+
+class TestAnSdkThatRejectsTheOptionsNeverBreaksTheCommand:
+    """init runs at CLI entry for every command: a future SDK renaming an
+    option must turn reporting OFF, not raise out of `magent status`."""
+
+    def test_an_init_typeerror_degrades_to_a_logged_warning(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        fake_sdk = _install_fake_sentry_sdk(monkeypatch, version="3.0.1")
+
+        def _reject(**_kwargs: object) -> None:
+            raise TypeError("Unknown option 'data_collection'")
+
+        fake_sdk.init = _reject
+        registered: list[object] = []
+        monkeypatch.setattr(atexit, "register", registered.append)
+        records: list[str] = []
+
+        class _RecordingLogger:
+            def warning(self, msg: str, *args: object) -> None:
+                records.append(msg % args if args else msg)
+
+        monkeypatch.setattr(
+            "magent.sentry.get_logger", lambda _name: _RecordingLogger()
+        )
+
+        init_sentry(_FAKE_DSN)  # must not raise
+
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert captured.out == ""
+        (record,) = records
+        assert "reporting is OFF" in record
+        assert "TypeError" in record
+        assert "Unknown option" in record
+        assert _FAKE_DSN not in record
+        assert registered == [], "no flush hook for a client that never started"
+
+    def test_a_rejected_integration_keyword_degrades_the_same_way(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The integrations are built inside the guard too: a future
+        LoggingIntegration dropping `breadcrumb_level` raises from THEIR
+        constructor, before init is even called."""
+        # A "3.x" fake whose LoggingIntegration refuses the 3.x keyword.
+        _install_fake_sentry_sdk(monkeypatch, version="3.0.1")
+        logging_mod = sys.modules["sentry_sdk.integrations.logging"]
+
+        class _Strict:
+            def __init__(self, level: int | None, event_level: int) -> None:
+                self.level, self.event_level = level, event_level
+
+        monkeypatch.setattr(logging_mod, "LoggingIntegration", _Strict)
+        monkeypatch.setattr(atexit, "register", lambda _callback: None)
+
+        init_sentry(_FAKE_DSN)  # must not raise
 
 
 class TestMissingSdkIsQuietButLogged:

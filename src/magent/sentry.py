@@ -4,14 +4,19 @@ sentry-sdk is a base dependency (see pyproject.toml), so a healthy install
 always has it; reporting itself stays opt-in via MAGENT_SENTRY_DSN.
 When the DSN is unset: zero work, zero imports (the SDK loads only inside
 init_sentry, keeping `--help` startup lean). When set: init with
-errors-only (no traces), no PII, no frame locals, logging integration at ERROR level
-(captures every logger.exception), excepthook, and threading integrations.
+errors-only (no traces), no PII, no frame locals, no breadcrumbs, no Sentry
+Logs, logging integration at ERROR level (captures every logger.exception),
+excepthook, and threading integrations. What that means on each SDK major --
+the options are spelled differently -- lives in `_privacy_options` and
+`_logging_integration`, and is pinned against the REAL SDK in
+tests/unit/test_sentry_real_sdk.py.
 
 If the SDK is somehow missing anyway (a broken/partial install), init
 degrades to a rotating-log warning — never a console nag: init runs at CLI
 entry for EVERY command, so a stderr line would tax unrelated commands
 (`attach`, `status`, …). The actionable repair hint surfaces in
-`magent doctor`.
+`magent doctor`. An SDK that rejects an option (a future major renaming one)
+degrades the same way: reporting is off, the command still runs.
 
 Import this module in-body at CLI entry, after env validation.
 """
@@ -107,14 +112,22 @@ def _release() -> str | None:
         return None
 
 
+def _sdk_major(sentry_sdk: ModuleType) -> int:
+    """The installed SDK's major version; 2 when it cannot be read (every real
+    SDK has ``VERSION``, and 2.x is the spelling the floor supports)."""
+    major = str(getattr(sentry_sdk, "VERSION", "2")).partition(".")[0]
+    return int(major) if major.isdigit() else 2
+
+
 def _privacy_options(sentry_sdk: ModuleType) -> dict[str, object]:
-    """The no-PII, no-frame-locals init options, spelled for the installed SDK.
+    """The no-PII, no-frame-locals, no-breadcrumbs init options, spelled for
+    the installed SDK.
 
     sentry-sdk 3.0 replaced ``send_default_pii`` and ``include_local_variables``
     with one structured ``data_collection`` option (the old names now raise
-    ``TypeError: Unknown option``), so the two spellings are chosen by the SDK's
-    major version. Both mean the same thing here, and both are privacy
-    guarantees rather than tuning:
+    ``TypeError: Unknown option``), so the spellings are chosen by the SDK's
+    major version. Both mean the same thing here, and all of it is a privacy
+    guarantee rather than tuning:
 
     * no PII (``send_default_pii=False`` / ``user_info=False``);
     * never ship frame locals. The SDK's scrubber redacts by key NAME only
@@ -122,18 +135,62 @@ def _privacy_options(sentry_sdk: ModuleType) -> dict[str, object]:
       ``stdin``/``input_bytes`` -- a GitHub token, say -- rode along verbatim
       in every RemoteError's event. Errors-only reporting never needed locals;
       the traceback stays. Reproduction:
-      test_remote_mux.py::TestASecretNeverReachesSentry.
+      test_remote_mux.py::TestASecretNeverReachesSentry;
+    * no breadcrumbs, on either major (``max_breadcrumbs=0``). A breadcrumb is
+      a trail of what happened BEFORE the error -- INFO log lines naming
+      projects, user paths and ssh hosts, outgoing-http URLs with their query
+      string -- and ``scrub_event`` cuts link secrets only, not those. The
+      error and its traceback are all an errors-only report needs.
     """
-    major = str(getattr(sentry_sdk, "VERSION", "2")).partition(".")[0]
-    if major.isdigit() and int(major) >= 3:
+    if _sdk_major(sentry_sdk) >= 3:
+        # 3.x's `data_collection` has no "everything off" switch: a category
+        # not named here keeps its (collecting) default, and a new SDK release
+        # can add one. So every category the 3.0 SDK defines is closed
+        # explicitly. The one key left alone, `frame_context_lines`, is the
+        # source text around a traceback frame -- code, not user data, and sent
+        # by 2.x too. tests/unit/test_sentry_real_sdk.py walks the SDK's
+        # RESOLVED options and fails if any category is still on, so one added
+        # upstream turns that test red until it is closed here.
+        off = {"mode": "off"}
         return {
+            "max_breadcrumbs": 0,
             "data_collection": {
                 "user_info": False,
                 "stack_frame_variables": False,
                 "http_bodies": [],
-            }
+                "cookies": off,
+                "http_headers": {"request": off},
+                "url_query_params": off,
+                "graphql": {"document": False, "variables": False},
+                "gen_ai": {"inputs": False, "outputs": False},
+                "mcp": {"inputs": False, "outputs": False},
+                "database_query_data": False,
+                "queues": False,
+            },
         }
-    return {"send_default_pii": False, "include_local_variables": False}
+    return {
+        "send_default_pii": False,
+        "include_local_variables": False,
+        "max_breadcrumbs": 0,
+    }
+
+
+def _logging_integration(
+    sentry_sdk: ModuleType, integration: Callable[..., object]
+) -> object:
+    """``LoggingIntegration`` that turns ERROR records into events and does
+    nothing else, whichever major is installed.
+
+    2.x: ``level`` is the BREADCRUMB level, so ``level=None`` disables log
+    breadcrumbs, and there is no Sentry Logs product. 3.x: ``level`` became
+    the Sentry-Logs level and a separate ``breadcrumb_level`` (default INFO)
+    took over breadcrumbs, so BOTH are None there -- left alone, every INFO
+    line magent logs would ride along on an event. 2.x would raise TypeError
+    on that extra keyword, hence the split.
+    """
+    if _sdk_major(sentry_sdk) >= 3:
+        return integration(level=None, event_level=logging.ERROR, breadcrumb_level=None)
+    return integration(level=None, event_level=logging.ERROR)
 
 
 def init_sentry(dsn: str) -> None:
@@ -159,27 +216,46 @@ def init_sentry(dsn: str) -> None:
     # `Callable[..., None]`: the privacy options are spelled per SDK major (see
     # _privacy_options), so no single static signature of `init` covers both.
     init = cast("Callable[..., None]", sentry_sdk.init)
-    init(
-        dsn=dsn,
-        # magent is a single-operator dev tool today (CI never inits Sentry),
-        # so the environment is fixed to "dev" -- without minting a new MAGENT_
-        # env var, which would break the closed-schema contract for one knob. A
-        # future deployment story (prod/staging) would parameterize this.
-        environment="dev",
-        release=_release(),
-        # server_name (hostname) + sys.argv ride along via Sentry's default
-        # integrations. Kept on purpose: this is a self-hosted, single-operator
-        # setup where "which machine, what command" is exactly the debugging
-        # context wanted, and the no-PII setting below is the actual PII gate.
-        traces_sample_rate=0,
-        # ...and never a link credential (scrub_event above).
-        before_send=scrub_event,
-        integrations=[
-            LoggingIntegration(level=None, event_level=logging.ERROR),
-            # `propagate_scope` is the name on every supported SDK (2.0 renamed
-            # it from `propagate_hub`; 3.0 removed the old spelling).
-            ThreadingIntegration(propagate_scope=True),
-        ],
-        **_privacy_options(sentry_sdk),
-    )
+    try:
+        init(
+            dsn=dsn,
+            # magent is a single-operator dev tool today (CI never inits
+            # Sentry), so the environment is fixed to "dev" -- without minting
+            # a new MAGENT_ env var, which would break the closed-schema
+            # contract for one knob. A future deployment story (prod/staging)
+            # would parameterize this.
+            environment="dev",
+            release=_release(),
+            # server_name (hostname) + sys.argv ride along via Sentry's default
+            # integrations. Kept on purpose: this is a self-hosted,
+            # single-operator setup where "which machine, what command" is
+            # exactly the debugging context wanted, and the no-PII setting
+            # below is the actual PII gate.
+            traces_sample_rate=0,
+            # ...and never a link credential (scrub_event above).
+            before_send=scrub_event,
+            integrations=[
+                _logging_integration(sentry_sdk, LoggingIntegration),
+                # `propagate_scope` is the name on every supported SDK (2.0
+                # renamed it from `propagate_hub`; 3.0 removed the old
+                # spelling).
+                ThreadingIntegration(propagate_scope=True),
+            ],
+            **_privacy_options(sentry_sdk),
+        )
+    except Exception as exc:  # noqa: BLE001  # reason: init runs for every command; any SDK rejection must degrade to a log line, never a crash
+        # Init runs at CLI entry for EVERY command, so an SDK that renames or
+        # drops an option (3.0 did exactly that) must not take the CLI down
+        # with a TypeError: reporting is simply off. Quiet for the same reason
+        # as the missing-SDK path -- a stderr line would tax every command --
+        # so it goes to the rotating log: the exception type and message
+        # only, never the DSN.
+        get_logger("sentry").warning(
+            "sentry-sdk %s rejected magent's init options (%s: %s) -- error "
+            "reporting is OFF",
+            getattr(sentry_sdk, "VERSION", "?"),
+            type(exc).__name__,
+            exc,
+        )
+        return
     atexit.register(lambda: sentry_sdk.flush(timeout=2))
