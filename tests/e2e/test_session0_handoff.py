@@ -117,6 +117,10 @@ def _child_env(home: Path, bin_dir: Path, **extra: str) -> dict[str, str]:
     env["MAGENT_PSMUX_BOOST"] = "0"
     env["MAGENT_NODE_SYNC"] = "0"
     env["MAGENT_IDLE_REAP"] = "0"
+    # ...and the relay link, whose reach is the internet.
+    env["MAGENT_LINK"] = "0"
+    env["MAGENT_EVENTS"] = "0"
+    env["MAGENT_LINK_URL"] = "http://127.0.0.1:9"
     home.mkdir(parents=True, exist_ok=True)
     home_s = str(home)
     drive, tail = os.path.splitdrive(home_s)
@@ -149,6 +153,21 @@ def _config(tmp_path: Path) -> Path:
 def _run_up(cfg: Path, env: dict[str, str], *args: str, timeout: float):
     return subprocess.run(
         [sys.executable, "-m", "magent", "--config", str(cfg), "up", *args],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        env=env,
+        timeout=timeout,
+    )
+
+
+def _run_bare(cfg: Path, env: dict[str, str], *args: str, timeout: float):
+    """`python -m magent --config CFG [ARGS]` with stdin on the NUL device --
+    exactly the stdin a Task Scheduler hand-off child has, and the one stdin
+    `CliRunner` cannot model (on Windows, NUL answers ``isatty() == True``)."""
+    return subprocess.run(
+        [sys.executable, "-m", "magent", "--config", str(cfg), *args],
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         errors="replace",
@@ -204,6 +223,30 @@ class TestAWindowsSshLoginNeverCreatesSessionsInPlace:
         # Nothing was scheduled either: a refusal must not also write a task.
         assert _calls(bin_dir) == []
         assert time.monotonic() - started < _BUDGET_S
+
+    @pytest.mark.parametrize("args", [(), ("--all",)], ids=["bare", "all"])
+    def test_a_nul_stdin_never_paints_the_menu(self, tmp_path, args):
+        # The hand-off's desktop copy runs with stdin=NUL and, when the user's
+        # launch carried no directive (`magent`, `magent -a`), no `--go`/`-g`/
+        # `--only` either. Windows reports NUL as a tty, so a raw isatty() gate
+        # painted the interactive menu there, hit EOF and died "Aborted!" rc=1
+        # with nothing launched. Policy `refuse` + an ssh login keep this
+        # incapable of launching or tiling anything: the refusal is the
+        # expected end, and what must be ABSENT is the menu.
+        bin_dir = tmp_path / "bin"
+        _fake_psmux(bin_dir)
+        env = _child_env(
+            tmp_path / "home",
+            bin_dir,
+            SSH_CONNECTION="1.2.3.4 1 5.6.7.8 22",
+            MAGENT_SESSION0_POLICY="refuse",
+        )
+
+        result = _run_bare(_config(tmp_path), env, *args, timeout=_BUDGET_S)
+
+        assert "Aborted" not in result.stderr, result.stderr
+        assert "refusing to start psmux sessions" in result.stderr
+        assert result.returncode == 1
 
     def test_allow_is_the_escape_hatch_for_a_headless_host(self, tmp_path):
         # The same child, same ssh environment, one policy value apart: a

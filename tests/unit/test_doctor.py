@@ -1092,6 +1092,7 @@ class TestDoctorCli:
             "nodes",
             "idle-reap",
             "claude-token",
+            "link",
         } == names
 
 

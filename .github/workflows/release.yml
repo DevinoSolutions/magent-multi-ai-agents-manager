@@ -120,7 +120,7 @@ jobs:
               sys.exit(1)
           print(f"tag {tag} matches the built version {built}")
           PY
-      - uses: DevinoSolutions/artifact/upload@739b3abd2f5f7bd4db8106bda6513ae94020c9e6  # v1
+      - uses: DevinoSolutions/artifact/upload@44df16680dcb504375db03d284d75808db18e4ed  # v1.2.1
         with:
           name: dist
           path: dist/
