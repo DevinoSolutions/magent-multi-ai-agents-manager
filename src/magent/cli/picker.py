@@ -55,7 +55,7 @@ from magent.cli.ui import _menu_item
 from magent.style import style
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
+    from collections.abc import Callable, Generator, Iterable, Sequence
 
 # -- ranking ------------------------------------------------------------------
 
@@ -247,7 +247,7 @@ def read_char(fd: int) -> str:
 
 
 @contextlib.contextmanager
-def key_session() -> Iterator[None]:
+def key_session() -> Generator[None, None, None]:
     """Hold the terminal in cbreak for a WHOLE picker run, not per keystroke.
 
     The input mode used to be toggled around every single read -- raw for the

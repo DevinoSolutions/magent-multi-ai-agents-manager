@@ -238,6 +238,38 @@ def report_bring_up_casualties(
         click.echo(f"  {style(note, dim=True)}")
 
 
+def session0_gate(plat: Platform) -> Literal["run", "handoff", "refuse"]:
+    """``session0_disposition`` for a command shell, with the refusal said aloud.
+
+    What every command that CREATES sessions asks before it does any work: the
+    answer is the policy's, and on "refuse" the reason has already been
+    printed (stderr), so the caller only has to choose how to stop -- exit 1,
+    or back to the menu it was called from. "handoff" is the caller's to carry
+    out with ``relay_handoff`` and ``handoff_argv``.
+    """
+    disposition = session0_disposition(plat)
+    if disposition == "refuse":
+        click.echo(f"  {style('x', fg='red')} {session0_refusal(plat)}", err=True)
+    return disposition
+
+
+def handoff_argv(config_path: str | None, *args: str) -> list[str]:
+    """The magent command line the desktop copy must run.
+
+    ``sys.executable -m magent``, not a bare ``magent``: the desktop copy must
+    be THIS install, not whatever a differently-ordered desktop PATH resolves --
+    and a console-script shim may not even be on a scheduled task's PATH. The
+    group-level ``--config`` goes first when the user gave one: ``find_config``
+    walks up from the working directory, so a hand-off that dropped it could
+    bring up a different config's projects than the one the user pointed at.
+    """
+    argv = [sys.executable, "-m", "magent"]
+    if config_path:
+        argv.extend(["--config", str(config_path)])
+    argv.extend(args)
+    return argv
+
+
 def relay_handoff(plat: Platform, argv: list[str], *, timeout_s: float) -> int:
     """Run ``argv`` on the desktop, relay its output verbatim, return its code.
 
@@ -2141,6 +2173,46 @@ def psmux_status(
     return psmux.psmux_status(config, group)
 
 
+@dataclass(frozen=True)
+class BringUp:
+    """What a quiet bring-up did, as data: ``created`` (local and node
+    sessions the verify proved up), ``local_failed`` (each local casualty
+    mapped to why, "" = see launch.log) and every node outcome, ok or not."""
+
+    created: list[str]
+    local_failed: dict[str, str]
+    node_outcomes: list[NodeBringUpOutcome]
+
+
+def bring_up_psmux_quiet(
+    config: MagentConfig,
+    only: list[str] | None = None,
+    group: str | None = None,
+    *,
+    allow_dirty: bool = False,
+    config_path: str | None = None,
+) -> BringUp:
+    """``psmux.bring_up`` plus the pool-node projects, printing nothing --
+    the core ``control.start`` (a serve thread, no console) and
+    ``bring_up_psmux`` (the CLI path, which prints the node outcomes) share.
+    A node session that came up gets the node sync daemon started on
+    ``config_path``, the file this bring-up read."""
+    from magent import psmux
+
+    created, failed = psmux.bring_up(config, only, group)
+    outcomes = bring_up_node_projects(
+        config, only=only, group=group, allow_dirty=allow_dirty
+    )
+    if any(o.ok for o in outcomes):
+        # The sync daemon reads the same file this bring-up did (E).
+        _keep_node_sync(config, config_path)
+    return BringUp(
+        created=[*created, *(o.sid for o in outcomes if o.ok)],
+        local_failed=failed,
+        node_outcomes=outcomes,
+    )
+
+
 def bring_up_psmux(
     config: MagentConfig,
     only: list[str] | None = None,
@@ -2149,27 +2221,21 @@ def bring_up_psmux(
     allow_dirty: bool = False,
     config_path: str | None = None,
 ) -> tuple[list[str], dict[str, str]]:
-    """Delegate to ``psmux.bring_up``, then bring the pool-node projects up
-    too (PR-D; no windows -- this is the host side of attach). Returns
-    ``(created, failed)`` over both, where ``failed`` maps each session that
-    stayed down to why ("" = see the log). A node casualty maps to "": its
-    reason is printed with the node outcomes, the only place it appears, and
-    ``report_bring_up_casualties`` must not print it twice. A node session
-    that came up gets the node sync daemon started on ``config_path``, the
-    file this bring-up read."""
-    from magent import psmux
-
-    created, failed = psmux.bring_up(config, only, group)
-    outcomes = bring_up_node_projects(
-        config, only=only, group=group, allow_dirty=allow_dirty
+    """``bring_up_psmux_quiet``, then the node outcomes printed for the CLI
+    shells. Returns ``(created, failed)`` over both, where ``failed`` maps
+    each session that stayed down to why ("" = see the log). A node casualty
+    maps to "": its reason is printed with the node outcomes, the only place
+    it appears, and ``report_bring_up_casualties`` must not print it twice."""
+    result = bring_up_psmux_quiet(
+        config, only, group, allow_dirty=allow_dirty, config_path=config_path
     )
-    _echo_node_outcomes(outcomes)
-    if any(o.ok for o in outcomes):
-        # The sync daemon reads the same file this bring-up did (E).
-        _keep_node_sync(config, config_path)
+    _echo_node_outcomes(result.node_outcomes)
     return (
-        [*created, *(o.sid for o in outcomes if o.ok)],
-        {**failed, **{o.sid: "" for o in outcomes if not o.ok}},
+        result.created,
+        {
+            **result.local_failed,
+            **{o.sid: "" for o in result.node_outcomes if not o.ok},
+        },
     )
 
 

@@ -28,9 +28,20 @@ say() { printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}"; }
 # version_row <status> <item> <tool> [<prefix>]: say <status> <item> with the
 # first line of `<tool> --version`, under timeout(1) -- a hung binary is its
 # own fail row, not a hung setup (124: TERM ended it, 137: KILL did).
+# The output goes to a file, never a $(...) pipe: timeout(1) only promises to
+# end the tool itself, and a child of it that outlives the KILL would hold a
+# pipe open until it chose to exit -- the read, and setup, waiting with it.
+# uutils' timeout (Ubuntu 26.04's default coreutils) is one such: its -k KILL
+# reaches the tool but not the tool's process group.
 version_row() {
-  local s=4 k=2 out rc=0
-  out=$(timeout -k "$k" "$s" "$3" --version 2>/dev/null) || rc=$?
+  local s=4 k=2 out='' rc=0 f
+  if ! f=$(mktemp 2>/dev/null); then
+    say fail "$2" "mktemp failed: nowhere to capture $3 --version"
+    return 1
+  fi
+  timeout -k "$k" "$s" "$3" --version >"$f" 2>/dev/null </dev/null || rc=$?
+  IFS= read -r out <"$f" || true
+  rm -f -- "$f"
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
     say fail "$2" "$3 --version timed out after ${s}s"
     return 1

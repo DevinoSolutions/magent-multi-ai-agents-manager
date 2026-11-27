@@ -142,7 +142,7 @@ def _force_utf8_console() -> None:
 def _print_qr(url: str) -> None:
     """Print a scannable QR for the URL if the qrcode lib is available."""
     try:
-        import qrcode  # ty: ignore[unresolved-import]  # reason: optional dep, guarded by try/except (see pyproject qrcode note)
+        import qrcode  # ty: ignore[import-not-found]  # reason: optional dep, guarded by try/except (see pyproject qrcode note)
     except ImportError:
         click.echo(
             f"  {style('Tip:', dim=True)} {style('pip install qrcode', bold=True)} "

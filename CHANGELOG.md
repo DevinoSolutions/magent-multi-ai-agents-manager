@@ -7,7 +7,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A rejected `MAGENT_SENTRY_DSN` no longer writes part of the DSN into
+  `~/.magent/logs/sentry.log`.** When the SDK refused to start, the warning
+  quoted the SDK's own exception message, and that message is built from the
+  DSN (a `BadDsn` echoes the project path segment, a bad port echoes the port
+  text). The warning now carries the exception type, the SDK version and a
+  fixed "check MAGENT_SENTRY_DSN" hint, and never the message or a traceback.
+  Local log file only; nothing was ever sent. (#306)
+
+## [3.21.2] - 2026-11-27
+
+### Fixed
+
+- **Error reporting works on sentry-sdk 3.x, and the `<3` cap is lifted.**
+  sentry-sdk 3.0 removed options `init_sentry` passed
+  (`ThreadingIntegration(propagate_hub=)`, `send_default_pii`,
+  `include_local_variables`), so with `MAGENT_SENTRY_DSN` set a fresh
+  `pip install` raised `TypeError` at startup; 3.21.1 worked around it by
+  capping the dependency at `sentry-sdk>=2,<3`, and that cap is gone again.
+  `init_sentry` now uses `propagate_scope` and spells the privacy settings the
+  way the installed SDK wants them: no PII, no frame locals, and on 3.x every
+  `data_collection` category closed explicitly (it has no off switch, and an
+  omitted category collects).
+- **Error reports carry no breadcrumbs.** An event used to be able to carry a
+  trail of what happened before the error. sentry-sdk 3.x turns INFO log lines
+  into breadcrumbs by default (so project names, user paths and ssh hosts
+  would have ridden along), and both majors record outgoing-http URLs with
+  their query string. `max_breadcrumbs=0` on both majors, and the logging
+  integration is built for ERROR events only (no breadcrumbs, no Sentry Logs).
+- **A Sentry init failure can no longer break a command.** If the installed
+  SDK rejects any of magent's init options (a future major renaming one),
+  reporting is switched off with a warning in `~/.magent/logs/sentry.log`
+  instead of a `TypeError` out of every `magent` invocation.
+
+## [3.21.1] - 2026-11-27
+
+### Fixed
+
+- **A fresh install no longer pulls in a sentry-sdk that breaks error
+  reporting.** sentry-sdk 3.0 removed options `init_sentry` relies on, so with
+  `MAGENT_SENTRY_DSN` set a fresh `pip install` raised `TypeError` at startup.
+  The dependency is now capped at `sentry-sdk>=2,<3`.
+- **`magent`, `magent --go`, `-a` and `-g` now work over ssh on Windows.** They
+  fell through to the psmux choke point, which could only refuse ("refusing to
+  start psmux sessions from a non-interactive logon session ... would have
+  created: demo", then "tiling: window not found"). The top-level launch
+  path now asks the same `session0_disposition` as `magent up`: `refuse` prints
+  the reason and exits 1, `handoff` re-runs the launch on the desktop (the menu
+  and project checklist still run in the ssh terminal; the concrete selection
+  travels as a hidden `--only`) and exits with its code. The menu's `u` hands
+  off as `magent up [-g GROUP]`; status and the other read-only actions are
+  untouched. With `MAGENT_SESSION0_POLICY=refuse`, a `--go` or `--retile-all`
+  over ssh now exits 1 with the refusal where a retile used to find no windows
+  and exit 0.
+- **Hand-off children no longer run at background priority.** A Task Scheduler
+  task defaults to priority 7 (BelowNormal CPU, Low I/O) and everything the
+  hand-off started inherited it: a `claude --continue` read a 424 MB transcript
+  at 0.4 MB/s and looked hung. The staged launcher now resets itself to Normal
+  CPU and I/O priority before starting the command.
+
+## [3.21.0] - 2026-11-09
+
 ### Added
+
+- **`magent link` pairs this machine with the magent app over the relay.**
+  It prints a QR code and an 8-character code, waits for the app to claim it
+  (a typed code is confirmed with a 6-digit safety number on both screens),
+  and asks whether paired devices may drive sessions: remote control, off
+  unless you say yes (`--remote-control` / `--no-remote-control` change it
+  later, stored as `settings.link.remoteControl` in the config file the CLI
+  resolves; off whenever that file cannot be read). `--add-device` pairs
+  another device, `--status [--json]` shows the link, and `magent unlink`
+  revokes it. Needs the new `[link]` extra.
+- **`magent serve` keeps the link open.** One outbound connection to
+  `api.magent.now`, nothing listening: session rows, events, command results
+  and uploaded files are end-to-end encrypted for the paired devices, and a
+  device's command runs only if its signature verifies, it is under two
+  minutes old and it comes from a paired device. A command the relay replays
+  never runs twice, and an upload is pasted once. An answer too large to send
+  comes back as `502 result_too_large`, and an upload state the relay missed
+  is sent again. One serve per machine runs the link and any other stands by;
+  `magent link --status`, `status` and `doctor` name it, and warn when it
+  reads remote control from another config file than the CLI. Decrypted
+  files a serve left behind mid-pull are removed when the next serve takes
+  the link, or by `magent unlink`. `MAGENT_LINK=0` keeps a linked machine
+  offline; `MAGENT_LINK_URL` points at another relay.
+- **`magent status`, `magent doctor` and `status --json` report the link:**
+  `unlinked`, `connecting`, `online`, `offline (retry in Ns)`, `revoked` or
+  `disabled`. Error reports sent to Sentry have the link's token and keys
+  stripped.
+- **A versioned local API: `/api/v1`.** `magent serve` now answers
+  `/api/v1/meta`, `health`, `status`, `sessions` (each row carries the hook
+  state and, with `?fresh=1`, the pane state, side by side), a session's pane, `projects`, an
+  SSE event stream (`/api/v1/events`, resumable with `Last-Event-ID`) and its
+  long-poll twin, and uploads -- every reply one `{ok, data}` /
+  `{ok, error: {code, message}}` envelope, described by
+  `docs/api/v1.schema.json`. From this machine only, it also drives the
+  fleet: send, choose, interrupt, model, start, stop, and project
+  add / enable / disable / remove. `MAGENT_EVENTS=0` turns the event poller off.
+- **`magent choose <session> <n>` and `magent interrupt <session>`.** Answer a
+  numbered dialog (only while one is on screen) or press Escape mid-turn.
+- **`--json` on `send`, `model`, `peek`, `choose` and `interrupt`, and `--v1` on
+  `status` and `sessions`,** printing exactly what the matching `/api/v1` route
+  returns. The existing `status --json` and `sessions --json` shapes are
+  unchanged.
 
 - **Where to get help is now one link away.** `magent --help` ends with the
   mAgent Discord invite, a failing `magent doctor` points there under its
@@ -16,6 +121,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The upload server refuses cross-site and rebound requests.** A browser
+  request whose Host, Origin or `Sec-Fetch-Site` does not belong to this
+  server gets 403, on the legacy routes too -- a web page can no longer flash
+  your status bar through `<img src=.../api/flash>` or switch the picker through
+  `/focus`.
+  Scripts and the Alt+V listener are unaffected, and so is the phone page when
+  it uses the tailnet name or IP, this machine's hostname, or the address
+  `magent serve` binds. A `magent mobile --host` name outside that list, such
+  as another mDNS `.local` name, now gets 403.
+- **Config edits are backed up and written atomically; add/remove/enable/disable/migrate are validated first.**
+  `config add`, `remove`, `enable`, `disable` and `migrate` (and the API)
+  refuse a change that would not load. Every config write keeps the previous
+  file in `~/.magent/backups` (newest 20 per config file) and swaps the new one
+  in with one rename.
 - **Every psmux argv is now built in `psmux.py`.** The attach, new-session and
   agent-command send argvs that `platform/windows.py` and the session picker
   hand-built are named builders there, and custom lint rule MD007 fails the gate
@@ -2020,6 +2139,9 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.21.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.21.1...v3.21.2
+[3.21.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.21.0...v3.21.1
+[3.21.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.20.0...v3.21.0
 [3.20.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.4...v3.20.0
 [3.20.0rc2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.20.0rc1...v3.20.0rc2
 [3.20.0rc1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.2...v3.20.0rc1

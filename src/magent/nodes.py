@@ -42,6 +42,7 @@ from magent.config import (
     is_cloud,
     runs_on_node,
 )
+from magent.config_io import replace_retrying
 from magent.json_depth import MAX_JSON_DEPTH, TOO_DEEP, nests_too_deep
 from magent.lockfile import LockHeld, persistent_lock
 from magent.log import get_logger
@@ -51,7 +52,14 @@ from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+    from collections.abc import (
+        Callable,
+        Generator,
+        Iterable,
+        Iterator,
+        Mapping,
+        Sequence,
+    )
 
     from magent.config import MagentConfig, ProjectConfig
 
@@ -1753,15 +1761,7 @@ _REPLACE_SLEEP_S = 0.025
 
 
 def _replace_retrying(src: Path, dst: Path) -> None:
-    for attempt in range(_REPLACE_RETRIES + 1):
-        try:
-            os.replace(src, dst)
-        except PermissionError:
-            if attempt == _REPLACE_RETRIES:
-                raise
-            time.sleep(_REPLACE_SLEEP_S)
-        else:
-            return
+    replace_retrying(src, dst, retries=_REPLACE_RETRIES, sleep_s=_REPLACE_SLEEP_S)
 
 
 # The sidecar every map writer holds (DECISION-13): ~/.magent/node-map.lock,
@@ -1780,7 +1780,7 @@ _MAP_LOCK = threading.Lock()
 
 
 @contextlib.contextmanager
-def map_lock(wait_s: float = MAP_LOCK_WAIT_S) -> Iterator[None]:
+def map_lock(wait_s: float = MAP_LOCK_WAIT_S) -> Generator[None, None, None]:
     """Hold the node map exclusively across threads AND processes, waiting up
     to ``wait_s`` in all for it. Raises LockHeld (an OSError) when it stays
     taken. ``update_node_map`` is the one production holder; a test holds it

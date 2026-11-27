@@ -70,3 +70,14 @@ paths = [
 ]
 regexTarget = "secret"
 regexes = ['''^-----BEGIN OPENSSH PRIVATE KEY-----\x5cn"\s*f"\{secret\}\x5cn"\s*"-----END OPENSSH PRIVATE KEY-----$''']
+
+# The marker test_sentry.py first planted as the DSN's public key (before it
+# carried DECOY, now renamed): a synthetic literal in a key-named constant, not
+# a credential. Pinned by exact value AND file, content-based on purpose -- the
+# scan reads every commit's patch, so a rename alone cannot clear it.
+[[allowlists]]
+description = "sentry DSN-redaction test marker: synthetic public-key stand-in"
+condition = "AND"
+paths = ['''^tests/unit/test_sentry\.py$''']
+regexTarget = "secret"
+regexes = ['''^KEYMARK-3b9e51$''']
