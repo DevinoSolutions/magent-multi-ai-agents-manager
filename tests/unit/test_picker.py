@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -278,7 +279,8 @@ class TestKeyDecoding:
             ("Z", "Z"),
             ("-", "-"),
             (" ", " "),
-            ("\t", picker.IGNORED),
+            ("\t", picker.TAB),
+            ("\x01", picker.CTRL_A),
             ("\x00", picker.IGNORED),
         ],
     )
@@ -301,6 +303,71 @@ class TestKeyDecoding:
         st = _state(["api"])
         assert st.press(picker.IGNORED) is None
         assert st.query == "" and not st.moved
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            picker.PGUP,
+            picker.PGDN,
+            picker.HOME,
+            picker.END,
+            picker.TAB,
+            picker.BTAB,
+            picker.CTRL_A,
+        ],
+    )
+    def test_the_single_select_picker_ignores_the_checklist_navigation_keys(
+        self, token
+    ):
+        st = _state(["api"])
+        assert st.press(token) is None
+        assert st.query == "" and not st.moved
+
+    @pytest.mark.parametrize(
+        ("intro", "params", "final", "token"),
+        [
+            ("[", "", "A", picker.UP),
+            ("[", "", "B", picker.DOWN),
+            ("[", "", "H", picker.HOME),
+            ("[", "", "F", picker.END),
+            ("[", "", "Z", picker.BTAB),
+            ("[", "5", "~", picker.PGUP),
+            ("[", "6", "~", picker.PGDN),
+            ("[", "1", "~", picker.HOME),
+            ("[", "4", "~", picker.END),
+            ("[", "1;5", "A", picker.UP),  # Ctrl+Up is still Up
+            ("[", "5;5", "~", picker.PGUP),
+            ("O", "", "H", picker.HOME),  # application-cursor mode
+            ("O", "", "B", picker.DOWN),
+            ("[", "3", "~", picker.IGNORED),  # Delete: not bound
+            ("[", "", "x", picker.IGNORED),
+        ],
+    )
+    def test_posix_escape_sequences_decode(self, intro, params, final, token):
+        assert picker.decode_escape(intro, params, final) == token
+
+    @pytest.mark.parametrize(
+        ("codes", "token"),
+        [
+            (["\xe0", "H"], picker.UP),
+            (["\xe0", "P"], picker.DOWN),
+            (["\xe0", "I"], picker.PGUP),
+            (["\xe0", "Q"], picker.PGDN),
+            (["\xe0", "G"], picker.HOME),
+            (["\xe0", "O"], picker.END),
+            (["\x00", "\x0f"], picker.BTAB),  # Shift+Tab
+            (["\t"], picker.TAB),
+            (["\x01"], picker.CTRL_A),
+            (["\xe0", "S"], picker.IGNORED),  # Delete: not bound
+        ],
+    )
+    def test_windows_console_codes_decode(self, monkeypatch, codes, token):
+        feed = iter(codes)
+        fake = types.SimpleNamespace(getwch=lambda: next(feed), kbhit=lambda: False)
+        monkeypatch.setitem(sys.modules, "msvcrt", fake)
+        monkeypatch.setattr(sys, "platform", "win32")
+
+        assert picker._read_key_windows() == token
 
 
 class TestReadCharIsUnbuffered:
