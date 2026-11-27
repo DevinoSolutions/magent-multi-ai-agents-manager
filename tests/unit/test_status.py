@@ -640,6 +640,7 @@ class TestJson:
             "node_sync_paused": None,
             "daemons_session0": 0,
             "claude_token": None,
+            "link": {"state": "disabled", "retry_in_s": None},
         }
 
     def test_degraded_emits_parseable_status_and_exit_3(
@@ -670,6 +671,7 @@ class TestJson:
             "node_sync_paused": None,
             "daemons_session0": 0,
             "claude_token": None,
+            "link": {"state": "disabled", "retry_in_s": None},
         }
 
 

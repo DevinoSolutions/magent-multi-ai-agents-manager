@@ -21,7 +21,6 @@ from magent.lockfile import LockHeld, exclusive_lock
 from magent.paths import find_config
 from magent.procs import await_registration, pid_alive, predates_boot
 from magent.style import style
-from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -87,60 +86,27 @@ def stop_daemon() -> bool:
     return False
 
 
-def name_pairs_from_config(cfg: MagentConfig) -> list[tuple[str, str]]:
-    """(display name, resolved path) for every enabled project — the input
-    to attention.name_map_from_projects. Shared with status/watch."""
-    from magent.launch import _resolve_path  # heavy subsystem: in-body per policy
-
-    pairs: list[tuple[str, str]] = []
-    for proj in cfg.projects:
-        if not proj.enabled:
-            continue
-        resolved = _resolve_path(proj.path, cfg.base_dir) or proj.path
-        pairs.append((proj.title or get_leaf_name(proj.path), resolved))
-    return pairs
+# The config -> engine translation lives in ``fleetview`` (lifted there so a
+# src module can build the engine without importing the cli package). These
+# two are plain re-exports kept lazy -- fleetview pulls in attention and
+# agent_state, which this module must not import at the top (MD005) -- for
+# the callers that still spell them here. New code reaches for fleetview.
 
 
 def staleness_from_config(cfg: MagentConfig) -> dict[str, float]:
-    """``settings.attention``'s staleness keys as the ``{state: seconds}`` window
-    map every state-aging surface takes.
+    """``fleetview.staleness_from_config``, the ONE translation of
+    ``settings.attention``'s staleness keys."""
+    from magent import fleetview  # heavy subsystem: in-body per policy
 
-    The ONE translation, and deliberately not inlined into the engine builder
-    below: the engine is not the only reader. ``session_picker._session_states``
-    ages the per-session rows behind `magent sessions` AND `status`'s
-    psmux-session table, and it used to import ``attention.STALENESS_S``
-    directly — so a widened window was honored by the daemon, `watch` and
-    `status --json`'s agents array while those two surfaces silently kept the
-    module defaults. The cli module owns the config translation and hands its
-    consumers plain values."""
-    from magent import agent_state  # heavy subsystem: in-body per policy
-
-    att = cfg.settings.attention
-    return {
-        agent_state.WORKING: att.staleness_working_s,
-        agent_state.NEEDS_INPUT: att.staleness_needs_input_s,
-    }
+    return fleetview.staleness_from_config(cfg)
 
 
 def engine_from_config(cfg: MagentConfig) -> attention.AttentionEngine:
-    """Build an AttentionEngine whose staleness/debounce come from
-    ``settings.attention`` — so `status`/`watch` age states with the SAME
-    config-driven windows as the daemon, not the module defaults. The name_map
-    is derived from the enabled projects. Daemon-only concerns (renderers, ntfy
-    topic) stay at the daemon call site; this helper covers the config-derived
-    kwargs common to all three surfaces. When a project runs on a node, the
-    engine also reads each placed node session's mirrored state store
-    (node_sync.state_stores)."""
-    from magent import attention, node_sync  # heavy subsystem: in-body per policy
+    """``fleetview.engine_from_config``, the one place an AttentionEngine is
+    built (MD012)."""
+    from magent import fleetview  # heavy subsystem: in-body per policy
 
-    return attention.AttentionEngine(
-        attention.name_map_from_projects(name_pairs_from_config(cfg)),
-        staleness=staleness_from_config(cfg),
-        debounce_s=cfg.settings.attention.debounce_s,
-        # Node sessions' states, pulled home by `magent node sync`, keyed by
-        # the node map (project -> nick, sid) and named by their project.
-        extra_stores=node_sync.state_stores if node_sync.wanted(cfg) else None,
-    )
+    return fleetview.engine_from_config(cfg)
 
 
 def _plan_renderers(

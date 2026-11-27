@@ -619,6 +619,35 @@ def _check_claude_token(cfg: MagentConfig | None) -> CheckResult:
     return (OK, f"valid until {day}")
 
 
+def _check_link(
+    cfg: MagentConfig | None, config_file: Path | None = None
+) -> CheckResult:
+    """The relay link (`magent link`) -- WARN at worst, like the nodes row: a
+    link that is revoked, unreadable or waiting to reconnect, or a serve
+    running it that reads remote control from another config file than
+    ``config_file``, is not this machine's environment failing. Who runs the
+    link is the link lock's answer, as in `status`."""
+    from magent.cli import status as cli_status
+
+    port = cfg.settings.upload_port if cfg else 8033
+    report = cli_status._link_report(
+        lambda: cli_status._upload_state(port) == "on",
+        port=port,
+        config_file=config_file,
+    )
+    status = report.status
+    lines = [status.detail, *report.notes]
+    if status.hint:
+        lines.append(status.hint)
+    lines.extend(report.warnings)
+    warn = (
+        status.state in ("revoked", "offline")
+        or status.detail.startswith("unlinked (")
+        or bool(report.warnings)
+    )
+    return (WARN if warn else OK, "\n".join(lines))
+
+
 def _run_checks(config_file: Path) -> list[dict[str, str]]:
     (config_res, cfg) = _check_config(config_file)
     checks: list[tuple[str, CheckResult]] = [("config", config_res)]
@@ -641,6 +670,7 @@ def _run_checks(config_file: Path) -> list[dict[str, str]]:
         ("nodes", lambda: _check_nodes(cfg)),
         ("idle-reap", lambda: _check_idle_reap(cfg)),
         ("claude-token", lambda: _check_claude_token(cfg)),
+        ("link", lambda: _check_link(cfg, config_file)),
     ]
     checks.extend((name, fn()) for name, fn in rest)
     return [
