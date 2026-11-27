@@ -52,7 +52,14 @@ from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+    from collections.abc import (
+        Callable,
+        Generator,
+        Iterable,
+        Iterator,
+        Mapping,
+        Sequence,
+    )
 
     from magent.config import MagentConfig, ProjectConfig
 
@@ -1773,7 +1780,7 @@ _MAP_LOCK = threading.Lock()
 
 
 @contextlib.contextmanager
-def map_lock(wait_s: float = MAP_LOCK_WAIT_S) -> Iterator[None]:
+def map_lock(wait_s: float = MAP_LOCK_WAIT_S) -> Generator[None, None, None]:
     """Hold the node map exclusively across threads AND processes, waiting up
     to ``wait_s`` in all for it. Raises LockHeld (an OSError) when it stays
     taken. ``update_node_map`` is the one production holder; a test holds it

@@ -1700,8 +1700,8 @@ class UploadHandler(BaseHTTPRequestHandler):
         else:
             self._json_response({"ok": False, "error": "Not found"}, 404)
 
-    def log_message(self, fmt: str, *args: object) -> None:  # ty: ignore[invalid-method-override]  # reason: *args: object is a safe contravariant widening of *args: Any from BaseHTTPRequestHandler
-        get_logger("upload").debug(fmt, *args)
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002  # reason: BaseHTTPRequestHandler's own parameter name, which callers may pass by keyword
+        get_logger("upload").debug(format, *args)
 
 
 # --- One port, one server -------------------------------------------------------

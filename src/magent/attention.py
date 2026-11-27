@@ -452,7 +452,7 @@ class ToastRenderer:
             if not self._engine.should_fire(v.cwd, f"toast:{v.state}"):
                 continue
             try:
-                from winotify import (  # ty: ignore[unresolved-import]  # reason: optional dep, guarded by try/except (the [toast] extra)
+                from winotify import (  # ty: ignore[import-not-found]  # reason: optional dep, guarded by try/except (the [toast] extra)
                     Notification,
                 )
             except ImportError:
