@@ -13,6 +13,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reporting.** sentry-sdk 3.0 removed options `init_sentry` relies on, so with
   `MAGENT_SENTRY_DSN` set a fresh `pip install` raised `TypeError` at startup.
   The dependency is now capped at `sentry-sdk>=2,<3`.
+- **`magent`, `magent --go`, `-a` and `-g` now work over ssh on Windows.** They
+  fell through to the psmux choke point, which could only refuse ("refusing to
+  start psmux sessions from a non-interactive logon session ... would have
+  created: demo", then "tiling: window not found"). The top-level launch
+  path now asks the same `session0_disposition` as `magent up`: `refuse` prints
+  the reason and exits 1, `handoff` re-runs the launch on the desktop (the menu
+  and project checklist still run in the ssh terminal; the concrete selection
+  travels as a hidden `--only`) and exits with its code. The menu's `u` hands
+  off as `magent up [-g GROUP]`; status and the other read-only actions are
+  untouched. With `MAGENT_SESSION0_POLICY=refuse`, a `--go` or `--retile-all`
+  over ssh now exits 1 with the refusal where a retile used to find no windows
+  and exit 0.
+- **Hand-off children no longer run at background priority.** A Task Scheduler
+  task defaults to priority 7 (BelowNormal CPU, Low I/O) and everything the
+  hand-off started inherited it: a `claude --continue` read a 424 MB transcript
+  at 0.4 MB/s and looked hung. The staged launcher now resets itself to Normal
+  CPU and I/O priority before starting the command.
 
 ## [3.21.0] - 2026-11-09
 
