@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.21.4] - 2026-11-27
+
 ### Fixed
 
 - **`magent doctor` no longer says error reporting is active after the SDK
@@ -2162,6 +2164,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.21.4]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.21.3...v3.21.4
 [3.21.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.21.2...v3.21.3
 [3.21.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.21.1...v3.21.2
 [3.21.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.21.0...v3.21.1
