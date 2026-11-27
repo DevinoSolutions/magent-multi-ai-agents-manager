@@ -6,7 +6,7 @@ non-interactive logon session.
 types by hand did not: over ssh, `magent --go` fell through to the psmux choke
 point, which could only refuse -- launch.log read "refusing to start psmux
 sessions from a non-interactive logon session ... (would have created:
-MASTER_CHAT)" and then "tiling: window not found". Same policy function, same
+demo)" and then "tiling: window not found". Same policy function, same
 three answers, now asked before anything is created.
 
 Nothing here starts a session: `run_magent` is replaced, and the platform is a
@@ -18,7 +18,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import click.testing
 import pytest
 
 import magent.cli as cli_pkg
@@ -75,9 +74,7 @@ def _policy(monkeypatch, value: str) -> None:
 
 def _terminal(monkeypatch, *answers: dict[str, object]) -> None:
     """A real-terminal run: stdin reports a tty and the menu gives `answers`."""
-    monkeypatch.setattr(
-        click.testing._NamedTextIOWrapper, "isatty", lambda self: True, raising=False
-    )
+    monkeypatch.setattr("magent.console.human_at_console", lambda: True)
     seq = iter(answers)
     monkeypatch.setattr(cli_pkg, "_show_menu", lambda *_a, **_k: next(seq))
 

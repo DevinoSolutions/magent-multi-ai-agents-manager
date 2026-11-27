@@ -2196,14 +2196,18 @@ makes the user answer a prompt; the menu and checklist then run in the ssh
 terminal (they are only UI) and what is handed off is the concrete answer --
 `--go`/`--retile-all`/`-g`/`--all`/`--allow-dirty` plus a hidden, repeatable
 `--only NAME` carrying the checklist's selection, because the desktop copy's
-stdin is NUL and it shows neither. Tiling therefore only ever runs in the
+stdin is NUL and it shows neither. That holds even for a launch with no
+directive flag (`magent`, `magent -a`): the menu gate asks
+`console.human_at_console()`, not a raw `isatty()`, because Windows reports NUL
+as a tty and the desktop copy would otherwise paint the menu, hit EOF and die
+"Aborted!" with nothing launched. Tiling therefore only ever runs in the
 desktop copy. A `--dry-run` creates and moves nothing and is left to run in
-place. The CHOKE
-POINT -- `psmux.launch_verified`, which every session magent creates passes
-through -- only ever REFUSES, and that asymmetry is deliberate. Reaching the
-choke point in Session 0 means a path that did not hand off (`revive`, or a
-future caller that skipped `launch.session0_gate`), and the honest outcome there is a loud failure naming the cause
-rather than a subsystem quietly writing scheduled tasks. The three "N session(s)
+place. The CHOKE POINT -- `psmux.launch_verified`, which every session magent
+creates passes through -- only ever REFUSES, and that asymmetry is deliberate.
+Reaching the choke point in Session 0 means a path that did not hand off
+(`revive`, or a future caller that skipped `launch.session0_gate`), and the
+honest outcome there is a loud failure naming the cause rather than a subsystem
+quietly writing scheduled tasks. The three "N session(s)
 failed to come up" printers add `launch.session0_note()` so the casualty list
 never arrives without its reason -- last time a user read 40 failed names and
 had to find `launch.log` to learn nothing had been attempted.

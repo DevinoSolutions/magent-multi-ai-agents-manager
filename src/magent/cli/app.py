@@ -12,6 +12,7 @@ from pathlib import Path
 
 import click
 
+from magent import console
 from magent.cli.checklist import ABORT_MESSAGE, choose_projects
 from magent.cli.config_io import _load_config_or_exit
 from magent.cli.pipeguard import run_guarded
@@ -308,7 +309,7 @@ def main(
         if config_path:
             click.echo(f"No config found at: {config_file}", err=True)
             sys.exit(1)
-        if sys.stdin.isatty() and not go:
+        if console.human_at_console() and not go:
             wrote = _run_discovery(config_file)
             if not wrote:
                 sys.exit(1)
@@ -319,7 +320,11 @@ def main(
     cfg = _load_config_or_exit(config_file)
 
     has_directive = go or retile_all or dry_run or group or only_names
-    if not has_directive and sys.stdin.isatty():
+    # `human_at_console`, not a raw isatty(): the hand-off's desktop copy runs
+    # with stdin on NUL, which Windows reports as a tty, and a directive-less
+    # launch (`magent`, `magent -a`) would otherwise paint this menu there, hit
+    # EOF and die "Aborted!" with nothing launched.
+    if not has_directive and console.human_at_console():
         while True:
             groups = sorted({p.group for p in cfg.projects if p.group})
             menu = _show_menu(list(groups), config_file)
