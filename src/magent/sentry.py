@@ -248,14 +248,16 @@ def init_sentry(dsn: str) -> None:
         # drops an option (3.0 did exactly that) must not take the CLI down
         # with a TypeError: reporting is simply off. Quiet for the same reason
         # as the missing-SDK path -- a stderr line would tax every command --
-        # so it goes to the rotating log: the exception type and message
-        # only, never the DSN.
+        # so it goes to the rotating log. That file is what people paste into
+        # bug reports, and an SDK exception's text is built from the DSN it
+        # was handed (BadDsn echoes the project path segment, a bad port
+        # echoes the port text), so only the exception TYPE is logged: never
+        # `str(exc)`, and never `exc_info` (a traceback carries the message).
         get_logger("sentry").warning(
-            "sentry-sdk %s rejected magent's init options (%s: %s) -- error "
-            "reporting is OFF",
+            "sentry-sdk %s rejected magent's init options (%s) -- error "
+            "reporting is OFF; check MAGENT_SENTRY_DSN",
             getattr(sentry_sdk, "VERSION", "?"),
             type(exc).__name__,
-            exc,
         )
         return
     atexit.register(lambda: sentry_sdk.flush(timeout=2))

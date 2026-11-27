@@ -15,12 +15,11 @@ import logging
 import subprocess
 import sys
 import types
-from typing import TYPE_CHECKING
 
+import pytest
+
+from magent import log
 from magent.sentry import SENTRY_INSTALL_HINT, init_sentry
-
-if TYPE_CHECKING:
-    import pytest
 
 _FAKE_DSN = "https://example@o0.ingest.sentry.io/0"
 
@@ -264,7 +263,10 @@ class TestAnSdkThatRejectsTheOptionsNeverBreaksTheCommand:
         (record,) = records
         assert "reporting is OFF" in record
         assert "TypeError" in record
-        assert "Unknown option" in record
+        # The type names the failure; the MESSAGE is the SDK's own text and
+        # can carry the DSN (see TestTheInitFailureWarningNeverCarriesTheDsn),
+        # so it is never logged.
+        assert "Unknown option" not in record
         assert _FAKE_DSN not in record
         assert registered == [], "no flush hook for a client that never started"
 
@@ -340,3 +342,100 @@ class TestNoEagerImport:
             check=True,
         )
         assert result.stdout.strip() == "False"
+
+
+# Unique markers in the three places a DSN carries identity: the public key,
+# the host, and the project path segment (the SDK echoes the last one in
+# "Invalid project in DSN ('...')"). A marker found anywhere in the log file is
+# a leak.
+_KEY_MARK = "KEYDECOY-3b9e51"
+_HOST_MARK = "hostmark-3b9e51"
+_PROJECT_MARK = "projmark-3b9e51"
+_MARKED_DSN = f"https://{_KEY_MARK}@{_HOST_MARK}.invalid/{_PROJECT_MARK}"
+_MARKS = (_KEY_MARK, _HOST_MARK, _PROJECT_MARK, _MARKED_DSN)
+
+
+class TestTheInitFailureWarningNeverCarriesTheDsn:
+    """sentry.log is a file people paste into bug reports, and an SDK
+    exception's text is built from the DSN it was handed (BadDsn echoes the
+    path segment, a port ValueError the port text). So the warning names the
+    exception TYPE and the SDK version, never `str(exc)` and never a
+    traceback (which carries the message). Asserted on the REAL log file, not
+    on a stand-in logger, so an attached `exc_info` shows up too."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_log(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(atexit, "register", lambda _callback: None)
+        log.reset_logging()
+        yield
+        log.reset_logging()
+
+    @staticmethod
+    def _sentry_log() -> str:
+        path = log.LOG_DIR / "sentry.log"
+        assert path.exists(), "the degraded init must leave a log line"
+        return path.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("version", ["2.71.0", "3.0.1"])
+    def test_an_exception_message_carrying_the_dsn_stays_out_of_the_log(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        version: str,
+    ) -> None:
+        fake_sdk = _install_fake_sentry_sdk(monkeypatch, version=version)
+
+        class BadDsn(ValueError):
+            pass
+
+        def _reject(**kwargs: object) -> None:
+            dsn = str(kwargs["dsn"])
+            # What the real SDK does with a bad DSN, and worse: the whole
+            # string, in the message and in a chained cause.
+            inner = ValueError(f"cannot parse {dsn}")
+            raise BadDsn(f"Invalid project in DSN ({dsn!r})") from inner
+
+        fake_sdk.init = _reject
+
+        init_sentry(_MARKED_DSN)  # must not raise
+
+        text = self._sentry_log()
+        assert "BadDsn" in text
+        assert version in text
+        assert "reporting is OFF" in text
+        assert "MAGENT_SENTRY_DSN" in text, "the fixed hint names what to check"
+        for mark in _MARKS:
+            assert mark not in text, mark
+        assert "Traceback" not in text, "no exc_info on the warning"
+        captured = capsys.readouterr()
+        assert captured.out == captured.err == ""
+
+    def test_no_dsn_substring_survives_in_the_log(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Beyond the markers: no run of the DSN's identity (key, host or
+        project, 6+ characters) appears in the line."""
+        fake_sdk = _install_fake_sentry_sdk(monkeypatch)
+
+        def _reject(**kwargs: object) -> None:
+            raise RuntimeError(str(kwargs["dsn"]))
+
+        fake_sdk.init = _reject
+        init_sentry(_MARKED_DSN)
+
+        text = self._sentry_log()
+        for part in (_KEY_MARK, _HOST_MARK, _PROJECT_MARK):
+            for i in range(len(part) - 5):
+                assert part[i : i + 6] not in text, part[i : i + 6]
+
+    def test_the_missing_sdk_line_carries_no_dsn_either(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "sentry_sdk", None)
+
+        init_sentry(_MARKED_DSN)
+
+        text = self._sentry_log()
+        assert "sentry-sdk is missing" in text
+        for mark in _MARKS:
+            assert mark not in text, mark
