@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.21.3] - 2026-11-27
+
 ### Fixed
 
 - **A rejected `MAGENT_SENTRY_DSN` no longer writes part of the DSN into
@@ -16,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text). The warning now carries the exception type, the SDK version and a
   fixed "check MAGENT_SENTRY_DSN" hint, and never the message or a traceback.
   Local log file only; nothing was ever sent. (#306)
+
+### Changed
+
+- **Build, release and dev-tool dependencies refreshed.** The release workflow
+  now publishes through `pypa/gh-action-pypi-publish` 1.14.3 (which carries the
+  certifi and sigstore security upgrade) and the newer artifact, `setup-python`
+  and `setup-uv` actions, all pinned by commit; the dev tooling (type checker,
+  linter, test tools) and the lockfile moved to their latest minor and patch
+  releases. No change to runtime behaviour.
 
 ## [3.21.2] - 2026-11-27
 
@@ -2139,6 +2150,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.21.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.21.2...v3.21.3
 [3.21.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.21.1...v3.21.2
 [3.21.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.21.0...v3.21.1
 [3.21.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.20.0...v3.21.0
