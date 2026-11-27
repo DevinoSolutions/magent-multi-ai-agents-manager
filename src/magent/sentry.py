@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING, cast
 from magent.log import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from types import ModuleType
+
     from sentry_sdk._types import Event, Hint
 
 # Repair hint for the should-never-happen state: sentry-sdk ships as a base
@@ -104,6 +107,35 @@ def _release() -> str | None:
         return None
 
 
+def _privacy_options(sentry_sdk: ModuleType) -> dict[str, object]:
+    """The no-PII, no-frame-locals init options, spelled for the installed SDK.
+
+    sentry-sdk 3.0 replaced ``send_default_pii`` and ``include_local_variables``
+    with one structured ``data_collection`` option (the old names now raise
+    ``TypeError: Unknown option``), so the two spellings are chosen by the SDK's
+    major version. Both mean the same thing here, and both are privacy
+    guarantees rather than tuning:
+
+    * no PII (``send_default_pii=False`` / ``user_info=False``);
+    * never ship frame locals. The SDK's scrubber redacts by key NAME only
+      (token/secret/auth...), so a node payload in a local named
+      ``stdin``/``input_bytes`` -- a GitHub token, say -- rode along verbatim
+      in every RemoteError's event. Errors-only reporting never needed locals;
+      the traceback stays. Reproduction:
+      test_remote_mux.py::TestASecretNeverReachesSentry.
+    """
+    major = str(getattr(sentry_sdk, "VERSION", "2")).partition(".")[0]
+    if major.isdigit() and int(major) >= 3:
+        return {
+            "data_collection": {
+                "user_info": False,
+                "stack_frame_variables": False,
+                "http_bodies": [],
+            }
+        }
+    return {"send_default_pii": False, "include_local_variables": False}
+
+
 def init_sentry(dsn: str) -> None:
     """Initialize Sentry SDK with the given DSN. Call once at CLI entry."""
     import atexit
@@ -124,7 +156,10 @@ def init_sentry(dsn: str) -> None:
         )
         return
 
-    sentry_sdk.init(
+    # `Callable[..., None]`: the privacy options are spelled per SDK major (see
+    # _privacy_options), so no single static signature of `init` covers both.
+    init = cast("Callable[..., None]", sentry_sdk.init)
+    init(
         dsn=dsn,
         # magent is a single-operator dev tool today (CI never inits Sentry),
         # so the environment is fixed to "dev" -- without minting a new MAGENT_
@@ -135,20 +170,16 @@ def init_sentry(dsn: str) -> None:
         # server_name (hostname) + sys.argv ride along via Sentry's default
         # integrations. Kept on purpose: this is a self-hosted, single-operator
         # setup where "which machine, what command" is exactly the debugging
-        # context wanted, and send_default_pii=False is the actual PII gate.
+        # context wanted, and the no-PII setting below is the actual PII gate.
         traces_sample_rate=0,
-        send_default_pii=False,
-        # Never ship frame locals. sentry-sdk 2.x defaults this to True and
-        # its scrubber redacts by key NAME only (token/secret/auth...), so a
-        # node payload in a local named `stdin`/`input_bytes` -- a GitHub
-        # token, say -- rode along verbatim in every RemoteError's event.
-        # Errors-only reporting never needed locals; the traceback stays.
-        include_local_variables=False,
         # ...and never a link credential (scrub_event above).
         before_send=scrub_event,
         integrations=[
             LoggingIntegration(level=None, event_level=logging.ERROR),
-            ThreadingIntegration(propagate_hub=True),
+            # `propagate_scope` is the name on every supported SDK (2.0 renamed
+            # it from `propagate_hub`; 3.0 removed the old spelling).
+            ThreadingIntegration(propagate_scope=True),
         ],
+        **_privacy_options(sentry_sdk),
     )
     atexit.register(lambda: sentry_sdk.flush(timeout=2))

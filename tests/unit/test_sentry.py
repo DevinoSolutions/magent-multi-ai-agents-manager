@@ -25,10 +25,15 @@ if TYPE_CHECKING:
 _FAKE_DSN = "https://example@o0.ingest.sentry.io/0"
 
 
-def _install_fake_sentry_sdk(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+def _install_fake_sentry_sdk(
+    monkeypatch: pytest.MonkeyPatch, version: str = "2.71.0"
+) -> types.ModuleType:
     """Register a fake sentry_sdk package in sys.modules, recording every
-    call so tests can assert on exactly what init_sentry passed it."""
+    call so tests can assert on exactly what init_sentry passed it. ``version``
+    picks the API shape: like the real SDK, a 3.x fake REJECTS the options 3.0
+    removed instead of silently accepting them."""
     fake_sdk = types.ModuleType("sentry_sdk")
+    fake_sdk.VERSION = version
     fake_integrations = types.ModuleType("sentry_sdk.integrations")
     fake_logging_mod = types.ModuleType("sentry_sdk.integrations.logging")
     fake_threading_mod = types.ModuleType("sentry_sdk.integrations.threading")
@@ -36,7 +41,11 @@ def _install_fake_sentry_sdk(monkeypatch: pytest.MonkeyPatch) -> types.ModuleTyp
     fake_sdk.init_calls = []
     fake_sdk.flush_calls = []
 
+    removed_in_3 = {"send_default_pii", "include_local_variables"}
+
     def _init(**kwargs: object) -> None:
+        if version.startswith("3.") and removed_in_3 & kwargs.keys():
+            raise TypeError(f"Unknown option {sorted(removed_in_3 & kwargs.keys())}")
         fake_sdk.init_calls.append(kwargs)
 
     def _flush(timeout: int) -> None:
@@ -51,8 +60,9 @@ def _install_fake_sentry_sdk(monkeypatch: pytest.MonkeyPatch) -> types.ModuleTyp
             self.event_level = event_level
 
     class FakeThreadingIntegration:
-        def __init__(self, propagate_hub: bool) -> None:
-            self.propagate_hub = propagate_hub
+        # Only the name both 2.x and 3.x accept: 3.0 removed `propagate_hub`.
+        def __init__(self, propagate_scope: bool) -> None:
+            self.propagate_scope = propagate_scope
 
     fake_logging_mod.LoggingIntegration = FakeLoggingIntegration
     fake_threading_mod.ThreadingIntegration = FakeThreadingIntegration
@@ -99,6 +109,27 @@ class TestCapturabilityContract:
         assert len(registered) == 1, "init_sentry must register an atexit callback"
         registered[0]()  # invoke the registered callback directly
         assert fake_sdk.flush_calls == [2]
+
+    def test_a_sentry_sdk_3_gets_data_collection_not_the_removed_options(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """sentry-sdk 3.0 replaced send_default_pii/include_local_variables
+        with `data_collection` and raises on the old names. The privacy
+        guarantees (no PII, no frame locals) must survive the new spelling."""
+        fake_sdk = _install_fake_sentry_sdk(monkeypatch, version="3.0.1")
+        monkeypatch.setattr(atexit, "register", lambda _callback: None)
+
+        init_sentry(_FAKE_DSN)  # a leftover removed option would raise here
+
+        (call,) = fake_sdk.init_calls
+        assert "send_default_pii" not in call
+        assert "include_local_variables" not in call
+        assert call["data_collection"]["user_info"] is False
+        assert call["data_collection"]["stack_frame_variables"] is False
+        (threading_integration,) = (
+            i for i in call["integrations"] if hasattr(i, "propagate_scope")
+        )
+        assert threading_integration.propagate_scope is True
 
     def test_init_tags_environment_dev_and_release(
         self, monkeypatch: pytest.MonkeyPatch
