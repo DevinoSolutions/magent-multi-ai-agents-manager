@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`magent doctor` no longer says error reporting is active after the SDK
+  rejected the DSN.** The `sentry` check reported "active" whenever
+  `MAGENT_SENTRY_DSN` was set and sentry-sdk imported, but a DSN the SDK
+  refuses (a non-numeric project, a missing project or key) turns reporting
+  off at startup, so the check and the real state disagreed. `doctor` now
+  reads what that startup init actually did: in that case the check is a
+  warning (never a failure) naming the exception type and the SDK version,
+  with a "check MAGENT_SENTRY_DSN" hint, and `doctor --json` carries the same
+  state. The DSN and the SDK's exception message are never shown. (#309)
+
 ## [3.21.3] - 2026-11-27
 
 ### Fixed

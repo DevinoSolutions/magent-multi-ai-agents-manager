@@ -21,11 +21,16 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
+import threading
+import time
 from typing import TYPE_CHECKING
 
 import pytest
+
+from magent.config import SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -392,3 +397,190 @@ class TestARejectedDsnNeverReachesTheLog:
         echoed_parts = [part for part in _ECHOED_PARTS if part in dsn]
         if echoed_parts and not any(part in message for part in echoed_parts):
             pytest.skip(f"this SDK no longer echoes the DSN: {message!r}")
+
+
+# --- `magent doctor` reports what the real SDK did with the DSN --------------
+
+# The real CLI (`python -m magent --config <tmp> doctor --json`) in a child
+# whose home family AND app-data folders are redirected: with only HOME moved,
+# doctor reads the developer's real config and %APPDATA%.
+#
+# Where a DSN falls over differs by how broken it is, which the table pins:
+# `env` -- the closed env schema (an http(s) URL) refuses it before the SDK is
+# ever asked, and the CLI exits 1 with its own message; `sdk` -- it is a URL,
+# so it reaches `init_sentry`, the real SDK rejects it, and doctor must say
+# reporting is OFF. Either way nothing of the DSN may be written anywhere.
+_DOCTOR_ROUTE = {
+    "non-numeric-project": "sdk",
+    "missing-project": "sdk",
+    "missing-key": "sdk",
+    "unsupported-scheme": "env",
+    "non-numeric-port": "env",
+    "no-scheme": "env",
+    "garbage": "env",
+}
+
+
+def _doctor_env(home: Path) -> dict[str, str]:
+    """`_child_env` plus every app-data door doctor reads through."""
+    appdata, local = home / "AppData" / "Roaming", home / "AppData" / "Local"
+    for folder in (appdata, local):
+        folder.mkdir(parents=True, exist_ok=True)
+    return {
+        **_child_env(home),
+        "APPDATA": str(appdata),
+        "LOCALAPPDATA": str(local),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+    }
+
+
+def _run_doctor(home: Path, dsn: str) -> dict[str, object]:
+    cfg = home / "magent.config.json"
+    cfg.write_text(
+        json.dumps({"version": SCHEMA_VERSION, "projects": [{"path": "api"}]}),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, "-m", "magent", "--config", str(cfg), "doctor", "--json"],
+        env={**_doctor_env(home), "MAGENT_SENTRY_DSN": dsn},
+        cwd=str(home),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    sentry_row = None
+    if proc.stdout.strip().startswith("{"):
+        checks = json.loads(proc.stdout)["checks"]
+        sentry_row = next(c for c in checks if c["name"] == "sentry")
+    return {
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "sentry": sentry_row,
+        "log": (
+            (home / ".magent" / "logs" / "sentry.log").read_text(encoding="utf-8")
+            if (home / ".magent" / "logs" / "sentry.log").exists()
+            else None
+        ),
+    }
+
+
+def _files_containing(home: Path, needles: tuple[str, ...]) -> list[tuple[str, str]]:
+    """Every (file, needle) under the redirected home that holds a needle."""
+    hits = []
+    for path in home.rglob("*"):
+        if path.is_file():
+            data = path.read_bytes()
+            hits += [(str(path), n) for n in needles if n.encode() in data]
+    return hits
+
+
+@pytest.fixture(scope="module", params=sorted(_bad_dsns()))
+def doctor_rejected(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
+) -> dict[str, object]:
+    dsn, exc_type, marks = _bad_dsns()[request.param]
+    home = tmp_path_factory.mktemp("sentry-doctor-bad-home")
+    run = _run_doctor(home, dsn)
+    return {
+        **run,
+        "case": request.param,
+        "dsn": dsn,
+        "exc_type": exc_type,
+        "marks": marks,
+        "leaks": _files_containing(home, (dsn, *marks)),
+    }
+
+
+class TestDoctorSaysOffWhenTheRealSdkRejectedTheDsn:
+    def test_nothing_of_the_dsn_is_written_anywhere(
+        self, doctor_rejected: dict[str, object]
+    ) -> None:
+        marks = doctor_rejected["marks"]
+        assert isinstance(marks, tuple)
+        for stream in ("stdout", "stderr"):
+            text = doctor_rejected[stream]
+            assert isinstance(text, str)
+            assert doctor_rejected["dsn"] not in text, stream
+            for mark in marks:
+                assert mark not in text, (stream, mark)
+        assert doctor_rejected["leaks"] == []
+
+    def test_the_sentry_check_is_not_active_and_names_the_type(
+        self, doctor_rejected: dict[str, object]
+    ) -> None:
+        row = doctor_rejected["sentry"]
+        if _DOCTOR_ROUTE[str(doctor_rejected["case"])] == "env":
+            # Refused by the env schema before any SDK call: doctor never ran.
+            assert row is None
+            assert doctor_rejected["returncode"] == 1
+            return
+        assert isinstance(row, dict)
+        assert row["status"] == "warn"
+        detail = str(row["detail"])
+        assert "active" not in detail
+        assert "reporting is OFF" in detail
+        assert f"({doctor_rejected['exc_type']})" in detail
+        assert "check MAGENT_SENTRY_DSN" in detail
+        assert "Traceback" not in detail
+
+    def test_the_check_and_the_log_agree(
+        self, doctor_rejected: dict[str, object]
+    ) -> None:
+        row = doctor_rejected["sentry"]
+        if not isinstance(row, dict):
+            # The env schema refused this DSN before the SDK saw it: init
+            # never ran, so there is nothing to log and nothing to disagree.
+            assert doctor_rejected["log"] is None
+            return
+        log_text = doctor_rejected["log"]
+        assert isinstance(log_text, str)
+        assert f"({doctor_rejected['exc_type']})" in log_text
+        assert "reporting is OFF" in log_text
+
+
+class _Counting:
+    """A loopback listener that counts connections and answers nothing."""
+
+    def __init__(self) -> None:
+        self.connections = 0
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self.port = self._sock.getsockname()[1]
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            self.connections += 1
+            conn.close()
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+def test_a_well_formed_dsn_reads_active_and_doctor_sends_nothing(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """The other half: a DSN the SDK accepts still reads active, and the whole
+    doctor run -- init at CLI entry, the check, the atexit flush -- puts
+    nothing on the wire. The DSN points at a real loopback listener, so a
+    send would be counted rather than guessed at."""
+    sink = _Counting()
+    try:
+        home = tmp_path_factory.mktemp("sentry-doctor-good-home")
+        run = _run_doctor(home, f"http://k@127.0.0.1:{sink.port}/1")
+        time.sleep(0.5)  # a send racing the child's exit would land by now
+    finally:
+        sink.close()
+    row = run["sentry"]
+    assert isinstance(row, dict), run["stderr"]
+    assert row["status"] == "ok"
+    assert "active" in str(row["detail"])
+    assert "reporting is OFF" not in str(row["detail"])
+    assert sink.connections == 0

@@ -405,15 +405,29 @@ def _check_state_dir() -> CheckResult:
 
 
 def _check_sentry() -> CheckResult:
-    """Surface the DSN-set-but-SDK-missing state HERE, not at CLI entry:
+    """Report whether error reporting is ACTUALLY on, from what the CLI-entry
+    ``init_sentry`` recorded -- not from "a DSN is set and the SDK imports".
+
     init_sentry degrades to a log-file warning so everyday commands stay
-    quiet, and doctor is where the actionable hint lives. sentry-sdk is a
-    base dependency, so the WARN below indicates a broken install, not a
-    missing optional extra."""
+    quiet (a missing SDK, or an SDK that rejects the DSN/options), and doctor
+    is where the actionable hint lives. It runs in the same process as that
+    init, so it reads the recorded outcome rather than re-deriving it: no
+    second DSN parse, no second init, no second atexit flush. WARN at worst.
+
+    The DSN and the exception's message are never printed here: an SDK
+    exception's text echoes parts of the DSN it rejected, so only the
+    exception TYPE and the SDK version are shown. sentry-sdk is a base
+    dependency, so "missing" indicates a broken install, not a missing extra.
+    """
     from pydantic import ValidationError  # heavy subsystem: in-body per policy
 
     from magent import env as env_module  # heavy subsystem: in-body per policy
-    from magent.sentry import SENTRY_INSTALL_HINT, sdk_installed
+    from magent.sentry import (  # heavy subsystem: in-body per policy
+        SENTRY_INSTALL_HINT,
+        ReportingState,
+        init_outcome,
+        sdk_installed,
+    )
 
     try:
         dsn = env_module.get_env().sentry_dsn
@@ -421,16 +435,43 @@ def _check_sentry() -> CheckResult:
         return (OK, "skipped — environment invalid (see the env check)")
     if dsn is None:
         return (OK, "error reporting off (MAGENT_SENTRY_DSN not set)")
-    if not sdk_installed():
+    missing = (
+        WARN,
+        (
+            "MAGENT_SENTRY_DSN is set but sentry-sdk is missing — error "
+            "reporting is OFF. sentry-sdk ships with magent, so this "
+            f"install looks broken. Repair: {SENTRY_INSTALL_HINT}"
+        ),
+    )
+    outcome = init_outcome()
+    if outcome is None:
+        # A DSN is set but init never ran in this process (the CLI entry runs
+        # it for every command, so only a caller that skipped the entry gets
+        # here). Say what can be said without guessing "active".
+        if not sdk_installed():
+            return missing
         return (
             WARN,
             (
-                "MAGENT_SENTRY_DSN is set but sentry-sdk is missing — error "
-                "reporting is OFF. sentry-sdk ships with magent, so this "
-                f"install looks broken. Repair: {SENTRY_INSTALL_HINT}"
+                "MAGENT_SENTRY_DSN is set but error reporting was not started in "
+                "this process — its state is unknown"
             ),
         )
-    return (OK, "error reporting active (DSN set, sentry-sdk installed)")
+    if outcome.state is ReportingState.SDK_MISSING:
+        return missing
+    if outcome.state is ReportingState.REJECTED:
+        return (
+            WARN,
+            (
+                f"sentry-sdk {outcome.sdk_version} rejected the error-reporting "
+                f"setup ({outcome.error_type}) — error reporting is OFF. "
+                "Repair: check MAGENT_SENTRY_DSN"
+            ),
+        )
+    return (
+        OK,
+        f"error reporting active (DSN set, sentry-sdk {outcome.sdk_version} accepted it)",
+    )
 
 
 def _check_tailscale() -> CheckResult:
