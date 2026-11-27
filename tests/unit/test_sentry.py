@@ -348,7 +348,7 @@ class TestNoEagerImport:
 # the host, and the project path segment (the SDK echoes the last one in
 # "Invalid project in DSN ('...')"). A marker found anywhere in the log file is
 # a leak.
-_KEY_MARK = "KEYMARK-3b9e51"
+_KEY_MARK = "KEYDECOY-3b9e51"
 _HOST_MARK = "hostmark-3b9e51"
 _PROJECT_MARK = "projmark-3b9e51"
 _MARKED_DSN = f"https://{_KEY_MARK}@{_HOST_MARK}.invalid/{_PROJECT_MARK}"

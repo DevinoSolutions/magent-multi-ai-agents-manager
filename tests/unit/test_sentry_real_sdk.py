@@ -290,7 +290,7 @@ def _bad_dsns() -> dict[str, tuple[str, str, tuple[str, ...]]]:
     Every DSN carries a marker in its host, and in its key where it has one;
     the component the SDK is known to echo (project path, scheme, port)
     carries one too."""
-    key, host = f"KEY{_TAG}", f"host{_TAG}.invalid"
+    key, host = f"KEYDECOY{_TAG}", f"host{_TAG}.invalid"
     return {
         "non-numeric-project": (
             f"http://{key}@{host}/proj{_TAG}",
