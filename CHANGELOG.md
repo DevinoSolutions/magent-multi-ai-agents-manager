@@ -16,6 +16,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `propagate_scope` and picks the SDK's own spelling of the no-PII and
   no-frame-locals settings, so 2.x and 3.x both keep those guarantees.
 
+## [3.21.1] - 2026-11-27
+
+### Fixed
+
+- **A fresh install no longer pulls in a sentry-sdk that breaks error
+  reporting.** sentry-sdk 3.0 removed options `init_sentry` relies on, so with
+  `MAGENT_SENTRY_DSN` set a fresh `pip install` raised `TypeError` at startup.
+  The dependency is now capped at `sentry-sdk>=2,<3`.
+- **`magent`, `magent --go`, `-a` and `-g` now work over ssh on Windows.** They
+  fell through to the psmux choke point, which could only refuse ("refusing to
+  start psmux sessions from a non-interactive logon session ... would have
+  created: demo", then "tiling: window not found"). The top-level launch
+  path now asks the same `session0_disposition` as `magent up`: `refuse` prints
+  the reason and exits 1, `handoff` re-runs the launch on the desktop (the menu
+  and project checklist still run in the ssh terminal; the concrete selection
+  travels as a hidden `--only`) and exits with its code. The menu's `u` hands
+  off as `magent up [-g GROUP]`; status and the other read-only actions are
+  untouched. With `MAGENT_SESSION0_POLICY=refuse`, a `--go` or `--retile-all`
+  over ssh now exits 1 with the refusal where a retile used to find no windows
+  and exit 0.
+- **Hand-off children no longer run at background priority.** A Task Scheduler
+  task defaults to priority 7 (BelowNormal CPU, Low I/O) and everything the
+  hand-off started inherited it: a `claude --continue` read a 424 MB transcript
+  at 0.4 MB/s and looked hung. The staged launcher now resets itself to Normal
+  CPU and I/O priority before starting the command.
+
 ## [3.21.0] - 2026-11-09
 
 ### Added
@@ -2087,6 +2113,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.21.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.21.0...v3.21.1
 [3.21.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.20.0...v3.21.0
 [3.20.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.4...v3.20.0
 [3.20.0rc2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.20.0rc1...v3.20.0rc2

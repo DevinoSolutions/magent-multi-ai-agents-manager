@@ -838,16 +838,15 @@ class TestAMintStartsOnlyFromAPersonsCommand:
 
     def test_nothing_but_the_console_module_asks_stdin_isatty(self):
         """Every prompt/mint decision goes through ``console.human_at_console``.
-        ``cli/app.py`` keeps its two pre-existing first-run/menu gates: they
-        choose a line-based ``click.prompt`` that reads EOF and exits under
-        NUL -- nothing is started for a person there."""
+        ``cli/app.py``'s first-run and menu gates ask it too: a hand-off's
+        desktop copy runs with stdin on NUL, which Windows calls a tty."""
         callers = {
             path
             for path, calls in self._calls("isatty").items()
             for call in calls
             if call.startswith("sys.stdin.")
         }
-        assert callers == {"console.py", "cli/app.py"}
+        assert callers == {"console.py"}
 
     def test_no_daemon_module_imports_the_minting_path(self):
         import ast
