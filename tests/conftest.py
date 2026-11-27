@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import types
@@ -84,6 +85,10 @@ _IMPORT_BOUND_PATHS = (
     ("magent.psmux", "DECOR_STAMP", "decor.stamp"),
     ("magent.nodes", "NODES_DIR", "nodes"),
     ("magent.nodes", "NODE_MAP_PATH", "nodes/node-map.json"),
+    ("magent.linkfiles", "LINK_PATH", "link.json"),
+    ("magent.linkfiles", "LINK_STATE_PATH", "link-state.json"),
+    ("magent.linkfiles", "INCOMING_DIR", "uploads/.incoming"),
+    ("magent.linkfiles", "LINK_SERVE_PATH", "link-serve.json"),
     # win32-only module (it raises ImportError elsewhere by design), so this
     # entry is skipped rather than imported off-Windows.
     ("magent.hotkey", "_PID_PATH", "hotkey.pid"),
@@ -247,6 +252,25 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # box's live fleet. Off for every tier; reaper tests turn it on IN PROCESS
     # only (monkeypatch.setenv + resetting env._cached_env).
     monkeypatch.setenv("MAGENT_IDLE_REAP", "0")
+    # ...and a sixth: `magent serve`'s event poller (events.run_poller)
+    # captures every live pane on this machine while a client listens. A test
+    # that starts a real serve and opens /api/v1/events would otherwise read
+    # the developer's own fleet. Off for every tier; tests that are ABOUT the
+    # poller drive EventPoller.tick directly with fake seams.
+    monkeypatch.setenv("MAGENT_EVENTS", "0")
+    # ...and a seventh, whose reach is the internet: `magent serve` runs the
+    # magent link thread, and on a developer box that is LINKED it would dial
+    # the real relay with the developer's own host token from the moment a test
+    # starts a real serve -- and run whatever the relay queued. Off for every
+    # tier; the link tests drive the link runner in process against a fake
+    # relay and never need the thread.
+    monkeypatch.setenv("MAGENT_LINK", "0")
+    # ...and its address: a dead loopback port (nothing listens on the
+    # discard port, so a dial is refused at once). Code that reads relay_url(),
+    # `magent link` included, can never reach the real relay because a test
+    # forgot to set one; the fake-relay tests set their own MAGENT_LINK_URL.
+    # _no_production_relay below covers the fallback that ignores this pin.
+    monkeypatch.setenv("MAGENT_LINK_URL", "http://127.0.0.1:9")
     log.reset_logging()
     yield
     log.reset_logging()
@@ -268,6 +292,65 @@ def _no_inherited_git_repo_env(monkeypatch):
     """
     for name in env.GIT_LOCAL_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+
+
+# The production relay's domain. No in-process test resolves a name under it.
+_PRODUCTION_RELAY_DOMAIN = "magent.now"
+
+
+@pytest.fixture(autouse=True)
+def _no_production_relay(monkeypatch):
+    """No test resolves the production relay, whatever URL it ended up with.
+
+    The MAGENT_LINK_URL pin above covers every reader of the env, but
+    ``link.relay_url()`` fails OPEN to ``https://api.magent.now`` when the
+    MAGENT_* environment does not validate, and a test can build a
+    RelayClient from ``link.DEFAULT_RELAY_URL`` directly. Every connection
+    resolves its host through ``socket.getaddrinfo`` first, so this refuses
+    the name there. ``pytest.fail`` raises a BaseException: the transport's
+    ``except OSError`` cannot turn it into a quiet network error.
+    """
+    real = socket.getaddrinfo
+
+    def guarded(host, *args, **kwargs):
+        raw = str((host.decode("latin-1") if isinstance(host, bytes) else host) or "")
+        try:
+            # The resolver IDNA-encodes a str host, so "api.magent\u3002now"
+            # (an ideographic or fullwidth dot) IS api.magent.now to it.
+            name = raw.encode("idna").decode("ascii")
+        except UnicodeError:
+            name = raw  # not IDNA-clean ("api.magent.now.."): judge it as given
+        name = name.lower().rstrip(".")
+        if name == _PRODUCTION_RELAY_DOMAIN or name.endswith(
+            "." + _PRODUCTION_RELAY_DOMAIN
+        ):
+            pytest.fail(
+                f"a test tried to resolve {name}: tests never reach the production relay"
+            )
+        return real(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", guarded)
+
+
+@pytest.fixture
+def fake_relay(monkeypatch):
+    """A running FakeRelay (tests/_fake_relay.py) that MAGENT_LINK_URL names,
+    with MAGENT_LINK_APP_URL on the same address (the fake answers pair/start
+    with its own URL as the appUrl, and a pairing refuses any other).
+
+    The pin above aims every test at a dead port; a link test points the env at
+    its own loopback relay and drops the env cache so ``link.relay_url()``
+    reads it. Tests that need constructor options (devices, host_keys,
+    long_poll_s, heartbeat_s) build their own ``with FakeRelay(...)`` and set
+    MAGENT_LINK_URL the same way.
+    """
+    from tests._fake_relay import FakeRelay
+
+    with FakeRelay() as relay:
+        monkeypatch.setenv("MAGENT_LINK_URL", relay.url)
+        monkeypatch.setenv("MAGENT_LINK_APP_URL", relay.url)
+        monkeypatch.setattr(env, "_cached_env", None)
+        yield relay
 
 
 @pytest.fixture(autouse=True)
@@ -300,6 +383,24 @@ def _no_real_gh(monkeypatch):
     and ``node setup`` registers an ssh key to their account with it. Same
     device as ``_no_real_ssh``; the ``fake_gh`` fixture wins over it."""
     monkeypatch.setattr("magent.remote_mux.find_gh", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_tailnet_names(request, monkeypatch):
+    """No in-process ``run_server`` learns the developer's REAL tailnet
+    names. ``upload_server._learn_hosts`` runs on a daemon thread that
+    ``run_server`` starts: it shells out to ``tailscale`` and writes
+    ``UploadHandler.allowed_hosts``, a class attribute, so a thread that
+    outlives its test's monkeypatch teardown would land the real MagicDNS
+    name and tailnet IP in the class state every later test reads. Stubbed
+    on the module attribute (the thread target is looked up at start time),
+    so the one test that drives ``_learn_hosts`` directly opts out with
+    ``@pytest.mark.learn_hosts`` and patches ``tailnet`` itself. A real
+    serve in a child process keeps the real function: its class state dies
+    with the process."""
+    if request.node.get_closest_marker("learn_hosts") is not None:
+        return
+    monkeypatch.setattr("magent.upload_server._learn_hosts", lambda _host: None)
 
 
 @pytest.fixture(autouse=True)

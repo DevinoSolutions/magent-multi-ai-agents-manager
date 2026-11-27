@@ -19,8 +19,13 @@ Import this module in-body at CLI entry, after env validation.
 from __future__ import annotations
 
 import logging
+import re
+from typing import TYPE_CHECKING, cast
 
 from magent.log import get_logger
+
+if TYPE_CHECKING:
+    from sentry_sdk._types import Event, Hint
 
 # Repair hint for the should-never-happen state: sentry-sdk ships as a base
 # dependency, so its absence means the install itself is damaged.
@@ -39,6 +44,51 @@ def sdk_installed() -> bool:
         # ValueError: sys.modules["sentry_sdk"] is None (how tests simulate
         # the package being absent).
         return False
+
+
+# Never shipped to Sentry: the link's credentials (`magent link`). Keys are
+# matched case-insensitively, camelCase spellings included; in any string, a
+# Bearer value, a host or poll token (``mlh_``/``mlp_`` + base64url) and the
+# pairing QR link's secret (``s=`` in its fragment) are cut out wherever they
+# sit.
+_SECRET_KEYS = frozenset(
+    {"authorization", "host_token", "poll_token", "hosttoken", "polltoken"}
+)
+_BEARER_RE = re.compile(r"(?i)(\bbearer\s+)[^\s\"',;)]+")
+_TOKEN_RE = re.compile(r"ml[hp]_[A-Za-z0-9_-]+")
+_QR_SECRET_RE = re.compile(r"(?<=[#&]s=)[A-Za-z0-9_-]+")
+REDACTED = "[redacted]"
+
+
+def _scrub_text(text: str) -> str:
+    text = _BEARER_RE.sub(lambda m: m.group(1) + REDACTED, text)
+    text = _TOKEN_RE.sub(REDACTED, text)
+    return _QR_SECRET_RE.sub(REDACTED, text)
+
+
+def _scrub(value: object, key: str = "") -> object:
+    lowered = key.lower()
+    if lowered in _SECRET_KEYS or lowered.endswith("priv"):
+        return REDACTED
+    if isinstance(value, str):
+        return _scrub_text(value)
+    if isinstance(value, dict):
+        return {k: _scrub(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_scrub(v) for v in value)
+    return value
+
+
+def scrub_event(event: Event, hint: Hint) -> Event | None:
+    """Sentry ``before_send``: the event with every link secret redacted --
+    Authorization headers and Bearer values, host and poll tokens, private
+    keys, the QR link's secret -- in messages, breadcrumbs, exception
+    values, request data and extras alike."""
+    del hint  # the SDK's signature; nothing in it is sent
+    scrubbed = _scrub(event)
+    return cast("Event", scrubbed) if isinstance(scrubbed, dict) else event
 
 
 def _release() -> str | None:
@@ -94,6 +144,8 @@ def init_sentry(dsn: str) -> None:
         # token, say -- rode along verbatim in every RemoteError's event.
         # Errors-only reporting never needed locals; the traceback stays.
         include_local_variables=False,
+        # ...and never a link credential (scrub_event above).
+        before_send=scrub_event,
         integrations=[
             LoggingIntegration(level=None, event_level=logging.ERROR),
             ThreadingIntegration(propagate_hub=True),

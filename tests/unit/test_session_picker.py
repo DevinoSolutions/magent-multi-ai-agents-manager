@@ -109,7 +109,7 @@ class TestPickerStalenessComesFromConfig:
     agents array, and silently ignored by `magent sessions` (and by `status`'s
     psmux-session table, which reads these same helpers). The window map now
     arrives as a plain argument, built once by
-    `attention_cmd.staleness_from_config`.
+    `fleetview.staleness_from_config`.
     """
 
     def _working_record(self, monkeypatch, age_s: float) -> None:

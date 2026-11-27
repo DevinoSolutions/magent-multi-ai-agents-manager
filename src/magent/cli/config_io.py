@@ -1,27 +1,29 @@
-"""Config-editor JSON I/O: the round-tripping raw-dict path (preserves
-unknown/unmodeled keys on every read-modify-write), deliberately kept
-separate from magent.config.load_config (the validated typed path for
-runtime consumption). E7 ships no typed *writer* and its loader intentionally
-drops unknown keys -- round-tripping an editor save through the dataclass
-would silently lose data. This module is that documented two-path contract,
-not an oversight (E6.md S2.4 / S0 deviation).
+"""Config-editor JSON I/O: the exit-on-error face of ``magent.config_io``.
+
+The round-tripping raw-dict path (preserves unknown/unmodeled keys on every
+read-modify-write) lives in ``src/magent/config_io.py`` so ``projects.py`` and
+the API can use it; this module keeps the editor's exit-1 style and the
+raw-dict narrowing helpers. Deliberately separate from
+magent.config.load_config (the validated typed path for runtime consumption):
+round-tripping an editor save through the dataclass would silently lose data
+(E6.md S2.4 / S0 deviation).
 """
 
 from __future__ import annotations
 
 import json
-import os
 import sys
-import tempfile
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
 
+from magent import config_io
 from magent.config import load_config
 from magent.style import style
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from magent.config import MagentConfig
 
 
@@ -37,41 +39,26 @@ def _load_raw_config(path: Path) -> dict[str, object]:
 
 
 def _save_raw_config(path: Path, data: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    """The interactive editor's save: ``config_io.save`` without validation
+    (the editor may pass through a state the user is still fixing), but with
+    the backup and the atomic write every config write now gets."""
+    config_io.save(path, data, validate=False)
 
 
 def _save_raw_config_atomic(path: Path, data: dict[str, object]) -> None:
-    """Write DATA over PATH without ever leaving a half-written config: the
-    JSON lands in a sibling temp file first, then one ``os.replace`` swaps it
-    in. ``_save_raw_config``'s straight write is fine for the interactive
-    editor (the user is right there, watching one field change); a whole config
-    arriving over SSH from another machine is not -- a truncated write there
-    would be discovered much later, by a launch that suddenly has no projects.
-    Sibling, not tempdir: ``os.replace`` is only atomic within a filesystem."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    """Write DATA over PATH without ever leaving a half-written config -- the
+    whole config arriving over SSH (``config put``) or from node onboarding,
+    already validated by the caller. Same write as ``_save_raw_config``; the
+    name stays for its callers. Known overlap: ``config put`` also keeps its
+    own ``<config>.bak-remote-edit`` copy, so a remote edit is backed up twice
+    (there and in ``~/.magent/backups``)."""
+    config_io.save(path, data, validate=False)
 
 
 def _validate_config_text(text: str) -> str | None:
-    """``None`` when TEXT would load as a valid config, else the reason it
-    would not (bad JSON included -- ConfigError subclasses ValueError).
-
-    Validation runs against a throwaway copy because ``load_config`` reads a
-    path, not a string: nothing is written near the real config until the
-    content has already passed. Both sides of the remote-edit flow call this --
-    ``config edit`` before it pushes, ``config put`` before it writes -- so a
-    mistake is rejected with the same words wherever it is caught."""
-    with tempfile.TemporaryDirectory(prefix="magent-cfgcheck-") as td:
-        probe = Path(td) / "config.json"
-        probe.write_text(text, encoding="utf-8")
-        try:
-            load_config(str(probe))
-        except (ValueError, OSError) as e:
-            return str(e)
-    return None
+    """Delegate to ``config_io.validate_text``: ``None`` when TEXT would load
+    as a valid config, else the reason it would not."""
+    return config_io.validate_text(text)
 
 
 # --- Raw-dict narrowing helpers ------------------------------------------

@@ -1,0 +1,897 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://magent.now/api/v1.schema.json",
+  "title": "magent /api/v1 wire types",
+  "$defs": {
+    "ChooseResult": {
+      "properties": {
+        "session": {
+          "title": "Session",
+          "type": "string"
+        },
+        "option": {
+          "title": "Option",
+          "type": "integer"
+        },
+        "confirmed": {
+          "title": "Confirmed",
+          "type": "boolean"
+        },
+        "pane_state_after": {
+          "title": "Pane State After",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "option",
+        "confirmed",
+        "pane_state_after"
+      ],
+      "title": "ChooseResult",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "Error": {
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_request",
+            "unauthorized",
+            "forbidden",
+            "not_found",
+            "method_not_allowed",
+            "conflict",
+            "expired",
+            "payload_too_large",
+            "rate_limited",
+            "internal",
+            "unavailable",
+            "timeout"
+          ],
+          "title": "Code",
+          "type": "string"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "details": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Details"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "title": "ErrorBody",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "Event": {
+      "description": "One event as it travels: SSE ``data:``, long-poll ``events[]`` item.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "hello",
+            "session.added",
+            "session.removed",
+            "session.state",
+            "session.pane",
+            "attention",
+            "upload",
+            "project.changed",
+            "reset"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "ts": {
+          "title": "Ts",
+          "type": "number"
+        },
+        "data": {
+          "additionalProperties": true,
+          "title": "Data",
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "ts",
+        "data"
+      ],
+      "title": "Event",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "Health": {
+      "description": "``/health`` and ``/api/v1/health``: one shape, two routes.",
+      "properties": {
+        "service": {
+          "title": "Service",
+          "type": "string"
+        },
+        "port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Port"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pid"
+        },
+        "uptime_s": {
+          "title": "Uptime S",
+          "type": "number"
+        },
+        "session_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Count"
+        },
+        "sessions_age_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Sessions Age S"
+        }
+      },
+      "required": [
+        "service",
+        "port",
+        "pid",
+        "uptime_s",
+        "session_count",
+        "sessions_age_s"
+      ],
+      "title": "Health",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "InterruptResult": {
+      "properties": {
+        "session": {
+          "title": "Session",
+          "type": "string"
+        },
+        "key": {
+          "title": "Key",
+          "type": "string"
+        },
+        "pane_state_after": {
+          "title": "Pane State After",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "key",
+        "pane_state_after"
+      ],
+      "title": "InterruptResult",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "Limits": {
+      "properties": {
+        "upload_max_bytes": {
+          "title": "Upload Max Bytes",
+          "type": "integer"
+        },
+        "pane_lines_max": {
+          "title": "Pane Lines Max",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "upload_max_bytes",
+        "pane_lines_max"
+      ],
+      "title": "Limits",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "LinkInfo": {
+      "properties": {
+        "state": {
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "title": "LinkInfo",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "Meta": {
+      "properties": {
+        "api": {
+          "title": "Api",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "string"
+        },
+        "epoch": {
+          "title": "Epoch",
+          "type": "string"
+        },
+        "caps": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Caps",
+          "type": "array"
+        },
+        "write_allowed": {
+          "title": "Write Allowed",
+          "type": "boolean"
+        },
+        "limits": {
+          "$ref": "#/$defs/Limits"
+        },
+        "link": {
+          "$ref": "#/$defs/LinkInfo"
+        }
+      },
+      "required": [
+        "api",
+        "version",
+        "epoch",
+        "caps",
+        "write_allowed",
+        "limits",
+        "link"
+      ],
+      "title": "Meta",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "ModelResult": {
+      "properties": {
+        "session": {
+          "title": "Session",
+          "type": "string"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Effort"
+        },
+        "verified": {
+          "title": "Verified",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "session",
+        "model",
+        "effort",
+        "verified"
+      ],
+      "title": "ModelResult",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "PaneResult": {
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "timed_out": {
+          "title": "Timed Out",
+          "type": "boolean"
+        },
+        "captured_at": {
+          "title": "Captured At",
+          "type": "number"
+        }
+      },
+      "required": [
+        "text",
+        "timed_out",
+        "captured_at"
+      ],
+      "title": "PaneResult",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "Poll": {
+      "description": "What a client resuming from ``last_id`` gets: the events after it, or\na ``reset`` reason when the gap cannot be replayed; ``next`` is the id to\nresume from next time.",
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/$defs/Event"
+          },
+          "title": "Events",
+          "type": "array"
+        },
+        "next": {
+          "title": "Next",
+          "type": "string"
+        },
+        "reset": {
+          "anyOf": [
+            {
+              "enum": [
+                "epoch",
+                "evicted"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reset"
+        }
+      },
+      "required": [
+        "events",
+        "next"
+      ],
+      "title": "Since",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "Project": {
+      "description": "One configured project as the API reports it (spec 3.3).",
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "session": {
+          "title": "Session",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "group": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Group"
+        },
+        "tool": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool"
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "node": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Node"
+        },
+        "windows": {
+          "title": "Windows",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "session",
+        "path",
+        "group",
+        "tool",
+        "enabled",
+        "node",
+        "windows"
+      ],
+      "title": "Project",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "ProjectList": {
+      "properties": {
+        "projects": {
+          "items": {
+            "$ref": "#/$defs/Project"
+          },
+          "title": "Projects",
+          "type": "array"
+        }
+      },
+      "required": [
+        "projects"
+      ],
+      "title": "ProjectList",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "RemoveResult": {
+      "properties": {
+        "removed": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Removed",
+          "type": "array"
+        },
+        "stopped": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Stopped",
+          "type": "array"
+        }
+      },
+      "title": "RemoveResult",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "removed",
+        "stopped"
+      ]
+    },
+    "SendResult": {
+      "properties": {
+        "session": {
+          "title": "Session",
+          "type": "string"
+        },
+        "confirmed": {
+          "title": "Confirmed",
+          "type": "boolean"
+        },
+        "pane_state_after": {
+          "title": "Pane State After",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "confirmed",
+        "pane_state_after"
+      ],
+      "title": "SendResult",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "SessionList": {
+      "properties": {
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionRow"
+          },
+          "title": "Sessions",
+          "type": "array"
+        },
+        "snapshot_ts": {
+          "title": "Snapshot Ts",
+          "type": "number"
+        }
+      },
+      "required": [
+        "sessions",
+        "snapshot_ts"
+      ],
+      "title": "SessionList",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "SessionRow": {
+      "description": "One session as every API surface reports it (spec 3.4).",
+      "properties": {
+        "session": {
+          "title": "Session",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "cwd": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cwd"
+        },
+        "group": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Group"
+        },
+        "tool": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool"
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "node": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Node"
+        },
+        "live": {
+          "title": "Live",
+          "type": "boolean"
+        },
+        "hook_state": {
+          "anyOf": [
+            {
+              "enum": [
+                "working",
+                "done",
+                "needs-input",
+                "error",
+                "idle",
+                "parked"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Hook State"
+        },
+        "hook_state_ts": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Hook State Ts"
+        },
+        "hook_state_age_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Hook State Age S"
+        },
+        "hook_state_stale": {
+          "title": "Hook State Stale",
+          "type": "boolean"
+        },
+        "pane_state": {
+          "anyOf": [
+            {
+              "enum": [
+                "dialog",
+                "busy",
+                "limit",
+                "idle",
+                "nopane",
+                "timeout",
+                "dead",
+                "cloud"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pane State"
+        },
+        "pane_state_ts": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pane State Ts"
+        },
+        "node_state": {
+          "anyOf": [
+            {
+              "enum": [
+                "live",
+                "stale",
+                "dead"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Node State"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Effort"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Id"
+        }
+      },
+      "required": [
+        "session",
+        "name",
+        "path",
+        "cwd",
+        "group",
+        "tool",
+        "enabled",
+        "node",
+        "live",
+        "hook_state",
+        "hook_state_ts",
+        "hook_state_age_s",
+        "hook_state_stale",
+        "pane_state",
+        "pane_state_ts",
+        "node_state",
+        "model",
+        "effort",
+        "session_id"
+      ],
+      "title": "SessionRow",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "StartFailure": {
+      "properties": {
+        "session": {
+          "title": "Session",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "reason"
+      ],
+      "title": "StartFailure",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "StartResult": {
+      "properties": {
+        "started": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Started",
+          "type": "array"
+        },
+        "already_live": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Already Live",
+          "type": "array"
+        },
+        "failed": {
+          "items": {
+            "$ref": "#/$defs/StartFailure"
+          },
+          "title": "Failed",
+          "type": "array"
+        }
+      },
+      "title": "StartResult",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "started",
+        "already_live",
+        "failed"
+      ]
+    },
+    "Status": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "StopResult": {
+      "properties": {
+        "stopped": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Stopped",
+          "type": "array"
+        },
+        "still_running": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Still Running",
+          "type": "array"
+        }
+      },
+      "title": "StopResult",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stopped",
+        "still_running"
+      ]
+    },
+    "UploadResult": {
+      "description": "What one upload became: where every file landed, in the order sent,\nand the paste state. ``upload_id`` names the request.",
+      "properties": {
+        "upload_id": {
+          "title": "Upload Id",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Paths",
+          "type": "array"
+        },
+        "paste": {
+          "enum": [
+            "injected",
+            "pending",
+            "saved"
+          ],
+          "title": "Paste",
+          "type": "string"
+        }
+      },
+      "required": [
+        "upload_id",
+        "path",
+        "paths",
+        "paste"
+      ],
+      "title": "UploadResult",
+      "type": "object",
+      "additionalProperties": false
+    }
+  }
+}
