@@ -15,6 +15,7 @@ from click.testing import CliRunner
 from magent import cli, wt_keys
 from magent import env as env_module
 from magent import psmux as psmux_mod
+from magent import sentry as sentry_mod
 from magent.cli import doctor
 from magent.cli.doctor import (
     FAIL,
@@ -779,14 +780,25 @@ class TestCheckPsmuxWedge:
 
 
 class TestCheckSentry:
-    """The DSN-set-but-SDK-missing state surfaces HERE (as a broken-install
-    warning with a repair hint — sentry-sdk is a base dependency), never as a
-    per-command stderr nag — see
+    """The sentry check reports what `init_sentry` RECORDED at CLI entry -- the
+    DSN-set-but-SDK-missing state surfaces HERE (as a broken-install warning
+    with a repair hint -- sentry-sdk is a base dependency) and so does a DSN
+    the SDK rejected, never as a per-command stderr nag. See
+    test_sentry.py::TestDoctorReadsTheInitOutcome for the full CLI path and
     test_sentry.py::TestMissingSdkIsQuietButLogged for the init side."""
+
+    _DSN = "https://example@o0.ingest.sentry.io/0"
 
     def _fake_env(self, monkeypatch, dsn):
         monkeypatch.setattr(
             "magent.env.get_env", lambda: types.SimpleNamespace(sentry_dsn=dsn)
+        )
+
+    @staticmethod
+    def _recorded(monkeypatch, state, version=None, error_type=None):
+        monkeypatch.setattr(
+            "magent.sentry._outcome",
+            sentry_mod.InitOutcome(state, version, error_type),
         )
 
     def test_no_dsn_is_ok_and_reports_off(self, monkeypatch):
@@ -795,18 +807,19 @@ class TestCheckSentry:
         assert status == OK
         assert "off" in detail
 
-    def test_dsn_with_sdk_installed_is_ok(self, monkeypatch):
-        self._fake_env(monkeypatch, "https://example@o0.ingest.sentry.io/0")
-        monkeypatch.setattr("magent.sentry.sdk_installed", lambda: True)
+    def test_dsn_the_sdk_accepted_is_ok_and_active(self, monkeypatch):
+        self._fake_env(monkeypatch, self._DSN)
+        self._recorded(monkeypatch, sentry_mod.ReportingState.ACTIVE, "2.71.0")
         status, detail = _check_sentry()
         assert status == OK
         assert "active" in detail
+        assert "2.71.0" in detail
 
     def test_dsn_without_sdk_warns_as_broken_install_with_repair_hint(
         self, monkeypatch
     ):
-        self._fake_env(monkeypatch, "https://example@o0.ingest.sentry.io/0")
-        monkeypatch.setattr("magent.sentry.sdk_installed", lambda: False)
+        self._fake_env(monkeypatch, self._DSN)
+        self._recorded(monkeypatch, sentry_mod.ReportingState.SDK_MISSING)
         status, detail = _check_sentry()
         assert status == WARN
         assert "sentry-sdk is missing" in detail
@@ -815,6 +828,39 @@ class TestCheckSentry:
         assert "install looks broken" in detail
         assert "pip install --force-reinstall magent-multi-ai-agents-manager" in detail
         assert "[sentry]" not in detail
+
+    def test_dsn_the_sdk_rejected_warns_naming_the_type_and_the_hint(self, monkeypatch):
+        self._fake_env(monkeypatch, self._DSN)
+        self._recorded(
+            monkeypatch, sentry_mod.ReportingState.REJECTED, "3.0.1", "BadDsn"
+        )
+        status, detail = _check_sentry()
+        assert status == WARN
+        assert "BadDsn" in detail
+        assert "3.0.1" in detail
+        assert "reporting is OFF" in detail
+        assert "check MAGENT_SENTRY_DSN" in detail
+        assert "active" not in detail
+        assert self._DSN not in detail
+
+    def test_a_dsn_with_no_recorded_init_never_reads_active(self, monkeypatch):
+        # Init did not run in this process (nothing recorded): doctor cannot
+        # know, so it must not claim "active".
+        self._fake_env(monkeypatch, self._DSN)
+        monkeypatch.setattr("magent.sentry.sdk_installed", lambda: True)
+        status, detail = _check_sentry()
+        assert status == WARN
+        assert "active" not in detail
+        assert "unknown" in detail
+
+    def test_a_dsn_with_no_recorded_init_and_no_sdk_still_names_the_repair(
+        self, monkeypatch
+    ):
+        self._fake_env(monkeypatch, self._DSN)
+        monkeypatch.setattr("magent.sentry.sdk_installed", lambda: False)
+        status, detail = _check_sentry()
+        assert status == WARN
+        assert "pip install --force-reinstall" in detail
 
 
 class TestCheckIdleReap:

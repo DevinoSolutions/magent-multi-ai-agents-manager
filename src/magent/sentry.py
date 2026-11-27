@@ -18,13 +18,20 @@ entry for EVERY command, so a stderr line would tax unrelated commands
 `magent doctor`. An SDK that rejects an option (a future major renaming one)
 degrades the same way: reporting is off, the command still runs.
 
+Every path out of `init_sentry` records an `InitOutcome` (active / SDK
+missing / rejected, with the SDK version and the exception TYPE -- never the
+DSN or the message), and `magent doctor` reads that record rather than
+re-deriving it: one answer to "is reporting actually on?".
+
 Import this module in-body at CLI entry, after env validation.
 """
 
 from __future__ import annotations
 
+import enum
 import logging
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from magent.log import get_logger
@@ -38,6 +45,49 @@ if TYPE_CHECKING:
 # Repair hint for the should-never-happen state: sentry-sdk ships as a base
 # dependency, so its absence means the install itself is damaged.
 SENTRY_INSTALL_HINT = "pip install --force-reinstall magent-multi-ai-agents-manager"
+
+
+class ReportingState(enum.Enum):
+    """What `init_sentry` did with a DSN, as `magent doctor` reports it."""
+
+    ACTIVE = "active"  # the SDK accepted the DSN and the options
+    SDK_MISSING = "sdk-missing"  # sentry-sdk would not import: a broken install
+    REJECTED = "rejected"  # the SDK refused the DSN or an option: reporting is off
+
+
+@dataclass(frozen=True)
+class InitOutcome:
+    """The recorded result of `init_sentry`.
+
+    Deliberately NOT carried: the DSN and the exception's message. An SDK
+    exception's text is built from the DSN it was handed (BadDsn echoes the
+    project segment, a bad port echoes the port text), so the only thing kept
+    about a rejection is the exception's TYPE name -- the same rule as the log
+    line. Nothing here can leak what it never held.
+    """
+
+    state: ReportingState
+    sdk_version: str | None = None
+    error_type: str | None = None
+
+
+# One process, one init (CLI entry), one outcome: written by `init_sentry` on
+# every path out of it, read by `magent doctor` -- which runs in that same
+# process, after the group callback. A second reader re-deriving this (parsing
+# the DSN, re-initialising the SDK) would be a second answer to "is reporting
+# on?", free to disagree with the first.
+_outcome: InitOutcome | None = None
+
+
+def _record(outcome: InitOutcome) -> None:
+    global _outcome  # noqa: PLW0603  # reason: module-level outcome of the one CLI-entry init, same singleton pattern as env._cached_env
+    _outcome = outcome
+
+
+def init_outcome() -> InitOutcome | None:
+    """What `init_sentry` recorded in THIS process; ``None`` when it has not
+    run here (no DSN, or no CLI entry -- e.g. a library import)."""
+    return _outcome
 
 
 def sdk_installed() -> bool:
@@ -211,6 +261,7 @@ def init_sentry(dsn: str) -> None:
             "install looks broken. Repair: %s",
             SENTRY_INSTALL_HINT,
         )
+        _record(InitOutcome(ReportingState.SDK_MISSING))
         return
 
     # `Callable[..., None]`: the privacy options are spelled per SDK major (see
@@ -253,11 +304,16 @@ def init_sentry(dsn: str) -> None:
         # was handed (BadDsn echoes the project path segment, a bad port
         # echoes the port text), so only the exception TYPE is logged: never
         # `str(exc)`, and never `exc_info` (a traceback carries the message).
+        version = str(getattr(sentry_sdk, "VERSION", "?"))
         get_logger("sentry").warning(
             "sentry-sdk %s rejected magent's init options (%s) -- error "
             "reporting is OFF; check MAGENT_SENTRY_DSN",
-            getattr(sentry_sdk, "VERSION", "?"),
+            version,
             type(exc).__name__,
         )
+        _record(InitOutcome(ReportingState.REJECTED, version, type(exc).__name__))
         return
     atexit.register(lambda: sentry_sdk.flush(timeout=2))
+    _record(
+        InitOutcome(ReportingState.ACTIVE, str(getattr(sentry_sdk, "VERSION", "?")))
+    )

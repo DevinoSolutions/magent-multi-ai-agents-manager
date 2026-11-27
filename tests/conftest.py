@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from magent import agent_state, env, log, node_sync, procs, reap
+from magent import agent_state, env, log, node_sync, procs, reap, sentry
 from magent.grid import MonitorRect
 from magent.platform import (
     HandoffResult,
@@ -136,6 +136,9 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     monkeypatch.setattr(agent_state, "STATE_DIR", tmp_path / "agent-state")
     monkeypatch.setattr(env, "ENV_FILE", tmp_path / "env-file")
     monkeypatch.setattr(env, "_cached_env", None)
+    # The recorded outcome of the CLI-entry init_sentry is process-global, so
+    # an init one test ran must not read as "what happened" in the next one.
+    monkeypatch.setattr(sentry, "_outcome", None)
     if not _keeps_real_home(request):
         # A SIBLING of tmp_path, not a child: tmp_path is a working directory
         # tests scan, glob and assert the contents of (scan_for_projects walks

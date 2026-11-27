@@ -11,15 +11,19 @@ and pass even in an environment where it is absent.
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import subprocess
 import sys
 import types
 
 import pytest
+from click.testing import CliRunner
 
-from magent import log
+from magent import cli, log
+from magent.config import SCHEMA_VERSION
 from magent.sentry import SENTRY_INSTALL_HINT, init_sentry
+from tests.conftest import FakePlatform
 
 _FAKE_DSN = "https://example@o0.ingest.sentry.io/0"
 
@@ -439,3 +443,146 @@ class TestTheInitFailureWarningNeverCarriesTheDsn:
         assert "sentry-sdk is missing" in text
         for mark in _MARKS:
             assert mark not in text, mark
+
+
+# --- doctor reads what init actually did -------------------------------------
+
+# Appears only in the text of the exception the fake SDK raises, never in the
+# DSN: proof that doctor does not echo `str(exc)` any more than the log does.
+_MESSAGE_MARK = "SDK-MESSAGE-MARK-3b9e51"
+
+
+class TestDoctorReadsTheInitOutcome:
+    """`magent doctor` runs in the same process as the CLI-entry
+    ``init_sentry`` that already tried the DSN, so the sentry check reads what
+    that init recorded -- it does not guess from "a DSN is set and the SDK
+    imports", and it never inits, flushes or registers anything itself. Each
+    of the four states, in the plain checklist and in ``--json``."""
+
+    @pytest.fixture(autouse=True)
+    def _quiet_doctor(self, monkeypatch: pytest.MonkeyPatch):
+        self.atexit_calls: list[object] = []
+        monkeypatch.setattr(atexit, "register", self.atexit_calls.append)
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        log.reset_logging()
+        yield
+        log.reset_logging()
+
+    @staticmethod
+    def _doctor(tmp_config, dsn: str | None, *, as_json: bool):
+        cfg = tmp_config({"version": SCHEMA_VERSION, "projects": [{"path": "api"}]})
+        args = ["--config", cfg, "doctor"] + (["--json"] if as_json else [])
+        env = {} if dsn is None else {"MAGENT_SENTRY_DSN": dsn}
+        return CliRunner().invoke(cli.main, args, env=env)
+
+    @staticmethod
+    def _sentry_check(result, *, as_json: bool) -> tuple[str, str]:
+        """(status, detail) of the sentry row, from whichever rendering."""
+        if as_json:
+            checks = {c["name"]: c for c in json.loads(result.stdout)["checks"]}
+            return checks["sentry"]["status"], checks["sentry"]["detail"]
+        statuses = {"+": "ok", "!": "warn", "x": "fail"}
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[1] == "sentry" and parts[0] in statuses:
+                return statuses[parts[0]], parts[2]
+        raise AssertionError(f"no sentry row in:\n{result.stdout}")
+
+    @pytest.mark.parametrize("as_json", [True, False], ids=["json", "plain"])
+    def test_no_dsn_reads_off_and_ok(self, tmp_config, as_json: bool) -> None:
+        result = self._doctor(tmp_config, None, as_json=as_json)
+        status, detail = self._sentry_check(result, as_json=as_json)
+        assert status == "ok"
+        assert "off" in detail
+        assert "MAGENT_SENTRY_DSN not set" in detail
+
+    @pytest.mark.parametrize("as_json", [True, False], ids=["json", "plain"])
+    def test_an_accepted_dsn_reads_active(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_config, as_json: bool
+    ) -> None:
+        fake_sdk = _install_fake_sentry_sdk(monkeypatch)
+        result = self._doctor(tmp_config, _MARKED_DSN, as_json=as_json)
+        status, detail = self._sentry_check(result, as_json=as_json)
+        assert status == "ok"
+        assert "active" in detail
+        assert "2.71.0" in detail
+        # init ran exactly once (CLI entry); doctor added nothing.
+        assert len(fake_sdk.init_calls) == 1
+        assert len(self.atexit_calls) == 1
+        assert fake_sdk.flush_calls == []
+
+    @pytest.mark.parametrize("as_json", [True, False], ids=["json", "plain"])
+    def test_a_missing_sdk_warns_with_the_reinstall_hint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_config, as_json: bool
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "sentry_sdk", None)
+        result = self._doctor(tmp_config, _MARKED_DSN, as_json=as_json)
+        status, detail = self._sentry_check(result, as_json=as_json)
+        assert status == "warn"
+        assert "sentry-sdk is missing" in detail
+        assert "install looks broken" in detail
+        assert SENTRY_INSTALL_HINT in detail
+
+    @pytest.mark.parametrize("version", ["2.71.0", "3.0.1"])
+    @pytest.mark.parametrize("as_json", [True, False], ids=["json", "plain"])
+    def test_a_rejected_dsn_warns_naming_the_type_and_hint_only(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_config,
+        as_json: bool,
+        version: str,
+    ) -> None:
+        fake_sdk = _install_fake_sentry_sdk(monkeypatch, version=version)
+
+        class BadDsn(ValueError):
+            pass
+
+        def _reject(**kwargs: object) -> None:
+            raise BadDsn(f"{_MESSAGE_MARK} Invalid project in DSN ({kwargs['dsn']!r})")
+
+        fake_sdk.init = _reject
+
+        result = self._doctor(tmp_config, _MARKED_DSN, as_json=as_json)
+
+        status, detail = self._sentry_check(result, as_json=as_json)
+        assert status == "warn"
+        assert "BadDsn" in detail
+        assert version in detail
+        assert "reporting is OFF" in detail
+        assert "active" not in detail
+        assert "MAGENT_SENTRY_DSN" in detail, "the repair hint names what to check"
+        # Nothing of the DSN or of the exception's message, in any stream, nor
+        # in the sentry log doctor sits beside.
+        log_file = log.LOG_DIR / "sentry.log"
+        streams = {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "log": log_file.read_text(encoding="utf-8") if log_file.exists() else "",
+        }
+        for name, text in streams.items():
+            for mark in (*_MARKS, _MESSAGE_MARK):
+                assert mark not in text, (name, mark)
+        assert "Traceback" not in result.stdout + result.stderr
+        # Doctor re-initialised nothing and registered no second flush.
+        assert self.atexit_calls == []
+
+    def test_a_rejected_dsn_is_a_warning_not_a_failed_doctor(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_config
+    ) -> None:
+        """WARN-at-worst, like its siblings: the check never decides the exit
+        code."""
+        fake_sdk = _install_fake_sentry_sdk(monkeypatch)
+
+        def _reject(**kwargs: object) -> None:
+            raise ValueError("no")
+
+        fake_sdk.init = _reject
+        result = self._doctor(tmp_config, _MARKED_DSN, as_json=True)
+        report = json.loads(result.stdout)
+        sentry_row = next(c for c in report["checks"] if c["name"] == "sentry")
+        assert sentry_row["status"] == "warn"
+        assert report["failures"] == sum(
+            1 for c in report["checks"] if c["status"] == "fail"
+        )
