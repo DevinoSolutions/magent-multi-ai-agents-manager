@@ -1,4 +1,4 @@
-"""Unit tests for scripts/lint_rules.py — the MD001-MD007 custom lint layer.
+"""Unit tests for scripts/lint_rules.py — the MD001-MD013 custom lint layer.
 
 Each rule is proven with a violating snippet (fires) and a conforming snippet
 (silent), plus scope checks (which path prefixes each rule applies to). The
@@ -11,11 +11,30 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-_LINT_RULES = Path(__file__).resolve().parents[2] / "scripts" / "lint_rules.py"
-_spec = importlib.util.spec_from_file_location("lint_rules", _LINT_RULES)
-assert _spec is not None and _spec.loader is not None  # a loadable module guard
-lint_rules = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(lint_rules)
+import pytest
+
+from magent import api
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_script(name):
+    """A scripts/<name>.py module, loaded by file path (scripts/ is no package)."""
+    spec = importlib.util.spec_from_file_location(
+        name, _ROOT / "scripts" / f"{name}.py"
+    )
+    assert spec is not None and spec.loader is not None  # a loadable module guard
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+lint_rules = _load_script("lint_rules")
+
+# Every module under src/magent/, as the repo-relative posix path the rules key on.
+_SRC_RELS = sorted(
+    p.relative_to(_ROOT).as_posix() for p in (_ROOT / "src" / "magent").rglob("*.py")
+)
 
 
 def _codes(rel, source):
@@ -319,3 +338,259 @@ def test_md002_no_longer_whitelists_the_kill_recipes():
     allow = lint_rules.MD002_ALLOW
     assert "src/magent/cli/attention_cmd.py" not in allow
     assert "src/magent/node_sync.py" not in allow
+
+
+# ---- MD011: config writes only through the config_io seam -------------------
+
+
+def test_md011_flags_config_io_save_outside_the_allow_list():
+    src = "from magent import config_io\nconfig_io.save(p, d)\n"
+    assert _codes("src/magent/launch.py", src) == ["MD011"]
+
+
+def test_md011_flags_write_atomic_too():
+    src = "from magent import config_io\nconfig_io.write_atomic(p, d)\n"
+    assert _codes("src/magent/nodes.py", src) == ["MD011"]
+
+
+def test_md011_flags_importing_save_by_name():
+    assert _codes("src/magent/reap.py", "from magent.config_io import save\n") == [
+        "MD011"
+    ]
+
+
+def test_md011_flags_the_cli_wrappers_outside_the_editor():
+    src = "_save_raw_config(p, d)\n"
+    assert _codes("src/magent/cli/status.py", src) == ["MD011"]
+
+
+def test_md011_allows_projects_and_the_editor():
+    src = "from magent import config_io\nconfig_io.save(p, d)\n"
+    assert _codes("src/magent/projects.py", src) == []
+    assert _codes("src/magent/cli/config_editor.py", "_save_raw_config(p, d)\n") == []
+
+
+def test_md011_ignores_other_saves():
+    assert _codes("src/magent/launch.py", "image.save(p)\nstore.save(p)\n") == []
+
+
+def test_md011_allow_list_names_real_files():
+    root = Path(__file__).resolve().parents[2]
+    assert all((root / rel).is_file() for rel in lint_rules.MD011_ALLOW)
+
+
+# ---- MD009: the /api/v1 prefix is spelled only in api.py --------------------
+
+
+def test_md009_flags_the_prefix_outside_api():
+    assert _codes("src/magent/upload_server.py", 'X = "/api/v1/meta"\n') == ["MD009"]
+
+
+def test_md009_flags_an_fstring_that_builds_a_route():
+    src = 'def f(s):\n    return f"/api/v1/sessions/{s}"\n'
+    assert _codes("src/magent/link.py", src) == ["MD009"]
+
+
+def test_md009_allows_api_and_prose():
+    assert _codes("src/magent/api.py", 'PREFIX = "/api/v1"\n') == []
+    assert (
+        _codes("src/magent/cli/fleet_cmd.py", 'H = "Print the /api/v1 envelope"\n')
+        == []
+    )
+
+
+def test_md009_does_not_apply_to_tests():
+    assert _codes("tests/unit/test_api.py", 'P = "/api/v1/meta"\n') == []
+
+
+def test_md009_prefix_is_the_api_prefix():
+    assert lint_rules._MD009_PREFIX == api.PREFIX
+
+
+# ---- MD010: keystrokes only through the control seam ------------------------
+
+
+def test_md010_flags_send_keys_outside_the_allow_list():
+    src = "from magent import psmux\npsmux.send_keys(n, 'x', target=n)\n"
+    assert _codes("src/magent/cli/fleet_cmd.py", src) == ["MD010"]
+
+
+def test_md010_flags_paste_and_enter_and_switch_model():
+    src = "from magent import fleet\nfleet.paste_and_enter(n, t)\nfleet.switch_model(n, m, e)\n"
+    assert _codes("src/magent/launch.py", src) == ["MD010", "MD010"]
+
+
+def test_md010_flags_importing_a_keystroke_by_name():
+    assert _codes("src/magent/watch.py", "from magent.psmux import send_key\n") == [
+        "MD010"
+    ]
+
+
+def test_md010_allows_control_and_the_listed_pipelines():
+    src = "from magent import psmux\npsmux.send_key(n, 'Escape')\n"
+    for rel in ("src/magent/control.py", "src/magent/altv.py", "src/magent/reap.py"):
+        assert _codes(rel, src) == []
+
+
+def test_md010_ignores_reads():
+    src = "from magent import psmux\npsmux.read_pane(n)\npsmux.capture_pane(n)\n"
+    assert _codes("src/magent/cli/fleet_cmd.py", src) == []
+
+
+def test_md010_allow_list_names_real_files():
+    root = Path(__file__).resolve().parents[2]
+    assert all((root / rel).is_file() for rel in lint_rules.MD010_ALLOW)
+
+
+# ---- MD012: one place builds an AttentionEngine -----------------------------
+
+
+def test_md012_flags_an_engine_built_outside_fleetview():
+    src = "from magent import attention\ne = attention.AttentionEngine(pairs)\n"
+    assert _codes("src/magent/node_sync.py", src) == ["MD012"]
+
+
+def test_md012_flags_the_bare_name_too():
+    src = "from magent.attention import AttentionEngine\ne = AttentionEngine(pairs)\n"
+    assert _codes("src/magent/events.py", src) == ["MD012"]
+
+
+def test_md012_allows_fleetview():
+    src = "from magent import attention\ne = attention.AttentionEngine(pairs)\n"
+    assert _codes("src/magent/fleetview.py", src) == []
+
+
+def test_md012_ignores_uses_that_build_nothing():
+    for src in (
+        "e = attention.engine_from_config(c)\n",
+        "ok = isinstance(e, AttentionEngine)\n",
+        "e = AttentionEngine.from_x()\n",
+    ):
+        assert _codes("src/magent/node_sync.py", src) == []
+
+
+# ---- MD009 / MD012: exactly one owner each ----------------------------------
+
+
+def test_md009_and_md012_each_name_one_real_owner():
+    assert lint_rules.MD009_OWNER == "src/magent/api.py"
+    assert lint_rules.MD012_OWNER == "src/magent/fleetview.py"
+    assert {lint_rules.MD009_OWNER, lint_rules.MD012_OWNER} <= set(_SRC_RELS)
+
+
+@pytest.mark.parametrize("rel", _SRC_RELS)
+def test_md009_and_md012_flag_every_other_module(rel):
+    want_md012 = [] if rel == lint_rules.MD012_OWNER else ["MD012"]
+    assert _codes(rel, "e = AttentionEngine(p)\n") == want_md012
+    want_md009 = [] if rel == lint_rules.MD009_OWNER else ["MD009"]
+    assert _codes(rel, 'X = "/api/v1/meta"\n') == want_md009
+
+
+def test_the_gate_label_names_every_rule():
+    check = _load_script("check")
+    assert any("MD001-MD013" in label for label, _ in check.FAST_STEPS)
+
+
+def test_the_repo_is_clean_under_md009_to_md013():
+    root = Path(__file__).resolve().parents[2]
+    new = {"MD009", "MD010", "MD011", "MD012", "MD013"}
+    assert [f for f in lint_rules.check_tree(root) if f.code in new] == []
+
+
+# ---- MD013: outbound HTTP only from the allowlisted files ---------------------
+
+
+def test_md013_flags_an_https_connection_in_a_new_module():
+    src = "import http.client\nc = http.client.HTTPSConnection('relay.example')\n"
+    # the import and the attribute
+    assert _codes("src/magent/newthing.py", src) == ["MD013", "MD013"]
+
+
+def test_md013_flags_a_bare_name_and_urlopen():
+    src = "from urllib.request import urlopen\nfrom http.client import HTTPConnection\nurlopen('x')\nHTTPConnection('h')\n"
+    assert _codes("src/magent/newthing.py", src) == ["MD013"] * 4
+
+
+def test_md013_flags_an_aliased_import():
+    src = "from urllib.request import urlopen as fetch\nfetch('x')\n"
+    assert _codes("src/magent/newthing.py", src) == ["MD013"]
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "import urllib.request\n",
+        "import http.client as hc\n",
+        "import xmlrpc.client\n",
+        "import requests\n",
+        "import requests.adapters\n",
+        "import httpx\n",
+        "import aiohttp\n",
+        "import urllib3\n",
+        "from requests import Session\n",
+        "from httpx import Client\n",
+        "from aiohttp import ClientSession\n",
+        "from urllib3 import PoolManager\n",
+        "from xmlrpc.client import ServerProxy\n",
+        "from urllib import request\n",
+        "from http import client\n",
+        "from xmlrpc import client as rpc\n",
+    ],
+)
+def test_md013_flags_every_http_client_import(src):
+    assert _codes("src/magent/newthing.py", src) == ["MD013"]
+
+
+@pytest.mark.parametrize("name", ["urlretrieve", "build_opener", "OpenerDirector"])
+def test_md013_flags_the_opener_names(name):
+    assert _codes("src/magent/newthing.py", f"{name}('x')\n") == ["MD013"]
+    assert _codes("src/magent/newthing.py", f"urllib.request.{name}('x')\n") == [
+        "MD013"
+    ]
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "import urllib.parse\n",
+        "from urllib.parse import urlsplit\n",
+        "import http.server\n",
+        "from http import HTTPStatus\n",
+        "import socket\nsocket.create_connection(('127.0.0.1', 1))\n",
+        "import subprocess\nsubprocess.run(['tailscale', 'ip'])\n",
+        "from . import client\n",
+        "import requestsx\n",
+    ],
+)
+def test_md013_leaves_parsing_servers_sockets_and_subprocesses_alone(src):
+    assert _codes("src/magent/newthing.py", src) == []
+
+
+def test_md013_allows_the_link_module_and_the_existing_callers():
+    src = "import http.client\nhttp.client.HTTPSConnection('h')\nfrom urllib.request import urlopen\nurlopen('x')\nimport requests\n"
+    for rel in lint_rules.MD013_ALLOW:
+        assert "MD013" not in _codes(rel, src), rel
+
+
+def test_md013_does_not_apply_outside_src_magent():
+    src = "from urllib.request import urlopen\nurlopen('x')\n"
+    assert _codes("tests/unit/test_x.py", src) == []
+
+
+def test_md013_every_allow_entry_exists_and_has_a_reason():
+    root = Path(__file__).resolve().parents[2]
+    for rel, why in lint_rules.MD013_ALLOW.items():
+        assert (root / rel).is_file(), rel
+        assert len(why) > 20, rel
+
+
+def test_md013_names_link_py_as_the_one_relay_dialer():
+    assert "src/magent/link.py" in lint_rules.MD013_ALLOW
+    assert set(lint_rules.MD013_ALLOW) <= set(_SRC_RELS)
+
+
+@pytest.mark.parametrize("rel", _SRC_RELS)
+def test_md013_flags_every_module_off_the_allowlist(rel):
+    want = [] if rel in lint_rules.MD013_ALLOW else ["MD013"]
+    assert _codes(rel, "c = HTTPSConnection('h')\n") == want
+    assert _codes(rel, "import urllib.request\n") == want

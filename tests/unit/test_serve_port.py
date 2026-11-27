@@ -47,12 +47,18 @@ def ensured(monkeypatch):
 
 @pytest.fixture
 def served(monkeypatch):
-    """Record the kwargs the blocking `serve` path hands to run_server."""
+    """Record the kwargs the blocking `serve` path hands to run_server.
+
+    ``status_provider`` (what ``GET /api/v1/status`` calls) is a fresh closure
+    on every call, so it is checked for being callable and left out of the
+    record: the port is the subject here."""
     calls = []
-    monkeypatch.setattr(
-        "magent.upload_server.run_server",
-        lambda **kwargs: calls.append(kwargs),
-    )
+
+    def _run_server(**kwargs):
+        assert callable(kwargs.pop("status_provider"))
+        calls.append(kwargs)
+
+    monkeypatch.setattr("magent.upload_server.run_server", _run_server)
     # The banner shells out to `tailscale`; the port is the subject here.
     monkeypatch.setattr("magent.tailnet.ip4", lambda: None)
     return calls

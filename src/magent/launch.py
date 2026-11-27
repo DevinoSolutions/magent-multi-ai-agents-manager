@@ -2141,6 +2141,46 @@ def psmux_status(
     return psmux.psmux_status(config, group)
 
 
+@dataclass(frozen=True)
+class BringUp:
+    """What a quiet bring-up did, as data: ``created`` (local and node
+    sessions the verify proved up), ``local_failed`` (each local casualty
+    mapped to why, "" = see launch.log) and every node outcome, ok or not."""
+
+    created: list[str]
+    local_failed: dict[str, str]
+    node_outcomes: list[NodeBringUpOutcome]
+
+
+def bring_up_psmux_quiet(
+    config: MagentConfig,
+    only: list[str] | None = None,
+    group: str | None = None,
+    *,
+    allow_dirty: bool = False,
+    config_path: str | None = None,
+) -> BringUp:
+    """``psmux.bring_up`` plus the pool-node projects, printing nothing --
+    the core ``control.start`` (a serve thread, no console) and
+    ``bring_up_psmux`` (the CLI path, which prints the node outcomes) share.
+    A node session that came up gets the node sync daemon started on
+    ``config_path``, the file this bring-up read."""
+    from magent import psmux
+
+    created, failed = psmux.bring_up(config, only, group)
+    outcomes = bring_up_node_projects(
+        config, only=only, group=group, allow_dirty=allow_dirty
+    )
+    if any(o.ok for o in outcomes):
+        # The sync daemon reads the same file this bring-up did (E).
+        _keep_node_sync(config, config_path)
+    return BringUp(
+        created=[*created, *(o.sid for o in outcomes if o.ok)],
+        local_failed=failed,
+        node_outcomes=outcomes,
+    )
+
+
 def bring_up_psmux(
     config: MagentConfig,
     only: list[str] | None = None,
@@ -2149,27 +2189,21 @@ def bring_up_psmux(
     allow_dirty: bool = False,
     config_path: str | None = None,
 ) -> tuple[list[str], dict[str, str]]:
-    """Delegate to ``psmux.bring_up``, then bring the pool-node projects up
-    too (PR-D; no windows -- this is the host side of attach). Returns
-    ``(created, failed)`` over both, where ``failed`` maps each session that
-    stayed down to why ("" = see the log). A node casualty maps to "": its
-    reason is printed with the node outcomes, the only place it appears, and
-    ``report_bring_up_casualties`` must not print it twice. A node session
-    that came up gets the node sync daemon started on ``config_path``, the
-    file this bring-up read."""
-    from magent import psmux
-
-    created, failed = psmux.bring_up(config, only, group)
-    outcomes = bring_up_node_projects(
-        config, only=only, group=group, allow_dirty=allow_dirty
+    """``bring_up_psmux_quiet``, then the node outcomes printed for the CLI
+    shells. Returns ``(created, failed)`` over both, where ``failed`` maps
+    each session that stayed down to why ("" = see the log). A node casualty
+    maps to "": its reason is printed with the node outcomes, the only place
+    it appears, and ``report_bring_up_casualties`` must not print it twice."""
+    result = bring_up_psmux_quiet(
+        config, only, group, allow_dirty=allow_dirty, config_path=config_path
     )
-    _echo_node_outcomes(outcomes)
-    if any(o.ok for o in outcomes):
-        # The sync daemon reads the same file this bring-up did (E).
-        _keep_node_sync(config, config_path)
+    _echo_node_outcomes(result.node_outcomes)
     return (
-        [*created, *(o.sid for o in outcomes if o.ok)],
-        {**failed, **{o.sid: "" for o in outcomes if not o.ok}},
+        result.created,
+        {
+            **result.local_failed,
+            **{o.sid: "" for o in result.node_outcomes if not o.ok},
+        },
     )
 
 
