@@ -12,6 +12,7 @@ from pathlib import Path
 
 import click
 
+from magent import console
 from magent.cli.checklist import ABORT_MESSAGE, choose_projects
 from magent.cli.config_io import _load_config_or_exit
 from magent.cli.pipeguard import run_guarded
@@ -91,6 +92,41 @@ def _escape_unencodable_output() -> None:
     reconfigure(errors=OUTPUT_ERRORS)
 
 
+def _launch_flags(
+    *,
+    go: bool,
+    retile_all: bool,
+    group: str | None,
+    launch_all: bool,
+    allow_dirty: bool,
+    only: frozenset[str] | None,
+) -> list[str]:
+    """The group-level flags that make the desktop copy do what this launch was
+    about to do, rebuilt from the FINAL values (the menu's answers included) and
+    never from ``sys.argv`` -- a menu pick has no argv at all.
+
+    The desktop copy has no terminal (its stdin is NUL), so it shows neither the
+    menu nor the checklist; ``--only`` is what carries the checklist's answer.
+    ``--go`` already implies a full re-tile, so ``--retile-all`` rides only when
+    ``--go`` does not.
+    """
+    flags: list[str] = []
+    if go:
+        flags.append("--go")
+    elif retile_all:
+        flags.append("--retile-all")
+    if group:
+        flags.extend(["-g", group])
+    if launch_all:
+        flags.append("--all")
+    if allow_dirty:
+        flags.append("--allow-dirty")
+    if only is not None:
+        for name in sorted(only):
+            flags.extend(["--only", name])
+    return flags
+
+
 class _MagentGroup(click.Group):
     """The entry-point group: runs under ``pipeguard`` so a closed stdout/stderr
     pipe ends the process quietly instead of as a traceback (Sentry MAGENT-1).
@@ -156,6 +192,13 @@ class _MagentGroup(click.Group):
     is_flag=True,
     help="Node projects: start despite a dirty or unpushed tree",
 )
+@click.option(
+    "--only",
+    "only_names",
+    multiple=True,
+    hidden=True,
+    help="Launch only the project(s) with this name (repeatable)",
+)
 # package_name (not a resolved literal) so click reads the distribution
 # metadata inside the --version callback only -- see magent/__init__.py.
 @click.version_option(package_name="magent-multi-ai-agents-manager")
@@ -176,6 +219,7 @@ def main(
     attach_port: int,
     attach_no_mux: bool,
     allow_dirty: bool,
+    only_names: tuple[str, ...],
 ) -> None:
     """Open every project in its own terminal and auto-tile across all monitors."""
     _escape_unencodable_output()
@@ -265,7 +309,7 @@ def main(
         if config_path:
             click.echo(f"No config found at: {config_file}", err=True)
             sys.exit(1)
-        if sys.stdin.isatty() and not go:
+        if console.human_at_console() and not go:
             wrote = _run_discovery(config_file)
             if not wrote:
                 sys.exit(1)
@@ -275,8 +319,12 @@ def main(
 
     cfg = _load_config_or_exit(config_file)
 
-    has_directive = go or retile_all or dry_run or group
-    if not has_directive and sys.stdin.isatty():
+    has_directive = go or retile_all or dry_run or group or only_names
+    # `human_at_console`, not a raw isatty(): the hand-off's desktop copy runs
+    # with stdin on NUL, which Windows reports as a tty, and a directive-less
+    # launch (`magent`, `magent -a`) would otherwise paint this menu there, hit
+    # EOF and die "Aborted!" with nothing launched.
+    if not has_directive and console.human_at_console():
         while True:
             groups = sorted({p.group for p in cfg.projects if p.group})
             menu = _show_menu(list(groups), config_file)
@@ -305,12 +353,32 @@ def main(
             group = group_choice if isinstance(group_choice, str) else None
             break
 
+    # In a non-interactive logon session (Session 0 -- an ssh login to Windows)
+    # a launch cannot happen here: the windows it opens and tiles would belong
+    # to a desktop nobody is looking at, and the psmux sessions behind them
+    # would hold their names against the real desktop. So decide it NOW, before
+    # the checklist asks anything of a user whose answer would be refused: a
+    # refusal ends the run; a hand-off lets the checklist (just UI in this
+    # terminal) run here and re-runs only the CONCRETE selection on the desktop,
+    # below. A dry run creates and moves nothing, so it is left to run in place.
+    plat = None
+    disposition = "run"
+    if not dry_run:
+        from magent.launch import session0_gate  # heavy subsystem: in-body per policy
+        from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+        plat = get_platform()
+        disposition = session0_gate(plat)
+        if disposition == "refuse":
+            sys.exit(1)
+
     # Which projects to launch. Off a terminal, or with `--all`, there is no
     # prompt and no narrowing -- `--go` in a script stays byte-for-byte what it
-    # was. A pure re-tile launches nothing, so it is never asked either.
+    # was. A pure re-tile launches nothing, so it is never asked either. An
+    # explicit `--only` (what a hand-off carries) is the answer already.
     tile_only = retile_all and not go
-    only: frozenset[str] | None = None
-    if not launch_all and not tile_only:
+    only: frozenset[str] | None = frozenset(only_names) if only_names else None
+    if only is None and not launch_all and not tile_only:
         choice = choose_projects(cfg, group=group)
         if choice.aborted:
             click.echo(ABORT_MESSAGE)
@@ -337,6 +405,28 @@ def main(
                 if only is None or nodes.project_name(p) in only
             ],
         )
+
+    if disposition == "handoff" and plat is not None:
+        if only is not None and not only:
+            return  # an empty selection launches nothing, here or there
+        from magent.launch import (  # heavy subsystem: in-body per policy
+            SESSION0_UP_TIMEOUT_S,
+            handoff_argv,
+            relay_handoff,
+        )
+
+        argv = handoff_argv(
+            config_path,
+            *_launch_flags(
+                go=go,
+                retile_all=retile_all,
+                group=group,
+                launch_all=launch_all,
+                allow_dirty=allow_dirty,
+                only=only,
+            ),
+        )
+        sys.exit(relay_handoff(plat, argv, timeout_s=SESSION0_UP_TIMEOUT_S))
 
     # Menu option 2 ("Re-tile all open windows") and a bare `--retile-all` both
     # promise tiling, not launching -- re-opening a window the user just closed
