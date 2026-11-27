@@ -146,10 +146,11 @@ def _strings(node: object, path: str = ""):
         yield path, node
 
 
-@pytest.fixture(scope="module")
-def captured(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
-    home = tmp_path_factory.mktemp("sentry-real-home")
-    out: Path = home / "result.json"
+def _child_env(home: Path) -> dict[str, str]:
+    """A child environment that cannot reach a real service or the real home:
+    the whole home family redirected, the DSN variables dropped, and loopback
+    exempt from any inherited proxy (the scenario's own request to its
+    in-process server must not be routed through a corporate/CI proxy)."""
     env = {
         **os.environ,
         "HOME": str(home),
@@ -157,13 +158,21 @@ def captured(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
         "HOMEDRIVE": home.drive or "",
         "HOMEPATH": str(home)[len(home.drive) :] if home.drive else str(home),
         "NO_COLOR": "1",
+        "NO_PROXY": "127.0.0.1,localhost",
+        "no_proxy": "127.0.0.1,localhost",
     }
-    # The child must not reach any real service or watch the real machine.
     for name in ("MAGENT_SENTRY_DSN", "SENTRY_DSN"):
         env.pop(name, None)
+    return env
+
+
+@pytest.fixture(scope="module")
+def captured(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
+    home = tmp_path_factory.mktemp("sentry-real-home")
+    out: Path = home / "result.json"
     proc = subprocess.run(
         [sys.executable, "-c", _SCENARIO, _DSN, str(out)],
-        env=env,
+        env=_child_env(home),
         cwd=str(home),
         capture_output=True,
         text=True,
@@ -243,3 +252,143 @@ class TestTheRealSdkSendsNothingButTheError:
     ) -> None:
         # Belt and braces for any breadcrumb source an integration adds later.
         assert captured["max_breadcrumbs"] == 0
+
+
+# --- a DSN the real SDK rejects never reaches sentry.log ---------------------
+
+# Runs in the child. argv: dsn, out-file. NO capture transport is installed
+# here (unlike _SCENARIO): with a transport object given, 2.x never parses the
+# DSN and so never rejects it, which is the very path under test. Nothing can
+# be sent either way -- every DSN below is rejected by the SDK's own parser
+# before a client exists, and the hosts are `.invalid`.
+_BAD_DSN_SCENARIO = """
+import json, sys
+import sentry_sdk
+from magent.sentry import init_sentry
+
+dsn, out = sys.argv[1], sys.argv[2]
+init_sentry(dsn)  # must not raise
+active = sentry_sdk.get_client().is_active()
+try:
+    sentry_sdk.init(dsn=dsn)
+    sdk_message = None
+except Exception as exc:
+    sdk_message = type(exc).__name__ + ": " + str(exc)
+json.dump(
+    {"version": sentry_sdk.VERSION, "active": active, "sdk_message": sdk_message},
+    open(out, "w"),
+)
+"""
+
+_TAG = "mk7c2e"  # the unique part of every marker below
+# The components the SDK is known to echo back in its message.
+_ECHOED_PARTS = (f"proj{_TAG}", f"scheme{_TAG}", f"port{_TAG}")
+
+
+def _bad_dsns() -> dict[str, tuple[str, str, tuple[str, ...]]]:
+    """case -> (dsn, exception type the SDK raises, markers in that DSN).
+    Every DSN carries a marker in its host, and in its key where it has one;
+    the component the SDK is known to echo (project path, scheme, port)
+    carries one too."""
+    key, host = f"KEY{_TAG}", f"host{_TAG}.invalid"
+    return {
+        "non-numeric-project": (
+            f"http://{key}@{host}/proj{_TAG}",
+            "BadDsn",
+            (key, host, f"proj{_TAG}"),
+        ),
+        "missing-project": (f"http://{key}@{host}/", "BadDsn", (key, host)),
+        "missing-key": (f"http://{host}/1", "BadDsn", (host,)),
+        "unsupported-scheme": (
+            f"scheme{_TAG}://{key}@{host}/1",
+            "BadDsn",
+            (key, host, f"scheme{_TAG}"),
+        ),
+        "non-numeric-port": (
+            f"http://{key}@{host}:port{_TAG}/1",
+            "ValueError",
+            (key, host, f"port{_TAG}"),
+        ),
+        "no-scheme": (f"{key}@{host}/1", "BadDsn", (key, host)),
+        "garbage": (f"garbage-{key}-{host}", "BadDsn", (key, host)),
+    }
+
+
+@pytest.fixture(scope="module", params=sorted(_bad_dsns()))
+def rejected(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
+) -> dict[str, object]:
+    dsn, exc_type, marks = _bad_dsns()[request.param]
+    home = tmp_path_factory.mktemp("sentry-bad-dsn-home")
+    out: Path = home / "result.json"
+    proc = subprocess.run(
+        [sys.executable, "-c", _BAD_DSN_SCENARIO, dsn, str(out)],
+        env=_child_env(home),
+        cwd=str(home),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    log_file = home / ".magent" / "logs" / "sentry.log"
+    return {
+        **json.loads(out.read_text(encoding="utf-8")),
+        "dsn": dsn,
+        "exc_type": exc_type,
+        "marks": marks,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "log": log_file.read_text(encoding="utf-8") if log_file.exists() else None,
+    }
+
+
+class TestARejectedDsnNeverReachesTheLog:
+    """The real SDK rejects each of these DSNs with a message that can echo
+    part of the DSN (see ``test_the_sdk_really_does_echo_part_of_the_dsn``).
+    magent's init-failure warning must name the exception type and nothing
+    from the message, on whichever SDK major is installed."""
+
+    def test_init_degrades_instead_of_raising(
+        self, rejected: dict[str, object]
+    ) -> None:
+        # The child asserted nothing escaped (rc 0); the client is off.
+        assert rejected["active"] is False
+
+    def test_the_warning_is_logged_with_the_type_only(
+        self, rejected: dict[str, object]
+    ) -> None:
+        text = rejected["log"]
+        assert isinstance(text, str), "the degraded init must leave a log line"
+        assert "reporting is OFF" in text
+        assert f"({rejected['exc_type']})" in text
+        assert str(rejected["version"]) in text
+        assert "MAGENT_SENTRY_DSN" in text
+        assert "Traceback" not in text
+
+    def test_no_part_of_the_dsn_is_written_anywhere(
+        self, rejected: dict[str, object]
+    ) -> None:
+        marks = rejected["marks"]
+        assert isinstance(marks, tuple)
+        for stream in ("log", "stdout", "stderr"):
+            text = rejected[stream]
+            assert isinstance(text, str)
+            assert rejected["dsn"] not in text, stream
+            for mark in marks:
+                assert mark not in text, (stream, mark)
+
+    def test_the_sdk_really_does_echo_part_of_the_dsn(
+        self, rejected: dict[str, object]
+    ) -> None:
+        """The premise, so the no-leak checks cannot pass vacuously. Only the
+        cases built around an echoed component assert it, and a future SDK
+        that stops echoing skips (visible in ``-rs``) instead of failing --
+        the no-leak tests above keep running either way."""
+        message = rejected["sdk_message"]
+        assert isinstance(message, str), "the SDK must reject this DSN"
+        assert message.startswith(str(rejected["exc_type"]))
+        dsn = str(rejected["dsn"])
+        echoed_parts = [part for part in _ECHOED_PARTS if part in dsn]
+        if echoed_parts and not any(part in message for part in echoed_parts):
+            pytest.skip(f"this SDK no longer echoes the DSN: {message!r}")

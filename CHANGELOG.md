@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A rejected `MAGENT_SENTRY_DSN` no longer writes part of the DSN into
+  `~/.magent/logs/sentry.log`.** When the SDK refused to start, the warning
+  quoted the SDK's own exception message, and that message is built from the
+  DSN (a `BadDsn` echoes the project path segment, a bad port echoes the port
+  text). The warning now carries the exception type, the SDK version and a
+  fixed "check MAGENT_SENTRY_DSN" hint, and never the message or a traceback.
+  Local log file only; nothing was ever sent. (#306)
+
 ## [3.21.2] - 2026-11-27
 
 ### Fixed
