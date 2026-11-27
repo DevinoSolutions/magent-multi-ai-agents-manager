@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Error reporting works on sentry-sdk 3.x, and the `<3` cap is lifted.**
+  sentry-sdk 3.0 removed options `init_sentry` passed
+  (`ThreadingIntegration(propagate_hub=)`, `send_default_pii`,
+  `include_local_variables`), so with `MAGENT_SENTRY_DSN` set a fresh
+  `pip install` raised `TypeError` at startup; 3.21.1 worked around it by
+  capping the dependency at `sentry-sdk>=2,<3`, and that cap is gone again.
+  `init_sentry` now uses `propagate_scope` and spells the privacy settings the
+  way the installed SDK wants them: no PII, no frame locals, and on 3.x every
+  `data_collection` category closed explicitly (it has no off switch, and an
+  omitted category collects).
+- **Error reports carry no breadcrumbs.** An event used to be able to carry a
+  trail of what happened before the error. sentry-sdk 3.x turns INFO log lines
+  into breadcrumbs by default (so project names, user paths and ssh hosts
+  would have ridden along), and both majors record outgoing-http URLs with
+  their query string. `max_breadcrumbs=0` on both majors, and the logging
+  integration is built for ERROR events only (no breadcrumbs, no Sentry Logs).
+- **A Sentry init failure can no longer break a command.** If the installed
+  SDK rejects any of magent's init options (a future major renaming one),
+  reporting is switched off with a warning in `~/.magent/logs/sentry.log`
+  instead of a `TypeError` out of every `magent` invocation.
+
 ## [3.21.1] - 2026-11-27
 
 ### Fixed

@@ -9,12 +9,7 @@ requires-python = ">=3.10"
 # MAGENT_SENTRY_DSN is set), but when the DSN IS set the SDK must exist —
 # bundling makes the "DSN set, SDK missing" state unrepresentable in a healthy
 # install instead of a warning users have to act on.
-# Capped below 3: sentry-sdk 3.0 removed `ThreadingIntegration(propagate_hub=)`
-# and the `send_default_pii` / `include_local_variables` init options (replaced
-# by a structured `data_collection` option), so `init_sentry` raises TypeError
-# on it. The PII / frame-locals settings are privacy guarantees, so moving to 3.x
-# is a deliberate port of `init_sentry`, not a blind bump.
-dependencies = ["click>=8.0", "pydantic-settings>=2.14", "sentry-sdk>=2,<3"]
+dependencies = ["click>=8.0", "pydantic-settings>=2.14", "sentry-sdk>=2"]
 keywords = [
   "terminal",
   "windows-terminal",
