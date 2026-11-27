@@ -48,7 +48,7 @@ from magent.log import clear_heartbeat, get_logger, run_heartbeat, write_heartbe
 from magent.procs import pid_alive
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Iterator, Mapping
+    from collections.abc import Callable, Collection, Generator, Mapping
     from concurrent.futures import Future
 
     from magent.config import MagentConfig
@@ -242,7 +242,7 @@ def supervisor_held(
     *,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
-) -> Iterator[bool]:
+) -> Generator[bool, None, None]:
     """Hold serve's supervisor lock (``SUPERVISOR_LOCK_NAME``) for the body,
     so no ``magent serve`` starts a daemon while ``down --all`` stops it: its
     ``_supervise_node_sync`` skips every tick it cannot take this lock for.
@@ -427,7 +427,7 @@ def node_lock(
     wait_s: float = 0.0,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
-) -> Iterator[None]:
+) -> Generator[None, None, None]:
     """Hold ``node-pull-<nick>`` for one pull, retrying every
     ``NODE_LOCK_RETRY_S`` for up to ``wait_s``. NodeLockHeld when it stays
     taken. Only ACQUIRING is retried: a LockHeld raised inside the body

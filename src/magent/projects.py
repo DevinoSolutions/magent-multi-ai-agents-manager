@@ -22,7 +22,7 @@ from magent.paths import find_config
 from magent.wire import WireError
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
 
 class ProjectError(WireError):
@@ -132,7 +132,7 @@ def _save(path: Path, data: dict[str, object]) -> None:
 
 
 @contextmanager
-def _locked() -> Iterator[None]:
+def _locked() -> Generator[None, None, None]:
     """``config_io.locked``: writers in this process queue, another process's
     writer is waited for (``config_io.LOCK_WAIT_S``), and only a lock that
     stays held is answered as ``conflict`` instead of ``LockHeld``."""

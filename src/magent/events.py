@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Literal
 from magent.log import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Generator
 
     from magent.attention import AttentionEngine
     from magent.config import MagentConfig
@@ -201,7 +201,7 @@ class EventBus:
     # -- who is listening -----------------------------------------------------
 
     @contextlib.contextmanager
-    def subscription(self, panes: tuple[str, ...] = ()) -> Iterator[None]:
+    def subscription(self, panes: tuple[str, ...] = ()) -> Generator[None, None, None]:
         """Count one listener (and its pane interest) for as long as the
         block runs: the poller works only while the count is above zero."""
         with self._cond:

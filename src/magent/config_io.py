@@ -38,7 +38,7 @@ from magent.fsutil import replace_retrying
 from magent.lockfile import LockHeld, persistent_lock
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
 BACKUP_KEEP = 20
 # Fixed-width, so a lexical sort of the names is a sort by time.
@@ -187,7 +187,7 @@ def save(
 
 
 @contextlib.contextmanager
-def locked(wait_s: float | None = None) -> Iterator[None]:
+def locked(wait_s: float | None = None) -> Generator[None, None, None]:
     """Hold the config exclusively across threads AND processes for one
     read-modify-write, waiting up to ``wait_s`` (default ``LOCK_WAIT_S``) in
     all for it. Raises ``lockfile.LockHeld`` when it stays taken. The file
