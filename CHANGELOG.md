@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A fresh install no longer pulls in a sentry-sdk that breaks error
+  reporting.** sentry-sdk 3.0 removed options `init_sentry` relies on, so with
+  `MAGENT_SENTRY_DSN` set a fresh `pip install` raised `TypeError` at startup.
+  The dependency is now capped at `sentry-sdk>=2,<3`.
 - **`magent`, `magent --go`, `-a` and `-g` now work over ssh on Windows.** They
   fell through to the psmux choke point, which could only refuse ("refusing to
   start psmux sessions from a non-interactive logon session ... would have
